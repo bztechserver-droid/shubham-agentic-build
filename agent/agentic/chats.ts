@@ -316,6 +316,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const env: Record<string, string> = {}
       for (const [k, v] of Object.entries(o.env ?? process.env)) if (v !== undefined && !DROP_ENV.test(k)) env[k] = v
       Object.assign(env, { TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3', SAD_AGENTIC_KEY: key, SAD_AGENTIC_URL: o.toolsUrl() })
+      // F-040: claude's plain screen, not its full-screen one. That one (the alternate screen,
+      // with the mouse captured) keeps no scrollback in the page's terminal and scrolls only by
+      // wheel events, which don't get through Windows' pseudo-terminal: the chat couldn't be
+      // scrolled. SAD_CLAUDE_FULLSCREEN=1 keeps the full-screen one, as before.
+      if ((o.env ?? process.env).SAD_CLAUDE_FULLSCREEN !== '1') Object.assign(env, { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1', CLAUDE_CODE_DISABLE_MOUSE: '1' })
       const token = o.token?.()
       if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
 

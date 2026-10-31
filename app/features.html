@@ -554,6 +554,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-040",
+    "title": "A chat's terminal scrolls up and down",
+    "said": "Now one thing to do: when I scroll on my terminal, the scroll does not happen up and down. I need that.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Found by starting claude 2.1.316 in a pseudo-terminal and reading what it sends: on its main screen it switches to the alternate screen (?1049h) and captures the mouse (?1000h, 1002h, 1003h, 1006h), its full-screen view. That view keeps nothing in the terminal's scrollback and scrolls its own transcript only by wheel events, which don't get through Windows' pseudo-terminal, so the wheel did nothing. Built: every chat now starts with claude's switches CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 and CLAUDE_CODE_DISABLE_MOUSE=1 (checked the same way: neither mode is turned on then), so it draws on the plain screen and the page's terminal keeps its 5000 lines of scrollback, scrolled by the wheel and its scrollbar. The full-screen view is kept as the alternative: SAD_CLAUDE_FULLSCREEN=1 on the PC. A chat running now gets it when it next starts (Stop, then Resume). Checked: a chat test (both switches given), all agent tests, types, lint. Code: agent/agentic/chats.ts."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
