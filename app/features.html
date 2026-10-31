@@ -578,6 +578,28 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-042",
+    "title": "A chat window's buttons on a phone, and Ctrl+C there",
+    "said": "one min i also dont see the reload chat button also have stop button on phone as there is no ctrl+c and that is the only command needed",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: The phone gets the current page (its app's service worker keeps nothing), so Reload was there but pushed off the right of the title bar: at a phone's width the two pickers and the PC tag left no room. Now the pickers give way first and the buttons never shrink, so they always fit; the title bar is 44px on touch. And a ^C button on touch screens (before Reload), which sends Ctrl+C to the chat: it stops what claude is doing; twice in a row ends claude, as in any terminal (Resume picks it back up). Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx, Terminal.tsx (keysRef)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-043",
+    "title": "A hard scroll keeps going",
+    "said": "also on the right side scroll that you made as fix introduce such that if i scroll hard it keeps going up",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built on F-041's wheel: steps that come close together (a fast spin, under 60 ms apart) count for more and more, up to 6 times; a pause starts from 1 again. When a fast spin stops, the terminal coasts on in the same direction, slowing to a stop in about half a second; a new wheel step or a key takes over at once. A slow turn is as before: 4 lines a step. Checked: types, lint, the page build. Code: src/agentic/Terminal.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
