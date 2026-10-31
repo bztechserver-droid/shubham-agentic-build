@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
 import type { Logger } from '../log.ts'
+import { createScreen, type Screen } from './screen.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
 // (node-pty, ConPTY on Windows), as agentic-claude-manager runs them (server/lib/terminal.js):
@@ -114,6 +115,8 @@ export interface ChatPool {
   resize(sessionId: string, cols: number, rows: number): void
   /** The last `lines` of its screen as plain text (read_chat); null when it isn't running. */
   read(sessionId: string, lines?: number): string | null
+  /** F-050: what its terminal shows now, line by line (a question waiting, the spinner: screen.ts reads them); null when it isn't running. */
+  screen(sessionId: string): string[] | null
   /** Pastes `text` and presses Enter (send_to_chat); false when it isn't running. */
   type(sessionId: string, text: string): boolean
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
@@ -178,6 +181,8 @@ interface Chat {
   exited: boolean
   lastSeen: number
   size: { cols: number; rows: number }
+  /** F-050: its terminal as a screen of text, kept as it prints. */
+  screen: Screen
   gates: { trust: boolean; trustTries: number; resume: boolean; scan: string; until: number }
 }
 
@@ -350,6 +355,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         exited: false,
         lastSeen: Date.now(),
         size,
+        screen: createScreen(size.cols, size.rows),
         gates: { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
       }
       chats.set(s.sessionId, c)
@@ -358,6 +364,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         c.buffer.push(data)
         c.bytes += data.length
         while (c.bytes > MAX_BUFFER_BYTES && c.buffer.length > 1) c.bytes -= c.buffer.shift()!.length
+        c.screen.write(data)
         noteState(c, data)
         answerGates(c, data)
         for (const v of c.viewers) {
@@ -420,10 +427,16 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         if (w === c.size.cols && h === c.size.rows) {
           // Same size: nudge it, so the TUI repaints the whole screen for a page that just joined.
           c.pty.resize(w - 1, h)
+          c.screen.resize(w - 1, h)
           setTimeout(() => {
-            if (!c.exited) c.pty.resize(w, h)
+            if (c.exited) return
+            c.pty.resize(w, h)
+            c.screen.resize(w, h)
           }, 60).unref()
-        } else c.pty.resize(w, h)
+        } else {
+          c.pty.resize(w, h)
+          c.screen.resize(w, h)
+        }
         c.size = { cols: w, rows: h }
       } catch {
         // Exited meanwhile.
@@ -439,6 +452,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         .map(l => l.replace(/\s+$/, ''))
       while (all.length && all[all.length - 1] === '') all.pop()
       return all.slice(-cap).join('\n')
+    },
+
+    screen(id) {
+      const c = chats.get(id)
+      return c && !c.exited ? c.screen.lines() : null
     },
 
     type(id, text) {

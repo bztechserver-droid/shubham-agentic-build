@@ -207,7 +207,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
   // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
-  const chatFeeds = createChatFeeds({ projectsDir, log: o.log })
+  const chatFeeds = createChatFeeds({ projectsDir, log: o.log, screen: sid => chats.screen(sid) })
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
@@ -268,7 +268,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     await layerStarted
     return layer
   }
-  if (o.memory?.start && mode() !== 'member') void memoryLayer().catch(e => log?.warn(`memory: couldn't start: ${message(e)}`))
+  /** Switched on (main.ts): the chats get it (recall, the brief's section, memory_read, hits). Off, the Memory tab still can. */
+  const memoryOn = !!o.memory?.start
+  if (memoryOn && mode() !== 'member') void memoryLayer().catch(e => log?.warn(`memory: couldn't start: ${message(e)}`))
   /** F-051, on a member: the hub's memory section for its chats' briefs, as last fetched. */
   let memberBrief = ''
   function memoryBrief(): string {
@@ -1059,18 +1061,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const query = typeof args.query === 'string' ? args.query : ''
         const limit = typeof args.limit === 'number' ? args.limit : 10
         const entries = memory.search(floor.id, query, limit)
-        // F-051: the floor's notes by keyword as before, and hits from all of the memory beside them.
-        if (args.mode === 'keyword') return json({ entries })
+        // F-051: the floor's notes by keyword as before, and hits from all of the memory beside
+        // them once the layer is switched on (until then, the answer is exactly as it was).
+        if (args.mode === 'keyword' || !memoryOn) return json({ entries })
         const hits = query.trim() ? await (await memoryLayer()).search(query, { limit, excludeSession: sid }) : []
         return json({ entries, hits })
       }
       case 'memory_recent':
         return json({ entries: memory.recent(floor.id, typeof args.limit === 'number' ? args.limit : 10) })
       case 'memory_read':
+        if (!memoryOn) throw apiError(409, "The app's memory (F-051) isn't switched on yet; memory_search finds the floor's notes.")
         return (await memoryLayer()).read(typeof args.ref === 'string' ? args.ref : '')
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
       case 'memory_recall':
-        return (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' })
+        return memoryOn ? (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
         const model = args.model

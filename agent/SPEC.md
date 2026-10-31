@@ -1428,6 +1428,65 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   `allowRemote` taking only tailnet and loopback addresses (403, or the socket closed, for
   others); gone, it is closed. Its API token rule is the page's (fromApp: an IP Host, same origin).
 
+## F-051: the memory layer (agentic/memory-layer.ts and the files it names)
+
+Kept on the hub (or a PC on its own); a member's chats reach it through the hub, their tool
+calls as before (`tool`), their recall as the internal tool `memory_recall`, the page's routes
+as any non-local route.
+
+- **Raw, never changed:** the floors' notes (memory.ts, as before), and the floor chats' turns
+  (memory-turns.ts): read from each floor session's JSONL as it grows (a cursor per session,
+  whole lines only), a turn is something said (Shubham's, or another chat's `[message from ...]`)
+  with the chat's last text before the next one as its answer, closed by the next message or 3
+  minutes of quiet; kept in `memory-layer/turns.jsonl`, once per message uuid (a copied
+  conversation, F-022, is not kept twice). Tool results, slash commands, claude's notices and
+  `<system-reminder>`s are not turns. No model is run for any of this.
+- **The wiki** (wiki.ts), Karpathy's LLM wiki in `<state>/agent/agentic/wiki`: `SCHEMA.md` (the
+  librarian's rules; written only when missing), `core.md` (the always page), `index.md` and
+  `log.md` (written by the app), `inbox/` (each run's material, never changed), pages in
+  folders (`people/`, `projects/`, `howto/`, `decisions/`, `setup/`, `topics/`); front matter
+  `title`, `summary`, `tags`, `updated`. A git repository when git is on PATH, a commit after each
+  run (the identity given with `-c`, no global config touched).
+- **Search** (memory-search.ts, embedder.ts): every wiki section, note and turn, by words (BM25,
+  code-like names whole and in parts) and by meaning (bge-base-en-v1.5, 8-bit, through
+  onnxruntime-node, 2 threads; a passage cut at 320 tokens, a turn embedded by its first 1,000
+  characters). Fused: min-max over each list's top 50, meaning weighted `0.8 - 0.6 × c²` where `c`
+  is the best words hit's share of the query's words by rarity. The model is fetched at first use
+  from Hugging Face into `<state>/agent/models` (sha256 checked against `X-Linked-Etag`); until
+  it is ready, and if it can't be had, search goes by words. Vectors are kept in
+  `memory-layer/vectors-<model>.jsonl` by the sha1 of what was embedded, compacted once mostly dead.
+- **Recall:** each floor chat starts with `--settings hooks.json` (one `UserPromptSubmit` command,
+  `"<node>" "<memory-hook.ts>"`, forward slashes, both quoted; claude adds it to the user's own
+  settings: checked, a project's hook and this one both run). The hook posts the prompt to
+  `POST /agentic/mcp/recall` with the chat's key (ownAuth, as `/mcp/call`: no token, refused with
+  an Origin) and prints the answer as `additionalContext`; on any error it prints nothing and
+  exits 0. Nothing is searched for a slash command, another chat's message, or under 3 words of
+  3+ letters. Up to 4 hits, each with meaning ≥ 0.62 or a share of the words ≥ 0.75, never the
+  chat's own turns, one section per page, none shown to that chat within its last 8 prompts.
+- **The brief:** `## What you remember` last in every chat's brief: what the memory is, core.md
+  (4,000 characters at most) and the wiki's pages (3,000 characters, newest first). A member
+  takes it from the hub (`GET /memory/brief`), fetched every 5 minutes and as a chat starts.
+- **The librarian** (librarian.ts): `claude -p --model <sonnet|haiku|opus> --restricted
+  --strict-mcp-config --tools Read,Write,Edit,Glob,Grep --permission-mode acceptEdits
+  --no-session-persistence --output-format json --append-system-prompt-file SCHEMA.md`, in the
+  wiki's folder, the prompt on stdin, `CLAUDE_CODE_OAUTH_TOKEN` as the chats have it, the child
+  session markers and `SAD_*` dropped, 20 minutes at most. One run takes up to 100,000 characters
+  of material (notes, then Claude Code's memory files from `~/.claude/projects/*/memory/`, then
+  turns oldest first, an answer as its first 700 characters). After it: the pages changed (by
+  size and time), the index written, the log appended, a commit, the run kept (20) with its cost
+  and tokens from claude's JSON. A failed run removes its inbox file and compiles nothing.
+  Turns from before the layer first started (its baseline) are the past: compiled only with
+  `pastChats` on, in order, behind their own cursor. **Compile by itself** is off by default; on,
+  every 15 minutes it runs once `everyHours` (24) have passed and 1,500 characters are waiting.
+- **Switched on** by main.ts (`memory: { meaning: true, start: true }`): the layer starts with the
+  agent, chats get the hook and the brief's section. Without it (the build until Shubham says, and
+  the tests): the layer starts at first use, by words only, and chats get neither.
+- **Tools:** `memory_search` answers `entries` (the floor's notes by keyword, as before) and `hits`
+  (all of the memory; `mode: "keyword"` for the old answer alone); `memory_read` opens a page by
+  path or a hit by id. **Routes** (the page's, a member's to the hub): `GET /memory/status`,
+  `/memory/search?q=&kinds=&limit=`, `/memory/wiki`, `/memory/page?path=`, `/memory/read?ref=`,
+  `/memory/brief`, `POST /memory/compile {mode}`, `PATCH /memory/settings`.
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
@@ -1554,6 +1613,21 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   limits, broadcast, memory shared on the floor and announced, agent_hire for the boss only, a
   stopped chat's key refused); the terminal socket (replay, keys, size, exit, a stopped chat) and
   the events socket (token, first floors then live).
+  With the memory layer (F-051, 2026-10-31), also: `agentic/memory-layer.test.ts` (search: code
+  names whole and in parts, BM25 in and out, a hit's share of the query, the fusion going by
+  words for an exact name and by meaning for a sentence, sections and snippets; the wiki: paths
+  kept inside it and out of inbox/ and .git/, front matter, made with its rules, the index by
+  folder, Shubham's SCHEMA.md kept; turns: said and answered, tool results, commands, claude's
+  notices and another chat's messages told apart, read as the file grows, a half line waiting,
+  a copied conversation not kept twice; the librarian: the inbox's marks, material taken to its
+  size with turns in order, claude -p's flags and environment, its JSON answer; the layer, with
+  a pretend embedder and a pretend claude: notes, wiki and turns searched together, recall (not
+  the chat's own, not again straight after, nothing for commands, other chats or a word or two,
+  off when switched off), the brief, memory_read, a compile (inbox, the run with its cost, the
+  index and the log, nothing new after, an edited note new again), a failed run, the past only
+  when asked, the settings, a note searched at once; the model: fetched once with its sha256
+  checked, a bad one thrown away; the hook: in and out, quiet on errors, run as a process).
+  `index.test.ts`: memory_read in the tools' list; memory_search still answers `entries`.
 - **E2E (`npm run test:e2e`), on this PC:**
   - Setup: a temp `SAD_HOME` each for a hub and a member, and alternate ports (hbbs 21316,
     hbbr 21317, peer 21320, api 21321/21331, discovery 21322, rustdesk-direct =

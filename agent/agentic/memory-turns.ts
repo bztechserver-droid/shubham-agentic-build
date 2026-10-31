@@ -64,10 +64,38 @@ export function cleanSaid(raw: string): { text: string; from: 'shubham' | 'chat'
   t = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
   t = t.replace(/<\/?pasted_content[^>]*>/g, '')
   t = t.replace(/<\/?(user-prompt-submit-hook|command-args)[^>]*>/g, '')
-  t = t.trim()
+  t = redact(t).trim()
   if (!t) return null
   const from = /^\[(message|broadcast) from /.test(t) ? 'chat' : 'shubham'
   return { text: t.length > SAID_MAX ? `${t.slice(0, SAID_MAX)}…` : t, from }
+}
+
+// What looks like a secret, kept out of the turns: they are recalled into other chats and given
+// to the librarian. The kind of thing is kept ("[a key, removed]"), never its value.
+const SECRETS: [RegExp, string][] = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[a private key, removed]'],
+  [/\bsk-ant-[A-Za-z0-9_-]{16,}/g, '[a key, removed]'],
+  [/\bsk-(proj-)?[A-Za-z0-9_-]{32,}/g, '[a key, removed]'],
+  [/\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})/g, '[a GitHub token, removed]'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, '[an AWS key, removed]'],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, '[a Google key, removed]'],
+  [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, '[a Slack token, removed]'],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[a token, removed]'],
+  // user:password@ in a link.
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]{3,}@/gi, '$1[removed]@'],
+  // NAME=value, "password": "value", token: value: the name kept, the value gone. A value is 8
+  // characters or more with a digit or a sign in it (not "token: present", not "author: Shubham").
+  [
+    /\b([A-Za-z0-9_]*(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)[A-Za-z0-9_]*)(["']?\s*[:=]\s*)(["']?)(?=[^\s"'`,;]{8,})(?=[^\s"'`,;]*[\d_\-/+=!@#$%^&*])[^\s"'`,;]+\4/gi,
+    '$1$3$4[removed]$4',
+  ],
+]
+
+/** The text with what looks like a secret taken out. */
+export function redact(text: string): string {
+  let t = text
+  for (const [re, to] of SECRETS) t = t.replace(re, to)
+  return t
 }
 
 /** The text parts of a message's content (a string, or blocks), tool results left out. */
@@ -85,7 +113,7 @@ function textOf(content: unknown): { text: string; toolResultOnly: boolean } {
 }
 
 const cutAnswer = (t: string) => {
-  const s = t.trim()
+  const s = redact(t).trim()
   return s.length > ANSWER_MAX ? `${s.slice(0, ANSWER_MAX)}…` : s
 }
 

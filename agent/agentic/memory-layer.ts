@@ -63,8 +63,13 @@ interface Doc {
 
 interface State {
   settings: MemorySettings
-  /** What the librarian has compiled: notes by key → version, memory files by path → mtime, turns by count. */
-  compiled: { notes: Record<string, string>; seeds: Record<string, string>; turns: number }
+  /**
+   * What the librarian has compiled: notes by key → version, memory files by path → mtime; the
+   * turns (in the order kept) up to `turns`, and of the past (those before `baseline`) the first `history`.
+   */
+  compiled: { notes: Record<string, string>; seeds: Record<string, string>; turns: number; history: number }
+  /** How many turns there were when the memory first started: those are the past, compiled only when asked. */
+  baseline: number | null
   runs: LibrarianRun[]
   lastAutoAt: number | null
 }
@@ -160,7 +165,7 @@ export function formatRecall(hits: MemoryHit[]): string {
 }
 
 function loadState(file: string): State {
-  const fresh: State = { settings: { ...DEFAULT_MEMORY_SETTINGS }, compiled: { notes: {}, seeds: {}, turns: 0 }, runs: [], lastAutoAt: null }
+  const fresh: State = { settings: { ...DEFAULT_MEMORY_SETTINGS }, compiled: { notes: {}, seeds: {}, turns: 0, history: 0 }, baseline: null, runs: [], lastAutoAt: null }
   try {
     const raw: unknown = JSON.parse(readFileSync(file, 'utf8'))
     if (!isObject(raw)) return fresh
@@ -171,7 +176,9 @@ function loadState(file: string): State {
         notes: isObject(c.notes) ? (c.notes as Record<string, string>) : {},
         seeds: isObject(c.seeds) ? (c.seeds as Record<string, string>) : {},
         turns: typeof c.turns === 'number' ? c.turns : 0,
+        history: typeof c.history === 'number' ? c.history : 0,
       },
+      baseline: typeof raw.baseline === 'number' ? raw.baseline : null,
       runs: Array.isArray(raw.runs) ? (raw.runs as LibrarianRun[]).filter(r => isObject(r) && typeof r.id === 'string').slice(0, RUNS_KEPT) : [],
       lastAutoAt: typeof raw.lastAutoAt === 'number' ? raw.lastAutoAt : null,
     }
@@ -189,6 +196,7 @@ export function cleanSettings(v: unknown, base: MemorySettings): MemorySettings 
     model: (LIBRARIAN_MODELS as readonly unknown[]).includes(s.model) ? (s.model as MemorySettings['model']) : base.model,
     recall: typeof s.recall === 'boolean' ? s.recall : base.recall,
     fromChats: typeof s.fromChats === 'boolean' ? s.fromChats : base.fromChats,
+    pastChats: typeof s.pastChats === 'boolean' ? s.pastChats : base.pastChats,
   }
 }
 
@@ -523,14 +531,24 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     }
     notes.sort((a, b) => a.at.localeCompare(b.at))
     const seeds = state.settings.fromChats ? seedFiles().filter(s => state.compiled.seeds[s.key.slice(0, s.key.lastIndexOf(':'))] !== s.key.slice(s.key.lastIndexOf(':') + 1)) : []
-    const all = turns.all()
-    const fresh = state.settings.fromChats ? all.slice(Math.min(state.compiled.turns, all.length)) : []
-    return { notes, seeds, turns: fresh }
+    const { past, fresh } = pendingTurns()
+    // The past first (oldest first), then what came after the memory started.
+    return { notes, seeds, turns: state.settings.pastChats ? [...past, ...fresh] : fresh }
   }
+
+  /** The turns still to compile: of the past (before the baseline), and since. */
+  function pendingTurns(): { past: Turn[]; fresh: Turn[] } {
+    if (!state.settings.fromChats) return { past: [], fresh: [] }
+    const all = turns.all()
+    const base = Math.min(state.baseline ?? 0, all.length)
+    return { past: all.slice(Math.min(state.compiled.history, base), base), fresh: all.slice(Math.max(state.compiled.turns, base)) }
+  }
+
+  const turnChars = (list: Turn[]) => list.reduce((s, t) => s + t.said.length + Math.min(t.answer.length, 700), 0)
 
   function pendingCount() {
     const p = pending()
-    const chars = p.notes.reduce((s, n) => s + n.text.length, 0) + p.seeds.reduce((s, n) => s + n.text.length, 0) + p.turns.reduce((s, t) => s + t.said.length + t.answer.length, 0)
+    const chars = p.notes.reduce((s, n) => s + n.text.length, 0) + p.seeds.reduce((s, n) => s + n.text.length, 0) + turnChars(p.turns)
     return { notes: p.notes.length, turns: p.turns.length, seeds: p.seeds.length, chars }
   }
 
@@ -542,6 +560,8 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
     let take: Material = { notes: [], turns: [], seeds: [] }
     let chars = 0
     let inbox: string | undefined
+    // How many of the turns given come from the past (they are first): what the run moves on.
+    const pastGiven = state.settings.pastChats ? pendingTurns().past.length : 0
     if (mode === 'ingest') {
       const t = takeMaterial(pending())
       take = t.take
@@ -594,7 +614,9 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
           const cut = s.key.lastIndexOf(':')
           state.compiled.seeds[s.key.slice(0, cut)] = s.key.slice(cut + 1)
         }
-        state.compiled.turns += take.turns.length
+        const fromPast = Math.min(take.turns.length, pastGiven)
+        state.compiled.history += fromPast
+        state.compiled.turns = Math.max(state.compiled.turns, state.baseline ?? 0) + (take.turns.length - fromPast)
       } else if (inbox) rmSync(path.join(wiki.dir, ...inbox.split('/')), { force: true })
       try {
         wiki.writeIndex()
@@ -705,6 +727,12 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
       syncWiki(true)
       for (const t of turns.all()) turnDoc(t)
       collectTurns()
+      // The first start: every turn there is now is the past (searched, compiled only when asked).
+      if (state.baseline === null) {
+        state.baseline = turns.all().length
+        state.compiled.turns = Math.max(state.compiled.turns, state.baseline)
+        save()
+      }
       void pump()
       if (o.timers !== false) {
         const every = (ms: number, fn: () => void) => {
@@ -757,6 +785,12 @@ export function createMemoryLayer(o: MemoryLayerOptions): MemoryLayer {
         wiki: { dir: wiki.dir, pages: wiki.pages().length, git: wiki.git() },
         settings: { ...s },
         pending: pendingCount(),
+        past: (() => {
+          const all = turns.all()
+          const base = Math.min(state.baseline ?? 0, all.length)
+          const left = all.slice(Math.min(state.compiled.history, base), base)
+          return { total: base, left: left.length, chars: turnChars(left) }
+        })(),
         running: running ? { ...running } : null,
         runs: state.runs,
         nextAutoAt,

@@ -84,9 +84,15 @@ export interface MemorySettings {
   recall: boolean
   /** The floor chats' turns are kept and searched (no model is run for that). */
   fromChats: boolean
+  /**
+   * The turns from before the memory was first started (the past) are compiled too, oldest
+   * first, a run at a time. Off by default: they are searched and recalled as they are, and
+   * compiling them all is many runs (measured: 2,925 turns, 27 runs).
+   */
+  pastChats: boolean
 }
 
-export const DEFAULT_MEMORY_SETTINGS: MemorySettings = { auto: false, everyHours: 24, model: 'sonnet', recall: true, fromChats: true }
+export const DEFAULT_MEMORY_SETTINGS: MemorySettings = { auto: false, everyHours: 24, model: 'sonnet', recall: true, fromChats: true, pastChats: false }
 
 export type MeaningState = 'off' | 'waiting' | 'downloading' | 'loading' | 'ready' | 'failed'
 
@@ -99,8 +105,10 @@ export interface MemoryStatus {
   index: { chunks: number; wiki: number; notes: number; turns: number; embedded: number }
   wiki: { dir: string; pages: number; git: boolean }
   settings: MemorySettings
-  /** Not yet compiled into the wiki. */
+  /** Not yet compiled into the wiki (the past's turns only when pastChats is on). */
   pending: { notes: number; turns: number; seeds: number; chars: number }
+  /** The turns from before the memory started: how many, how many still to compile, and their size. */
+  past: { total: number; left: number; chars: number }
   running: LibrarianRun | null
   runs: LibrarianRun[]
   nextAutoAt: string | null

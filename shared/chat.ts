@@ -77,6 +77,29 @@ export type ChatItem = ChatUserItem | ChatAssistantItem | ChatToolItem | ChatNot
 /** What changes on an item already sent: a tool call's answer arriving. */
 export type ChatPatch = Partial<Pick<ChatToolItem, 'status' | 'output' | 'more'>>
 
+/**
+ * A question claude is waiting on, read off its screen (agent/agentic/screen.ts): its numbered
+ * options. The conversation file doesn't have it while it waits (claude writes a tool call and
+ * its answer together, once it has one). A number typed into the chat answers it.
+ */
+export interface ChatMenu {
+  /** The chip above the question ("Color"), when there is one. */
+  header: string
+  question: string
+  options: { n: number; label: string; description: string; selected: boolean }[]
+  /** Its footer line ("Enter to select · ↑/↓ to navigate · Esc to cancel"). */
+  hint: string
+  /** Boxes to tick, not one to pick: answered in the terminal. */
+  multi: boolean
+}
+
+/** What claude says it is doing while it works ("Pollinating… (5s · ↓ 167 tokens)"). */
+export interface ChatStatus {
+  text: string
+  secs: number | null
+  tokens: string | null
+}
+
 /** The chat WebSocket, server to page, as text frames. */
 export type ChatFeedMessage =
   /**
@@ -89,6 +112,10 @@ export type ChatFeedMessage =
   | { t: 'add'; items: ChatItem[] }
   /** A tool call answered. */
   | { t: 'patch'; id: string; patch: ChatPatch }
+  /** A question is up on claude's screen (or none is any more). Only for a chat running on the PC that serves the socket. */
+  | { t: 'menu'; menu: ChatMenu | null }
+  /** What claude is doing now, from its spinner line (null: nothing to say). */
+  | { t: 'status'; status: ChatStatus | null }
 
 /** GET /floors/:f/agents/:a/chat?before=<offset>&limit=<n>: an older page. */
 export interface ChatHistory {

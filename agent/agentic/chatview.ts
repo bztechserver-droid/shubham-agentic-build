@@ -12,6 +12,7 @@ import {
   type ChatToolItem,
 } from '../../shared/chat.ts'
 import type { Logger } from '../log.ts'
+import { readMenu, readStatus } from './screen.ts'
 import { claudeProjectsDir, findTranscript } from './transcripts.ts'
 
 // F-050: the chat view's side of the agent. A chat's conversation is claude's JSONL, and it can
@@ -447,6 +448,9 @@ interface Follow {
   conv: Converter
   subs: Set<(m: ChatFeedMessage) => void>
   timer: ReturnType<typeof setInterval> | null
+  /** What was last said of the screen (JSON), so a change is said once. */
+  menu: string
+  status: string
 }
 
 export interface ChatFeedsOptions {
@@ -454,6 +458,12 @@ export interface ChatFeedsOptions {
   /** How often a watched file is looked at (350 ms). */
   pollMs?: number
   log?: Logger
+  /**
+   * The lines of a chat's terminal screen, when this PC runs it (the pool's): a question that is
+   * waiting and the spinner line are read off it and sent as `menu` and `status`. The conversation
+   * file has neither (claude writes a tool call and its answer together, once it has one).
+   */
+  screen?: (sessionId: string) => string[] | null
 }
 
 export interface ChatFeeds {
@@ -517,8 +527,39 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
     return { t: 'hello', sessionId: f.sessionId, items: tail.items, before: tail.before, size: tail.end }
   }
 
-  /** One look at the file: what it grew by, as items, or a new hello when it is not the file it was. */
+  /** What the chat's screen says now: a waiting question, and what claude is doing. */
+  function onScreen(sessionId: string) {
+    const lines = o.screen?.(sessionId) ?? null
+    return { menu: lines ? readMenu(lines) : null, status: lines ? readStatus(lines) : null }
+  }
+
+  /** The screen looked at: a change in the waiting question or in the spinner line is sent, once. */
+  function pollScreen(f: Follow) {
+    if (!o.screen) return
+    try {
+      const { menu, status } = onScreen(f.sessionId)
+      const m = JSON.stringify(menu)
+      const s = JSON.stringify(status)
+      if (m !== f.menu) {
+        f.menu = m
+        send(f, { t: 'menu', menu })
+      }
+      if (s !== f.status) {
+        f.status = s
+        send(f, { t: 'status', status })
+      }
+    } catch (e) {
+      o.log?.warn(`chat feed ${f.sessionId.slice(0, 8)}: screen: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   function tick(f: Follow) {
+    follow(f)
+    pollScreen(f)
+  }
+
+  /** One look at the file: what it grew by, as items, or a new hello when it is not the file it was. */
+  function follow(f: Follow) {
     try {
       if (!locate(f)) return
       let st: Stats
@@ -570,7 +611,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
         const t = f.file ? readTail(f.file, { end: f.pos, live: true }) : null
         sendTo({ t: 'hello', sessionId, items: t?.items ?? [], before: t?.before ?? null, size: f.pos })
       } else {
-        f = { sessionId, file: null, ident: '', pos: 0, conv: new Converter(), subs: new Set(), timer: null }
+        f = { sessionId, file: null, ident: '', pos: 0, conv: new Converter(), subs: new Set(), timer: null, menu: 'null', status: 'null' }
         locate(f)
         try {
           sendTo(hello(f))
@@ -579,6 +620,14 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
           sendTo({ t: 'hello', sessionId, items: [], before: null, size: 0 })
         }
         follows.set(sessionId, f)
+      }
+      // What is on the chat's screen now, for the page that has just joined (the others have been told).
+      if (o.screen) {
+        const { menu, status } = onScreen(sessionId)
+        f.menu = JSON.stringify(menu)
+        f.status = JSON.stringify(status)
+        if (menu) sendTo({ t: 'menu', menu })
+        if (status) sendTo({ t: 'status', status })
       }
       const watch = f
       watch.subs.add(sendTo)
