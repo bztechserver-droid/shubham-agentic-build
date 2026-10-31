@@ -1,4 +1,5 @@
 import type net from 'node:net'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
@@ -19,7 +20,7 @@ import type { Control, Mux, OpenMeta, StreamUser } from './link/mux.ts'
 import { listenTls } from './link/tls.ts'
 import { createHubLinks, createMemberLinks, type HubLinks, type MemberLinks } from './links.ts'
 import { closeLog, initLog, log as rootLog, type Logger } from './log.ts'
-import { localSubnets, parseHostPort, tailnetAddress } from './net.ts'
+import { inCidr, localSubnets, parseHostPort, tailnetAddress } from './net.ts'
 import { createPairingHub, normalizeCode, startJoin, type Join, type PairingHub } from './pairing.ts'
 import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
 import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, rustdeskHandler } from './rustdesk.ts'
@@ -49,6 +50,11 @@ const IDLE_JOIN: JoinState = { status: 'idle', hubAddress: null, sas: null, erro
 /** F-014: who is controlling, in the notice and on This PC, when it is this PC's own page from another device. */
 const OWN_PAGE = "Another device on this PC's page"
 const CODE = /^[0-9A-HJKMNP-TV-Z]{8}$/
+/** F-028: Tailscale's addresses (100.64.0.0/10), and this PC itself. */
+const isTailnetAddress = (a: string) => {
+  const ip = a.replace(/^::ffff:/, '')
+  return inCidr(ip, '100.64.0.0/10') || ip === '127.0.0.1' || ip === '::1'
+}
 
 export interface Agent {
   state(): AgentState
@@ -693,6 +699,7 @@ if (import.meta.main) {
   let agent: Agent | null = null
   let build: Build | null = null
   let ui: UiServer | null = null
+  let uiTailnet: UiServer | null = null
   let exiting = false
   const shutdown = async (why: string, code = 0) => {
     // A second Ctrl+C: don't wait any longer.
@@ -702,6 +709,7 @@ if (import.meta.main) {
     try {
       build?.close()
       await ui?.close()
+      await uiTailnet?.close()
       await agent?.stop()
     } catch (e) {
       log.error(`while stopping: ${message(e)}`)
@@ -770,6 +778,47 @@ if (import.meta.main) {
         )
       }
       servePage()
+      // F-028: opened to the tailnet (Open-To-Tailnet.cmd, run as administrator, leaves the
+      // marker): the page and its API on this PC's Tailscale address too, for the other PCs.
+      // Looked for every 30 s, so running the script (or -Remove) needs no restart.
+      const marker = path.join(config.paths.root, 'agent', 'open-to-tailnet')
+      const tailnetPort = Number(process.env.SAD_UI_TAILNET_PORT) || 5190
+      let opening = false
+      const tailnetPage = (): void => {
+        if (exiting || opening) return
+        const want = existsSync(marker)
+        if (!want && uiTailnet) {
+          void uiTailnet.close()
+          uiTailnet = null
+          log.info('closed to the tailnet: the page is on this PC only')
+          return
+        }
+        const at = tailnetAddress()
+        if (!want || uiTailnet || !at) return
+        opening = true
+        startUiServer({
+          port: tailnetPort,
+          host: at,
+          appDir: path.resolve(process.argv[appIndex + 1]),
+          apiPort: () => apiPort,
+          token: loadOrCreateApiToken(config.paths.root),
+          log: log.child('page'),
+          allowRemote: a => isTailnetAddress(a),
+        }).then(
+          s => {
+            opening = false
+            if (exiting) return void s.close()
+            uiTailnet = s
+            log.info(`opened to the tailnet: the page on http://${at}:${tailnetPort}`)
+          },
+          (e: unknown) => {
+            opening = false
+            log.error(`couldn't serve the page on the tailnet: ${message(e)}; trying again in 30 s`)
+          },
+        )
+      }
+      tailnetPage()
+      setInterval(tailnetPage, 30_000).unref()
     }
     process.send?.({ t: 'ready', apiPort: agent.apiPort })
   } catch (e) {

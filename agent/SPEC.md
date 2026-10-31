@@ -1419,6 +1419,15 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   check; `publish.pending` is false when it equals the newest build's (the last published here, the
   newer one on GitHub, or the current), null when that build has none. Test: `build.test.ts`.
 
+## F-028: open to the tailnet (build-files/Open-To-Tailnet.ps1, ui-server.ts)
+
+- The script (elevating itself) writes `<state>\agent\open-to-tailnet` and adds the firewall rule
+  "Shubham Agentic: all ports from the tailnet" (TCP and UDP, every port, RemoteAddress
+  100.64.0.0/10, every profile); `-Remove` deletes both. The agent looks for the marker every
+  30 s: present, a second page server on the Tailscale address (`SAD_UI_TAILNET_PORT`, 5190) with
+  `allowRemote` taking only tailnet and loopback addresses (403, or the socket closed, for
+  others); gone, it is closed. Its API token rule is the page's (fromApp: an IP Host, same origin).
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.

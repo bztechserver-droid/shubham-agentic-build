@@ -438,6 +438,19 @@ via the threed tos in teh each agnet",
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-028",
+    "title": "Reach the other PCs' ports through the app, so their side can be tested from here",
+    "said": "i think to fix this all pcs connected through this app 
+should havae all their ports accesible so this way it would be easire fo you tto test it",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Logged; asked how wide before building. Why: the laptop's side of F-021 to F-023 (its page, its log) can't be seen from the server, so its bugs (Use here on Lead) were found by reasoning, not by looking. The PCs already share a paired link with pinned keys; the app's page and API listen on each PC's loopback only. Opening every port on the network would expose much more than testing needs.",
+      "2026-10-31: Asked how wide: the app only over the link (Recommended), any port over the link, or all ports on the network. Shubham chose All ports on the network. Built as the network of the PCs themselves, the tailnet (Tailscale's 100.64.0.0/10, the PCs on this Tailscale account), never the LAN or the internet: Open-To-Tailnet.cmd in the build folder (it asks Windows for administrator) adds one firewall rule, \"Shubham Agentic: all ports from the tailnet\", every inbound TCP and UDP port from those addresses, and leaves a marker; within 30 s the app also serves its page and API on the PC's Tailscale address, port 5190 (5173 there is the phone gate's on the server), to tailnet addresses only. Open-To-Tailnet.cmd -Remove takes both away. To run once on each PC, as it needs that PC's administrator. Checked: a page-server test (only the addresses allowed get the page), all agent tests, types, lint; the script parses. Code: agent/scripts/build-files/Open-To-Tailnet.ps1 and .cmd, agent/ui-server.ts (allowRemote), agent/main.ts."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

@@ -29,6 +29,8 @@ export interface UiServerOptions {
   /** The API token: added for the app's own pages, never handed to anything else. */
   token: string
   log?: Logger
+  /** F-028: who may connect (by remote address); anyone reaching the listener when left out (loopback). */
+  allowRemote?: (address: string) => boolean
 }
 
 export interface UiServer {
@@ -137,6 +139,7 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
   }
 
   function onRequest(req: IncomingMessage, res: ServerResponse) {
+    if (o.allowRemote && !o.allowRemote(req.socket.remoteAddress ?? '')) return plain(res, 403, 'Not from this PC or its tailnet')
     if (!hostAllowed(req.headers.host)) return plain(res, 403, BLOCKED)
     const url = new URL(req.url ?? '/', 'http://app')
     if (url.pathname === AGENT_API_PREFIX || url.pathname.startsWith(`${AGENT_API_PREFIX}/`)) return api(req, res)
@@ -151,6 +154,7 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
   // handshake goes on to the agent with the token added for the app's own pages, then bytes both
   // ways as they come, whatever their size; either side closing closes the other.
   function onUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
+    if (o.allowRemote && !o.allowRemote(req.socket.remoteAddress ?? '')) return void socket.destroy()
     socket.on('error', () => {})
     const url = new URL(req.url ?? '/', 'http://app')
     if (!hostAllowed(req.headers.host) || !url.pathname.startsWith(`${AGENT_API_PREFIX}/`)) {
