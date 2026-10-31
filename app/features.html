@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feature log</title>
+<style>
+  :root {
+    --bg: #f6f6f3; --card: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e2e2de;
+    --accent: #2f6fde; --quote: #f0f0ec; --done: #1f8f4e; --done-bg: #e6f5ec; --todo: #b8b8b2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --card: #1d1d20; --text: #ececef; --muted: #9a9aa3; --line: #2e2e33;
+      --accent: #74a4ff; --quote: #26262a; --done: #4cc38a; --done-bg: #17301f; --todo: #55555c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 20px; }
+  .bar button { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+                border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  .bar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .progress { margin-left: auto; color: var(--muted); font-size: 13px; }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  .feature { display: grid; grid-template-columns: 32px 1fr; gap: 12px; padding: 16px;
+             background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .feature.done { border-color: color-mix(in srgb, var(--done) 40%, var(--line)); }
+  .tick { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
+          border: 2px solid var(--todo); }
+  .done .tick { background: var(--done); border-color: var(--done); color: #fff; }
+  .tick svg { width: 16px; height: 16px; }
+  .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+  .id { font: 600 12px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; color: var(--muted); }
+  h2 { font-size: 16px; margin: 0; }
+  .status { font-size: 12px; padding: 2px 8px; border-radius: 999px; color: var(--muted); border: 1px solid var(--line); }
+  .done .status { color: var(--done); background: var(--done-bg); border-color: transparent; }
+  blockquote { margin: 10px 0 0; padding: 10px 12px; background: var(--quote); border-radius: 8px;
+               border-left: 3px solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .notes { margin: 10px 0 0; padding-left: 18px; color: var(--text); }
+  .notes li { margin: 2px 0; overflow-wrap: anywhere; }
+  .meta { margin-top: 10px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .empty { padding: 32px 16px; text-align: center; color: var(--muted);
+           border: 1px dashed var(--line); border-radius: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>shubham-agentic-dev: feature log</h1>
+  <p class="sub">Every feature Shubham asks for, in Shubham's own words, ticked once it is built.
+    Inspired by <code>agentic-claude-manager-dev</code>.</p>
+  <div class="bar" role="group" aria-label="Show">
+    <button type="button" data-filter="all" aria-pressed="true">All</button>
+    <button type="button" data-filter="todo" aria-pressed="false">Not built</button>
+    <button type="button" data-filter="done" aria-pressed="false">Built</button>
+    <span class="progress" id="progress"></span>
+  </div>
+  <ol id="list"></ol>
+</main>
+
+<!--
+  THE LOG. Claude sessions add features here; this block is the record, chats come and go.
+  Keep it valid JSON. One object per feature, oldest first:
+  {
+    "id": "F-001",                  next number in the list
+    "title": "Short name",
+    "said": "Shubham's words, verbatim - never reworded",
+    "added": "2026-10-27",
+    "notes": ["2026-10-28: a later change or clarification, dated"],
+    "done": null,                   the date it was built and checked, e.g. "2026-11-02" - shows the tick
+    "doneNote": ""                  where it was built: files, commit
+  }
+-->
+<script type="application/json" id="features">
+[
+  {
+    "id": "F-001",
+    "title": "Theme: Expo design + 21st.dev, Christopher colours, Space Grotesk, empty Vite app with smooth transitions",
+    "said": "first lets finalize the theme we wont use the chritopher os them\nhttps://getdesign.md/expo/design-md\nchoose from here and 21st and make a empty vite based app\nbut super smooth animation transaitoni\ncolor can be same as christoper\nbut differente theme\nfont space grostesqu",
+    "added": "2026-10-27",
+    "notes": [
+      "2026-10-27: Shubham added \"if possible tell it to list multiple thin\" (message cut off), then \"while finalizing thememes make multiple that can be used in future\". Read as: build several themes into the app that can be switched, not just one, so the others stay available for later."
+    ],
+    "done": "2026-10-27",
+    "doneNote": "Vite 8 + React 19 + Tailwind 4 + motion app in this folder (src/, README.md). Spec: DESIGN.md. Six switchable themes in src/themes (Parchment default, Brass, Expo, Linear, Vercel, Supabase), rules in design/themes/CONTRACT.md, all passing npm run check:themes. Run start-dev.cmd; phone: https://server.tailc768e5.ts.net:5173"
+  },
+  {
+    "id": "F-002",
+    "title": "Features tab in the sidebar: see the logged features and tick them one by one as they are integrated",
+    "said": "in the sidebar make the fearutes tab where i can directly see the features made and then we will tick one by one\nas they get integrated",
+    "added": "2026-10-29",
+    "notes": [],
+    "done": "2026-10-29",
+    "doneNote": "Features page at /features (sidebar, rail and phone tabs): src/pages/Features.tsx, src/features/, src/components/ui/checkbox.tsx, and the Vite plugin feature-log.ts. Ticking writes done into this file through the dev server; the page follows changes to the file live. Spec: DESIGN.md > Components > Features."
+  },
+  {
+    "id": "F-003",
+    "title": "A shared drive: one place to store files that this PC, the laptop and the phone all reach",
+    "said": "btw the first feature is adding a a drive so two computer this and my laptop and phoen have common place to store files",
+    "added": "2026-10-29",
+    "notes": [],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-004",
+    "title": "Laptop and server find each other: on start, check whether both are on the same network, otherwise connect over the internet (RustDesk suggested)",
+    "said": "now we have to add a feature that if we run the aplliction \non my pc and the server first it will establish if we are on the same network ornot \nif not then online connect \nso  this server and my lapotp nees to be connected for that we can use the open source \nrust desk repo \nhttps://github.com/rustdesk/rustdesk",
+    "added": "2026-10-29",
+    "notes": [
+      "2026-10-29: Shubham added \"or howmany ever pc are connected trhough the app but primarliy it is for 2 pcs server adn my laptop\". Read as: any number of PCs running the app should be able to connect, but the main case is two, this server and the laptop.",
+      "2026-10-29: Asked how the PCs should connect, Shubham answered \"find a way to have to integrate rustdesk wihtint the app the code is open source of rust desk adn keep raly server on this pc itslef\"; asked about company use and Tailscale, \"we wont requrei taiscale who ever on app only they can connect through the relay server \"; and chose a private GitHub repo to get the app onto the laptop. Read as: no Tailscale dependency; build RustDesk's open-source connection code into the app; run RustDesk's ID/relay server on this server PC; only people using the app can connect through it. Research and the earlier Tailscale-based proposal: design/features/F-004-device-link.md.",
+      "2026-10-29: Shubham asked \"is it possible that all pc runinng this app can connect to each other reomtely\". Read as: every PC running the app should be able to reach every other one over the internet, not only the server.",
+      "2026-10-29: After the second design round, Shubham chose: the FortiGate firewall in front of this PC is run by someone else (send them a port-forward request); Route A (unmodified RustDesk servers hbbs/hbbr on this PC, the app speaks RustDesk's protocol itself); build the at-home part (phase 1) now; the private repo is owned by bztechserver-droid. Design: design/features/F-004-device-link.md.",
+      "2026-10-29: Phase 1 (same network) built and checked on this PC, commit 4472e39: the device agent (agent/, npm run agent) and the Devices page (/devices). On start a PC tries a direct link on the network, then asks the RustDesk server whether the other PC is on the same network, then goes through the relay; pairing uses a one-time code plus a check number confirmed on both screens. 250 unit tests and an end-to-end test against the real RustDesk servers pass. Not ticked yet: connecting over the internet (phase 2) waits on the FortiGate port forward (design/features/F-004-firewall-request.md), and it has not been tried on the laptop yet. Correction to an earlier answer: two PCs that are both away from home connect through the relay on this PC, not directly.",
+      "2026-10-29: Shubham asked \"can we route ip thorugh tailscale because im at home using you trying to connect to same app \nbecasue thourhgt tailsacle an rustdesk we are connected so the relay server that needs to be unlcoked firewall can be done later and we have two ways to connect is that possible \nbecause you siad no incoming from outisde but via tailscale it is possible\". Read as: add Tailscale as a second way for the app's PCs to reach each other, usable now while the relay's firewall opening waits; the relay stays as the other way. Not decided or built yet. That evening the server was on the Wi-Fi \"VBA\" (192.168.5.224) and the laptop was at home; both were on Tailscale, directly connected, 17 ms.",
+      "2026-10-29: Shubham answered \"yes build it\nand give option to switch also start\". Built: the hub also listens on its Tailscale address, and a member away from the hub's network links over Tailscale before trying the RustDesk servers (pairing from anywhere by typing the hub's Tailscale address). The option to switch is \"How to connect\" on a member's Devices page: Auto, Tailscale, RustDesk or Relay (it replaces the old Force relay switch). Started: the hub agent runs on this PC, listening on 192.168.5.224 and 100.65.101.123. 258 unit tests and the end-to-end test (7 steps, now with a real Tailscale link) pass. Still to do: install on the laptop and pair.",
+      "2026-10-30: The laptop (\"Shubham\") paired with the hub over Tailscale at 00:08 and stays linked (Tailscale, about 11 ms). Shubham then asked \"can we using remote desktop inside the app please\". Read as: open the other PC's screen from the app. Today \"Open screen\" on a device row starts RustDesk in its own window, carried over the app's link; asked whether the screen should instead show inside the app's page itself, which would be a new piece of work. Answered: yes, inside the app; logged as F-005.",
+      "2026-10-30: Shubham asked for the relay to be fixed if the FortiGate is not in the way on the VBA Wi-Fi. Checked: the VBA Wi-Fi's router (192.168.5.1) is the FortiGate 60F itself, so it is in the way there too, with no D-Link behind it now. The relay from outside still needs the FortiGate's administrator: the request in design/features/F-004-firewall-request.md now asks for one forward from 61.246.245.66 straight to this PC (192.168.5.224) and a DHCP reservation for it. The router doesn't accept UPnP mapping requests.",
+      "2026-10-30: Shubham asked to \"mention this in the app devices near teh relay button wiht i icon ok\" (the four points for the FortiGate's administrator). Done: an \"i\" button beside Relay in a member's How to connect, and beside \"Through the RustDesk servers\" on the hub's page, opens a note with the four points and where the full request is (src/components/relay-info.tsx).",
+      "2026-10-30: Shubham gave full permission to keep going without stopping. Done meanwhile: the hub agent now starts at every logon and restarts itself 5 s after it stops (agent/scripts/install-hub-startup.ps1, installed on this PC; commit e26c6e0)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-005",
+    "title": "Remote control inside the app: the other PC's screen, mouse and keyboard in the app's own page, like RustDesk, built from RustDesk's open-source code",
+    "said": "im already using rustdek plus tailscael to control you when i do open screen if i wnated to see the screen out side the app i woudl have already implementd a different method \ni wnat to remote control inside the app all control liek rustdesk insdie the app thats why i said use rustdesk opensource code",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: This followed \"can we using remote desktop inside the app please\" (see F-004). Read as: \"Open screen\" (F-004) starts RustDesk in its own window, which Shubham can already do with RustDesk and Tailscale; the ask is full remote control (screen, mouse, keyboard and the rest of what RustDesk does) shown and driven inside the app's page, using RustDesk's open-source code rather than the RustDesk app.",
+      "2026-10-30: Shubham chose \"Own viewer in the app\" over embedding RustDesk's Flutter web client, and later gave full permission to keep going without stopping. Phase 1 built: \"Control\" on a device row opens /devices/<id>/remote, where the page speaks RustDesk 1.5.0's protocol itself (shared/rustdesk/client.ts, ported from RustDesk's source, notes in design/features/F-005-protocol.md) over the agent's pipe to that PC's RustDesk: password (never stored, only its hash sent), VP9 video drawn with WebCodecs, mouse, keyboard (RustDesk map mode), displays, Ctrl+Alt+Del, clipboard both ways, full screen with keyboard lock, touch. 301 unit tests pass; checked against a pretend RustDesk in the browser and, read-only, against the real RustDesk on this PC up to its password challenge. Not ticked: the first real login, from the laptop, is still to come.",
+      "2026-10-30: First real use: Shubham logged in from the laptop with this PC's RustDesk password and is controlling this PC inside the app over Tailscale (\"ok im using you with the in app\"), then asked how to control the laptop from the server. Shubham turned on direct IP access in the laptop's RustDesk (its port 21118 now answers), and the hub agent was restarted on the new code (it had been running since before the viewer). The laptop's row on this PC now shows Control, and a read-only check through the hub's pipe reached the laptop's RustDesk password question in 71 ms. A login from this PC to the laptop is still to be tried. Not ticked.",
+      "2026-10-30: F-006 asks for the same control with no RustDesk installed on either PC. Shubham said to keep this RustDesk way as an alternative rather than remove it (see F-006)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-006",
+    "title": "Remote control with no RustDesk installed on either PC: only Tailscale, hbbs and hbbr, keeping RustDesk as an alternative",
+    "said": "now how do we do it wihtout having rustdesk installed on eitehr side is what you have to figure out\n  only tailsace hbbs or hbbr thats it",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Asked right after controlling the laptop from the server was set up (F-005), which needs RustDesk installed, with direct IP access on, on the PC being controlled. Read as: the app itself must capture the screen and carry out the mouse and keyboard on the controlled PC, so neither PC needs RustDesk; the connection stays on Tailscale, hbbs and hbbr. Asked to work out how, not yet to build it.",
+      "2026-10-30: Shubham added: \"remember dont remov ethe rustdesk option keep it as a alternative because reverting can be a headache\". So F-005's RustDesk way stays, as an alternative next to the new one.",
+      "2026-10-30: Shubham asked: \"i have one mqeustino can you not use rusdsk open source code to figure how that software does thing and integrate in our app instead of figuring how to screen record ho wmto capture input \\n\\nso no installing rustdsk but their git repo can be used rihgt?\" So RustDesk's source (its git repo, AGPL-3.0) may be used and built into the app; only installing RustDesk is ruled out. RustDesk 1.5.0's own way, from its source: screen capture with Windows' Desktop Duplication (libs/scrap), compression with libvpx and, on the graphics chip, FFmpeg (its hwcodec library; vcpkg.json), mouse and keyboard with Windows' SendInput (libs/enigo, src/server/input_service.rs), and a Windows service that starts the capture program in the signed-in session for the lock screen, UAC and Ctrl+Alt+Del (src/platform/windows.cc). Two ways were put to Shubham: port that code into the agent as the viewer was, or compile RustDesk's own Rust code into a program the app ships.",
+      "2026-10-30: Shubham chose the first way: \"1build it but keep the alternative of rustdesk software installed in pc like before ok\ncontinue\". Building it: the agent itself becomes the controlled side, ported from RustDesk 1.5.0's source (screen copy and compression through FFmpeg, mouse and keyboard through SendInput), and the in-app viewer offers both the app's own screen and, as before, the RustDesk installed on that PC.",
+      "2026-10-30: Built, not ticked yet (the first real use from the laptop is still to come). Each PC's agent is now also the controlled side of RustDesk's protocol (agent/screen/, ported from RustDesk 1.5.0, rules in design/features/F-006-host.md): FFmpeg captures the screen and compresses it on the graphics chip (Intel Quick Sync here; NVIDIA, AMD, Windows' own encoder or x264 elsewhere), and the agent moves the mouse, types, shares the clipboard and the pointer's shape through Windows' own calls (koffi). The viewer offers both ways per PC: the app's own screen first, and the RustDesk installed there exactly as before, switchable on the login panel and in its menu. Each PC's Devices page sets the app's own screen up (a one-time FFmpeg download, or npm run setup:screen) and holds its control password. Checked: 341 unit tests; the end-to-end test through the real hbbr (logged in and ten frames in 0.6 s); and this PC's real screen through two test agents in Chrome (1920x1200 at about 30 fps, a click landing at the centre, a key arriving as its scan code). Not yet, as RustDesk does them from its system service: the lock screen and UAC prompts, Ctrl+Alt+Del, windows running as administrator; RustDesk covers those.",
+      "2026-10-30: First real use: Shubham updated the laptop, set this PC's control password and controlled this PC from the laptop through the app's own screen: five sessions between 14:25 and 14:35 in this PC's agent log (H.264 on Quick Sync, the longest about five and a half minutes; first over Tailscale, then through hbbr on the LAN). Then asked: \"now how do we start ctrl+alt+dev in this\". Read as: make Ctrl+Alt+Del work in the app's own screen too, not only through RustDesk. In RustDesk's source that is its Windows service: the service, with system rights, starts the controlled side in the signed-in session with winlogon's token (src/platform/windows.cc:205-274), which follows the lock screen, the Ctrl+Alt+Del screen and UAC prompts by switching to the input desktop (windows.cc:276-359); Ctrl+Alt+Del itself is sent by the service with Windows' SendSAS, the software Ctrl+Alt+Del policy turned on for the moment if it is off (src/server/input_service.rs:2546-2553, src/platform/windows.rs:949-1029). On this PC RustDesk's service runs as LocalSystem and that policy is on (SoftwareSASGeneration = 1), so Ctrl+Alt+Del is available today through the RustDesk way. Asked how, not yet to build it.",
+      "2026-10-30: Fixed, found in this PC's agent log while building F-008 and F-009: a session from the laptop (16:46) stopped after about ten minutes, and the next two tries got no picture, because Windows' idle timeout (5 minutes on mains here) put this PC into Modern Standby with the display off (System log 16:56:26, \"Reason: Idle Timeout\"), where Desktop Duplication sees nothing. Now, as RustDesk does for an incoming session, the agent keeps the PC and its display awake while anyone is controlling it (SetThreadExecutionState, RustDesk's WakeLock: src/platform/windows.rs:3188-3224, src/server/connection.rs:6580-6625), and turns a display that is off back on before each capture (SC_MONITORPOWER, as windows.cc:528-538, and a zero-length pointer move); a capture that stops is retried after 1, 2, then 3 s. Notes in design/features/F-006-host.md.",
+      "2026-10-30: Shubham asked: \"also one more theing when the display goes to sleep then if i do contorl my pc then it doesnt start is that fixed as well\". The wake-up before the picture now moves the pointer one pixel and straight back (checked: it lands where it was), real mouse input, which is what ended this PC's Modern Standby twice today (System log \"Reason: Input Mouse\", 16:57:42 and 17:15:51) rather than a move of nothing, which Windows may ignore. Not yet tried with the display actually asleep: Shubham was on this PC through RustDesk, which keeps it awake while connected.",
+      "2026-10-30: Shubham added: \"but if other peopel laptop will also sleep i shuld be able to use this\". Read as: Control must work on any PC running the app, including other people's laptops after they go to sleep, not only on the server. The wake-up and keep-awake are in every PC's agent once it runs this version. A laptop whose sleep keeps its network on (Modern Standby on mains, as on this PC today) stays linked, and Control wakes it; a laptop in a sleep that turns its network off (on battery, lid shut, older machines' sleep) drops its link, and nothing can reach it until it wakes, RustDesk included. Asked how the app should treat that second kind.",
+      "2026-10-30: Shubham chose \"Stay reachable on mains (Recommended)\": while a PC is plugged in, its agent keeps it out of a sleep that turns its network off, so it stays linked and Control can wake it; on battery it sleeps as usual. Then added: \"and pne more thign if we where using rustdesk then it woke up\nsoo same should be this app\". Read as: Control through the app's own screen must wake a sleeping PC and bring its picture back, as RustDesk does, on every PC running the app.",
+      "2026-10-30: Built, not ticked yet (the laptop still has to pull it). A picture that stops no longer ends the connection, which is what happened before: three failed tries in 30 s ended it. As RustDesk's service loop does (src/server/service.rs:294-325, which tries again at most 1 s apart for as long as someone is connected), the capture is tried again after 1, 2, 3, 4, then every 5 s, the display woken before each try, and the viewer shows \"No picture from PC right now\", with \"It is being woken and tried again, and the picture comes back by itself\"; the first picture clears it. And every PC running the app, while plugged in, now stays out of a sleep that cuts its network (SetThreadExecutionState holding the system but not the display, so the screen still turns off as usual); on battery nothing is held unless someone is controlling it. Each PC's Devices page has the switch: This PC › Control from other PCs › \"Stay reachable when plugged in\", on by default. Checked on this PC: with its display turned off and the PC gone into Modern Standby, a Control login woke it (System log 17:36:37, \"Reason: SC_MONITORPOWER\", the app's own wake call) and the first picture came 1.1 s after the login. Also: 375 unit tests, the end-to-end test (now 9 steps; the new one starts an agent with the real Windows calls), the build, lint and the 6 themes pass. A startup bug in this change stopped this PC's agent from 17:38:15 to 17:38:40 (it restarted by itself until the fix was in); the new end-to-end step fails on that bug. Nothing reaches a PC that is shut down, hibernating, or asleep on battery, RustDesk included. Notes in design/features/F-006-host.md and agent/SPEC.md › F-006.",
+      "2026-10-30: Shubham reported: \"i did it and then i singel pressed my laotpo buton and then pressed cotnrol the laptop didnt start from sleep\nis there any chagen fomr you side\". This PC's own records: the laptop controlled this PC through the app until 17:55:03; this PC (the server, itself a laptop) went to sleep by its power button at 17:55:12 and was woken by its power button at 17:56:28 (System log, Kernel-Power 506/507 \"Power Button\"); RustDesk reconnected at 17:56:35, after that (its own log). Read as: Control from the laptop did not wake this PC after its power button put it to sleep. Why, from Microsoft's documentation: a sleep someone chooses (power button, lid, Start › Sleep) ends every program's power request (PowerSetRequest, Remarks), so \"Stay reachable when plugged in\" can't hold it off; within seconds of standby Windows pauses every desktop program, the agent among them, and lets services run only about one second in every 30 (\"Prepare software for modern standby\", the Desktop Activity Moderator). So nothing answered the laptop. What the hold does do: on mains it keeps a PC from falling asleep by itself. Also found: the app can change this PC's power-button setting without administrator rights (the same value written back, nothing changed).",
+      "2026-10-30: Correction to \"Checked on this PC\" in the note on what was built (\"Built, not ticked yet (the laptop still has to pull it)\"): no Control login woke this PC from standby. In that test this PC was on battery (Windows logged its charger out from 17:19:11 to 17:37:48); 6 s into standby (17:35:12) Windows turned its network off, and it had paused the test program. Windows itself left standby at 17:36:36 (\"Austerity Battery Drain Budget Exceeded\"); only then did the test log in, the app's wake turn the display on (17:36:37, \"Reason: SC_MONITORPOWER\") and the first picture come, 1.1 s after the login. So the wake works once the app is running, but nothing showed that a PC in standby can be reached. The Devices page's line under \"Stay reachable when plugged in\", the README, DESIGN.md, design/features/F-006-host.md and agent/SPEC.md are corrected to say so.",
+      "2026-10-30: Asked how the app should treat a PC whose power button gets pressed, Shubham chose \"Button only turns screen off (Recommended)\": only while plugged in, with \"Stay reachable\" on, the app sets the power button to just turn the screen off and the lid to do nothing, so the PC stays reachable and Control turns the screen back on; on battery the button still sleeps it; turning the switch off puts the old settings back. Built, not ticked yet: \"Stay reachable when plugged in\" now also sets the active power plan's plugged-in power button to turn the display off and its lid to do nothing (Windows' own power calls, no administrator rights needed; battery values untouched). What the plan had is kept first and put back when the switch is turned off, only where it is still as the app set it, so a change someone makes in Windows is never undone; the Devices page says what the button and lid do now. Start › Sleep still sleeps. Checked: 382 unit tests (7 new), the end-to-end test (step 9 reads this PC's power plan and, in test mode, never changes it), build, lint and the 6 themes pass; and on this PC the agent set it at 18:54:00 (power button: Sleep to turn the display off, lid: Sleep to do nothing, plugged in only; Windows shows the same). Not yet tried: pressing this PC's power button, then Control from the laptop.",
+      "2026-10-30: Shubham tried it: \"i pressed the button and screen went and it didnt connect not even with actual rustdesk software\", and asked: \"do you need to restatrt agent for it to work because all restart hapened on laptop not this hub\" (no: this PC's agent had been restarted at 18:54:00 and had set the button before the press). This PC's System log: with the button set to turn the display off, the press at 19:04:53 was still \"entering Modern Standby, Reason: Power Button\"; Windows paused programs, the app's agent and RustDesk alike, so neither connected; the button woke it at 19:07:47 and Control from the laptop connected at 19:07:55. So on a Modern Standby PC, turning the display off is still a sleep. Also checked: Windows lets only the keyboard, mouse and USB4 wake this PC; its Wi-Fi card (Intel Wi-Fi 6E AX211) has Wake on Magic Packet on in its driver, but isn't among the devices allowed to wake it (see F-010).",
+      "2026-10-30: Asked again, Shubham chose \"Do nothing (Recommended)\": plugged in only, the power button and the lid do nothing, so the PC never sleeps that way; the screen still turns off by itself after 5 minutes without use, the PC stays reachable, and Control wakes it; on battery both still sleep. Built, not ticked yet: \"Stay reachable when plugged in\" now sets both to do nothing while plugged in (a plan still at the first version's display-off is moved on at the next start; turning the switch off still puts back what the plan had first), and the Devices page says so. Checked: 383 unit tests, the end-to-end step with the real Windows calls, build and lint pass; on this PC the agent set it at 19:19:55 (power button: turn the display off to do nothing, lid: do nothing, plugged in only; battery still Sleep). That restart also ended a Control session from the laptop open since 19:09:22. Not yet tried: this PC's screen turning off by itself, then Control from the laptop (RustDesk keeps the screen on while it is connected)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-007",
+    "title": "Claude on each PC runs on my Claude subscription from the CRM: sign in with my CRM account in the app (5173), as Christopher does",
+    "said": "now moving to the next step we have to add the abiliyt tot infuse the claude subscription in the device though cmr subscription see teh agentic dev in crm m\nadn then add in our 5173 app then use my cmr login sbskrrt\n[password left out]\nto use my subscription",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: The password Shubham typed after the username is left out of \"said\" above, so it is in neither this file nor git; nothing else is changed. Read as: the CRM already holds the office's Claude subscriptions (sam-crm-be: the super admin adds each one with the token `claude setup-token` prints and puts each person, or the office default, on one; Code › Usage), and Christopher signs in with the person's CRM login (POST /v1/auth/login), fetches their subscription's token (GET /v1/org/claude-subscriptions/mine/credential, sam-crm-be controller/claudeSubscriptionsController.js:510-600) and starts every claude with it in CLAUDE_CODE_OAUTH_TOKEN. agentic-claude-manager-dev's main (084c4c9, 2026-10-07) has the CRM sign-in (server/lib/crmClient.js, crmSession.js) but not the subscription part, which is in its sealed build (agentic-claude-manager-build, server/index.js). The ask: the same in this app, each PC signed in with Shubham's CRM account (sbskrrt), so Claude on that PC runs on the subscription the CRM gives Shubham. Read as a request to build it (\"then add in our 5173 app\").",
+      "2026-10-30: Built, not ticked yet (the laptop still has to pull it and sign in). Each PC's agent signs in to the CRM (crmbe.bhole.co) with the person's own login, typed in This PC › Claude on this PC on the Devices page: the password goes to the CRM once and is kept nowhere; only the CRM's 7-day session is kept. It fetches the token of the subscription the CRM gives them and puts it in that Windows account's CLAUDE_CODE_OAUTH_TOKEN, so every Claude Code started on the PC afterwards runs on it (this app has no Claude sessions of its own to hand it to, as Christopher does). The CRM is asked again every hour and on Check now: a new token replaces the old, the CRM's no takes it out, Sign out takes it out, and a CLAUDE_CODE_OAUTH_TOKEN set by something else is left alone until Replace it. Code in agent/claude/, notes in design/features/F-007-claude-subscription.md. Checked: 361 agent tests (20 new), and on this PC signed in as sbskrrt as Shubham asked: the CRM gave the subscription \"Office 2(Jagtap)\", the variable was set, none of the agent's files held the password or the token, and a fresh Claude Code running on that token alone answered. Not yet: the hub signing a member in, and reporting this PC's usage to the CRM's Usage page."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-008",
+    "title": "Remember me on Control: the other PC's password typed once, not every time",
+    "said": "now we need a option when we do control pc i have to put password again again please introduce rememebr me ",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said in one message with F-009 (\"and\" between them). Read as: the Control page (F-005, F-006) asks for the other PC's password at every connection; a Remember me choice should keep it, so the next Control on that PC logs in without asking. Read as a request to build it (\"please introduce\").",
+      "2026-10-30: Built, not ticked yet (the laptop has to pull it first; the password is remembered by the PC doing the controlling). The password panel has \"Remember me on this PC\". Ticked, once the login works the controlling PC's agent keeps SHA256(password + salt), as RustDesk's own client keeps a remembered password (src/client.rs: handle_login_from_ui 4818-4848, handle_peer_info 3681-3715), never the password. The next Control logs in by itself: the agent answers that connection's challenge (handle_hash, 4632-4760), so what it keeps never reaches the page. A saved password that stops working (the password changed on that PC) is forgotten and asked again; the Control page's ⋯ menu has Forget the saved password. Per PC and way in (the app's own screen, or RustDesk). Code: agent/saved-passwords.ts, src/remote/session.ts. Checked: unit tests (the saved answer equals the viewer's own hash and the controlled side's check), the end-to-end test through the real hbbr (saved, then a second connection logged in with no password typed, then forgotten after the hub's password changed), and in the browser with the fixtures (ticked, connected, came back and logged in by itself, Forget)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-009",
+    "title": "The remote session stays open while I go to other pages in the sidebar and come back",
+    "said": "also if i swtihc tabs form the side bar and come back on this devices then my remote session shouldn't go",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said in one message with F-008. Read as: today, leaving the Control page for another page in the app's sidebar (Home, Features, Themes, Devices) closes the connection to the other PC; it should stay connected while the app is open, and coming back to Devices should lead straight back to it, until Disconnect.",
+      "2026-10-30: Built, not ticked yet (the laptop has to pull it first). The connection now belongs to the app rather than the Control page (src/remote/live.ts): going to another page keeps a connected session running, and coming back shows the last picture at once and the live one a moment later, with no new login. While one is open, Devices in the sidebar has a small green dot and leads straight back to it, and the Devices page shows a strip, \"Controlling NAME · for 12 min\", with Back to it and Disconnect. It ends on Disconnect, when the other PC or the link ends it (a toast says so if its page isn't showing), or when the browser tab closes or reloads. A connection still at the password ends when its page goes. Checked in the browser with the fixtures: connected, went to Features for a while, came back through the sidebar's Devices to the same live session (no login, the picture back in 0.4 s), the strip, Disconnect from the strip."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-010",
+    "title": "Wake-on-LAN: Control wakes a PC that is asleep",
+    "said": "we need wake on lan i guress",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said while trying F-006 on this PC (the server): its power button put it to sleep, and neither the app nor RustDesk could reach it until the button woke it. Read as: when Control finds a PC asleep, the app should wake it over the network with a Wake-on-LAN \"magic packet\" to its network card, sent by an awake PC on the same network (RustDesk's own Wake-on-LAN also asks an online peer on that network to send it). What this PC has: Wi-Fi only (Intel Wi-Fi 6E AX211, 60-DD-8E-C7-A8-85); its driver has Wake on Magic Packet and Wake on Pattern Match on, and the network stays connected in standby while plugged in, but Windows lists only the keyboard, mouse and USB4 among the devices that may wake it. So whether the Wi-Fi can wake it from Modern Standby needs a real try first: put it to sleep (Start › Sleep), send a magic packet from the laptop on the same network, and see. Allowing the card to wake the PC (powercfg /deviceenablewake) needs administrator rights, once per PC. A PC on another network (reached over Tailscale only) can't be woken this way unless an awake PC on its own network sends the packet. Logged, not built yet."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-011",
+    "title": "A Screen off button on the desktop",
+    "said": "mkae a button on the desktop screen off",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Asked right after the power button was made to do nothing while plugged in (F-006). Read as: a button on the desktop that turns the screen off now, as the power button used to, without putting the PC out of reach. Not a message to the display (SC_MONITORPOWER): Windows logged this PC's one at 17:35:12 as the sleep button (\"Reason SleepButton\") and slept it. Built, not ticked yet: agent/scripts/screen-off.ps1 cuts the display timeout to 3 s, so Windows turns the screen off the way it does after \"Turn off display after\", which \"Stay reachable when plugged in\" keeps short of sleep; it puts the timeout back once nobody has touched the PC and nobody has controlled it through the app for 5 s (pressed during a Control session, the screen goes off once the session ends), at most 10 minutes, and keeps the old timeouts in a file first. install-screen-off.ps1 puts it on the desktop as \"Screen off\" (no admin; -Remove takes it away); screen-off.vbs runs it without a window. Put on this PC's desktop. Checked: its check mode read this PC's timeouts (300 s plugged in, 180 s on battery) and saw the laptop's Control session. Not yet tried: pressing it, then Control from the laptop."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-012",
+    "title": "The other PC's own screen goes off while I control it from the app, with its on/off shown next to Disconnect",
+    "said": "i want the screen to go off when im using it from teh app and next to disconnect show if screen on or off",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Read as RustDesk's privacy mode: while a PC is controlled through the app, the people at that PC see a dark screen while the viewer still sees the picture; on by default (\"I want the screen to go off\"), and a control next to Disconnect shows whether that PC's screen is on or off and changes it. RustDesk 1.5.0 does it with a black window on every monitor that screen capture leaves out (privacy_mode_impl_exclude_from_capture, Windows 10 2004 and later), toggled by Misc.toggle_privacy_mode and answered with Misc.back_notification (src/server/connection.rs:4752-4757, 5099-5232; src/privacy_mode.rs; src/client/io_loop.rs:1340-1364, 2483-2560).",
+      "2026-10-30: Built, not ticked yet (the laptop has to pull it, and this PC's agent has to restart). On the app's own screen the agent shows one black window over every display, topmost, click-through and never focused, kept out of capture (SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE); it is one connection's at a time, ends with that connection, and nobody else may log in meanwhile, as RustDesk. The viewer speaks RustDesk's own messages, so it works on the RustDesk way too where the installed RustDesk offers it. The toolbar has a Screen switch before Disconnect (Screen, the switch, On or Off); the screen goes off with the first picture unless it was turned on for that PC, remembered per PC. Checked: with the cover up on this PC, a frame from the app's own capture (FFmpeg's ddagrab) showed the desktop, not black, and the cover came up in 9 ms; 392 unit tests (9 new), the end-to-end test, build, lint and themes pass; and in the browser against the pretend PC the switch went to Off with the first picture, then On and Off again when clicked. Not like RustDesk: the person at the PC can still use its mouse and keyboard (blocking them needs RustDesk's system service).",
+      "2026-10-30: Shubham found the Screen switch (\"which swithc\": it showed once this PC's agent was restarted on the new code at 20:09:23; from 20:10:28 the laptop turned this PC's screen off and on with it) and asked: \"pleae dont show cursor on the or server please\". Read as: while the screen is dark, its mouse pointer should not show on it either (RustDesk's privacy mode leaves it showing). Built: the pointer is hidden with the screen (Windows' MagShowSystemCursor) and shown again when it comes back. Windows keeps it hidden after the process that hid it ends (tried here: it stayed hidden), so the agent shows it again at every start, and a watcher process shows it should the agent end meanwhile (tried here: killing the process that hid it, the pointer came back within 4 s). The viewer keeps the pointer's shape. Checked: frames from the app's own capture with the pointer drawn showed it before, none while hidden, and it again after; 404 unit tests and the end-to-end test pass."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-013",
+    "title": "Alt+Tab and the other shortcuts RustDesk sends work in the app's Control too",
+    "said": "also please make the alt+tab work and other shorcuts which work in rust desk also",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said while F-012 was being built. Today the page can send Alt+Tab, the Windows key and the like only in Full screen (Chrome's Keyboard Lock); in a normal window Windows (and the browser, for Ctrl+W, Ctrl+T, Ctrl+Tab and others) takes them before the page sees them. RustDesk gets them with a low-level keyboard hook while its own window has the focus. Read as: the same in the app's Control without Full screen, on the controlling PC, through its agent. Logged; to be built next.",
+      "2026-10-30: Built, not ticked yet (the laptop has to pull it). The controlling PC's agent now takes every key while its Control screen has the focus, as RustDesk's viewer does (src/keyboard.rs:612-701): a low-level keyboard hook on its own thread (so Windows never drops it for answering late), only while the browser window that asked stays in front, handing each key to the page, which sends it on like any other. Caps Lock and Num Lock stay with this PC, as in RustDesk, and so does input that software injects. Holding Esc, or clicking outside the screen, gives the keys back; the toolbar says \"every key goes to NAME, Alt+Tab and Win too\" meanwhile. Ctrl+Alt+Del and Win+L stay Windows' own (Ctrl+Alt+Del has its button). Checked on this PC: the real hook took injected Alt+Tab (Alt held, Tab down and up) and F24 and passed them on, and the window in front stayed the same, so Alt+Tab never reached this PC; a real agent's /agent-api/keys hooked the keyboard and let go when closed; 401 unit tests (9 new), the end-to-end test, build, lint and themes pass. Not yet tried by hand from the laptop."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-014",
+    "title": "Control the hub from my phone (an APK on the phone?)",
+    "said": "now jsut go through the app shubham agentic dev now teh idea is i want my phone to contorl the hub as well how can we do that \napk on the phone?",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Asked as a question (how, and whether an APK is the way), not yet a request to build. Read as: from the phone, control this PC (the hub) the way Control on a device row does from the laptop: its screen, with touch for the mouse and a keyboard. Today the phone can open the app over Tailscale (https://server.tailc768e5.ts.net:5173) and the viewer already takes touch (src/remote/input.ts), but a page reaches screens only through its own PC's agent to another device (/devices/<id>/remote), the phone has no agent, and the hub has no Control for itself.",
+      "2026-10-30: Shubham asked: \"now how do i connect to my phone the https://server.tailc768e5.ts.net/ hwo will it show the hub pc on its url i can only use christoperh not th eacutal pc control can only happen form another computer\". Checked: the bare name is port 443, which is Christopher; this app is at https://server.tailc768e5.ts.net:5173, which loads over Tailscale with the hub's agent answering through the remote gate (state and its WebSocket both work). That page is the hub's own: its Devices page lists the laptop (linked over Tailscale) with Control, which goes phone → hub → laptop, but nothing controls the hub itself. Read as confirming the missing piece: Control of the PC whose page it is.",
+      "2026-10-30: Shubham said \"yes please build it\". Built, not ticked yet (Shubham to try it on the phone). No APK: the phone opens the hub's page over Tailscale (https://server.tailc768e5.ts.net:5173/devices), and Control on its This PC card opens the hub's own screen through the hub's own agent, with no link (agent/main.ts ownScreen: an in-process stream pair to the same 'screen' and 'rustdesk' handlers a link reaches, so both ways in, the control password, Remember me and the Screen switch work as for another PC). The card shows Control only on a page opened from elsewhere; on the PC it says the phone can do it. The phone gets a key row under the screen: Keyboard (its own keyboard, typed text sent as RustDesk's seq, as RustDesk's soft keyboard does), Esc, Tab, sticky Ctrl/Alt/Shift/Win, Del and arrows (src/remote/soft-keys.ts, src/remote/own.ts). F-013's /keys is only opened where the browser runs on the PC itself. Checked: 405 unit tests and e2e step 10 (the hub controlling itself with no link, Remember me for itself, its RustDesk port), the fixtures on a phone-sized touch screen (typing, a composed word corrected, Backspace with nothing typed, Enter, Ctrl+C), and the real hub through the Tailscale URL up to its control-password and RustDesk-password panels (not logged in). The hub agent was restarted on the new code at 21:58. Not done: pinch to zoom. Spec: agent/SPEC.md › F-014.",
+      "2026-10-31: Shubham said: \"now just one more thing the ctrl alt shift you added \nwhen we press tab its not sticky so on alt alt should be stcikly when i press tab but it goes away \nand give differnet colour for sticky tabs\". Read as: on the phone's key row, Ctrl, Alt, Shift and Win let go after one key, so Alt then Tab switches once and the Alt+Tab switcher never stays up; they should stay pressed on the other PC across keys (Alt held while Tab is tapped again and again) until tapped again, and a pressed one should look clearly different from the others.",
+      "2026-10-31: Built (the page only, live on the dev server; reload the phone's page). Ctrl, Alt, Shift and Win now go down on the other PC at one tap and up at the next, like keys held there, and a held one takes the filled primary look, apart from everything else on the row (src/remote/soft-keys.ts, src/pages/Remote.tsx). While one is held, letters, digits and spaces from the keyboard go as keys (Ctrl, c, Ctrl is Ctrl+C) and taps on the picture carry it (Ctrl+click); opening the keyboard keeps them held (src/remote/input.ts). Checked with the dev fixtures on a phone-sized touch screen: Alt, Tab, Tab, Tab left the pretend PC holding Alt through all three; Ctrl, Keyboard, c sent Ctrl+C with Ctrl still held; Ctrl again let go."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-015",
+    "title": "The lock screen and UAC prompts shouldn't block Control through the app's own screen",
+    "said": "now one more thign we have to do this error shoudl not show when we are usign the the app contorl \nServer is locked or showing an administer uac prompt \nthis should not shwo please fix htis",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: The message is agent/screen/host.ts › lockedNotice: about once a second the agent checks which desktop has the input, and when it isn't the normal Default one — the lock screen, the sign-in screen, or a UAC prompt on the secure desktop — it stops the picture and shows that notice, because a program running as the signed-in user (which the agent is) can't see or drive the secure desktop. RustDesk can because it runs a system service. Asked which fix, Shubham chose to build the RustDesk-style service (not the quick sleep-lock change, not auto-switching to the installed RustDesk when locked).",
+      "2026-10-30: Being built (F-015; F-014 is the phone feature in the other chat, so this took the next free id). Ported from RustDesk 1.5.0's Windows service (src/platform/windows.cc, windows.rs): a LocalSystem service (agent/system/ShubhamAgenticSystem.cs) that launches a helper into the console session with winlogon.exe's token, so the helper is SYSTEM there and can follow the input desktop (OpenInputDesktop, SetThreadDesktop), capture it with its own ffmpeg.exe, carry out the mouse and keyboard on it (SendInput), and send Ctrl+Alt+Del (SendSAS, with SoftwareSASGeneration set to 1 for the moment). The agent (agent/screen/, still to wire) will use it only while the desktop isn't Default; the lock screen and UAC then show in Control instead of the notice. Not like a program running as the user: this can see the secure desktop.",
+      "2026-10-30: Microsoft Defender removes the compiled service binary on sight — the winlogon-token + secure-desktop + SendSAS pattern trips its heuristics, as it would for any remote-control service. NOT worked around by reshaping the binary to slip past Defender (that is detection evasion, declined). Instead, on Shubham's choice, it is code-signed: a self-signed Scyramp code-signing certificate (Code Signing EKU only; private key kept in this PC's certificate store, public half in agent/system/ShubhamAgentic.cer, thumbprint A244DBE0…9549), installed as a trusted publisher on each PC, with a Defender exclusion for the install folder — an explicit owner's trust decision on PCs Scyramp owns, not a disguise. agent/scripts/build-system.ps1 (run elevated) trusts the cert, excludes the folder, compiles, signs and verifies the .exe (fails if the signature isn't Valid), copies ffmpeg.exe beside it, and installs the service. Not done yet: the elevated build has still to be run and verified, and the agent isn't wired to the service."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-016",
+    "title": "Mouse mode on the phone: switch between touch mode and cursor (touchpad) mode",
+    "said": "now can you please introduce abiliyt to switch the mouse mode from touch mode to cursor mode for phone aswell",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said in one message with the next feature, right after F-014 (Control from the phone) was built. Read as: on the phone's Control screen, a switch between today's touch mode (a tap clicks where the finger is, the pointer follows the finger) and a cursor mode like a laptop's touchpad (a finger moves the pointer from where it is, a tap clicks where the pointer is, with the pointer drawn on the picture), as RustDesk's phone app has. Read as a request to build it (\"please introduce\").",
+      "2026-10-30: Built, not ticked yet (Shubham to try it on the phone). A Touch | Cursor switch on the phone's key row, remembered on the phone (src/remote/touch-mode.ts). Touch mode as before; cursor mode is a touchpad: a finger slides the pointer by as much as it moves, a tap clicks where the pointer is, a two-finger tap or a long press right-clicks there, and the page draws the pointer on the picture with the other PC's own shape. Both modes now drag with a double-tap and slide (src/remote/input.ts). Checked with the dev fixtures on a phone-sized touch screen: the drawn pointer and the pretend PC's own pointer readout agree after a slide, a tap far away clicks without moving it, and a 60 px drag leaves no button held. Live already: it is the page only. Spec: agent/SPEC.md › F-016 and F-017."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-017",
+    "title": "The phone's keyboard opens by itself when I tap a text box on the other PC, and I can open it myself too",
+    "said": "and beter if we click any input auto keyboard open if possible\nplus option to use keyboard woudl be gretae",
+    "added": "2026-10-30",
+    "notes": [
+      "2026-10-30: Said in one message with F-016. Read as: when a tap on the controlled PC's picture puts the focus in a text box there, the phone's own keyboard should open by itself (\"if possible\"), and there should also be a way to open the keyboard by hand. The by-hand way is F-014's Keyboard button on the key row under the screen (built today, not yet tried by Shubham); the automatic one needs the controlled PC to say when a text box has the focus, which RustDesk's protocol has no message for.",
+      "2026-10-30: Built, not ticked yet (the hub agent has to restart on it; Shubham was controlling the hub from the phone, so it was left running). Through the app's own screen only: the phone's page asks that PC, with RustDesk's own plugin message (Misc.plugin_request, id sad.text-focus), to say when a text box has the keyboard focus; its agent asks Windows UI Automation on a worker thread, only while a phone asks (agent/screen/text-focus.ts, text-focus-worker.ts, host.ts); the page then focuses its hidden keyboard field, which opens the phone's keyboard, and closes it again when the focus leaves, if it opened by itself. RustDesk can't say, so through RustDesk it stays the Keyboard button, which is the \"option to use keyboard\" (built in F-014). Checked: 409 unit tests (UI Automation itself on this PC found the Windows search box as an editable Edit), and the fixtures' pretend text field opening and closing the keyboard field on taps. Not checked: a real phone keyboard opening from a page's focus, which Android allows only soon after a tap."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-018",
+    "title": "The Agentic Workflow section of agentic-claude-manager, in this app",
+    "said": "now biggest task implmeent the agentic worflwo section on agentic claudemanger in the shubham agentic dev",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: bring over agentic-claude-manager's Agentic Workflow mode (its default mode; uiMode 'agents' in frontend/src/App.tsx, the chips in components/Sidebar.tsx): Agents Workflow (floors with the agents and chats on them, Add floor), Project Workflows, Workflows, Skills and MCP, with the server side behind them. This app has no Claude sessions of its own yet (F-007 only puts the CRM's token in CLAUDE_CODE_OAUTH_TOKEN), so this is the first feature that runs Claude here. Mapping the original before building.",
+      "2026-10-31: Planned in four phases, each checked before the next: (1) Agents Workflow: floors, agents, their Claude Code chats side by side, Design, Preamble, Agents, Memory, and the tools the chats share; (2) Workflows and Project Workflows: templates, runs with a father chat, steps dispatched to agents and reported back (step_done, step_blocked, step_note); (3) the prompt board, autopilot, CRM goals (a floor attached through the F-007 sign-in) and hooks; (4) Skills and MCP.",
+      "2026-10-31: Phase 1 built, not ticked (three phases to go). Agents in the sidebar (/agents): Add floor makes a floor with its Lead; floors and agents on the left, and the floor's tabs: Chats (1, 2 or 4 windows, each an agent's live Claude Code in xterm.js), Design (the org chart on React Flow), Preamble (its folder and preamble), Agents (each agent's chat, model and conversation) and Memory. Each chat is the claude TUI in a pseudo-terminal on this PC (node-pty), started with the agent's brief, model and the tools of the shubham-agentic MCP server (list_chats, read_chat, send_to_chat, broadcast_to_chats, floor_roster, memory_save/search/recent, agent_hire for the Lead), which reach only the caller's floor, by the chat's own key, never the app's token. Chats run on the CRM's subscription (F-007) and this account's ~/.claude; the app marks claude's first-run setup done and the floor's folder trusted in ~/.claude.json so a chat opens on its prompt (claude 2.1's trust menu starts on No, exit, so an Enter would have quit). Checked: 432 agent tests (23 new) and e2e 10/10, build, lint, 6/6 themes; and in the real app on a test agent: a floor with Lead and Scout, both chats started from the page (Sonnet 5.5 and Haiku 5.5 on the CRM's token), Scout calling floor_roster, list_chats and send_to_chat, and Lead's chat receiving the message; the transcript reader, memory, the phone layout and dark mode. Stopping npm run agent ends every chat (each resumes when opened). Code: agent/agentic/, src/agentic/; spec: agent/SPEC.md › F-018, DESIGN.md › Agents.",
+      "2026-10-31: Shubham said: \"i want to contorl the claude in teminal nt eh app that is what agent workflwo was but it shows The device agent isn't running…\". The hub agent was still on the code from before F-018 (12:20: restarted, no Control session open); each agent's window is the claude terminal itself, typed into directly. That message now reads \"The device agent needs a restart\" when an older agent answers.",
+      "2026-10-31: Shubham said: \"i dont liek the agent viewi wnat it to be collpsible side bar like in the agentic claudemnager dev\". The page header (Agents, its line, Add floor) is gone; the floors and agents are a 288px sidebar as in agentic-claude-manager (\"Agents workflow\", a + for Add floor, a collapse button) that collapses to a 48px rail (expand, +, a button per floor with its dot), remembered in the browser; the floor's tabs and terminals take the rest of the page. On a phone the sidebar is the first screen. With no floors, the empty state carries Add floor. Checked in the browser on a test agent at 1440 px (open and collapsed) and on a phone.",
+      "2026-10-31: Shubham said: \"now next to floor name cna we have a spereateor / direclty after new fllow chats start\". A thin vertical rule now sits between the floor's name and its tabs (\"New floor | Chats Design …\").",
+      "2026-10-31: Shubham said: \"can you pleae / in the action button remove the agent\". Read as: an agent's ⋯ action menu in the sidebar gets Remove agent… (before, only Edit agent had it). It asks first, then the agent leaves the floor, its chat stops, and anyone reporting to it moves up to its manager; the boss has none. Also: wording that read \"the NAME floor\" (\"Test floor floor\") now names the floor on its own, in the page and in the agents' briefs (the briefs' change reaches chats started after the agent's next restart). Checked on a test agent: Scout removed from its ⋯ menu, gone on the agent and in the sidebar.",
+      "2026-10-31: Shubham said: \"it snot there only open chat copy chat and edit agent and stop caht\". His floor had only its Lead, and the boss had no Remove. Now every agent can be removed, the boss too: one of its direct reports (else the first agent left) takes over as boss, with the old boss's reports under it; the last agent leaves an empty floor, and the next agent added becomes its boss, named Agent 1 at the boss's desk. The agent (agent/agentic/floors.ts) no longer refuses a list without the boss. Checked on a test agent: Lead, the only agent, removed from its ⋯ menu, the floor empty, the next agent its boss. The hub agent was restarted at 12:46 to take it (no Control session open)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-019",
+    "title": "The menu as a horizontal bar along the bottom",
+    "said": "can you move the sidebar button to the bottom please\nmove button home feasuer theme deveice to agent to bttom\nbottom mena bottom bar \n--------------------\nhorizontal",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Said in three messages. Read first as moving the side menu's links to the foot of the side menu (built, then undone); the third message made it a horizontal bar along the bottom of the window, replacing the left side menu.",
+      "2026-10-31: Built, not ticked yet (Shubham to look). The default is now one horizontal bar along the foot of the window at every width: Home, Features, Themes, Devices and Agents as icon and label side by side, centred, the selected one on the nav pill; below 640px it is the phone's bottom tabs as before. The left side menu is kept as the alternative, exactly as it was (the side nav from 1024px, the icon rail from 640px): a new button in the top bar, left of the theme, shows where the menu is and moves it (\"Menu at the bottom\" / \"at the side\"), remembered in this browser (sad-nav). With the bottom bar the brand mark stays in the top bar. Checked in the browser at 1440, 820 and 390 px, both ways. Code: src/app/Shell.tsx; DESIGN.md › Shell."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-020",
+    "title": "Shubham Agentic build: the app the PCs run, published from Dev with a button",
+    "said": "Ek minute. Now we have a big task to do. Currently we are working on the Shubham Agentic Dev. Now we have to make the build.\n\nThe point of making the build is that currently we are using the Christopher chat to edit anything that is going on in Shubham Agentic Dev. What we will do is we will use the Shubham Agentic build to edit anything in the Dev. Till now the Shubham Agentic Dev wasn't there for us to make changes in it but now it is there.\n\nWe will now create a Shubham Agentic build and then send the build here also. Here also, on my laptop, we will use a Shubham Agentic build only not Dev. Dev will only be on the server and we will edit it. Whenever we want to publish the build, there will be a button to publish the build. That is what we have to work on now.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as, after agentic-claude-manager's dev → build → install: shubham-agentic-build (the empty sibling folder) becomes the built app every PC runs, the server and the laptop alike; Dev stays only on the server as the source, edited from the build's own Agents section (its Claude chats working in the Dev folder) instead of from Christopher. A Publish button builds Dev into a new build and gets it to the PCs. Planning before building."
+    ],
+    "done": null,
+    "doneNote": ""
+  }
+]
+</script>
+
+<script>
+  const features = JSON.parse(document.getElementById('features').textContent);
+  const list = document.getElementById('list');
+  const tickSvg = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7"/></svg>';
+  let filter = 'all';
+
+  function fmt(d) {
+    const t = new Date(d + 'T00:00:00');
+    return isNaN(t) ? d : t.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  }
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function render() {
+    const built = features.filter(f => f.done).length;
+    document.getElementById('progress').textContent =
+      features.length ? `${built} of ${features.length} built` : '';
+    list.replaceChildren();
+    const shown = features.filter(f => filter === 'all' || (filter === 'done') === Boolean(f.done));
+    if (!shown.length) {
+      list.append(el('li', 'empty', features.length ? 'Nothing here.' : 'No features yet. Describe the first one in any Claude chat and it will be logged here.'));
+      return;
+    }
+    for (const f of shown) {
+      const li = el('li', 'feature' + (f.done ? ' done' : ''));
+      const tick = el('div', 'tick');
+      tick.title = f.done ? 'Built' : 'Not built yet';
+      if (f.done) tick.innerHTML = tickSvg;
+      const body = el('div');
+      const head = el('div', 'head');
+      head.append(el('span', 'id', f.id), el('h2', '', f.title), el('span', 'status', f.done ? 'Built' : 'Not built'));
+      body.append(head, el('blockquote', '', f.said));
+      if (f.notes && f.notes.length) {
+        const ul = el('ul', 'notes');
+        for (const n of f.notes) ul.append(el('li', '', n));
+        body.append(ul);
+      }
+      let meta = `Asked ${fmt(f.added)}`;
+      if (f.done) meta += ` · Built ${fmt(f.done)}` + (f.doneNote ? ` · ${f.doneNote}` : '');
+      body.append(el('div', 'meta', meta));
+      li.append(tick, body);
+      list.append(li);
+    }
+  }
+
+  for (const b of document.querySelectorAll('[data-filter]')) {
+    b.addEventListener('click', () => {
+      filter = b.dataset.filter;
+      for (const o of document.querySelectorAll('[data-filter]')) o.setAttribute('aria-pressed', String(o === b));
+      render();
+    });
+  }
+  render();
+</script>
+</body>
+</html>

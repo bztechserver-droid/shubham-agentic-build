@@ -1,0 +1,64 @@
+// Minimal interop schema for talking to an UNMODIFIED rustdesk-server hbbs/hbbr 1.1.16.
+// Written for shubham-agentic-dev from the wire facts only (package name, message field
+// numbers and types), so the app need not ship RustDesk's rendezvous.proto.
+// Field numbers checked against hbb_common 83419b6 (pinned by rustdesk-server tag 1.1.16)
+// and fae47e0 (pinned by rustdesk 3cb027a). Fields newer than 1.1.16 are left out.
+syntax = "proto3";
+package hbb; // must stay "hbb": only matters for text/JSON forms, not the binary wire
+
+enum NatType { UNKNOWN_NAT = 0; ASYMMETRIC = 1; SYMMETRIC = 2; }
+enum ConnType { DEFAULT_CONN = 0; FILE_TRANSFER = 1; PORT_FORWARD = 2; RDP = 3; }
+
+message IdPk { string id = 1; bytes pk = 2; }                 // what hbbs signs (sodium sign, combined mode)
+
+message RegisterPeer { string id = 1; int32 serial = 2; }       // UDP, every 15 s
+message RegisterPeerResponse { bool request_pk = 2; }
+message RegisterPk { string id = 1; bytes uuid = 2; bytes pk = 3; string old_id = 4; } // UDP only
+message RegisterPkResponse {
+  enum Result { OK = 0; UUID_MISMATCH = 2; ID_EXISTS = 3; TOO_FREQUENT = 4; INVALID_ID_FORMAT = 5; NOT_SUPPORT = 6; SERVER_ERROR = 7; }
+  Result result = 1; int32 keep_alive = 2;
+}
+
+message PunchHoleRequest { string id = 1; NatType nat_type = 2; string licence_key = 3; ConnType conn_type = 4; string token = 5; string version = 6; } // TCP only
+message PunchHole { bytes socket_addr = 1; string relay_server = 2; NatType nat_type = 3; }          // hbbs -> controlled, over UDP
+message PunchHoleSent { bytes socket_addr = 1; string id = 2; string relay_server = 3; NatType nat_type = 4; string version = 5; } // controlled -> hbbs, send over TCP
+message PunchHoleResponse {
+  bytes socket_addr = 1; bytes pk = 2;                          // pk = hbbs-signed IdPk, only if responder sent a version
+  enum Failure { ID_NOT_EXIST = 0; OFFLINE = 2; LICENSE_MISMATCH = 3; LICENSE_OVERUSE = 4; }
+  Failure failure = 3; string relay_server = 4;
+  oneof union { NatType nat_type = 5; bool is_local = 6; }
+  string other_failure = 7;
+}
+message FetchLocalAddr { bytes socket_addr = 1; string relay_server = 2; }                           // hbbs -> controlled, over UDP
+message LocalAddr { bytes socket_addr = 1; bytes local_addr = 2; string relay_server = 3; string id = 4; string version = 5; } // controlled -> hbbs, send over TCP
+
+message RequestRelay { string id = 1; string uuid = 2; bytes socket_addr = 3; string relay_server = 4; bool secure = 5; string licence_key = 6; ConnType conn_type = 7; string token = 8; }
+message RelayResponse { bytes socket_addr = 1; string uuid = 2; string relay_server = 3; oneof union { string id = 4; bytes pk = 5; } string refuse_reason = 6; string version = 7; }
+
+message TestNatRequest { int32 serial = 1; }                   // optional NAT test (TCP 21116 and 21115)
+message TestNatResponse { int32 port = 1; }
+message OnlineRequest { string id = 1; repeated string peers = 2; } // TCP 21115: presence bitmap
+message OnlineResponse { bytes states = 1; }
+message KeyExchange { repeated bytes keys = 1; }               // never sent by OSS 1.1.16; skip if seen
+
+message RendezvousMessage {
+  oneof union {
+    RegisterPeer register_peer = 6;
+    RegisterPeerResponse register_peer_response = 7;
+    PunchHoleRequest punch_hole_request = 8;
+    PunchHole punch_hole = 9;
+    PunchHoleSent punch_hole_sent = 10;
+    PunchHoleResponse punch_hole_response = 11;
+    FetchLocalAddr fetch_local_addr = 12;
+    LocalAddr local_addr = 13;
+    RegisterPk register_pk = 15;
+    RegisterPkResponse register_pk_response = 16;
+    RequestRelay request_relay = 18;
+    RelayResponse relay_response = 19;
+    TestNatRequest test_nat_request = 20;
+    TestNatResponse test_nat_response = 21;
+    OnlineRequest online_request = 23;
+    OnlineResponse online_response = 24;
+    KeyExchange key_exchange = 25;
+  }
+}

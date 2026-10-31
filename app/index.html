@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" data-theme="parchment" data-mode="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- The stored theme and mode, applied before first paint so there is no flash.
+         src/theme/ThemeProvider.tsx takes over from here and uses the same keys. -->
+    <script>
+      ;(function () {
+        var root = document.documentElement
+        var theme = null
+        var mode = null
+        try {
+          theme = localStorage.getItem('sad-theme')
+          mode = localStorage.getItem('sad-mode')
+        } catch (e) {}
+        root.dataset.theme = theme || 'parchment'
+        root.dataset.mode =
+          mode === 'light' || mode === 'dark' ? mode : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+      })()
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>shubham-agentic-dev</title>
+    <script type="module" crossorigin src="/assets/index-D0duibIz.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DEvvOQoX.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
