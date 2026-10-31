@@ -475,6 +475,39 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-033",
+    "title": "Drag floors and agents in the sidebar",
+    "said": "oen now we need drag move move of floor and drag and move of agents \nalso make the selceted ui a little vweiwavle \nadn spereate teh slecet of agents in two parts oen being hte floor and other being the agent",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. In the Agents sidebar: drag a floor onto another to put it before that one (the order is kept, as Reorder was); drag an agent onto another agent to put it before that one, or onto another floor's row to move it there, its chat with it (it joins under that floor's boss; those who reported to it stay and move up; a boss moved off leaves one of its reports as boss; a name already on that floor is refused). Where it would land shows as a primary line or ring. Dragging an agent onto a chat window still puts its chat there (F-032). Checked: a floor-store test (reordered, moved with its chat, reports and boss after, a name taken refused), types, lint, the page build. Code: agent/agentic/floors.ts (moveAgent), index.ts (POST .../move), src/agentic/FloorList.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-034",
+    "title": "The selected floor and agent easier to see",
+    "said": "oen now we need drag move move of floor and drag and move of agents \nalso make the selceted ui a little vweiwavle \nadn spereate teh slecet of agents in two parts oen being hte floor and other being the agent",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. The selected floor and agent in the sidebar were a faint surface with a hairline; now the surface has a primary-tinted edge and a 3px primary bar at its start. Checked: types, lint. Code: src/agentic/util.ts (SELECTED_ROW), FloorList.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-035",
+    "title": "A window's picker in two parts: the floor, then the agent",
+    "said": "oen now we need drag move move of floor and drag and move of agents \nalso make the selceted ui a little vweiwavle \nadn spereate teh slecet of agents in two parts oen being hte floor and other being the agent",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. A chat window's title bar has two pickers: the floor (the open one first, every other after), then an agent on that floor (\"Pick an agent\" until one is). Picking a floor alone changes nothing on screen; it comes back to the agent's own floor when the window's agent changes. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

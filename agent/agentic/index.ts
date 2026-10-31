@@ -1238,6 +1238,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return floors.addAgent(id, b as NewAgent)
       },
     ],
+    [
+      'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/,
+      ([id, agentId], r) => {
+        // F-033: dragged: reordered on its floor, or onto another (its chat goes on as it is).
+        const b = isObject(r.body) ? r.body : {}
+        const to = typeof b.floorId === 'string' && b.floorId ? b.floorId : id
+        return floors.moveAgent(id, agentId, to, typeof b.before === 'string' ? b.before : null)
+      },
+    ],
     ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body), 'local'],
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => openChat(id, agentId, openRequest(r.body)), 'local'],
     [

@@ -127,6 +127,12 @@ export interface FloorStore {
   patch(id: string, patch: FloorPatch): Floor
   remove(id: string): Floor | null
   reorder(order: string[]): Floor[]
+  /**
+   * F-033: an agent moved, keeping its chat: before `before` (another agent there; last when
+   * left out) on its own floor, or onto another floor (under that floor's boss; its own floor's
+   * chart repaired, a new boss when it was the boss).
+   */
+  moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null): { from: Floor; to: Floor }
   addAgent(floorId: string, req: NewAgent): { floor: Floor; agent: FloorAgent }
   /** Binds (or with null unbinds) an agent's chat. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
@@ -263,6 +269,36 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       floors = [...floors].sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity))
       save()
       return clone(floors)
+    },
+
+    moveAgent(fromFloorId, agentId, toFloorId, before) {
+      const from = find(fromFloorId)
+      const to = find(toFloorId)
+      const agent = agentOf(from, agentId)
+      if (to !== from) {
+        if (to.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `${to.name} already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
+        if (!uniqueName(to, agent.name)) throw apiError(409, `There is already an agent called "${agent.name}" on ${to.name}; rename one first`)
+      }
+      from.agents = from.agents.filter(a => a !== agent)
+      if (to !== from) {
+        // Its reports stay behind, moving up to its manager there; there, it joins under the boss.
+        for (const a of from.agents) if (a.reportsTo === agent.id) a.reportsTo = agent.reportsTo
+        const wasBoss = agent.isBoss
+        agent.isBoss = to.agents.length === 0
+        agent.reportsTo = to.agents.find(a => a.isBoss)?.id ?? null
+        if (wasBoss && from.agents.length) {
+          const next = from.agents.find(a => a.reportsTo === agent.id || a.reportsTo === null) ?? from.agents[0]
+          next.isBoss = true
+        }
+        from.agents = repairAgents(from.agents)
+        from.updatedAt = now()
+      }
+      const at = before ? to.agents.findIndex(a => a.id === before) : -1
+      to.agents.splice(at === -1 ? to.agents.length : at, 0, agent)
+      to.agents = repairAgents(to.agents)
+      to.updatedAt = now()
+      save()
+      return { from: clone(from), to: clone(to) }
     },
 
     addAgent(floorId, req) {
