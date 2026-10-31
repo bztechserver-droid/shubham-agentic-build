@@ -92,6 +92,39 @@ export interface ChatOpened {
   resumed: boolean
 }
 
+/** GET /agentic/sessions: a Claude Code conversation on this PC, newest first (Bring in a Claude chat). */
+export interface ClaudeSession {
+  sessionId: string
+  /** The folder it was held in; null when its file doesn't say. */
+  cwd: string | null
+  /** Its name as Claude Code titled it (or it was renamed), else its first prompt. */
+  title: string | null
+  bytes: number
+  /** When it was last written to. */
+  updatedAt: string
+  /** It is already an agent's chat here. */
+  agent: { floorId: string; floorName: string; agentId: string; name: string } | null
+}
+
+/** POST /agentic/floors/:id/import: a copy of a conversation becomes an agent's chat. */
+export interface ImportChat {
+  sessionId: string
+  /** The agent whose chat it becomes (the chat it had stops and is let go); a new agent when left out. */
+  agentId?: string
+  /** A new agent's name and role. */
+  name?: string
+  role?: string
+}
+
+export interface ChatImported {
+  floor: Floor
+  agent: FloorAgent
+  /** The copy's id, the agent's chat now. The original is left as it was. */
+  sessionId: string
+  /** Where the conversation was held: its chat opens there. */
+  cwd: string
+}
+
 /** One message of a chat's transcript (the Agents tab's reader). */
 export interface ChatMessage {
   id: string

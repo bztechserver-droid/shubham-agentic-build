@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,7 +8,9 @@ import {
   AGENT_MODELS,
   type AgentModel,
   type AgenticEvent,
+  type ChatImported,
   type ChatOpened,
+  type ClaudeSession,
   type Floor,
   type FloorAgent,
   type FloorPatch,
@@ -24,7 +26,7 @@ import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, type ChatInfo, type ChatPool, type PtySpawn } from './chats.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
-import { claudeProjectsDir, findTranscriptCwd, readTranscript, transcriptInfo } from './transcripts.ts'
+import { claudeProjectsDir, copyTranscript, findTranscriptCwd, listSessions, readTranscript, transcriptInfo } from './transcripts.ts'
 
 // F-018: the Agentic Workflow section's backend (agentic-claude-manager's floors, agents and
 // their chats, and the tools those chats share), mounted on the agent's local API at /agentic.
@@ -317,6 +319,50 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { floor }
   }
 
+  /** This account's Claude Code conversations, each with the agent here it already is, if any. */
+  async function sessions(): Promise<ClaudeSession[]> {
+    const bound = new Map<string, ClaudeSession['agent']>()
+    for (const f of floors.list()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
+    return (await listSessions(projectsDir)).map(x => ({ ...x, agent: bound.get(x.sessionId) ?? null }))
+  }
+
+  /** A copy of a conversation becomes an agent's chat (transcripts.ts says why a copy): a new agent's, or the one named's. */
+  async function importChat(floorId: string, body: unknown): Promise<ChatImported> {
+    if (!isObject(body) || typeof body.sessionId !== 'string' || !UUID_RE.test(body.sessionId)) throw apiError(400, 'Expected {sessionId, agentId?, name?, role?}')
+    const from = body.sessionId
+    const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
+    const floor = floorOf(floorId)
+    if (intoId) agentOf(floor, intoId)
+    const cwd = findTranscriptCwd(from, projectsDir)
+    if (!cwd) throw apiError(404, `There is no conversation ${from} on this PC, or it never said which folder it was held in`)
+    if (!existsSync(cwd)) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
+    const sid = randomUUID()
+    let copy: string
+    try {
+      copy = (await copyTranscript(from, sid, projectsDir)).file
+    } catch (e) {
+      throw apiError(500, `Couldn't copy that conversation: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    try {
+      // Looked up again: the floor may have changed while it copied.
+      let agentId = intoId
+      if (agentId) {
+        const before = agentOf(floorOf(floorId), agentId).sessionId
+        if (before) chats.kill(before)
+      } else {
+        const name = typeof body.name === 'string' ? body.name : ''
+        agentId = floors.addAgent(floorId, { name, role: typeof body.role === 'string' ? body.role.trim() : '' }).agent.id
+      }
+      const after = floors.bindSession(floorId, agentId, sid)
+      const agent = agentOf(after, agentId)
+      log?.info(`brought a copy of conversation ${from.slice(0, 8)} onto ${after.name} as ${agent.name}'s chat (${sid.slice(0, 8)})`)
+      return { floor: after, agent, sessionId: sid, cwd }
+    } catch (e) {
+      rmSync(copy, { force: true })
+      throw e
+    }
+  }
+
   type Handler = (m: string[], r: MountRequest) => unknown
   const routes: [string, RegExp, Handler][] = [
     ['GET', /^\/floors$/, () => answer()],
@@ -329,6 +375,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { floors: floors.reorder(r.body.order as string[]) }
       },
     ],
+    ['GET', /^\/sessions$/, async () => ({ sessions: await sessions() })],
     ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body)],
     [
       'DELETE',
@@ -350,6 +397,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return floors.addAgent(id, b as NewAgent)
       },
     ],
+    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body)],
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/,
