@@ -646,6 +646,9 @@ a member leaving a relay has two for a moment). A new TLS peer:
     `POST /agent-api/screen/setup` (F-006, below)
   - `POST /agent-api/claude/sign-in` with `{login, password}`, `POST /agent-api/claude/check`
     with `{replace?}` and `POST /agent-api/claude/sign-out`, each → `ClaudeInfo` (F-007, below)
+  - `POST /agent-api/claude/switch/refresh` with `{readings?}` and `/switch/auto` with `{on}` →
+    `ClaudeInfo`; `/switch/preview` with `{to}` → `SwitchPreview`; `/switch` with `{to, restart:
+    [chat ids]}` → `{ok, message, restarted, failed}` (Claude subscription failover, below)
   - `POST /agent-api/devices/:id/password/login` with `{via, salt, challenge}` →
     `{digest | null}`, `/password/save` with `{via, salt, h1}` and `/password/forget` with
     `{via?}` (F-008, below)
@@ -678,6 +681,14 @@ a member leaving a relay has two for a moment). A new TLS peer:
     is answered with the same code; RSV bits, an unmasked frame or a long or fragmented
     control frame close with 1002, a frame over 64 KiB with 1009; a client that stops reading
     (4 MiB queued) is dropped. Text from clients is ignored.
+  - F-057, the live link (`agent/ws-live.ts`; the page's half is `shared/live-socket.ts`): on every
+    text WebSocket (the state, and each mount's: events, a chat's terminal, a chat's feed) a client
+    message that starts `{"t":"ping"` is answered with `{"t":"pong","n":<the same n, digits only>}`
+    by the API itself and never reaches the mount; the page uses it to tell a link that is alive
+    from one that died without a FIN or RST (a phone that locked, a VPN that dropped). The agent
+    also sends a ping frame every 20 s and drops a client that has sent nothing at all (no frame,
+    no pong) for 65 s; browsers answer a ping frame by themselves, also while the page is frozen.
+    The remote screen's pipe and the `/keys` socket have no such sweep.
   - While a client is connected the state is also pushed every 5 s (round trips, last seen),
     and an unpaired member looks for hubs on the LAN.
 - **Vite side**, in `vite.config.ts`: proxy `/agent-api` to `http://127.0.0.1:21221` with
@@ -1009,7 +1020,8 @@ instead, and every Claude Code started on this PC afterwards runs on it. Sources
   (name, username, url, signedInAt, expiresAt), `check` (at, ok/none/error, the message) and
   `busy`.
 - **Not yet:** the hub signing a member in; reporting this PC's Claude usage to the CRM's Usage
-  page, as Christopher's builds do (so the CRM's weekly caps don't count it).
+  page, as Christopher's builds do (so the CRM's weekly caps don't count it). Moving the person
+  to the office's other subscription is "Claude subscription failover and switch", below.
 
 ## F-008 and F-009: Remember me on Control, and sessions that outlive the page
 
@@ -1487,6 +1499,239 @@ as any non-local route.
   `/memory/search?q=&kinds=&limit=`, `/memory/wiki`, `/memory/page?path=`, `/memory/read?ref=`,
   `/memory/brief`, `POST /memory/compile {mode}`, `PATCH /memory/settings`.
 
+## F-050: the chat view (agentic/chatview.ts, screen.ts)
+
+The Chats page (DESIGN.md › Chats) reads a chat's conversation and what is on its screen, and types
+into it. Types: `shared/chat.ts`. Nothing here reads a whole conversation file: they reach hundreds of
+MB (`GET .../messages` was bounded to its last 8 MB for the same reason).
+
+- **Rows to items** (`Converter`, `parseRow`). Claude's JSONL rows, in file order, become `ChatItem`s:
+  the person's messages (a `[message from NAME on FLOOR, chat 8hex]` prefix makes it a sibling chat's,
+  with `from`), the agent's text blocks (markdown), tool calls (`label`, a one-line `summary`, `detail`,
+  `status` running until their answer, `output` cut at 1500 characters, `ask` for AskUserQuestion) and
+  notices (an interrupt, a compaction, a command's output, claude's own error lines). A message typed
+  while claude was working arrives as an `attachment` of type `queued_command` (commandMode `prompt`),
+  not as a user row. Left out: rows that start `{"type":"` (api-request, mode, ai-title... never
+  parsed, some are megabytes), sidechains, meta rows, task notifications, system reminders.
+- **The end of a file** (`readTail(file, {end?, messages?})`): lines are cut on the newline byte, a window
+  of 512 KiB at the end is widened (×4, to 48 MiB) until it holds the last 40 messages (not counting tool
+  calls), and the result has `before`, a byte offset to ask the page before with (null: the start). A
+  tool call with no answer in an older page is shown done. Checked on 5 real conversations (290 MB: 66 ms).
+- **Following** (`createChatFeeds`): one follower per watched session, stat every 350 ms while a page has
+  it (a new file appearing, a swapped-in copy (a different file id) = a new `hello`), what the file grew by
+  as `add` (`patch` for a tool call's answer); a line still being written waits for its newline.
+- **API** (`/agentic`, token as the rest): WebSocket `/chat?session=<id>` sends `hello {items, before, size}`
+  then `add {items}`, `patch {id, patch}`, `menu {menu|null}`, `status {status|null}`; `GET /floors/:f/agents/:a/chat?before=&limit=`
+  (an older page, `local`), `GET /previews` (`ChatPreview` per agent: the last thing said, cached by file size
+  and time, `local`), `POST /floors/:f/agents/:a/say {text}` (at most 20,000 characters: typed as a paste and
+  Enter, as `send_to_chat`; a chat started less than 20 s ago waits for its prompt, one not running is started
+  or resumed first and the text follows once it is ready; `local`).
+- **The screen** (`screen.ts`, a terminal model: cursor, print, wrap, scroll, erase/insert/delete; colours
+  and modes skipped; no package). `chats.ts` keeps one per chat, fed as it prints and resized with the pty;
+  `screen(sessionId)` returns its lines. `readMenu(lines)`: the footer ("Enter to select|confirm" or
+  "Esc to cancel"), the numbered options above it (with their notes and which one the cursor is on), the
+  question and the chip (`☐ Color`); `multi` for boxes to tick. `readStatus(lines)`: the spinner line
+  ("✽ Pollinating… (5s · ↓ 167 tokens)"), only while the footer says "esc to interrupt". The feed polls them
+  with the file and says a change once. A chat on another PC has no screen here (no menu, no status).
+- **Found in claude 2.1.316** (recordings in `screen.fixture.ts`): in its plain screen it writes an answer in
+  one piece when the turn ends (no words stream), the question menu says "Enter to select" (the state
+  detection takes `entertoselect`), and a number alone (no Enter) answers it.
+- **Tests:** `chatview.test.ts` (items, tails, paging, a 120 MB file, the follower), `chatroutes.test.ts`
+  (the socket, history, previews, say, the menu over the socket), `screen.test.ts` (the model, and the
+  recorded menu and spinner), and in `shared/`: `chat-markdown.test.ts`, `chat-rows.test.ts`.
+
+## F-056: the task list (agentic/tasks.ts)
+
+The Tasks page (DESIGN.md › Tasks) and every chat share one list of tasks, kept by the hub. Types:
+`shared/tasks.ts` (`Task`: id, text, done, createdAt, updatedAt, doneAt, deletedAt, `by` {kind
+`you`|`agent`, name, floor}).
+
+- **The store** is `TaskStore` (`tasks.ts`): `list({status, query, limit})` (newest first, never the
+  deleted), `counts()`, `get(id)` (a deleted one too), `add({text, by, id?})`, `update(id, {text?, done?,
+  deleted?})` (404 `No such task`; `deleted: false` brings one back) and `onChange(listener)`. Nothing
+  outside `tasks.ts` knows where tasks are kept, so a hosted store (a Supabase table with id uuid, text,
+  done, created_at, updated_at, done_at, deleted_at, by_kind, by_name, by_floor) can implement the same
+  interface and be chosen in `createAgentic`; `onChange` is there so that one can tell about changes
+  other devices made.
+- **The file store** (`createFileTaskStore`): `<state>/agent/agentic/tasks.json` as `{tasks}`, written
+  whole with `writeAtomic` after every change; a corrupt file is renamed `.corrupt-<ms>` and the list
+  starts again; rows are checked as they are read (odd ones left out, missing parts filled in). Text is
+  trimmed, 1 to 2000 characters (400); at most 5000 tasks (409). `createdAt` is strictly increasing
+  (`max(now, newest + 1)`), so two adds in one millisecond keep their order. A deleted task is kept 30
+  days (dropped the next time the file is written after that), so Undo works. An `add` with an `id` already
+  used (8 to 64 of `A-Za-z0-9_-`, else 400) answers with that task and changes nothing: the page's retry
+  after a lost answer can't add twice.
+- **Routes** (`/agentic`, not `local`: a member passes them on to the hub, 503 when it can't): `GET /tasks?status=open|done|all&q=&limit=`
+  → `{tasks, counts}` (counts of the whole list, whatever the filter), `POST /tasks {text, id?}` → `{task}`,
+  `PATCH /tasks/:id {text?, done?, deleted?}` → `{task}` (400 for nothing to change), `DELETE /tasks/:id`
+  (a soft delete) → `{task}`.
+- **Events:** every change is one `{t:'tasks'}` to every page's events socket and every member's
+  subscription (a member re-emits it to its own pages). It carries nothing: a page asks for the list.
+  Reading, and a change that is refused, ping nothing.
+- **Tools** (`tools.ts`, run on the hub like the memory's): `task_add {text}` (added as that chat's agent:
+  `by` has its name and floor; the same open task added within 10 minutes answers `{id, note}` instead of a
+  second one), `task_list {status?, query?, limit?}` (open by default, 30, at most 100; each with its id,
+  text, done, when and who added it, plus the counts), `task_update {id, done?, text?, delete?}`. A chat's
+  brief (`briefs.ts`) says when to use them.
+- **The page** (`src/tasks/`): `store.ts` keeps the hub's list as last seen (the newest 300 are kept in
+  `localStorage` `sad-tasks-cache`, so the tab opens with a list on screen) and an outbox (`sad-tasks-outbox`) of
+  what the page asked for and the hub hasn't confirmed: `add` (with the id the page made) and `patch`
+  ops. What is shown is `deriveTasks(server, outbox, ghosts)` (`shared/tasks-model.ts`): nothing is rolled
+  back by hand, a confirmed or refused op leaves the outbox and the view is worked out again. The outbox is
+  sent in order; a failure that `retryable(status)` (no answer, 5xx, 408, 425, 429, 401, 403) keeps it and
+  tries again after 2, 5, 10, then every 30 s (and on `online`, and when the tab is shown again); one the hub
+  refused (400, 404, 409...) is dropped (a toast, except a 404 on a change). The list is asked for again
+  after the events socket's `tasks` (`useTasksSignal` in the Agents store, which also changes when the socket
+  reconnects), when the tab becomes visible, and every 45 s as a safety net; an answer that a confirmed
+  change overtook is not believed. A draft in the capture field is kept in `sad-tasks-draft`.
+- **Tests:** `tasks.test.ts` (the file store), `taskroutes.test.ts` (the routes, the ping, the chats' tools
+  and their key), `team.test.ts` (the laptop through the hub, and the hub out of reach), `index.test.ts`
+  (the tool list), and in `shared/`: `tasks-model.test.ts`.
+
+## F-054: the CRM as a page, referenced (agentic/crm.ts, src/crm/)
+
+The CRM is not compiled into the app (DESIGN.md › CRM): its own website is shown in a frame, at an
+address the hub keeps. Types: `shared/crm.ts`.
+
+- **The address** (`createCrmStore`, `<state>/agent/agentic/crm.json` as `{url}`, written whole): `crmAddress`
+  keeps it as `new URL(..).toString()` without `#...`: https only (http for localhost, 127.0.0.1 and [::1]), no
+  user name or password, at most 300 characters; a bare host is taken as https; empty or null clears it; an
+  unreadable or odd file is no address.
+- **The check** (`checkCrm(url, {app, fetch, timeoutMs})`): one GET (redirects followed, the body cancelled,
+  8 s) and a `CrmCheck` {ok, reason, status, message, header, ms}. Reasons: `dns` (ENOTFOUND, EAI_AGAIN), `cert`
+  (CERT_HAS_EXPIRED, self-signed and unverifiable ones), `refused`, `timeout`, `network` (anything else, with the
+  code); by status: 402 or `x-vercel-error: DEPLOYMENT_DISABLED` is `disabled`, 404 `notfound`, 401 and 403 and
+  other 4xx or 5xx `status`; an answer under 400 is read for framing: `framing` when `X-Frame-Options` is DENY, or
+  SAMEORIGIN (the app is never the site's own origin), or any `Content-Security-Policy` policy's `frame-ancestors` doesn't
+  admit the app (`'none'`, an empty list, `'self'`, a scheme source, a host source with its port and `*.` wildcard,
+  `*`; with no app origin known only a list that cannot include it refuses). ALLOW-FROM is obsolete and ignored.
+  Messages are one plain sentence naming the host and the cause. Run against the real sites: scrm/sam/sam-crm-fe
+  `disabled`, crm `dns`, bcrm `cert` (expired), crmbe `framing` (X-Frame-Options: SAMEORIGIN).
+- **Routes** (`/agentic`, not `local`: a member passes them to the hub): `GET /crm?origin=<the page's origin>&fresh=1` →
+  `{url, check}` (the check of the address, kept 30 s per address and origin unless `fresh`; `{url: null,
+  check: null}` while there is none), `PATCH /crm {url}` (400 for a bad address or no `url`; sets it, forgets
+  the kept check, answers with a fresh one).
+- **The page** (`src/crm/`): `CrmHost` (eager: the Alt+B key, in the capture phase so the terminal can't stop
+  it, and the keep-alive) and `CrmFrame` (lazy: the frame, the corner button, the cards) beside `<RouterProvider>`
+  in main.tsx. The route `/crm` only gives the address a title. Two sizes of one frame: on `/crm` it is laid
+  over the app's `<main>` (its rectangle, kept by a ResizeObserver), so the menu and the top bar stay; on
+  `/crm?full=1` it covers the window. Alt+B (`isCrmShortcut`: the physical B key with Alt alone) from anywhere
+  else remembers the address in `sessionStorage` and goes to `/crm?full=1`; from the full window it goes back to
+  what was remembered (`leaveTarget`: a local address that isn't the full window, else `/`); on the CRM page it
+  goes full window and back to the CRM page. The frame is let go 10 minutes after the page was left. It has
+  `sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox
+  allow-downloads allow-modals allow-storage-access-by-user-activation"` (no top navigation).
+- **Not done, on purpose:** serving the CRM from here. sam-crm-fe has no node_modules (about 100 packages,
+  Next 15, Tailwind 3) and agentic-claude-manager needed ~45 KB of shims, copied design tokens and a
+  server proxy holding the CRM's cookie; the result is 15.6 MB. If the CRM's site stays down, that is the
+  alternative, and a decision for Shubham.
+- **Tests:** `crm.test.ts` (the address, the file, the headers matrix, the check against stand-in sites for
+  each outcome, and the routes through the API), `shared/crm-nav.test.ts` (the key, the addresses, where
+  leaving goes).
+
+## Claude subscription failover and switch (claude/failover.ts, the switch in claude/index.ts)
+
+Built 2026-10-31. A task Shubham set, not a numbered feature. The CRM keeps two Claude
+subscriptions for the office, "Office 2(Jagtap)" and "Office 1", and puts each person on one
+(F-007). Shubham's choice: stay on Office 2 until its weekly limit is used up, then carry on on
+Office 1 by itself and tell him; and a switch he can make himself on the page (This PC › Which
+Claude subscription). Everything below is reads, except one write.
+
+- **The one write** (`claude/crm.ts` `moveMeTo`): `PUT /v1/org/model-settings/<the signed-in
+  person's own user id>` with `{"subscription_id": "<uuid>"}` (sam-crm-be
+  `userModelSettingsController.js` `setModelSetting`, `routes/orgRoutes.js:352`). Only that field
+  changes (their model and effort stay); a disabled subscription, or one that is not the office's,
+  is a 400 with the CRM's sentence. It is for the CRM super admin only (`lib/superAdmin.js`: the
+  user ids in the CRM server's `CRM_SUPER_ADMIN_USER_IDS`); anyone else gets 403 "Only the super
+  admin can assign models" and the page says so. Every state-changing `/v1/org` request needs the
+  CRM's double-submit CSRF pair (`middleware/csrf.js`): `GET /v1/auth/csrf-token` → `{csrfToken}`,
+  sent back as the `crm_csrf` cookie and the `x-csrf-token` header. The function takes no user id
+  (the path is always the session's own), sends nothing but the subscription (no cap, no model, no
+  office default), and refuses anything that is not a UUID before a request leaves.
+- **The reads.** `GET /v1/org/claude-subscriptions` (super admin: id, name, the token's last four
+  characters, disabled, the default weekly cap), `GET /v1/org/model-settings/me` (which one the
+  person is on, and their cap and share there) and `GET /v1/org/christopher-usage?days=1` (super
+  admin; only the subscriptions' own weekly readings are used, and it is asked for at most every
+  5 minutes: it is heavy for the CRM). The CRM tells a person's weekly cap only on the
+  subscription they are ON (their cap on the other lives in a table nothing reads back), so for
+  the other one the page shows what the app last saw there (`seen` in `claude-switch.json`), else
+  the subscription's default, and says which. Before a switch it warns when the cap there is lower
+  than on the subscription being left.
+- **What counts as a week used up** (`claude/limits.ts`). Claude's own refusal row in a chat's
+  transcript: an assistant row with `isApiErrorMessage: true`, `error: "rate_limit"` and
+  `quotaLimits.status: "rejected"`, whose `quotaLimits.rateLimitType` names the window:
+  `five_hour` (the "session" limit: back in hours, so it NEVER switches by itself; the page
+  offers "Switch now"), `seven_day` and the per-model `seven_day_opus` / `_sonnet` /
+  `_overage_included` (a week: counts), `overage` and anything else (credits, a spend cap:
+  ignored). The sentence is read only for a claude without `quotaLimits`, and only when it starts
+  the row's text: the same words quoted in a tool result, a user message or an assistant's
+  explanation (this repo has several) never count. A row older than the token in use, or than the
+  chat's own start, or whose window is over, is ignored. `claude/rowwatch.ts` follows every
+  running chat's transcript every 2 s for these (agent/agentic keeps no always-on observer): from
+  a little before the end of the file when a chat is first seen, byte-exact lines, never throwing.
+- **One sign is a suspicion** (`claude/failover.ts`). A weekly refusal from one chat makes the app
+  ask the CRM at once. It switches when the CRM agrees (the credential answers 403
+  `WEEKLY_CAP_REACHED` or 409 `SUBSCRIPTION_DISABLED`), or a second chat says the same, or the same
+  chat is refused again a minute later. The CRM alone (the hourly check) needs the same codes
+  twice, 40 s apart. While it confirms, the token stays (it is not taken out as in F-007). Other
+  CRM answers (Claude turned off by the admin, none assigned) are not its business: the token
+  comes out as before. The CRM's own share cap counts only usage that Christopher builds report,
+  and this app reports none, so for work done in these chats the chats' own rows are the main sign.
+- **Safeguards in `switchTo`** (so no caller can get around them): not when switching by itself is
+  turned off (the page's toggle, kept in `claude-switch.json`); not within 24 hours of the last
+  switch it made by itself; never back onto the subscription it left before that one's week is
+  back (claude's reset time, else the CRM's reading, else a week); never onto one whose week reads
+  100% with its end ahead, nor where the person's share is seen used up. A switch by hand is
+  allowed past the last two, with a warning. If the CRM already has the person on the target
+  (another PC moved them) no write is made, only the token is fetched.
+- **After the move**: `GET .../mine/credential` for the new token, which goes into
+  `CLAUDE_CODE_OAUTH_TOKEN` as in F-007 (a token set by something else is left alone, and said).
+  If the CRM gives no token for the new one either, the move stands, the token comes out, and the
+  app stops (below). Then ONLY the chats that hit the limit (rows in force) are restarted, one after
+  the other, 2 s apart: an idle chat is told `/exit` and ends itself, so nothing is killed; one that
+  does not end in 15 s, or is at a menu or mid-turn, is stopped the app's usual way (`restartChat`,
+  `agentic/index.ts`: `stopAt`, then `openChat`, resuming its conversation on the token read
+  afresh). Each is then typed "[message from the app] Your Claude subscription was switched from X
+  to Y because ... Your conversation is kept. Please carry on where you left off.", once it is idle
+  and 5 s after its start, and checked to have reached its transcript (typed once more if not).
+  Chats that were still working keep the old token; one that hits the limit later holds an older
+  token than the one in place, so it is restarted the same way and never causes a second switch.
+  Hub only: a member PC's chats are restarted by its own agent.
+- **Telling Lead.** Every switch, by itself or by hand, is typed into Lead's chat on floor Final as
+  "[message from the app]": from, to (names and last four characters), why, which chats were
+  restarted or could not be, which still run on the old token, the cap warning, and "No reply
+  needed." A stop is told once, not again every hour.
+- **When it stops.** The other subscription is also used up, or its token is refused, or the
+  account may not switch, or there is no single other subscription: nothing more is switched, the
+  page shows the plain reason (`ClaudeSwitchInfo.watch` 'stopped'), Lead is told once, and the app
+  stays stopped until the week it is waiting for is back (at most 6 hours per stop). The CRM's own
+  no then applies as it always did. A CRM that cannot be reached is not a stop: it tries again in
+  5 minutes, up to three times. A switch by hand lifts a stop.
+- **State** `<state>/agent/claude-switch.json` (mode 0600; the person's, forgotten at sign-out and
+  when someone else signs in): `auto`, the log (the newest 100: when, by itself or by hand, from,
+  to, why, the chats restarted, the warnings), since when the person is on their subscription, the
+  last switch made by itself (for the safeguards), the caps seen. No token, cookie or password:
+  names and the last four characters only, in it, in the log (`agent/logs`) and in what Lead is
+  told. Anything token-shaped in a sentence is replaced by `[token]` before it is written.
+- **Safe to run.** It all runs from events and timers inside the agent, where an uncaught error
+  would end every chat: all of it is caught and logged. Without a CRM session, or with a token the
+  app did not put in, it does nothing. `status()` never asks the CRM (the page reads it every few
+  seconds); opening the panel and its Refresh do.
+- **API.** `POST /agent-api/claude/switch/refresh {readings?}` and `/switch/auto {on}` →
+  `ClaudeInfo`; `/switch/preview {to}` → `SwitchPreview` (the warnings, and the running chats that
+  would restart, ticked by default when they hit the limit or are idle); `/switch {to, restart:
+  [chat ids]}` → `{ok, message, restarted, failed}` (`ok: false` is not an HTTP error: the message
+  says why). `ClaudeInfo.switch` (`shared/claude-switch.ts`): `allowed`, `note`, `choices` (name,
+  last four characters, active, disabled, the week, the cap and where it comes from), `current`
+  with `since` and who switched, `log`, `auto`, `watch`, `readAt`. Beside them, in the Agents
+  API (same token as every agentic route): `POST /agent-api/agentic/floors/:floorId/agents/:agentId/restart`
+  → `{sessionId, restarted}`, which restarts that agent's chat the way a switch does (`restartChat`:
+  `/exit` first, resumed on the token in place now); `restarted: false` when its chat is not
+  running on the hub. A member's call goes to the hub.
+- **Not yet / not done:** writing a cap (it is not the person's own assignment: Shubham raises his
+  cap on Office 1 on the CRM's Code › Usage); a member PC restarting its chats from the hub's
+  switch; reading his cap on a subscription he is not on (the CRM does not give it).
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
@@ -1567,6 +1812,19 @@ as any non-local route.
   end and a 401, the CRM not answering, another person signing in, no user environment),
   `userenv.test.ts` (the real Windows calls on a scratch key under HKCU\Software, removed
   after), config (`crmSession`, `claudeSubscription`), api (the three routes and their checks).
+  With Claude subscription failover (2026-10-31), also: `agent/claude/limits.test.ts` (claude's own
+  refusal row as 2.1.260-2.1.316 write it, and everything that must not count), `choices.test.ts`
+  (the picker's rows, the cap on each subscription, the warnings before a switch), `crm.test.ts`
+  (the CSRF-checked write, its path and body, the refusals), `switch.test.ts` (the switch against
+  the fake office: the write, the token, the rules against flipping back, who may, what is
+  remembered and forgotten), `failover.test.ts` (when it switches and when it must not, the stops,
+  the chats, by hand), `rowwatch.test.ts` (real files that grow), `bridge.test.ts`,
+  `together.test.ts` (all of it wired as main.ts wires it, with the real chat pool and a fake pty: a
+  refusal row appears, one write to the fake CRM, the chat comes back on the new token with its
+  conversation and is told to carry on, Lead is told, nobody else is touched, nothing is killed),
+  `agent/agentic/restart.test.ts` (/exit first, the usual stop only if needed; the restart route
+  and its token), config
+  (`claudeSwitch`), api (the four routes and their checks).
   With Remember me (F-008, 2026-10-30), also: `agent/saved-passwords.test.ts` (the answer is the
   viewer's own hash for any challenge and the host's check; per PC and way; a new salt forgets
   it; forgetting; a restart; nothing but H1 on disk; damaged files), the viewer client (a saved

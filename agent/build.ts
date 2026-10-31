@@ -80,10 +80,23 @@ export function parseVersion(text: string): BuildVersion | null {
  * F-026: Dev's files as a fingerprint: its commit, every change to tracked files and every new
  * file not ignored. Publish records it in the build; the same fingerprint now means nothing new.
  */
-export async function devFingerprint(dir: string, git: Git = runGit): Promise<string | null> {
+export async function devFingerprint(dir: string, git: Git = runGit, also: string[] = []): Promise<string | null> {
+  const h = createHash('sha256')
+  if (!(await addRepo(h, dir, git))) return null
+  // F-054: the page is built from other folders too (the CRM's source); a change there is something
+  // new as well. One that isn't a git folder (or isn't there) adds nothing.
+  for (const other of also) {
+    const part = createHash('sha256')
+    if (await addRepo(part, other, git)) h.update(`\0also ${path.basename(other)}\0`).update(part.digest())
+  }
+  return h.digest('hex').slice(0, 20)
+}
+
+/** A git folder's commit, changes to tracked files and new files, added to a hash; false when git can't say. */
+async function addRepo(h: ReturnType<typeof createHash>, dir: string, git: Git): Promise<boolean> {
   const [head, diff, others] = await Promise.all([git(['rev-parse', 'HEAD'], dir), git(['diff', 'HEAD', '--binary'], dir), git(['ls-files', '--others', '--exclude-standard', '-z'], dir)])
-  if (head.code !== 0 || diff.code !== 0 || others.code !== 0) return null
-  const h = createHash('sha256').update(head.stdout.trim()).update('\0').update(diff.stdout)
+  if (head.code !== 0 || diff.code !== 0 || others.code !== 0) return false
+  h.update(head.stdout.trim()).update('\0').update(diff.stdout)
   for (const f of others.stdout.split('\0').filter(Boolean).sort()) {
     h.update(`\0${f}\0`)
     try {
@@ -92,7 +105,17 @@ export async function devFingerprint(dir: string, git: Git = runGit): Promise<st
       // Gone since it was listed.
     }
   }
-  return h.digest('hex').slice(0, 20)
+  return true
+}
+
+/**
+ * F-054: the CRM's source, which the page is compiled with (crm-host/vite-plugin.ts): the sam-crm-fe
+ * checkout beside Dev's folder, read in place and never copied or changed, or where SAD_CRM_SRC says.
+ * Empty when it isn't there. The build repo never has it: it gets only what was compiled.
+ */
+export function crmSourceDirs(devDir: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const dir = path.resolve(env.SAD_CRM_SRC || path.join(devDir, '..', '..', 'sam-crm-fe', 'src'))
+  return existsSync(path.join(dir, 'app')) ? [dir] : []
 }
 
 /** Dev beside a build: the sibling shubham-agentic-dev folder, or the folder itself when it is Dev. */
@@ -149,7 +172,7 @@ export function createBuild(o: BuildOptions): Build {
     const [head, status] = await Promise.all([git(['rev-parse', '--short', 'HEAD'], publish.devDir), git(['status', '--porcelain'], publish.devDir)])
     publish.devCommit = head.code === 0 ? head.stdout.trim() : null
     publish.devChanges = status.code === 0 ? status.stdout.split('\n').filter(l => l.trim()).length : 0
-    devHash = await devFingerprint(publish.devDir, git)
+    devHash = await devFingerprint(publish.devDir, git, crmSourceDirs(publish.devDir))
   }
 
   async function checkNow(): Promise<BuildInfo> {

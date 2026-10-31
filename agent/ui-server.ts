@@ -31,6 +31,11 @@ export interface UiServerOptions {
   log?: Logger
   /** F-028: who may connect (by remote address); anyone reaching the listener when left out (loopback). */
   allowRemote?: (address: string) => boolean
+  /**
+   * F-058: the guard's own routes (/guard/status), tried after the host check and before the page
+   * and the API. Resolves true when it answered; false lets the request go on. Never for /agent-api.
+   */
+  handle?: (req: IncomingMessage, res: ServerResponse, url: URL) => boolean | Promise<boolean>
 }
 
 export interface UiServer {
@@ -142,12 +147,20 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
     if (o.allowRemote && !o.allowRemote(req.socket.remoteAddress ?? '')) return plain(res, 403, 'Not from this PC or its tailnet')
     if (!hostAllowed(req.headers.host)) return plain(res, 403, BLOCKED)
     const url = new URL(req.url ?? '/', 'http://app')
-    if (url.pathname === AGENT_API_PREFIX || url.pathname.startsWith(`${AGENT_API_PREFIX}/`)) return api(req, res)
-    page(req, res, url).catch(e => {
+    const isApi = url.pathname === AGENT_API_PREFIX || url.pathname.startsWith(`${AGENT_API_PREFIX}/`)
+    const fail = (e: unknown) => {
       log?.error(`page ${url.pathname}: ${e instanceof Error ? e.message : String(e)}`)
       if (!res.headersSent) plain(res, 500, 'Internal error')
       else res.destroy()
-    })
+    }
+    const route = () => {
+      if (isApi) return api(req, res)
+      page(req, res, url).catch(fail)
+    }
+    if (!o.handle || isApi) return route()
+    Promise.resolve(o.handle(req, res, url)).then(answered => {
+      if (!answered) route()
+    }, fail)
   }
 
   // A WebSocket for /agent-api (the state, a screen's pipe, the keys, the agents' terminals): the

@@ -1,0 +1,1 @@
+var e=`/agentic`,t=8e3,n=2e4;export{n,t as r,e as t};

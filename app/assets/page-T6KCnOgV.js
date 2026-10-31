@@ -1,0 +1,1 @@
+import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./react-B8SKf8RM.js";var n=e(t());function r(){return(0,n.useEffect)(()=>{if(typeof window>`u`)return;let e=new URLSearchParams(window.location.search).get(`view`)||`dashboard`;window.location.replace(`/${e}`)},[]),null}export{r as default};

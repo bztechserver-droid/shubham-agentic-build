@@ -2,6 +2,8 @@
 // Types only, so both sides can import it. The agent serves it on 127.0.0.1 (see
 // agent/SPEC.md › Local API); the app reaches it through Vite's proxy at AGENT_API_PREFIX.
 
+import type { ClaudeSwitchInfo } from './claude-switch.ts'
+
 export const AGENT_API_PREFIX = '/agent-api'
 
 /** The hub runs the RustDesk servers (hbbs/hbbr) and approves new PCs; members join it. */
@@ -196,9 +198,11 @@ export interface ClaudeInfo {
   /** Who is signed in to the CRM on this PC, or null. The session ends at `expiresAt` (7 days). */
   crm: { name: string; username: string | null; url: string; signedInAt: string; expiresAt: string } | null
   /** The CRM was last asked at `at`: it gave a subscription, none (`message` says why, in its words), or couldn't be asked. */
-  check: { at: string; result: 'ok' | 'none' | 'error'; message: string | null } | null
+  check: { at: string; result: 'ok' | 'none' | 'error'; message: string | null; /** The CRM's own code for a 'none' (WEEKLY_CAP_REACHED, SUBSCRIPTION_DISABLED, ...). */ code?: string | null } | null
   /** Signing in, or asking the CRM, right now. */
   busy: boolean
+  /** Claude subscription failover and the manual switch (agent/SPEC.md › Claude subscription failover). Absent from an older agent. */
+  switch?: ClaudeSwitchInfo
 }
 
 /** POST /claude/sign-in: the person's own CRM username (or email) and password, used once. */

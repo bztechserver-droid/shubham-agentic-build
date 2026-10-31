@@ -244,6 +244,8 @@ export type AgenticEvent =
   | { t: 'floors'; floors: Floor[] }
   | { t: 'live'; live: Record<string, ChatState> }
   | { t: 'memory'; floorId: string }
+  /** F-056: the task list changed (something was added, ticked, edited or deleted, by anyone): ask for it again. */
+  | { t: 'tasks' }
   /** F-021: chats on the other PCs, where idle ones ran last, and this PC among the hub's. */
   | { t: 'where'; elsewhere: Record<string, ChatElsewhere>; last: Record<string, ChatLast>; team: AgenticTeam | null }
 

@@ -141,3 +141,208 @@ export async function credential(s: Pick<CrmSession, 'url' | 'cookie'>, build: s
   }
   throw refusal(r, "The CRM couldn't give the Claude subscription")
 }
+
+// ── Claude subscription failover: which subscription the person is on, and moving them ──────────
+// Three reads and ONE write. The write is the only thing the app ever changes in the CRM, and what
+// it changes is the signed-in person's own subscription assignment, nothing else:
+//   PUT /v1/org/model-settings/<their own user id>   {"subscription_id": "<uuid>"}
+//        (sam-crm-be controller/userModelSettingsController.js setModelSetting, routes/orgRoutes.js:352)
+// Only the field sent changes (the model and effort they run stay), the CRM refuses a disabled
+// subscription or one that is not the office's (400), and it is for the CRM super admin only
+// (lib/superAdmin.js: their user id is on the CRM server's CRM_SUPER_ADMIN_USER_IDS list). Every
+// state-changing /v1/org request also needs the CRM's double-submit CSRF pair (middleware/csrf.js):
+// GET /v1/auth/csrf-token hands out a token, which goes back as the crm_csrf cookie and the
+// x-csrf-token header. The reads:
+//   GET /v1/org/claude-subscriptions   the office's subscriptions (super admin only; never a token)
+//   GET /v1/org/model-settings/me      which one the person runs on, and where they stand against their cap
+//   GET /v1/org/christopher-usage      each subscription's own weekly reading (super admin only)
+
+/** The CRM's ids are UUIDs; one that isn't is never sent. */
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** A reading the CRM may refuse: not its super admin (403), or the session ended (401). */
+export type Read<T> = { kind: 'ok'; value: T } | { kind: 'forbidden'; message: string } | { kind: 'expired' }
+
+/** One of the office's Claude subscriptions, as the super admin's list shows it: its last four characters, never its token. */
+export interface CrmSubscription {
+  id: string
+  name: string
+  /** Last four characters of its token. */
+  hint: string | null
+  disabled: boolean
+  isDefault: boolean
+  /** The weekly cap, in points of the subscription's week, everyone has there without one of their own. */
+  defaultCapPercent: number | null
+  /** How many people run on it. */
+  assigned: number
+}
+
+export interface CrmSubscriptions {
+  subscriptions: CrmSubscription[]
+  defaultId: string | null
+}
+
+/** Where the person stands against their weekly cap on the subscription they run on (lib/weeklyCap.js). */
+export interface WeeklyCap {
+  capPercent: number
+  /** 'person': set for them; 'subscription': the subscription's default. */
+  capSource: 'person' | 'subscription' | 'none'
+  /** Their share of the subscription's week, or null without a reading. */
+  usedPercent: number | null
+  /** Used up: the CRM refuses them the token (403 WEEKLY_CAP_REACHED). */
+  over: boolean
+  weekResetsAt: string | null
+  /** What everyone on the subscription has used of its week, by Claude's own reading. */
+  totalPercent: number | null
+}
+
+/** GET /v1/org/model-settings/me, without the model settings: which subscription, and their cap on it. */
+export interface CrmSetting {
+  subscription: { id: string; name: string; source: 'user' | 'org'; disabled: boolean } | null
+  /** An office that manages subscriptions and none for them: no Claude. */
+  noClaude: boolean
+  claudeBlocked: boolean
+  weeklyCap: WeeklyCap | null
+}
+
+/** Claude's own reading of one window of a subscription, as Christopher builds report it. */
+export interface CrmWindow {
+  percent: number | null
+  resetsAt: string | null
+  observedAt: string | null
+  /** The CRM's own word for a reading it hasn't had news of lately. */
+  stale: boolean
+}
+
+export interface CrmReadings {
+  fiveHour: CrmWindow
+  week: CrmWindow
+}
+
+/** What the CRM said to the move. */
+export type Moved =
+  | { kind: 'ok' }
+  /** Not the CRM super admin: it changes nobody's subscription (403). */
+  | { kind: 'forbidden'; message: string }
+  /** The CRM turned this subscription down (400): disabled, not the office's. */
+  | { kind: 'refused'; status: number; message: string }
+  | { kind: 'expired' }
+
+const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const lower = (v: unknown) => text(v)?.toLowerCase() ?? null
+
+function readStatus<T>(r: { status: number; body: Record<string, unknown> }, what: string, shape: (body: Record<string, unknown>) => T): Read<T> {
+  if (r.status === 200) return { kind: 'ok', value: shape(r.body) }
+  if (r.status === 401) return { kind: 'expired' }
+  if (r.status === 403) return { kind: 'forbidden', message: text(r.body.error) ?? 'The CRM only lets its super admin do that' }
+  throw refusal(r, `The CRM couldn't give ${what}`)
+}
+
+/** The office's Claude subscriptions. Super admin only: anyone else is 'forbidden'. */
+export async function listSubscriptions(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<Read<CrmSubscriptions>> {
+  const r = await call(`${s.url}/v1/org/claude-subscriptions`, { headers: { cookie: s.cookie, accept: 'application/json' } })
+  return readStatus(r, 'the Claude subscriptions', body => {
+    const out: CrmSubscription[] = []
+    for (const x of Array.isArray(body.subscriptions) ? body.subscriptions : []) {
+      if (!isObject(x) || lower(x.id) === null || text(x.name) === null) continue
+      out.push({
+        id: lower(x.id)!,
+        name: text(x.name)!,
+        hint: text(x.tokenHint),
+        disabled: x.disabled === true,
+        isDefault: x.isDefault === true,
+        defaultCapPercent: num(x.defaultWeekCapPercent),
+        assigned: num(x.assigned) ?? 0,
+      })
+    }
+    return { subscriptions: out, defaultId: lower(body.defaultSubscriptionId) }
+  })
+}
+
+/** Which subscription the CRM puts this person on now, and their cap on it. Any signed-in member may ask. */
+export async function mySetting(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<Read<CrmSetting>> {
+  const r = await call(`${s.url}/v1/org/model-settings/me`, { headers: { cookie: s.cookie, accept: 'application/json' } })
+  return readStatus(r, 'which Claude subscription is yours', body => {
+    const sub = body.subscription
+    const cap = body.weeklyCap
+    return {
+      subscription:
+        isObject(sub) && lower(sub.id) !== null
+          ? { id: lower(sub.id)!, name: text(sub.name) ?? 'Claude', source: sub.source === 'org' ? 'org' : 'user', disabled: sub.disabled === true }
+          : null,
+      noClaude: body.noClaude === true,
+      claudeBlocked: body.claudeBlocked === true,
+      weeklyCap:
+        isObject(cap) && num(cap.capPercent) !== null
+          ? {
+              capPercent: num(cap.capPercent)!,
+              capSource: cap.capSource === 'person' ? 'person' : cap.capSource === 'subscription' ? 'subscription' : 'none',
+              usedPercent: num(cap.usedPercent),
+              over: cap.over === true,
+              weekResetsAt: text(cap.weekResetsAt),
+              totalPercent: num(cap.totalPercent),
+            }
+          : null,
+    }
+  })
+}
+
+const windowOf = (w: unknown): CrmWindow =>
+  isObject(w)
+    ? { percent: num(w.percent), resetsAt: text(w.resetsAt), observedAt: text(w.observedAt), stale: w.stale !== false }
+    : { percent: null, resetsAt: null, observedAt: null, stale: true }
+
+/**
+ * Each subscription's own weekly (and 5-hour) reading, by id: how much of its week everyone on it
+ * has used, and when the week ends. Christopher builds report these; this app reports none, so a
+ * reading can be old (`stale`). Super admin only. Only the subscriptions part of the CRM's usage
+ * overview is read: none of the people.
+ */
+export async function subscriptionReadings(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<Read<Record<string, CrmReadings>>> {
+  const r = await call(`${s.url}/v1/org/christopher-usage?days=1`, { headers: { cookie: s.cookie, accept: 'application/json' } })
+  return readStatus(r, "the subscriptions' weekly readings", body => {
+    const out: Record<string, CrmReadings> = {}
+    for (const x of Array.isArray(body.subscriptions) ? body.subscriptions : []) {
+      if (!isObject(x) || lower(x.id) === null) continue
+      out[lower(x.id)!] = { fiveHour: windowOf(x.fiveHour), week: windowOf(x.week) }
+    }
+    return out
+  })
+}
+
+/** The CRM's CSRF token for this session (routes/authRoutes.js GET /csrf-token). */
+async function csrfToken(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<string> {
+  const r = await call(`${s.url}/v1/auth/csrf-token`, { headers: { cookie: s.cookie, accept: 'application/json' } })
+  const token = text(r.body.csrfToken)
+  if (r.status !== 200 || !token || !/^[A-Za-z0-9_-]{16,256}$/.test(token)) throw refusal(r, 'The CRM gave no CSRF token')
+  return token
+}
+
+/**
+ * Moves THIS signed-in person to the subscription `subscriptionId` in the CRM: the app's only
+ * write to the CRM. It takes no user id: the path is always the session's own, so it cannot move
+ * anyone else, and the body is exactly {subscription_id}, so it changes nothing else (not their
+ * model, effort, caps or the office default).
+ */
+export async function moveMeTo(s: Pick<CrmSession, 'url' | 'cookie' | 'user'>, subscriptionId: string): Promise<Moved> {
+  if (!UUID.test(subscriptionId)) throw new CrmError('That is not a Claude subscription id', 400)
+  if (!UUID.test(s.user.id)) throw new CrmError("The CRM's id for you is not an id", 400)
+  const csrf = await csrfToken(s)
+  const r = await call(`${s.url}/v1/org/model-settings/${s.user.id}`, {
+    method: 'PUT',
+    headers: {
+      cookie: `${s.cookie}; crm_csrf=${csrf}`,
+      'x-csrf-token': csrf,
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({ subscription_id: subscriptionId.toLowerCase() }),
+  })
+  if (r.status === 200 && r.body.ok === true) return { kind: 'ok' }
+  if (r.status === 401) return { kind: 'expired' }
+  const sentence = text(r.body.error)
+  // 403 is two different things: the CSRF pair was wrong (the app's fault), or this is not the super admin.
+  if (r.status === 403 && sentence !== null && !/csrf/i.test(sentence)) return { kind: 'forbidden', message: sentence }
+  if (r.status === 400) return { kind: 'refused', status: 400, message: sentence ?? 'The CRM turned that Claude subscription down' }
+  throw refusal(r, "The CRM wouldn't move you to that Claude subscription")
+}

@@ -28,6 +28,8 @@ import {
   type TerminalClientMessage,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
+import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
+import type { CrmAnswer, CrmCheck, CrmSessionInfo } from '../../shared/crm.ts'
 import type { MemoryKind } from '../../shared/memory.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -37,6 +39,10 @@ import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
+import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
+import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
+import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
+import { createCrmProxy } from './crmproxy.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
@@ -124,6 +130,18 @@ export interface AgenticOptions {
    * use. The rest are for tests.
    */
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
+  /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
+  restartGraceMs?: number
+  /**
+   * F-058: the chats that were open when the app last stopped come back by themselves (the guard sets
+   * SAD_RESUME_CHATS=1, main.ts passes it): each is opened again, resumed, and told to carry on if it
+   * was mid-turn. `resumeAfterMs` waits for the API to be up (4 s); `resumeGapMs` spaces the chats out (2 s).
+   */
+  resumeChats?: boolean
+  resumeAfterMs?: number
+  resumeGapMs?: number
+  /** F-054: this PC's CRM session (crm-session.json, beside the agentic folder); tests give a scratch one. */
+  crmSession?: string
 }
 
 export interface Agentic {
@@ -135,6 +153,19 @@ export interface Agentic {
   callTool(key: string, name: string, args: unknown): Promise<string>
   /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
   serve(meta: Record<string, unknown>): (stream: Duplex) => void
+  /**
+   * Claude subscription failover (agent/claude/failover.ts): the agent's chat on this PC stopped and
+   * started again on the token in place now, its conversation resumed. true: it is running again.
+   * false: it isn't running here, or this PC is a member (the hub holds the session).
+   */
+  restartChat(sessionId: string): Promise<boolean>
+  /**
+   * F-058: a chat that was open when the app stopped, opened again (its conversation resumed) and,
+   * when `text` is given, told it once it is at its prompt (up to 90 s). true: it is running
+   * afterwards; false: it can't be opened here (unknown session, a member PC, held elsewhere, an error).
+   * Text goes only to a chat started now, never to one that was running already.
+   */
+  resumeChat(sessionId: string, text?: string): Promise<boolean>
   close(): void
 }
 
@@ -241,6 +272,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     pushState()
   })
   const memory = createMemoryStore(path.join(o.dir, 'memory'))
+  // F-056: the task list (the Tasks tab, and the chats' task tools), kept on the hub like the floors.
+  // Behind TaskStore (tasks.ts): a hosted database can take its place without anything else changing.
+  const tasks = createFileTaskStore(path.join(o.dir, 'tasks.json'))
+  tasks.onChange(() => tasksChanged())
+
+  // F-054: how the CRM page shows the CRM (built into the page, or its website in a frame) and where
+  // that website is, kept on the hub, with the last look at that site (for the frame).
+  const crm = createCrmStore(path.join(o.dir, 'crm.json'))
+  let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
+  // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
+  const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json') })
 
   // F-051: the memory layer, kept on the hub (or a PC on its own); a member's chats reach it
   // through the hub, as their tool calls do. Started with the agent when main.ts says so, else
@@ -406,6 +448,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   let liveTimer: NodeJS.Timeout | null = null
   let lastLive = new Set<string>()
+  // F-058: the list of open chats the next start will reopen (see resumeAll below).
+  let recovery: Recovery | null = null
+  let closing = false
   const chats = createChatPool({
     toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
     mcpConfig,
@@ -417,6 +462,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-051: recall in every prompt, once the memory layer is on (main.ts).
     settings: o.memory?.start ? hooksFile : undefined,
     onChange: () => {
+      noteOpen()
       // A chat that ended lets its session go (after its last write is sent on).
       const now = new Set(Object.keys(chats.states()))
       for (const sid of lastLive) if (!now.has(sid)) void ended(sid)
@@ -772,6 +818,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       appendAt(fileOf(raw.sid), raw.from, Buffer.from(raw.d, 'base64'))
     } else if (raw.t === 'memory' && typeof raw.floorId === 'string') {
       emit({ t: 'memory', floorId: raw.floorId })
+    } else if (raw.t === 'tasks') {
+      // F-056: the hub's task list changed; this PC's page asks the hub for it again.
+      emit({ t: 'tasks' })
     }
   }
 
@@ -836,6 +885,82 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (mode() === 'hub') release(sid, self())
       throw e
     }
+  }
+
+  /**
+   * Claude subscription failover (agent/claude/failover.ts): the chat stopped and started again, its
+   * conversation resumed, on the token in place now (chats.start reads it afresh). It is stopped
+   * gently first: a chat sitting at its prompt is told /exit and ends itself, so no process is
+   * killed; only one that has not ended after `restartGraceMs` is stopped the way the app stops one
+   * (stopAt: chats.kill, its last write sent on, the session let go). Then it is opened the way
+   * openChat opens it. A member PC does not: the hub holds the session, so it is restarted there.
+   */
+  async function restartChat(sid: string): Promise<boolean> {
+    if (mode() === 'member') return false
+    const at = floors.bySession(sid)
+    if (!at || !chats.info(sid)) return false
+    if (chats.info(sid)?.state === 'idle' && chats.type(sid, '/exit')) {
+      const until = Date.now() + (o.restartGraceMs ?? 15_000)
+      while (chats.info(sid) && Date.now() < until) await new Promise(r => setTimeout(r, 200))
+    }
+    await stopAt(self().id, sid)
+    const opened = await openChat(at.floor.id, at.agent.id, {})
+    return opened.started || chats.info(sid) !== null
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-058: the chats that were open when the app stopped come back (recover.ts)
+
+  async function resumeChat(sid: string, text?: string): Promise<boolean> {
+    if (team?.role() === 'member') return false
+    const at = floors.bySession(sid)
+    if (!at) return false
+    try {
+      const opened = await openChat(at.floor.id, at.agent.id, {})
+      if (opened.started && text) chats.typeWhenReady(sid, text)
+      return opened.started || chats.info(sid) !== null
+    } catch (e) {
+      log?.warn(`couldn't reopen chat ${sid.slice(0, 8)}: ${message(e)}`)
+      return false
+    }
+  }
+
+  /** The chats open now, written down for the next start. */
+  function noteOpen() {
+    if (!recovery) return
+    const open: Remembered[] = []
+    for (const [sid, state] of Object.entries(chats.states())) {
+      const info = chats.info(sid)
+      if (info) open.push({ sessionId: sid, floorId: info.floorId, agentId: info.agentId, state })
+    }
+    recovery.note(open)
+  }
+
+  let resumeTimer: NodeJS.Timeout | null = null
+  if (o.resumeChats && team?.role() !== 'member') {
+    const mine = createRecovery(path.join(o.dir, 'open-chats.json'), { log })
+    recovery = mine
+    resumeTimer = setTimeout(() => {
+      resumeTimer = null
+      void (async () => {
+        const list = mine.pending
+        if (list.length) log?.info(`recovery: reopening ${list.length} chat${list.length === 1 ? '' : 's'} that ${list.length === 1 ? 'was' : 'were'} open when the app stopped`)
+        let n = 0
+        for (const r of list) {
+          if (closing) return
+          if (chats.info(r.sessionId)) continue
+          const carryOn = r.state === 'running' || r.state === 'question'
+          const ok = await resumeChat(r.sessionId, carryOn ? CONTINUE_TEXT : undefined)
+          log?.info(`recovery: chat ${r.sessionId.slice(0, 8)} ${ok ? `reopened${carryOn ? ', told to carry on' : ''}` : 'could not be reopened'}`)
+          if (++n < list.length) await new Promise(res => setTimeout(res, o.resumeGapMs ?? 2000))
+        }
+        if (closing) return
+        // The list is used: from now on it follows the chats.
+        mine.arm()
+        noteOpen()
+      })()
+    }, o.resumeAfterMs ?? 4000)
+    resumeTimer.unref()
   }
 
   // ---------------------------------------------------------------------------------------
@@ -1075,6 +1200,35 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
       case 'memory_recall':
         return memoryOn ? (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+      // F-056: the app's one task list (the Tasks tab), for every chat.
+      case 'task_add': {
+        const body = taskText(args.text)
+        // The same task added twice within minutes (a retry, a chat repeating itself) is the one that is there.
+        const same = (await tasks.list({ status: 'open', limit: 100 })).find(t => t.text === body && Date.now() - Date.parse(t.createdAt) < 10 * 60_000)
+        if (same) return json({ id: same.id, note: 'That task is already on the list.' })
+        const task = await tasks.add({ text: body, by: { kind: 'agent', name: agent.name, floor: floor.name } })
+        return json({ added: task.id, text: task.text })
+      }
+      case 'task_list': {
+        const s = args.status
+        const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.min(Math.floor(args.limit), 100) : 30
+        const list = await tasks.list({ status: s === 'done' || s === 'all' ? s : 'open', query: typeof args.query === 'string' ? args.query : undefined, limit })
+        return json({
+          tasks: list.map(t => ({ id: t.id, text: t.text, done: t.done, added: t.createdAt, by: t.by.kind === 'agent' ? `${t.by.name ?? 'an agent'}${t.by.floor ? ` on ${t.by.floor}` : ''}` : 'Shubham' })),
+          counts: await tasks.counts(),
+        })
+      }
+      case 'task_update': {
+        const id = typeof args.id === 'string' ? args.id : ''
+        if (!id) throw apiError(400, 'id is missing: task_list gives it')
+        const patch = taskPatch({
+          ...(args.text !== undefined ? { text: args.text } : {}),
+          ...(args.done !== undefined ? { done: args.done } : {}),
+          ...(args.delete === true ? { deleted: true } : {}),
+        })
+        const task = await tasks.update(id, patch)
+        return json({ id: task.id, text: task.text, done: task.done, deleted: task.deletedAt !== null })
+      }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
         const model = args.model
@@ -1096,6 +1250,42 @@ export function createAgentic(o: AgenticOptions): Agentic {
       default:
         throw apiError(404, `No tool called ${name}`)
     }
+  }
+
+  /** F-056: the task list changed: every page here, and every member's, is told to ask for it again. */
+  function tasksChanged() {
+    emit({ t: 'tasks' })
+    for (const s of subs.values()) writeLine(s, { t: 'tasks' })
+  }
+
+  /** F-056: the list the Tasks tab shows (also what the chats' task_list reads). */
+  async function answerTasks(query: URLSearchParams): Promise<TasksAnswer> {
+    const s = query.get('status')
+    const status: TaskStatus = s === 'open' || s === 'done' ? s : 'all'
+    const limit = Number(query.get('limit'))
+    return { tasks: await tasks.list({ status, query: query.get('q') ?? undefined, limit: Number.isFinite(limit) && limit > 0 ? limit : undefined }), counts: await tasks.counts() }
+  }
+
+  /**
+   * F-054: the CRM's address and what this PC found when it asked that site, kept 30 seconds
+   * (`fresh` asks again). `origin` is the page's own, to read a frame-ancestors list against.
+   */
+  async function answerCrm(query: URLSearchParams, fresh = false): Promise<CrmAnswer> {
+    const { url, mode } = crm.get()
+    // Built into the page, there is no site to look at: the address matters only for the frame.
+    if (!url || mode !== 'frame') return { mode, url, check: null }
+    let app: string | null = null
+    try {
+      const u = new URL(query.get('origin') ?? '')
+      if (u.protocol === 'https:' || u.protocol === 'http:') app = u.origin
+    } catch {
+      // No origin, or not one: the list can only be judged without it.
+    }
+    const now = Date.now()
+    if (!fresh && crmChecked && crmChecked.url === url && crmChecked.app === app && now - crmChecked.at < 30_000) return { mode, url, check: crmChecked.check }
+    const check = await checkCrm(url, { app })
+    crmChecked = { url, app, at: now, check }
+    return { mode, url, check }
   }
 
   function memoryChanged(floorId: string) {
@@ -1388,6 +1578,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     [
       'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/restart$/,
+      async ([id, agentId]) => {
+        // Claude subscription failover: this agent's chat, running on the hub, stopped gently (told /exit) and started
+        // again on the token in place now, its conversation resumed (restartChat above). A member's call goes to the hub.
+        const a = agentOf(floorOf(id), agentId)
+        if (!a.sessionId || !chats.info(a.sessionId)) return { sessionId: a.sessionId, restarted: false }
+        return { sessionId: a.sessionId, restarted: await restartChat(a.sessionId) }
+      },
+    ],
+    [
+      'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/session$/,
       ([id, agentId], r) => {
         if (!isObject(r.body) || typeof r.body.sessionId !== 'string') throw apiError(400, "Expected {sessionId}, '' to unbind")
@@ -1424,6 +1625,35 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
+    // F-056: the task list. The hub keeps it, so a member passes these on (no `local`), like the floors.
+    ['GET', /^\/tasks$/, (_, r) => answerTasks(r.query)],
+    [
+      'POST',
+      /^\/tasks$/,
+      async (_, r) => {
+        const body = isObject(r.body) ? r.body : {}
+        return { task: await tasks.add({ text: taskText(body.text), id: taskId(body.id), by: { kind: 'you', name: null, floor: null } }) }
+      },
+    ],
+    ['PATCH', /^\/tasks\/([^/]+)$/, async ([id], r) => ({ task: await tasks.update(id, taskPatch(r.body)) })],
+    ['DELETE', /^\/tasks\/([^/]+)$/, async ([id]) => ({ task: await tasks.update(id, { deleted: true }) })],
+    // F-054: where the CRM's website is, and whether it can be shown. The hub keeps it; a member passes these on.
+    ['GET', /^\/crm$/, (_, r) => answerCrm(r.query, r.query.get('fresh') === '1')],
+    [
+      'PATCH',
+      /^\/crm$/,
+      async (_, r) => {
+        if (!isObject(r.body) || (!('url' in r.body) && !('mode' in r.body))) throw apiError(400, 'Expected {url?, mode?}')
+        crm.set({
+          ...('url' in r.body ? { url: crmAddress(r.body.url) } : {}),
+          ...('mode' in r.body ? { mode: crmMode(r.body.mode) } : {}),
+        })
+        crmChecked = null
+        return answerCrm(r.query, true)
+      },
+    ],
+    // Whether the CRM is signed in on THIS PC (the session is per PC, as Devices signs in): never the session itself.
+    ['GET', /^\/crm\/session$/, (): CrmSessionInfo => crmProxy.session(), 'local'],
     // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
     [
       'GET',
@@ -1824,6 +2054,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     prefix: AGENTIC_PREFIX,
     // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
+    // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
+    raw: (rest, url) => (rest.startsWith('/crm-proxy/') ? (req, res) => crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search) : null),
     http: r => route(r, mode() === 'member' ? toHub : undefined),
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)
@@ -1847,7 +2079,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     memory,
     callTool,
     serve,
+    restartChat,
+    resumeChat,
     close() {
+      // The chats are about to be closed with the app: what is open now is what the next start reopens.
+      closing = true
+      recovery?.freeze()
+      if (resumeTimer) clearTimeout(resumeTimer)
       if (liveTimer) clearTimeout(liveTimer)
       if (pushTimer) clearTimeout(pushTimer)
       if (replicaTimer) clearTimeout(replicaTimer)

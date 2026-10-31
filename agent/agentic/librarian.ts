@@ -3,6 +3,7 @@ import path from 'node:path'
 import type { LibrarianMode } from '../../shared/memory.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
+import { killTree as killProcessTree } from '../proc-tree.ts'
 import type { Turn } from './memory-turns.ts'
 
 // F-051: the librarian: claude -p, unattended, in the wiki's folder, folding the raw material
@@ -201,10 +202,14 @@ export function readResult(stdout: string): LibrarianResult {
   }
 }
 
-function killTree(pid: number | undefined) {
+/** F-058: by exact PID and start time (agent/proc-tree.ts), not `taskkill /t`, which follows parent numbers Windows reuses. */
+function killTree(pid: number | undefined, startedAt?: number) {
   if (!pid) return
-  if (process.platform === 'win32') spawn('taskkill', ['/pid', String(pid), '/f', '/t'], { windowsHide: true, detached: true, stdio: 'ignore' }).unref()
-  else {
+  if (process.platform === 'win32') {
+    void killProcessTree(pid, { since: startedAt }).catch(() => {
+      // Nothing left to end.
+    })
+  } else {
     try {
       process.kill(pid, 'SIGKILL')
     } catch {
@@ -236,8 +241,9 @@ export function runLibrarian(o: LibrarianRunOptions): Promise<LibrarianResult> {
       return finish({ ok: false, summary: '', costUsd: null, tokens: null, error: `couldn't start claude: ${e instanceof Error ? e.message : String(e)}` })
     }
     o.onSpawn?.(child.pid)
+    const spawnedAt = Date.now()
     const timer = setTimeout(() => {
-      killTree(child.pid)
+      killTree(child.pid, spawnedAt)
       finish({ ok: false, summary: '', costUsd: null, tokens: null, error: `stopped after ${Math.round((o.timeoutMs ?? 0) / 60000)} minutes` })
     }, o.timeoutMs ?? 20 * 60_000)
     child.stdout?.on('data', d => (out += d))

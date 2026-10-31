@@ -169,6 +169,48 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // F-056: the app's one task list, the Tasks tab Shubham opens on his phone or PC.
+  {
+    name: 'task_add',
+    description:
+      "Add a task to the app's TASK LIST: the Tasks tab Shubham opens on his phone or PC, the same list for every chat and device. Use it when the user tells you something to add, fix, build or remember as a task (\"add this to my tasks\", \"note this down\", \"we need to add ...\"): one task per call, in his own words with enough context to act on later. Do not add tasks he didn't ask for, and not what you are doing right now. Adding the same task twice is harmless: you get the existing one back.",
+    inputSchema: {
+      type: 'object',
+      properties: { text: { type: 'string', description: 'The task, in a sentence or two (at most 2000 characters).' } },
+      required: ['text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_list',
+    description:
+      "List the tasks on the app's TASK LIST, newest first: each one's id, text, whether it is done, who added it. The open ones by default. Use it to see what is waiting, to check before adding a task that may be there already, and when the user asks what is on his list. Also returns how many are open and done.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['open', 'done', 'all'], description: 'Which ones (default open).' },
+        query: { type: 'string', description: 'Only tasks whose text has this.' },
+        limit: { type: 'number', description: 'How many at most (default 30, max 100).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_update',
+    description:
+      "Change a task on the app's TASK LIST by its id (from task_list): tick it done (or untick it), correct its text, or delete it. Use it when the user says a task is done, wrong, or should go. Never delete one he didn't ask you to.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: "The task's id from task_list." },
+        done: { type: 'boolean', description: 'true: done; false: open again.' },
+        text: { type: 'string', description: 'The new text.' },
+        delete: { type: 'boolean', description: 'true: remove it from the list (it can be brought back from the Tasks tab for a while).' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
   {
     name: 'agent_hire',
     description:

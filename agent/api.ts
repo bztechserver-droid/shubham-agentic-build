@@ -24,9 +24,11 @@ import {
   type ScreenVia,
   type SettingsPatch,
 } from '../shared/agent-api.ts'
+import type { SwitchAutoRequest, SwitchPreview, SwitchRefreshRequest, SwitchRequest, SwitchResponse } from '../shared/claude-switch.ts'
 import { ROUTES } from './config.ts'
 import { loopbackOrigin } from './local-host.ts'
 import type { Logger } from './log.ts'
+import { keepalive, pongFor, WS_DEAD_MS, WS_PING_MS } from './ws-live.ts'
 
 // The local API the app talks to (agent/SPEC.md › Local API): HTTP and a WebSocket on
 // 127.0.0.1 only, with shared/agent-api.ts as the contract. Every request but /health must
@@ -36,7 +38,8 @@ import type { Logger } from './log.ts'
 // such a page the token, and this holds even if it did.
 // The WebSockets are a minimal RFC 6455 server: unmasked frames out; masked client frames in,
 // answering ping and close. No extensions. Two kinds:
-//   /ws                    the state, pushed as text; nothing a client sends is acted on.
+//   /ws                    the state, pushed as text; nothing a client sends is acted on, but the
+//                          page's {"t":"ping"} (F-057, agent/ws-live.ts: every text socket answers it).
 //   /devices/<id>/remote   a byte pipe to that device's screen: binary frames both ways carry
 //                          the raw stream the link opens, and the page speaks RustDesk's
 //                          protocol over it. ?via=app reaches the app's own screen on that PC
@@ -87,6 +90,14 @@ export interface ApiActions {
   claudeCheck(req: ClaudeCheckRequest): Promise<ClaudeInfo>
   /** F-007: take the CRM's subscription off this PC and sign out of the CRM. */
   claudeSignOut(): Promise<ClaudeInfo>
+  /** Claude subscription failover: read the office's subscriptions again from the CRM (with `readings`, each one's week too). */
+  claudeSwitchRefresh(req: SwitchRefreshRequest): Promise<ClaudeInfo>
+  /** What a switch to subscription `to` would do and which running chats it would restart. Changes nothing. */
+  claudeSwitchPreview(to: string): Promise<SwitchPreview>
+  /** The person's own switch to another Claude subscription, restarting the chats they chose. */
+  claudeSwitch(req: SwitchRequest): Promise<SwitchResponse>
+  /** Switch by itself when the weekly limit is used up: on or off. */
+  claudeSwitchAuto(req: SwitchAutoRequest): Promise<ClaudeInfo>
   /** F-008: the saved password's answer to this connection's challenge (never the saved H1 itself). */
   savedLogin(id: string, req: SavedLoginRequest): SavedLoginAnswer
   /** F-008: remember that PC's password for this way in, as H1, after a login that worked. */
@@ -108,6 +119,9 @@ export interface ApiOptions {
   log?: Logger
   /** F-018: parts of the API that live in modules of their own (agent/agentic/). */
   mounts?: ApiMount[]
+  /** F-057, tests: how often a text WebSocket client is pinged, and how long one may stay silent before it is dropped. */
+  wsPingMs?: number
+  wsDeadMs?: number
 }
 
 /** One HTTP request to a mount: `rest` is the path after its prefix, `body` the JSON of a POST, PATCH or PUT. */
@@ -140,6 +154,13 @@ export interface ApiMount {
   http(req: MountRequest): Promise<unknown>
   /** Its WebSocket at `rest`, run once accepted; null when it has none there (404). */
   ws?(rest: string, query: URLSearchParams): ((socket: WsSocket) => void) | null
+  /**
+   * F-054: a path that answers by itself, with the raw request and response (a proxy: any method, a
+   * body that isn't JSON, an answer that is streamed). Guarded like the JSON routes (a page on this
+   * PC, with x-sad-token) before it runs; null when `rest` isn't one. An apiError it throws is
+   * answered as JSON, as for the others.
+   */
+  raw?(rest: string, url: URL): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | null
 }
 
 export interface Api {
@@ -237,6 +258,33 @@ function claudeCheck(body: unknown): ClaudeCheckRequest {
   return body.replace === undefined ? {} : { replace: body.replace }
 }
 
+function switchRefresh(body: unknown): SwitchRefreshRequest {
+  if (!isObject(body) || (body.readings !== undefined && typeof body.readings !== 'boolean')) throw apiError(400, 'Expected {readings?: true or false}')
+  return body.readings === undefined ? {} : { readings: body.readings }
+}
+
+/** The CRM's ids are UUIDs; nothing else is passed on to it. */
+const SUBSCRIPTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function switchTarget(body: unknown): string {
+  if (!isObject(body) || typeof body.to !== 'string' || !SUBSCRIPTION_ID.test(body.to)) throw apiError(400, 'Expected {to: the id of a Claude subscription}')
+  return body.to.toLowerCase()
+}
+
+function switchRequest(body: unknown): SwitchRequest {
+  const to = switchTarget(body)
+  const restart = isObject(body) ? body.restart : undefined
+  if (!Array.isArray(restart) || restart.length > 64 || restart.some(x => typeof x !== 'string' || x.length === 0 || x.length > 80)) {
+    throw apiError(400, 'Expected {to, restart: [the ids of the chats to restart]}')
+  }
+  return { to, restart: [...new Set(restart as string[])] }
+}
+
+function switchAuto(body: unknown): SwitchAutoRequest {
+  if (!isObject(body) || typeof body.on !== 'boolean') throw apiError(400, 'Expected {on: true or false}')
+  return { on: body.on }
+}
+
 function joinConfirm(body: unknown): JoinConfirm {
   if (!isObject(body) || typeof body.match !== 'boolean') throw apiError(400, 'Expected {match: true or false}')
   return { match: body.match }
@@ -285,6 +333,8 @@ export function wsFrame(opcode: number, payload: Buffer = Buffer.alloc(0)): Buff
 interface WsClient {
   socket: Duplex
   closing: boolean
+  /** F-057: when anything last arrived from the client (wsReader sets it), for the sweep of silent ones. */
+  seen?: number
 }
 
 /** A close frame's payload: the status code, and a reason cut to fit the 125-byte limit. */
@@ -319,6 +369,7 @@ function wsReader(client: WsClient, onClose: () => void, opts: ReaderOptions = {
     onClose()
   }
   return (chunk: Buffer) => {
+    client.seen = Date.now()
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk
     while (buf.length >= 2) {
       const fin = (buf[0] & 0x80) !== 0
@@ -397,6 +448,10 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ['POST', /^\/claude\/sign-in$/, (_, body) => a.claudeSignIn(claudeSignIn(body))],
     ['POST', /^\/claude\/check$/, (_, body) => a.claudeCheck(claudeCheck(body))],
     ['POST', /^\/claude\/sign-out$/, () => a.claudeSignOut()],
+    ['POST', /^\/claude\/switch\/refresh$/, (_, body) => a.claudeSwitchRefresh(switchRefresh(body))],
+    ['POST', /^\/claude\/switch\/preview$/, (_, body) => a.claudeSwitchPreview(switchTarget(body))],
+    ['POST', /^\/claude\/switch\/auto$/, (_, body) => a.claudeSwitchAuto(switchAuto(body))],
+    ['POST', /^\/claude\/switch$/, (_, body) => a.claudeSwitch(switchRequest(body))],
     ['POST', /^\/devices\/([^/]+)\/password\/login$/, ([id], body) => a.savedLogin(id, savedLogin(body))],
     ['POST', /^\/devices\/([^/]+)\/password\/save$/, ([id], body) => a.savePassword(id, savePassword(body))],
     ['POST', /^\/devices\/([^/]+)\/password\/forget$/, ([id], body) => a.forgetPassword(id, forgetPassword(body))],
@@ -426,9 +481,11 @@ export function startApi(o: ApiOptions): Promise<Api> {
     const texts: ((text: string) => void)[] = []
     const closes: (() => void)[] = []
     let done = false
+    const stopSweep = sweep(client)
     const finish = () => {
       if (done) return
       done = true
+      stopSweep()
       pipes.delete(stop)
       for (const cb of closes) cb()
     }
@@ -445,6 +502,9 @@ export function startApi(o: ApiOptions): Promise<Api> {
     const read = wsReader(client, finish, {
       maxFrame: MAX_PIPE_FRAME,
       onText: t => {
+        // F-057: the page's ping is answered here and never reaches the mount.
+        const pong = pongFor(t)
+        if (pong !== null) return push(client, pong)
         for (const cb of texts) cb(t)
       },
     })
@@ -479,6 +539,13 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (!path.startsWith(`${AGENT_API_PREFIX}/`)) return send(res, 404, { error: `No such path: ${path}` })
     const mount = mountOf(path)
     if (mount) {
+      // F-054: a path that takes over the response (the CRM's proxy), guarded the same way.
+      const raw = mount.raw?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url)
+      if (raw) {
+        if (foreignOrigin(req)) throw apiError(403, 'Requests from pages on other sites are refused')
+        if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
+        return raw(req, res)
+      }
       const result = await answerMount(mount, req, url)
       return send(res, 200, typeof result === 'object' && result !== null ? result : { ok: true })
     }
@@ -532,6 +599,27 @@ export function startApi(o: ApiOptions): Promise<Api> {
       return
     }
     client.socket.write(wsFrame(0x1, Buffer.from(text)))
+  }
+
+  /**
+   * F-057: pings a text WebSocket client now and then and drops one that has gone silent (a phone
+   * that locked or lost its VPN leaves no FIN, and its socket would otherwise stay for ever).
+   * The remote screen's pipe and the keys socket are left as they were.
+   */
+  function sweep(client: WsClient) {
+    client.seen = Date.now()
+    return keepalive(
+      {
+        seen: () => client.seen ?? 0,
+        alive: () => !client.closing && !client.socket.destroyed,
+        ping: () => void client.socket.write(wsFrame(0x9)),
+        drop: () => {
+          log?.warn('a WebSocket client went silent; dropped it')
+          client.socket.destroy()
+        },
+      },
+      { pingMs: o.wsPingMs ?? WS_PING_MS, deadMs: o.wsDeadMs ?? WS_DEAD_MS },
+    )
   }
 
   function refuse(socket: Duplex, status: number, text: string) {
@@ -685,13 +773,21 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ;(socket as net.Socket).setNoDelay?.(true)
     const client: WsClient = { socket, closing: false }
     let gone = false
+    const stopSweep = sweep(client)
     const drop = () => {
       if (gone) return
       gone = true
+      stopSweep()
       clients.delete(client)
       o.onClients?.(clients.size)
     }
-    const read = wsReader(client, drop)
+    // Nothing a client says is acted on, but the page's ping gets its pong (F-057).
+    const read = wsReader(client, drop, {
+      onText: t => {
+        const pong = pongFor(t)
+        if (pong !== null) push(client, pong)
+      },
+    })
     socket.on('data', read)
     socket.on('close', drop)
     clients.add(client)

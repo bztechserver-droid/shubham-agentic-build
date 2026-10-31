@@ -1,4 +1,3 @@
-import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -6,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
 import type { Logger } from '../log.ts'
+import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, type Screen } from './screen.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
@@ -140,20 +140,22 @@ export interface ChatPoolOptions {
   /** Live set or a chat's state changed. */
   onChange?: () => void
   env?: NodeJS.ProcessEnv
-  /** Ends a process and its children (taskkill /t). Tests with a fake pty, whose pid is some other process's, pass a no-op. */
-  treeKill?: (pid: number) => void
+  /** Ends a process and its children, given when it started. Tests with a fake pty, whose pid is some other process's, pass a no-op. */
+  treeKill?: (pid: number, startedAt?: number) => void
   /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
   settings?: string
 }
 
-/** taskkill /f /t: pty.kill() ends the console, and claude's own children (its MCP servers) go with /t. */
-function taskkillTree(pid: number) {
+/**
+ * pty.kill() ends the console; claude's own children (its MCP servers) are ended by exact PID,
+ * found by when they started (agent/proc-tree.ts). Not by `taskkill /t`, which follows parent
+ * numbers Windows reuses: on 31 Oct 2026 that took down the whole app (features.html F-058).
+ */
+function stopTree(pid: number, startedAt?: number) {
   if (process.platform !== 'win32') return
-  try {
-    spawnProcess('taskkill', ['/pid', String(pid), '/f', '/t'], { windowsHide: true, detached: true, stdio: 'ignore' }).unref()
-  } catch {
-    // Nothing left to kill.
-  }
+  void killProcessTree(pid, { since: startedAt }).catch(() => {
+    // Nothing left to end.
+  })
 }
 
 /** claude on PATH: claude.exe (the native install), else claude.cmd (npm's), else claude. */
@@ -256,7 +258,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     }
   }
 
-  const treeKill = o.treeKill ?? taskkillTree
+  const treeKill = o.treeKill ?? stopTree
 
   function killTree(c: Chat) {
     const pid = c.pty.pid
@@ -265,7 +267,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     } catch {
       // Already gone; the tree below may still be there.
     }
-    if (pid) treeKill(pid)
+    if (pid) treeKill(pid, Date.parse(c.info.startedAt))
   }
 
   function finish(c: Chat, code: number | null) {

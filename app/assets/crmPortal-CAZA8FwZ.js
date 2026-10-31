@@ -1,0 +1,1 @@
+function e(){if(typeof window>`u`)return;let e=window.__CRM_PORTAL__;return e instanceof HTMLElement&&e.isConnected?e:void 0}export{e as t};

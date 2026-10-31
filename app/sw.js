@@ -3,7 +3,8 @@
 // agent API and its WebSockets are never touched). Only when opening a page fails outright
 // (the phone offline, the server or the gate down) does it answer with a small page saying
 // so, with a Try again button, rather than the browser's own error, which in an installed
-// app has no address bar to retry from.
+// app has no address bar to retry from. (F-057: the page presses it by itself as soon as the
+// server answers again.)
 
 self.addEventListener('install', () => self.skipWaiting())
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()))
@@ -24,7 +25,16 @@ const OFFLINE = `<!doctype html>
   <h1>Can't reach the server</h1>
   <p>Check that this phone is online and on Tailscale, and that the server is on.</p>
   <button onclick="location.reload()">Try again</button>
-</main></body></html>`
+</main>
+<script>
+  // F-057: it tries again by itself, so that an update or a restart of the server, or a phone that
+  // was offline, needs no tap: every few seconds, the moment the phone is back online, and the
+  // moment this page is shown again. The app itself comes up as soon as the server answers.
+  const back = () => fetch(location.href, { cache: 'no-store' }).then(r => { if (r.ok) location.reload() }, () => {})
+  setInterval(back, 4000)
+  addEventListener('online', back)
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) back() })
+</script></body></html>`
 
 self.addEventListener('fetch', event => {
   const req = event.request

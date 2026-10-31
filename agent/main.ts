@@ -5,15 +5,20 @@ import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
 import { agenticOff, createAgentic } from './agentic/index.ts'
 import type { LinkPeer } from './agentic/roam.ts'
+import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
 import { createBuild, findDevDir, type Build } from './build.ts'
+import { createBridge } from './claude/bridge.ts'
 import { CrmError } from './claude/crm.ts'
+import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, TOKEN_VAR } from './claude/index.ts'
+import { startRowWatch } from './claude/rowwatch.ts'
 import { loadUserEnv } from './claude/userenv.ts'
 import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './config.ts'
 import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
+import { externalServers } from './hub/external-servers.ts'
 import { startServers, type Servers } from './hub/rustdesk-server.ts'
 import { loadOrCreateIdentity } from './link/identity.ts'
 import type { Control, Mux, OpenMeta, StreamUser } from './link/mux.ts'
@@ -142,6 +147,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     claudeJson: testClaudeHome ? path.join(testClaudeHome, '.claude.json') : undefined,
     apiUrl: () => `http://127.0.0.1:${api?.port ?? ports.api}${AGENT_API_PREFIX}`,
     log: log.child('agentic'),
+    // F-058: under the guard, the chats that were open when the app last stopped come back.
+    resumeChats: process.env.SAD_RESUME_CHATS === '1',
     token: () => {
       try {
         return userEnv?.get(TOKEN_VAR) || null
@@ -166,6 +173,22 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       },
     },
   })
+
+  // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
+  // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this
+  // PC can be restarted; without the Agents section the switch is still made, only no chat is restarted.
+  const projectsDir = testClaudeHome ? path.join(testClaudeHome, 'projects') : undefined
+  const chatBridge = agentic ? createBridge({ agentic: () => agentic, find: sid => findTranscript(sid, projectsDir), log: log.child('failover') }) : null
+  const failover = createFailover({ claude, bridge: () => chatBridge, log: log.child('failover') })
+  const rowWatch = agentic
+    ? startRowWatch({
+        chats: () => agentic.chats.live().map(c => ({ sessionId: c.sessionId, name: agentic.floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8), startedAt: c.startedAt })),
+        find: sid => findTranscript(sid, projectsDir),
+        onLimit: e => failover.limitHit(e),
+        onMoved: id => failover.chatMoved(id),
+        log: log.child('failover'),
+      })
+    : null
 
   let hub: { servers: Servers; pairing: PairingHub; links: HubLinks; stop: () => Promise<void> } | null = null
   let member: { links: MemberLinks; discovery: DiscoveryClient } | null = null
@@ -204,13 +227,16 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   async function startHub() {
     // startServers reports its first states before it returns: hold onServers until all is set up.
     let started = false
-    const servers = startServers(config, {
+    // F-058: under the guard (SAD_RUSTDESK_EXTERNAL=1) hbbs and hbbr are the keeper's, a process of
+    // its own, so they go on when this agent dies; this only reads their state. Without it, as before.
+    const serverOptions = {
       log: log.child('rustdesk-server'),
       onChange: () => {
         if (started) onServers()
         changed()
       },
-    })
+    }
+    const servers: Servers = process.env.SAD_RUSTDESK_EXTERNAL === '1' ? externalServers(config, serverOptions) : startServers(config, serverOptions)
     const lanNow = () => {
       const lan = lanAddress()
       return lan ? { address: lan, peer: `${lan}:${ports.peer}`, hbbs: `${lan}:${ports.hbbs}`, hbbr: `${lan}:${ports.hbbr}` } : null
@@ -606,6 +632,18 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     },
     claudeCheck: ({ replace }) => claude.check({ replace }),
     claudeSignOut: () => claude.signOut(),
+    // Claude subscription failover and the person's own switch (agent/claude/failover.ts).
+    claudeSwitchRefresh: ({ readings }) => claude.refreshSwitch({ readings }),
+    async claudeSwitchPreview(to) {
+      const p = await failover.preview(to)
+      if ('error' in p) throw apiError(400, p.error)
+      return p
+    },
+    async claudeSwitch(req) {
+      const r = await failover.switchNow(req)
+      return { ok: r.ok, message: r.message, restarted: r.restarted, failed: r.failed }
+    },
+    claudeSwitchAuto: ({ on }) => claude.setAuto(on),
     // F-013: this PC's keys while a Control page here has the focus.
     grabKeys: (onKey, onEnd) => appScreen.grabKeys(onKey, onEnd),
     // F-008. Only for a paired PC, or this one (F-014); the saved H1 never leaves this process.
@@ -669,6 +707,10 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   async function stopAll() {
     for (const t of timers) clearInterval(t)
+    // Claude subscription failover first: nothing may start restarting a chat while they are being closed.
+    failover.stop()
+    rowWatch?.stop()
+    claude.close()
     agentic?.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()
@@ -777,7 +819,10 @@ if (import.meta.main) {
           },
         )
       }
-      servePage()
+      // F-058: under the guard the page on this port is the guard's (it is never closed, even while
+      // this agent restarts); the tailnet one below stays here.
+      if (process.env.SAD_PAGE_SERVER === 'guard') log.info('the page on the local port is served by the guard')
+      else servePage()
       // F-028: opened to the tailnet (Open-To-Tailnet.cmd, run as administrator, leaves the
       // marker): the page and its API on this PC's Tailscale address too, for the other PCs.
       // Looked for every 30 s, so running the script (or -Remove) needs no restart.
