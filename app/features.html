@@ -633,6 +633,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-047",
+    "title": "A phone's keys for the terminal: Esc, Tab, the arrows, Enter, Ctrl+C",
+    "said": "now one more issue lets say when i type effort. Then what happens is that it shows me low, medium, max but I cannot control it on the phone because there is no left, right, up arrow menu. I want the terminal to be touch-based on my phone. Please add that adjustment.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. On a touch screen, every chat window has a row of keys under its terminal: Esc, Tab, Shift+Tab (claude's next mode), the four arrows, Enter and ^C (moved here from the title bar, F-042). claude's menus (/effort's low, medium, max; a question's options) are worked with the arrows and Enter, Esc backs out. A key is sent on the press and keeps the focus where it was, so the phone's keyboard neither opens nor closes for it; no text selection or long-press menu on them. With a mouse and keyboard the row isn't shown. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx (TouchKeys)."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
