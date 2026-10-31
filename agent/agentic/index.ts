@@ -810,6 +810,26 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { sessionId: sid, id: w.id }
   }
 
+  /** F-029: a running chat anywhere in the app (any floor, any PC). */
+  function anyChat(sid: unknown): { sessionId: string; id: string } {
+    if (typeof sid !== 'string' || !sid) throw apiError(400, 'sessionId is missing')
+    const w = whereAll()[sid]
+    if (!w) throw apiError(404, `No running chat ${sid}; app_chats shows which are running`)
+    return { sessionId: sid, id: w.id }
+  }
+
+  /** F-029: an agent by its floor's and its own name (or ids). */
+  function findAgent(floorRef: unknown, agentRef: unknown): { floor: Floor; agent: FloorAgent } {
+    const want = (v: unknown) => (typeof v === 'string' ? v.trim().toLowerCase() : '')
+    const fw = want(floorRef)
+    const f = floors.list().find(x => x.id === floorRef || x.name.trim().toLowerCase() === fw)
+    if (!f) throw apiError(404, `No floor called ${String(floorRef)}`)
+    const aw = want(agentRef)
+    const a = f.agents.find(x => x.id === agentRef || x.name.trim().toLowerCase() === aw)
+    if (!a) throw apiError(404, `No agent called ${String(agentRef)} on ${f.name}`)
+    return { floor: f, agent: a }
+  }
+
   async function readChat(c: { sessionId: string; id: string }, lines: number): Promise<string> {
     if (c.id === self().id) return chats.read(c.sessionId, lines) ?? ''
     const link = team?.member(c.id)
@@ -840,6 +860,66 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const tag = `${agent.name}, chat ${sid.slice(0, 8)}`
 
     switch (name) {
+      // F-029: the whole app.
+      case 'app_chats': {
+        const where = whereAll()
+        const last = lastAll()
+        const rows = floors.list().flatMap(f =>
+          f.agents.map(a => {
+            const w = a.sessionId ? where[a.sessionId] : undefined
+            return {
+              floor: f.name,
+              agent: a.name,
+              role: a.role,
+              isBoss: a.isBoss,
+              sessionId: a.sessionId,
+              status: w ? 'running' : a.sessionId ? 'not running' : 'never opened',
+              doing: w?.state ?? null,
+              pc: w?.name ?? null,
+              lastOn: !w && a.sessionId ? (last[a.sessionId]?.pc ?? null) : null,
+              isYou: a.sessionId === sid,
+            }
+          }),
+        )
+        return json({ you: `${agent.name} on ${floor.name}`, pcs: pcs().map(p => p.name), chats: rows })
+      }
+      case 'app_read_chat': {
+        const target = anyChat(args.sessionId)
+        return readChat(target, typeof args.lines === 'number' ? Math.min(500, args.lines) : 100)
+      }
+      case 'app_read_conversation': {
+        if (typeof args.sessionId !== 'string' || !args.sessionId) throw apiError(400, 'sessionId is missing')
+        const file = findTranscript(args.sessionId, projectsDir)
+        if (!file) throw apiError(404, `There is no conversation ${args.sessionId} on the hub`)
+        const n = typeof args.last === 'number' ? Math.max(1, Math.min(200, args.last)) : 20
+        return json(readTranscriptFile(file).slice(-n).map(m => ({ role: m.role, at: m.timestamp, text: m.text.length > 4000 ? `${m.text.slice(0, 4000)}…` : m.text, tools: m.tools })))
+      }
+      case 'app_send_to_chat': {
+        const target = anyChat(args.sessionId)
+        if (target.sessionId === sid) throw apiError(400, "That's your own chat")
+        const body = text(args.text, 'text')
+        relayAllowed(sid, target.sessionId)
+        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
+        return `Sent to chat ${target.sessionId}.`
+      }
+      case 'app_open_chat': {
+        const { floor: f, agent: a } = findAgent(args.floor, args.agent)
+        const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null
+        const pc = pcName ? pcs().find(p => p.name.toLowerCase() === pcName || p.id === args.pc) : null
+        if (pcName && !pc) throw apiError(404, `No PC called ${String(args.pc)} within reach; app_chats lists them`)
+        const opened =
+          pc && !pc.here
+            ? await request<ChatOpened>(peerOf(pc.id), 'open', { floorId: f.id, agentId: a.id }, 60_000)
+            : await openChat(f.id, a.id, { takeOver: args.takeOver === true })
+        return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
+      }
+      case 'app_stop_chat': {
+        const target = anyChat(args.sessionId)
+        if (target.sessionId === sid) throw apiError(400, "That's your own chat")
+        stopAnywhere(target.sessionId)
+        return `Stopping chat ${target.sessionId}.`
+      }
       case 'list_chats': {
         const byId = new Map(floor.agents.map(a => [a.id, a]))
         const others = Object.entries(whereAll())

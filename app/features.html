@@ -451,6 +451,19 @@ should havae all their ports accesible so this way it would be easire fo you tto
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-029",
+    "title": "The app's tools for every chat: read and message any chat, on any floor and PC",
+    "said": "now you are running on the server 
+this nwo we need to create mcp forthe app so it cna read other chats and do other thigns as well 
+so within this app we can text any chat",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built on the app's own MCP server (shubham-agentic), which every chat already has; its old tools reach only the chat's own floor. New, for the whole app (every floor, the server and the laptop): app_chats (every agent on every floor: its chat running or not, on which PC, doing what, where it ran last), app_read_chat (any running chat's screen), app_read_conversation (any chat's saved conversation, running or not), app_send_to_chat (a message into any running chat, marked with who sent it; the same rate limits), app_open_chat (start or resume an agent's chat by floor and agent name, on this PC or the one named, take-over optional) and app_stop_chat. Every chat's brief names them. A laptop chat's calls go through the server, which reaches the laptop's chats over the link. Checked: a two-PC test (a laptop chat lists both floors and PCs, messages a chat on another floor on the server, reads its conversation, stops it and opens it on the laptop), all agent tests, types, lint. A chat sees the new tools once it starts after the update (claude reads its tools when it starts). Code: agent/agentic/tools.ts, index.ts, briefs.ts."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

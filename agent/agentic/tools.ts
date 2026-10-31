@@ -10,7 +10,54 @@ export interface ToolDef {
 
 const none = { type: 'object', properties: {}, additionalProperties: false }
 
+const sessionArg = { type: 'string', description: 'The chat\'s session id, from app_chats.' }
+const agentRef = {
+  floor: { type: 'string', description: 'The floor, by name or id.' },
+  agent: { type: 'string', description: 'The agent on it, by name or id.' },
+}
+
 export const TOOLS: ToolDef[] = [
+  // F-029: the whole app, not only this floor: every chat on every floor, on all the hub's PCs.
+  {
+    name: 'app_chats',
+    description:
+      'Every chat in the whole app: each agent on EVERY floor, with its floor, role, session id, whether its chat is running (and on which PC: the server or the laptop), doing what, or where it ran last. Use this to find any chat to read or message, not only the ones on your floor.',
+    inputSchema: none,
+  },
+  {
+    name: 'app_read_chat',
+    description:
+      "Read any running chat's terminal (any floor, any of the hub's PCs): its last N lines, ANSI-stripped. For a chat that isn't running, use app_read_conversation.",
+    inputSchema: { type: 'object', properties: { sessionId: sessionArg, lines: { type: 'number', description: 'Trailing lines (default 100, max 500).' } }, required: ['sessionId'], additionalProperties: false },
+  },
+  {
+    name: 'app_read_conversation',
+    description:
+      "Read any chat's conversation from its saved transcript (running or not, any floor): the last N user and assistant messages, tool calls named. Use to catch up on what another chat did.",
+    inputSchema: { type: 'object', properties: { sessionId: sessionArg, last: { type: 'number', description: 'How many messages from the end (default 20, max 200).' } }, required: ['sessionId'], additionalProperties: false },
+  },
+  {
+    name: 'app_send_to_chat',
+    description:
+      'Type a message into ANY running chat in the app (any floor, any PC) and submit it: that chat gets it as input, marked as from you. Never your own; never ask it to broadcast or to message you back in a loop.',
+    inputSchema: { type: 'object', properties: { sessionId: sessionArg, text: { type: 'string', description: 'The message.' } }, required: ['sessionId', 'text'], additionalProperties: false },
+  },
+  {
+    name: 'app_open_chat',
+    description:
+      "Start an agent's chat, or pick its conversation back up, on any floor: on this PC, or on the PC named (\"pc\": a name from app_chats, e.g. the laptop). Refused when it runs on another PC already, unless takeOver is true (it then stops there first).",
+    inputSchema: {
+      type: 'object',
+      properties: { ...agentRef, pc: { type: 'string', description: 'Which PC runs it (a name); this PC when left out.' }, takeOver: { type: 'boolean' } },
+      required: ['floor', 'agent'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'app_stop_chat',
+    description: "Stop a running chat (any floor, any PC). Its conversation is kept; opening it again picks it back up. Never your own.",
+    inputSchema: { type: 'object', properties: { sessionId: sessionArg }, required: ['sessionId'], additionalProperties: false },
+  },
   {
     name: 'list_chats',
     description:
