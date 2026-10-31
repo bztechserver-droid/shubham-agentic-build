@@ -159,11 +159,38 @@ export interface ClaudeSession {
   updatedAt: string
   /** It is already an agent's chat here. */
   agent: { floorId: string; floorName: string; agentId: string; name: string } | null
+  /** F-022: the PC it belongs to: where it was held, or the one it was copied from. */
+  pc?: string
+  /** F-022, listing another PC's: this PC has a copy of it already. */
+  here?: boolean
+}
+
+/** F-022: GET /agentic/sessions?pc=&q=&limit=&offset= */
+export interface SessionsAnswer {
+  sessions: ClaudeSession[]
+  /** How many match, of which this is a page. */
+  total: number
+  /** The PCs whose conversations can be listed now: this one first. */
+  pcs: { id: string; name: string; here: boolean }[]
+}
+
+/** F-022: copying every conversation of another PC here (GET/POST /agentic/sessions/copy-all). */
+export interface CopyAllJob {
+  pc: string
+  state: 'running' | 'done' | 'failed'
+  total: number
+  done: number
+  copied: number
+  bytes: number
+  error: string | null
+  startedAt: string
 }
 
 /** POST /agentic/floors/:id/import: a copy of a conversation becomes an agent's chat. */
 export interface ImportChat {
   sessionId: string
+  /** F-022: the PC it is on, when not this one: it is brought here first. */
+  pc?: string
   /** The agent whose chat it becomes (the chat it had stops and is let go); a new agent when left out. */
   agentId?: string
   /** A new agent's name and role. */

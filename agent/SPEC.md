@@ -1382,6 +1382,20 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   conversation into the member's own folder) and e2e step 11 (two real agents on a real link, a
   pretend claude: followed, taken over, the JSONL both ways, where it ran last).
 
+## F-022: another PC's Claude conversations (agentic/index.ts, transcripts.ts)
+
+- `GET /agentic/sessions?pc=&q=&limit=&offset=` → {sessions, total, pcs}: this PC's (or, with
+  `pc`, another's, over the link: op `sessions`) conversations, newest first. `listSessions`
+  stats every file and reads a page's (or, with `q`, every one's) first 128 KB and last 256 KB,
+  remembered per file until its size or time changes. Each has `pc`: where it was held, or the PC
+  it was copied from (`origins.json`); another PC's are marked `here` when this PC has a copy.
+- `POST /floors/:id/import {sessionId, pc}` brings the file over first (op `session-files` for
+  its project folder name, then `pull` into the same name here), then copies it as before; held
+  in a folder this PC hasn't got, the copy goes under the floor's folder here.
+- `POST /agentic/sessions/copy-all {pc}` (one at a time; `GET` for how far): every file on that PC
+  this one hasn't got or has less of is pulled into the same project folder name, skipping chats
+  running here. Tests: `team.test.ts` (listed with its PC, brought onto a floor, all copied).
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.

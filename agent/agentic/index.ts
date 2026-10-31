@@ -42,6 +42,8 @@ import {
   findTranscript,
   findTranscriptCwd,
   listSessions,
+  sessionFiles,
+  type SessionFile,
   readTranscriptFile,
   transcriptPath,
 } from './transcripts.ts'
@@ -144,6 +146,27 @@ export function agenticOff(): ApiMount {
         apiError(AGENTS_OFF_STATUS, "Agents are off in Dev: the build runs them, so Dev's chats never mix with its chats. Start Dev with --agents to try them here, apart from the build's"),
       ),
     ws: () => null,
+  }
+}
+
+/** F-022: copying every conversation of another PC here. */
+interface CopyAllState {
+  pc: string
+  state: 'running' | 'done' | 'failed'
+  total: number
+  done: number
+  copied: number
+  bytes: number
+  error: string | null
+  startedAt: string
+}
+
+function readJson(file: string): Record<string, unknown> {
+  try {
+    const v: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    return isObject(v) ? v : {}
+  } catch {
+    return {}
   }
 }
 
@@ -914,11 +937,119 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!existsSync(dir) || !statSync(dir).isDirectory()) throw apiError(400, `There is no folder ${dir}${mode() === 'member' ? ' on this PC' : ''}`)
   }
 
-  /** This account's Claude Code conversations, each with the agent here it already is, if any. */
-  async function sessions(): Promise<ClaudeSession[]> {
+  // ---------------------------------------------------------------------------------------
+  // F-022: Claude conversations on the hub's other PCs: listed, brought onto a floor, copied here
+
+  /** Which PC each conversation copied here came from (origins.json); one not in it is this PC's own. */
+  const originsFile = path.join(o.dir, 'origins.json')
+  const origins = new Map<string, string>(Object.entries(readJson(originsFile)).filter((e): e is [string, string] => typeof e[1] === 'string'))
+  let originsTimer: NodeJS.Timeout | null = null
+  function setOrigin(sid: string, pc: string) {
+    if (origins.get(sid) === pc) return
+    origins.set(sid, pc)
+    if (originsTimer) return
+    originsTimer = setTimeout(() => {
+      originsTimer = null
+      writeAtomic(originsFile, `${json(Object.fromEntries(origins))}\n`)
+    }, 1000)
+    originsTimer.unref()
+  }
+
+  /** The PCs whose conversations this one can reach now: itself, and those linked (the hub's members, or a member's hub). */
+  function pcs(): { id: string; name: string; here: boolean }[] {
+    const me = self()
+    const out = [{ ...me, here: true }]
+    if (mode() === 'hub') for (const [id, r] of remote) out.push({ id, name: r.name, here: false })
+    else if (mode() === 'member' && sub) {
+      const h = team!.hub()
+      if (h) out.push({ id: h.id, name: h.name, here: false })
+    }
+    return out
+  }
+
+  /** The link to another PC of the hub's, by id. */
+  function peerOf(pc: string): LinkPeer {
+    const link = mode() === 'hub' ? team?.member(pc) : mode() === 'member' && team?.hub()?.id === pc ? (team.hub()?.link ?? null) : null
+    if (!link) throw apiError(503, "That PC can't be reached right now")
+    return link
+  }
+
+  const pageOf = (q: URLSearchParams | Record<string, unknown>) => {
+    const get = (k: string) => (q instanceof URLSearchParams ? q.get(k) : typeof q[k] === 'string' || typeof q[k] === 'number' ? String(q[k]) : null)
+    return { q: get('q') ?? '', limit: Number(get('limit')) || 60, offset: Number(get('offset')) || 0 }
+  }
+
+  /** This PC's own conversations, each saying which PC it belongs to (its own, or the one it was copied from). */
+  async function ownSessions(page: { q: string; limit: number; offset: number }) {
+    const found = await listSessions(projectsDir, page)
+    return { sessions: found.sessions.map(x => ({ ...x, pc: origins.get(x.sessionId) ?? self().name })), total: found.total }
+  }
+
+  /** This PC's (or, with `pc`, another's) Claude Code conversations, each with the agent here it already is, if any. */
+  async function sessions(query: URLSearchParams) {
+    const pc = query.get('pc')
+    const page = pageOf(query)
+    const there = pc && pc !== self().id
+    const found = there ? await request<{ sessions: Omit<ClaudeSession, 'agent'>[]; total: number }>(peerOf(pc), 'sessions', page, 60_000) : await ownSessions(page)
     const bound = new Map<string, ClaudeSession['agent']>()
-    for (const f of allFloors()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
-    return (await listSessions(projectsDir)).map(x => ({ ...x, agent: bound.get(x.sessionId) ?? null }))
+    if (!there) for (const f of allFloors()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
+    const copied = new Set(there ? found.sessions.filter(x => findTranscript(x.sessionId, projectsDir)).map(x => x.sessionId) : [])
+    return {
+      sessions: found.sessions.map(x => ({ ...x, agent: bound.get(x.sessionId) ?? null, ...(there ? { here: copied.has(x.sessionId) } : {}) })),
+      total: found.total,
+      pcs: pcs(),
+    }
+  }
+
+  /** Another PC's conversation, brought here (into the same project folder name) or brought up to date. */
+  async function fetchFrom(pc: string, sid: string): Promise<string> {
+    const link = peerOf(pc)
+    const [one] = (await request<{ files: SessionFile[] }>(link, 'session-files', { sessionId: sid })).files
+    if (!one) throw apiError(404, `${link.name} has no conversation ${sid}`)
+    const file = findTranscript(sid, projectsDir) ?? path.join(projectsDir, one.dir, `${sid}.jsonl`)
+    if (markOf(file).bytes < one.bytes) await pullFrom(link, sid, file)
+    setOrigin(sid, link.name)
+    return file
+  }
+
+  /** Copy all: every conversation on another PC that this one hasn't got (or has less of), one at a time. */
+  let copyAll: CopyAllState | null = null
+  function startCopyAll(pc: string): CopyAllState {
+    if (copyAll?.state === 'running') throw apiError(409, `Already copying from ${copyAll.pc}`)
+    const link = peerOf(pc)
+    const job: CopyAllState = { pc: link.name, state: 'running', total: 0, done: 0, copied: 0, bytes: 0, error: null, startedAt: new Date().toISOString() }
+    copyAll = job
+    void (async () => {
+      try {
+        const { files } = await request<{ files: SessionFile[] }>(link, 'session-files', {}, 120_000)
+        job.total = files.length
+        for (const f of files) {
+          if (!chats.info(f.sessionId)) {
+            const mine = findTranscript(f.sessionId, projectsDir)
+            const file = mine ?? path.join(projectsDir, f.dir, `${f.sessionId}.jsonl`)
+            const had = markOf(file).bytes
+            if (had < f.bytes) {
+              try {
+                const m = await pullFrom(peerOf(pc), f.sessionId, file)
+                job.copied++
+                job.bytes += Math.max(0, m.bytes - had)
+                // A floor's session (F-021) is every PC's; any other first came from there.
+                if (!mine && !bySession(f.sessionId)) setOrigin(f.sessionId, link.name)
+              } catch (e) {
+                log?.warn(`copy all from ${link.name}: ${f.sessionId.slice(0, 8)} not copied: ${message(e)}`)
+              }
+            }
+          }
+          job.done++
+        }
+        job.state = 'done'
+        log?.info(`copied ${job.copied} of ${job.total} conversations from ${link.name} (${Math.round(job.bytes / 1e6)} MB)`)
+      } catch (e) {
+        job.state = 'failed'
+        job.error = message(e)
+      }
+    })()
+    return job
   }
 
   /** A copy of a conversation becomes an agent's chat (transcripts.ts says why a copy): a new agent's, or the one named's. */
@@ -929,13 +1060,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const floor = floorOf(floorId)
     if (intoId) agentOf(floor, intoId)
     const link = mode() === 'member' ? needHub() : null
-    const cwd = findTranscriptCwd(from, projectsDir)
-    if (!cwd) throw apiError(404, `There is no conversation ${from} on this PC, or it never said which folder it was held in`)
-    if (!existsSync(cwd)) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
+    // F-022: from another PC: brought here first.
+    const pc = typeof body.pc === 'string' && body.pc && body.pc !== self().id ? body.pc : null
+    if (pc) await fetchFrom(pc, from)
+    let cwd = findTranscriptCwd(from, projectsDir)
+    let intoDir: string | undefined
+    if (!cwd || !existsSync(cwd)) {
+      // Held in a folder this PC hasn't got (one copied from another PC): its copy goes under the floor's folder here.
+      if (!cwd && !findTranscript(from, projectsDir)) throw apiError(404, `There is no conversation ${from} on this PC`)
+      if (cwd && !origins.has(from) && !pc) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
+      cwd = codeDirOf(floor)
+      intoDir = path.join(projectsDir, encodeProjectPath(cwd))
+    }
     const sid = randomUUID()
     let copy: string
     try {
-      copy = (await copyTranscript(from, sid, projectsDir)).file
+      copy = (await copyTranscript(from, sid, projectsDir, intoDir)).file
     } catch (e) {
       throw apiError(500, `Couldn't copy that conversation: ${message(e)}`)
     }
@@ -977,7 +1117,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** `local`: a member answers it itself; the rest it passes to its hub, which keeps the floors. */
   const routes: [string, RegExp, Handler, 'local'?][] = [
     ['GET', /^\/floors$/, () => answerFloors(), 'local'],
-    ['GET', /^\/sessions$/, async () => ({ sessions: await sessions() }), 'local'],
+    ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
+    ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
+    [
+      'POST',
+      /^\/sessions\/copy-all$/,
+      (_, r) => {
+        if (!isObject(r.body) || typeof r.body.pc !== 'string') throw apiError(400, 'Expected {pc}')
+        return { job: startCopyAll(r.body.pc) }
+      },
+      'local',
+    ],
     ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined) })],
     [
       'POST',
@@ -1191,6 +1341,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (held.get(raw.sessionId)?.holder !== from.id && remote.get(from.id)?.live[raw.sessionId] === undefined) throw apiError(403, `${from.name} isn't running that chat`)
             return toolFor(raw.sessionId, raw.name, raw.arguments)
           })
+        case 'sessions':
+          return answer(raw => ownSessions(pageOf(isObject(raw) ? raw : {})))
+        case 'session-files':
+          return answer(async raw => {
+            const files = await sessionFiles(projectsDir)
+            return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
+          })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
       }
@@ -1214,6 +1371,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
             return chats.type(raw.sessionId, raw.text)
+          })
+        case 'sessions':
+          return answer(raw => ownSessions(pageOf(isObject(raw) ? raw : {})))
+        case 'session-files':
+          return answer(async raw => {
+            const files = await sessionFiles(projectsDir)
+            return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
           })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
@@ -1276,6 +1440,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (liveTimer) clearTimeout(liveTimer)
       if (pushTimer) clearTimeout(pushTimer)
       if (replicaTimer) clearTimeout(replicaTimer)
+      if (originsTimer) clearTimeout(originsTimer)
       if (memberTimer) clearInterval(memberTimer)
       if (stateTimer) clearInterval(stateTimer)
       tail.close()
