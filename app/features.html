@@ -572,7 +572,8 @@
     "said": "one problemthe scroll is too slow fix that",
     "added": "2026-10-31",
     "notes": [
-      "2026-10-31: Built. A wheel step scrolled xterm's default 1 line; now 4, and 15 with Alt held (xterm scrollSensitivity 4, fastScrollSensitivity 15, Alt). Checked: types, lint, the page build. Code: src/agentic/Terminal.tsx."
+      "2026-10-31: Built. A wheel step scrolled xterm's default 1 line; now 4, and 15 with Alt held (xterm scrollSensitivity 4, fastScrollSensitivity 15, Alt). Checked: types, lint, the page build. Code: src/agentic/Terminal.tsx.",
+      "2026-10-31: Shubham said: \"no still it scroll sometimes fast an sometimes one line only\". Two causes. A chat started before F-040 still runs claude's full-screen view, where the wheel is claude's and goes a line at a time: Stop, then Resume it. And xterm rounds a touchpad's or a precision wheel's many small steps unevenly. The page now does the wheel itself, in the plain view: by how far it turned, 4 lines for a mouse step (100 px or 3 lines), a touchpad's small ones adding up to the same, 4 times as far with Alt; the full-screen view is left to claude. Checked: types, lint, the page build."
     ],
     "done": null,
     "doneNote": ""
