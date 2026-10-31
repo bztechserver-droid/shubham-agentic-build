@@ -59,6 +59,10 @@ foreach ($port in 21221, 5173) {
 $folder = [regex]::Escape($here)
 Stop-Matching 'the previous run of this build' { $_.Name -eq 'cmd.exe' -and $_.CommandLine -match $folder -and $_.CommandLine -match 'Start\.cmd' }
 Stop-Matching 'the previous run of this build' { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'agent/main\.ts' -and $_.CommandLine -match '--app' }
+# The Agents section's chats of the agent just stopped, left running on their own by a hard
+# stop: their claude has the app's tools file (agentic\mcp.json). Each picks its conversation
+# back up when opened again.
+Stop-Matching 'an agent chat left running' { $_.Name -eq 'claude.exe' -and $_.CommandLine -match 'shubham-agentic\\agent\\agentic\\mcp\.json' }
 Start-Sleep -Seconds 2
 
 '3. Starting it at logon...'
@@ -71,8 +75,10 @@ Set-Content -Path $launcher -Encoding ASCII -Value @(
 "  $launcher -> $here"
 
 '4. Starting it now...'
+# Through WMI, so it belongs to no window or session this ran from and keeps going when they close.
 $vbs = Join-Path $here 'Start hidden.vbs'
-if ($Role) { & wscript.exe "$vbs" --role $Role } else { & wscript.exe "$vbs" }
+$line = "wscript.exe `"$vbs`"" + $(if ($Role) { " --role $Role" } else { '' })
+$null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $line; CurrentDirectory = $here }
 $up = $false
 for ($i = 0; $i -lt 60 -and -not $up; $i++) {
   Start-Sleep -Seconds 1
