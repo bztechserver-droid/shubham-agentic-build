@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
@@ -20,12 +21,13 @@ const FIRST_CHECK_MS = 30 * 1000
 const LOG_LINES = 400
 const GIT_TIMEOUT_MS = 60 * 1000
 const PUBLISHED_MARK = 'PUBLISHED '
+const DEV_EVERY_MS = 20_000
 
 export type Git = (args: string[], cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>
 
 export const runGit: Git = (args, cwd) =>
   new Promise(resolve => {
-    execFile('git', args, { cwd, windowsHide: true, timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile('git', args, { cwd, windowsHide: true, timeout: GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024 }, (err, stdout, stderr) => {
       const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? ((err as { code: number }).code) : 1) : 0
       resolve({ code, stdout: String(stdout), stderr: String(stderr) })
     })
@@ -65,7 +67,32 @@ export function parseVersion(text: string): BuildVersion | null {
     return null
   }
   if (!isObject(v) || typeof v.version !== 'string' || typeof v.builtAt !== 'string') return null
-  return { version: v.version, commit: typeof v.commit === 'string' ? v.commit : null, dirty: v.dirty === true, builtAt: v.builtAt }
+  return {
+    version: v.version,
+    commit: typeof v.commit === 'string' ? v.commit : null,
+    dirty: v.dirty === true,
+    builtAt: v.builtAt,
+    devHash: typeof v.devHash === 'string' ? v.devHash : null,
+  }
+}
+
+/**
+ * F-026: Dev's files as a fingerprint: its commit, every change to tracked files and every new
+ * file not ignored. Publish records it in the build; the same fingerprint now means nothing new.
+ */
+export async function devFingerprint(dir: string, git: Git = runGit): Promise<string | null> {
+  const [head, diff, others] = await Promise.all([git(['rev-parse', 'HEAD'], dir), git(['diff', 'HEAD', '--binary'], dir), git(['ls-files', '--others', '--exclude-standard', '-z'], dir)])
+  if (head.code !== 0 || diff.code !== 0 || others.code !== 0) return null
+  const h = createHash('sha256').update(head.stdout.trim()).update('\0').update(diff.stdout)
+  for (const f of others.stdout.split('\0').filter(Boolean).sort()) {
+    h.update(`\0${f}\0`)
+    try {
+      h.update(readFileSync(path.join(dir, f)))
+    } catch {
+      // Gone since it was listed.
+    }
+  }
+  return h.digest('hex').slice(0, 20)
 }
 
 /** Dev beside a build: the sibling shubham-agentic-dev folder, or the folder itself when it is Dev. */
@@ -96,7 +123,7 @@ export function createBuild(o: BuildOptions): Build {
 
   const update: BuildInfo['update'] = { state: 'unknown', available: null, checkedAt: null, error: null, can: cannot === null, cannot }
   const publish: NonNullable<BuildInfo['publish']> | null = o.devDir
-    ? { devDir: o.devDir, devCommit: null, devChanges: 0, state: 'idle', startedAt: null, endedAt: null, log: [], published: null, error: null }
+    ? { devDir: o.devDir, devCommit: null, devChanges: 0, pending: null, newest: null, state: 'idle', startedAt: null, endedAt: null, log: [], published: null, error: null }
     : null
   let running: ChildProcess | null = null
   let checking: Promise<BuildInfo> | null = null
@@ -106,14 +133,23 @@ export function createBuild(o: BuildOptions): Build {
     root: o.root,
     current,
     update: { ...update },
-    publish: publish && o.role() === 'hub' ? { ...publish, log: [...publish.log] } : null,
+    publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log] } : null,
   })
+
+  /** Dev against the newest build: published since (the last publish, or one on GitHub), or this one. */
+  let devHash: string | null = null
+  function pendingNow(): { pending: boolean | null; newest: string | null } {
+    const newest = publish?.published ?? update.available ?? current
+    if (!newest) return { pending: null, newest: null }
+    return { pending: newest.devHash && devHash ? newest.devHash !== devHash : null, newest: newest.version }
+  }
 
   async function devStatus() {
     if (!publish) return
     const [head, status] = await Promise.all([git(['rev-parse', '--short', 'HEAD'], publish.devDir), git(['status', '--porcelain'], publish.devDir)])
     publish.devCommit = head.code === 0 ? head.stdout.trim() : null
     publish.devChanges = status.code === 0 ? status.stdout.split('\n').filter(l => l.trim()).length : 0
+    devHash = await devFingerprint(publish.devDir, git)
   }
 
   async function checkNow(): Promise<BuildInfo> {
@@ -209,6 +245,9 @@ export function createBuild(o: BuildOptions): Build {
   const every = setInterval(() => void check(), CHECK_EVERY_MS)
   every.unref()
   void devStatus().catch(() => {})
+  // F-026: Dev looked at again every 20 s, so Publish shows once something changes there.
+  const devEvery = publish ? setInterval(() => void devStatus().catch(() => {}), DEV_EVERY_MS) : null
+  devEvery?.unref()
 
   const routes: Record<string, (r: MountRequest) => unknown> = {
     'GET /info': () => info(),
@@ -231,6 +270,7 @@ export function createBuild(o: BuildOptions): Build {
     close() {
       clearTimeout(first)
       clearInterval(every)
+      if (devEvery) clearInterval(devEvery)
       running?.kill()
     },
   }

@@ -1411,6 +1411,14 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   an `agentic` request `open` {floorId, agentId}, which runs the same there. `team.pcs` lists the PCs
   reachable now. Test: `team.test.ts` (from the Server to the Laptop and back).
 
+## F-026: Publish only when Dev has something new (build.ts, scripts/publish.ts)
+
+- `devFingerprint(dir)`: sha256 (20 hex) of `git rev-parse HEAD`, `git diff HEAD --binary` and every
+  file of `git ls-files --others --exclude-standard` (name and content). Publish writes it to
+  RELEASE.json as `devHash`, taken before anything is built. The hub reads Dev every 20 s and on
+  check; `publish.pending` is false when it equals the newest build's (the last published here, the
+  newer one on GitHub, or the current), null when that build has none. Test: `build.test.ts`.
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.

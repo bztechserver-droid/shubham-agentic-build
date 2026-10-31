@@ -16,6 +16,8 @@ export interface BuildVersion {
   commit: string | null
   dirty: boolean
   builtAt: string
+  /** F-026: a fingerprint of Dev's files it was built from (its commit, its changes, its new files); null for builds from before. */
+  devHash: string | null
 }
 
 export type UpdateState = 'unknown' | 'checking' | 'up-to-date' | 'available' | 'failed'
@@ -44,6 +46,13 @@ export interface BuildInfo {
     /** Dev's commit now (short) and how many files it has changed but not committed. */
     devCommit: string | null
     devChanges: number
+    /**
+     * F-026: whether Dev has anything the newest build hasn't: false hides Publish. Null when it
+     * can't be told (a build from before the fingerprint, or Dev not read yet).
+     */
+    pending: boolean | null
+    /** The newest build, that `pending` is against. */
+    newest: string | null
     state: PublishState
     startedAt: string | null
     endedAt: string | null

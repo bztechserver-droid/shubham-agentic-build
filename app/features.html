@@ -415,6 +415,28 @@ via the threed tos in teh each agnet",
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-026",
+    "title": "No Publish button when there is nothing new to publish",
+    "said": "now wehen we do new publish if thre is nothign to pushih then that publish button should not show please fix that",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. Publish now records in the build a fingerprint of Dev's files (its commit, every change to tracked files, every new file not ignored). The Build page compares Dev now (looked at every 20 s and on Check now) with the newest build (the last one published here, a newer one on GitHub, or this PC's): the same, and the Publish button is gone, with \"Nothing new in Dev since build X: nothing to publish\"; it shows again once Dev changes. Builds from before the fingerprint can't be compared, so the button shows until the first publish after this one. Checked: a build test (hidden when Dev matches, back after a new file), all agent tests, types, lint, the page build. Code: agent/build.ts (devFingerprint), agent/scripts/publish.ts, src/pages/Build.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-027",
+    "title": "Agents keeps its view when you go to another section and back",
+    "said": "one more thing when i swithc the tabs liek i go to devices or buidl form agents it looses the agetns wala view please fix",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. Agents' view (its floor, tab and agent) is in its address; the menu's Agents link always went to plain /agents, so coming back from Devices or Build opened the first floor. Now the link goes back to where Agents was left in this browser tab, as Devices goes back to an open Control session. The windows' agents, their count and layout, and the sidebar were already remembered. The chats' terminals reconnect on return (each shows its recent screen again). Checked: types, lint, the page build. Code: src/app/Shell.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
