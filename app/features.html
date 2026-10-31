@@ -611,6 +611,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-045",
+    "title": "The phone's keyboard opens only when the terminal is tapped",
+    "said": "now one problem that I have is that without me tapping on the input keyboard of the terminal, my keyboard automatically pops up. I don't want that. I don't want my keyboard to automatically pop up just when I switch from the build to the agents.\n\nWhen I go to the build and then I come to the agents, automatically that keyboard comes up because it thinks that I'm going to give an input but I don't want that. When I click on the input box then my phone keyboard should come up.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: The window with the keyboard had its terminal focused by the page itself, when Agents opened (its chats connect), when a window was picked, and when a chat connected; on a phone, a focused terminal opens the on-screen keyboard. Built: on a touch screen with no mouse, the page never focuses a terminal by itself; a tap on the terminal does, as on any text box (xterm's own). With a mouse and keyboard it is as before (the picked window's terminal takes the keys at once). Checked: types, lint, the page build. Code: src/agentic/Terminal.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
