@@ -137,12 +137,13 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'memory_search',
     description:
-      "Search your floor's SHARED MEMORY — notes saved by any chat on the floor, or by the human. Use before starting work on a topic, and whenever the user asks \"did we decide X\" or another chat may know.",
+      "Search your floor's SHARED MEMORY — notes saved by any chat on the floor, or by the human. Use before starting work on a topic, and whenever the user asks \"did we decide X\" or another chat may know. `entries` are your floor's notes by keyword, as always; `hits` (F-051) search ALL of the app's memory — the wiki the librarian keeps, every floor's notes, and what Shubham said in the floor chats — by meaning as well as words, so a question phrased differently, or in Hinglish, still finds it. Open a hit in full with memory_read.",
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Keywords to search for.' },
-        limit: { type: 'number', description: 'Max results (default 10).' },
+        query: { type: 'string', description: 'What to look for: keywords, or the question in your own words.' },
+        limit: { type: 'number', description: 'Max results of each kind (default 10).' },
+        mode: { type: 'string', enum: ['all', 'keyword'], description: 'all (default): entries and hits; keyword: only your floor\'s notes by keyword, as before.' },
       },
       required: ['query'],
       additionalProperties: false,
@@ -154,6 +155,17 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: { limit: { type: 'number', description: 'Max entries (default 10).' } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'memory_read',
+    description:
+      "Read from the app's MEMORY in full (F-051): a wiki page by its path (\"projects/shubham-agentic\", \"core\", \"index\" for every page), or a hit by its id from memory_search or from the memory shown with a message (\"turn:…\" is what was said in a floor chat and the answer, \"note:…\" a note).",
+    inputSchema: {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'A wiki page path, or a hit id (wiki:…, note:…, turn:…).' } },
+      required: ['ref'],
       additionalProperties: false,
     },
   },

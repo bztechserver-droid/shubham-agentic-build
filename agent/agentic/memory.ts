@@ -32,6 +32,8 @@ export interface MemoryStore {
   remove(scope: string, id: string): boolean
   /** The scope's file goes (its floor was deleted). */
   drop(scope: string): void
+  /** F-051: every note, oldest first (the memory layer indexes them all). */
+  all(scope: string): MemoryEntry[]
 }
 
 function cleanTags(v: unknown): string[] {
@@ -155,6 +157,10 @@ export function createMemoryStore(dir: string): MemoryStore {
 
     drop(scope) {
       rmSync(fileOf(scope), { force: true })
+    },
+
+    all(scope) {
+      return read(scope)
     },
   }
 }

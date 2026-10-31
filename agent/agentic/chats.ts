@@ -54,7 +54,8 @@ const strip = (s: string) => s.replace(OSC_RE, '').replace(ANSI_RE, '')
 //   asking   "Enter to confirm · Esc to cancel"
 const TURN_RUNNING_RE = /esctointerrupt/i
 const TURN_DONE_RE = /·done\d|·done$/i
-const TURN_QUESTION_RE = /entertoconfirm|doyouwant|doyoutrust|trustthisfolder|selectloginmethod/i
+// F-050: "Enter to select" is claude's own question menu (AskUserQuestion), as 2.1.316 draws it.
+const TURN_QUESTION_RE = /entertoconfirm|entertoselect|doyouwant|doyoutrust|trustthisfolder|selectloginmethod/i
 const TURN_IDLE_RE = /automodeon|\?forshortcuts/i
 const PROMPT_READY_RE = /❯|│>|\?forshortcuts|automodeon/i
 /** "Do you trust the files in this folder?": answered yes when it shows at start (see answerGates). */
@@ -138,6 +139,8 @@ export interface ChatPoolOptions {
   env?: NodeJS.ProcessEnv
   /** Ends a process and its children (taskkill /t). Tests with a fake pty, whose pid is some other process's, pass a no-op. */
   treeKill?: (pid: number) => void
+  /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
+  settings?: string
 }
 
 /** taskkill /f /t: pty.kill() ends the console, and claude's own children (its MCP servers) go with /t. */
@@ -329,6 +332,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', o.mcpConfig]
       if (s.model) args.push('--model', s.model)
       if (s.effort) args.push('--effort', s.effort)
+      if (o.settings) args.push('--settings', o.settings)
       const file = /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }

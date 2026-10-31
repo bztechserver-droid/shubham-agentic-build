@@ -28,15 +28,18 @@ import {
   type TerminalClientMessage,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
+import type { MemoryKind } from '../../shared/memory.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
-import { createChatPool, type ChatPool, type PtySpawn } from './chats.ts'
+import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
+import { noMeaning, type Embedder } from './embedder.ts'
+import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
 import { answer, pullFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
 import {
@@ -115,6 +118,12 @@ export interface AgenticOptions {
   claudeJson?: string
   /** Tests: how often a running chat's JSONL is looked at for what to send on (1 s). */
   syncEveryMs?: number
+  /**
+   * F-051: the memory layer. meaning: the embedding model (main.ts turns it on; left out, search
+   * goes by words and nothing is downloaded); start: started with the agent rather than at first
+   * use. The rest are for tests.
+   */
+  memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
 }
 
 export interface Agentic {
@@ -208,6 +217,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const shim = fileURLToPath(new URL('./mcp-shim.ts', import.meta.url))
   // The shim is named here once; the key it needs comes from the chat's own terminal.
   writeAtomic(mcpConfig, `${json({ mcpServers: { [MCP_SERVER_NAME]: { type: 'stdio', command: process.execPath, args: [shim] } } })}\n`)
+  // F-051: the memory's hook (memory-hook.ts), for every chat's --settings, which claude adds to
+  // the user's own settings. One command line, run by claude's shell: both paths quoted, with
+  // forward slashes (a folder like "Shubham's Agent" has a space and an apostrophe).
+  const hooksFile = path.join(o.dir, 'hooks.json')
+  const fwd = (p: string) => p.replace(/\\/g, '/')
+  const hookScript = fileURLToPath(new URL('./memory-hook.ts', import.meta.url))
+  writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}"`, timeout: 10 }] }] } })}\n`)
 
   /** 'alone': no hub (as before F-021); 'hub': it keeps the floors; 'member': it shows its hub's. */
   const mode = (): 'alone' | 'hub' | 'member' => (!team ? 'alone' : team.role() === 'hub' ? 'hub' : team.hub() ? 'member' : 'alone')
@@ -225,6 +241,50 @@ export function createAgentic(o: AgenticOptions): Agentic {
     pushState()
   })
   const memory = createMemoryStore(path.join(o.dir, 'memory'))
+
+  // F-051: the memory layer, kept on the hub (or a PC on its own); a member's chats reach it
+  // through the hub, as their tool calls do. Started with the agent when main.ts says so, else
+  // at first use; meaning (the embedding model) only when main.ts turns it on.
+  const layer: MemoryLayer = createMemoryLayer({
+    dir: o.dir,
+    modelsDir: path.join(o.dir, '..', 'models'),
+    notes: id => memory.all(id),
+    floors: () => floors.list(),
+    transcript: sid => findTranscript(sid, projectsDir),
+    projectsDir,
+    token: o.token,
+    claude: () => o.claude ?? findClaude(),
+    log,
+    embedder: o.memory?.embedder ?? (o.memory?.meaning ? undefined : noMeaning()),
+    timers: o.memory?.timers,
+    claudeArgs: o.memory?.claudeArgs,
+    active: () => mode() !== 'member',
+    live: !!o.memory?.start,
+  })
+  let layerStarted: Promise<void> | null = null
+  /** The memory layer, started (here: this PC keeps the memory). */
+  async function memoryLayer(): Promise<MemoryLayer> {
+    layerStarted ??= layer.start()
+    await layerStarted
+    return layer
+  }
+  if (o.memory?.start && mode() !== 'member') void memoryLayer().catch(e => log?.warn(`memory: couldn't start: ${message(e)}`))
+  /** F-051, on a member: the hub's memory section for its chats' briefs, as last fetched. */
+  let memberBrief = ''
+  function memoryBrief(): string {
+    if (mode() !== 'member') return layer.brief()
+    const link = team?.hub()?.link
+    if (link)
+      void request<{ text: string }>(link, 'http', { method: 'GET', rest: '/memory/brief', query: '', body: undefined })
+        .then(r => (memberBrief = typeof r?.text === 'string' ? r.text : memberBrief))
+        .catch(() => {})
+    return memberBrief
+  }
+  // A member keeps its copy fresh, so a chat started there has the hub's latest.
+  const memberBriefTimer = setInterval(() => {
+    if (mode() === 'member') memoryBrief()
+  }, 5 * 60_000)
+  memberBriefTimer.unref()
 
   // ---------------------------------------------------------------------------------------
   // F-021 state: on the hub, who holds what and its members' live chats; on a member, the copy
@@ -352,6 +412,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     treeKill: o.treeKill,
     claude: o.claude,
     token: o.token,
+    // F-051: recall in every prompt, once the memory layer is on (main.ts).
+    settings: o.memory?.start ? hooksFile : undefined,
     onChange: () => {
       // A chat that ended lets its session go (after its last write is sent on).
       const now = new Set(Object.keys(chats.states()))
@@ -416,7 +478,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch (e) {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent))
+    // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on.
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : ''))
     chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, effort: agent.effort, resume, cols: size.cols, rows: size.rows })
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
     return resume
@@ -992,10 +1055,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
         memoryChanged(floor.id)
         return json({ saved: entry.id })
       }
-      case 'memory_search':
-        return json({ entries: memory.search(floor.id, typeof args.query === 'string' ? args.query : '', typeof args.limit === 'number' ? args.limit : 10) })
+      case 'memory_search': {
+        const query = typeof args.query === 'string' ? args.query : ''
+        const limit = typeof args.limit === 'number' ? args.limit : 10
+        const entries = memory.search(floor.id, query, limit)
+        // F-051: the floor's notes by keyword as before, and hits from all of the memory beside them.
+        if (args.mode === 'keyword') return json({ entries })
+        const hits = query.trim() ? await (await memoryLayer()).search(query, { limit, excludeSession: sid }) : []
+        return json({ entries, hits })
+      }
       case 'memory_recent':
         return json({ entries: memory.recent(floor.id, typeof args.limit === 'number' ? args.limit : 10) })
+      case 'memory_read':
+        return (await memoryLayer()).read(typeof args.ref === 'string' ? args.ref : '')
+      // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
+      case 'memory_recall':
+        return (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' })
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
         const model = args.model
@@ -1022,6 +1097,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function memoryChanged(floorId: string) {
     emit({ t: 'memory', floorId })
     for (const s of subs.values()) writeLine(s, { t: 'memory', floorId })
+    // F-051: searched at once (once the layer has started).
+    layer.notesChanged(floorId)
   }
 
   // ---------------------------------------------------------------------------------------
@@ -1433,6 +1510,50 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
+    // F-051: the memory's hook (memory-hook.ts) for a chat's prompt, with that chat's key, as /mcp/call.
+    [
+      'POST',
+      /^\/mcp\/recall$/,
+      async (_, r) => {
+        const key = r.headers['x-sad-chat-key']
+        if (typeof key !== 'string' || !key) throw apiError(401, 'Missing x-sad-chat-key')
+        if (!isObject(r.body) || typeof r.body.prompt !== 'string') throw apiError(400, 'Expected {prompt}')
+        return { text: await callTool(key, 'memory_recall', { prompt: r.body.prompt.slice(0, 20_000) }) }
+      },
+      'local',
+    ],
+    // F-051: the memory layer for the page (the Memory tab); a member's go to the hub, which keeps it.
+    ['GET', /^\/memory\/status$/, async () => (await memoryLayer()).status()],
+    [
+      'GET',
+      /^\/memory\/search$/,
+      async (_, r) => {
+        const kinds = (r.query.get('kinds') ?? '').split(',').filter((k): k is MemoryKind => k === 'wiki' || k === 'note' || k === 'turn')
+        const limit = Number(r.query.get('limit')) || 20
+        return { hits: await (await memoryLayer()).search(r.query.get('q') ?? '', { limit, kinds }) }
+      },
+    ],
+    ['GET', /^\/memory\/wiki$/, async () => ({ pages: (await memoryLayer()).pages() })],
+    [
+      'GET',
+      /^\/memory\/page$/,
+      async (_, r) => {
+        const page = (await memoryLayer()).page(r.query.get('path') ?? '')
+        if (!page) throw apiError(404, 'No such page in the wiki')
+        return { page }
+      },
+    ],
+    ['GET', /^\/memory\/read$/, async (_, r) => ({ text: (await memoryLayer()).read(r.query.get('ref') ?? '') })],
+    ['GET', /^\/memory\/brief$/, async () => ({ text: (await memoryLayer()).brief() })],
+    [
+      'POST',
+      /^\/memory\/compile$/,
+      async (_, r) => {
+        const b = isObject(r.body) ? r.body : {}
+        return { run: (await memoryLayer()).compile(b.mode === 'tidy' ? 'tidy' : 'ingest', 'now') }
+      },
+    ],
+    ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await memoryLayer()).setSettings(r.body) })],
   ]
 
   /** Runs the route `rest` names; `forward` (a member) passes a non-local one to its hub instead. */
@@ -1697,7 +1818,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   const mount: ApiMount = {
     prefix: AGENTIC_PREFIX,
-    ownAuth: rest => rest === '/mcp/call',
+    // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
+    ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
     http: r => route(r, mode() === 'member' ? toHub : undefined),
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)
@@ -1730,6 +1852,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (stateTimer) clearInterval(stateTimer)
       tail.close()
       chatFeeds.close()
+      clearInterval(memberBriefTimer)
+      layer.close()
       chats.closeAll()
       sub?.stream.destroy()
       sub = null
