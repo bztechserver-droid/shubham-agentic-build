@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync } from 'node:fs'
 import {
   AGENT_BRIEF_MAX,
+  AGENT_EFFORTS,
   AGENT_MODELS,
   FLOOR_PREAMBLE_MAX,
   MAX_AGENTS_PER_FLOOR,
+  type AgentEffort,
   type AgentModel,
   type Floor,
   type FloorAgent,
@@ -30,6 +32,7 @@ const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.i
 const strList = (v: unknown) =>
   Array.isArray(v) ? [...new Set(v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim().slice(0, 200)))].slice(0, LIST_MAX) : []
 const isModel = (v: unknown): v is AgentModel => typeof v === 'string' && (AGENT_MODELS as readonly string[]).includes(v)
+const isEffort = (v: unknown): v is AgentEffort => typeof v === 'string' && (AGENT_EFFORTS as readonly string[]).includes(v)
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 /** F-021: a floor's folder on each of the hub's other PCs: device id to an absolute path. */
 const folderMap = (v: unknown): Record<string, string> =>
@@ -62,6 +65,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     md: str(a.md, AGENT_BRIEF_MAX),
     sessionId: typeof a.sessionId === 'string' && SESSION_ID_RE.test(a.sessionId) ? a.sessionId : null,
     model: isModel(a.model) ? a.model : '',
+    effort: isEffort(a.effort) ? a.effort : '',
     skills: strList(a.skills),
     mcpServers: strList(a.mcpServers),
     x: num(a.x, 80 + (index % 4) * 250),
@@ -319,6 +323,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
         reportsTo = manager.id
       }
       if (req.model !== undefined && !isModel(req.model)) throw apiError(400, 'model is opus, sonnet or haiku')
+      if (req.effort !== undefined && !isEffort(req.effort)) throw apiError(400, 'effort is low, medium, high, xhigh or max')
       const index = floor.agents.length
       // The first agent on an empty floor is its boss, at the boss's desk; the rest go in rows below.
       const desk = index === 0 ? { x: 320, y: 40 } : { x: 80 + ((index - 1) % 4) * 250, y: 240 + Math.floor((index - 1) / 4) * 190 }
@@ -329,6 +334,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           md: typeof req.md === 'string' && req.md.trim() ? req.md : `# ${name}\n\nWhat this agent is for.\n`,
           reportsTo,
           model: req.model ?? '',
+          effort: req.effort ?? '',
           ...desk,
         },
         index,

@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url'
 import {
   AGENTIC_PREFIX,
   AGENTS_OFF_STATUS,
+  AGENT_EFFORTS,
   AGENT_MODELS,
+  type AgentEffort,
   type AgentModel,
   type AgenticEvent,
   type AgenticTeam,
@@ -408,7 +410,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
     const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent))
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, resume, cols: size.cols, rows: size.rows })
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, effort: agent.effort, resume, cols: size.cols, rows: size.rows })
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
     return resume
   }
@@ -914,6 +916,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
             : await openChat(f.id, a.id, { takeOver: args.takeOver === true })
         return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
       }
+      case 'app_set_effort': {
+        // F-049: kept on the agent (its chat starts with --effort every time) and, when its chat
+        // is running and waiting, typed into it as /effort, which sets this session's at once.
+        const { floor: f, agent: a } = findAgent(args.floor, args.agent)
+        const raw = typeof args.level === 'string' ? args.level.trim().toLowerCase() : ''
+        const level = (raw === 'default' ? '' : raw) as AgentEffort
+        if (!(AGENT_EFFORTS as readonly string[]).includes(level)) throw apiError(400, 'level is low, medium, high, xhigh, max, or default')
+        floors.patch(f.id, { agents: f.agents.map(x => (x.id === a.id ? { ...x, effort: level } : x)) })
+        const w = a.sessionId ? whereAll()[a.sessionId] : undefined
+        const kept = level ? `${a.name} on ${f.name} starts on ${level} effort from now on` : `${a.name} on ${f.name} starts on the CLI's own effort from now on`
+        if (!w || !a.sessionId) return `${kept}; its chat isn't running, so that is when it next starts.`
+        if (!level) return `${kept}; its running chat keeps the effort it has until it starts again.`
+        if (a.sessionId === sid) return `${kept}. This is your own chat: it keeps its effort until it starts again (type /effort ${level} in it to change it now).`
+        if (w.state === 'running') return `${kept}. Its chat is working right now, so it keeps its effort until it starts again; ask again once it is waiting to set it at once.`
+        if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, `/effort ${level}`))) return `${kept}; its chat stopped before it could be set now.`
+        log?.info(`${agent.name} set ${a.name}'s effort to ${level}`)
+        return `${kept}, and its running chat (on ${w.name}) is on ${level} now: /effort ${level} was typed into it.`
+      }
       case 'app_stop_chat': {
         const target = anyChat(args.sessionId)
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
@@ -973,15 +993,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
         const model = args.model
         if (model !== undefined && !(AGENT_MODELS as readonly unknown[]).includes(model)) throw apiError(400, 'model is opus, sonnet or haiku')
+        // F-049: hired onto an effort, as on a model.
+        const effort = args.effort
+        if (effort !== undefined && !(AGENT_EFFORTS as readonly unknown[]).includes(effort)) throw apiError(400, 'effort is low, medium, high, xhigh or max')
         const { agent: hired, floor: after } = floors.addAgent(floor.id, {
           name: typeof args.name === 'string' ? args.name : '',
           role: typeof args.role === 'string' ? args.role : '',
           md: typeof args.md === 'string' ? args.md : undefined,
           reportsTo: typeof args.reportsTo === 'string' && args.reportsTo.trim() ? args.reportsTo : agent.id,
           model: model as AgentModel | undefined,
+          effort: effort as AgentEffort | undefined,
         })
         log?.info(`${agent.name} hired ${hired.name} on ${floor.name}`)
-        return json({ hired: hired.name, role: hired.role, total: after.agents.length, note: 'No chat is started yet; the human opens it from the floor.' })
+        return json({ hired: hired.name, role: hired.role, effort: hired.effort || 'inherit', total: after.agents.length, note: 'No chat is started yet; the human opens it from the floor.' })
       }
       default:
         throw apiError(404, `No tool called ${name}`)

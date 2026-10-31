@@ -54,6 +54,17 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: 'app_set_effort',
+    description:
+      "Set how hard an agent's chat thinks (claude's effort: low, medium, high, xhigh or max; default for the CLI's own), on any floor and PC. Kept on the agent, so its chat starts on it every time; if its chat is running and waiting, it is set there at once too (this session's /effort). A chat that is working keeps its effort until it starts again.",
+    inputSchema: {
+      type: 'object',
+      properties: { ...agentRef, level: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'default'] } },
+      required: ['floor', 'agent', 'level'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'app_stop_chat',
     description: "Stop a running chat (any floor, any PC). Its conversation is kept; opening it again picks it back up. Never your own.",
     inputSchema: { type: 'object', properties: { sessionId: sessionArg }, required: ['sessionId'], additionalProperties: false },
@@ -158,6 +169,7 @@ export const TOOLS: ToolDef[] = [
         md: { type: 'string', description: "The agent's brief in markdown — what it owns, its boundaries, how to report back. This becomes its system prompt." },
         reportsTo: { type: 'string', description: 'Name of the agent it reports to. Defaults to you.' },
         model: { type: 'string', enum: ['opus', 'sonnet', 'haiku'], description: 'Optional model to pin it to. Omit to inherit.' },
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'Optional effort its chat starts on every time (claude --effort). Omit to inherit.' },
       },
       required: ['name'],
       additionalProperties: false,

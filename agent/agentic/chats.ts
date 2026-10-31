@@ -77,6 +77,8 @@ export interface StartChat {
   cwd: string
   briefPath: string
   model: AgentModel
+  /** F-049: claude --effort (low ... max); none: the CLI's own. */
+  effort?: string
   /** claude --resume <id> rather than --session-id <id>: the conversation exists. */
   resume: boolean
   cols?: number
@@ -326,6 +328,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
       const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', o.mcpConfig]
       if (s.model) args.push('--model', s.model)
+      if (s.effort) args.push('--effort', s.effort)
       const file = /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }

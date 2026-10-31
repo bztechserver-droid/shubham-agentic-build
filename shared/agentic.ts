@@ -16,6 +16,10 @@ export const AGENTS_OFF_STATUS = 503
 export const AGENT_MODELS = ['', 'opus', 'sonnet', 'haiku'] as const
 export type AgentModel = (typeof AGENT_MODELS)[number]
 
+/** F-049: how hard an agent's chat thinks (claude --effort); '' lets the claude CLI choose. */
+export const AGENT_EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+export type AgentEffort = (typeof AGENT_EFFORTS)[number]
+
 /** At most this many agents on one floor (agentic-claude-manager's limit). */
 export const MAX_AGENTS_PER_FLOOR = 24
 /** A floor's preamble, given to every chat on it before the agent's own brief. */
@@ -37,6 +41,8 @@ export interface FloorAgent {
   /** Its chat, once opened: the claude session id. The one live binding. */
   sessionId: string | null
   model: AgentModel
+  /** F-049: its chat starts with claude --effort this. */
+  effort: AgentEffort
   /** Skills and MCP servers it was given; named in its brief (advisory, as in the original). */
   skills: string[]
   mcpServers: string[]
@@ -128,6 +134,7 @@ export interface NewAgent {
   /** Its manager, by id or name; the boss when left out. */
   reportsTo?: string
   model?: AgentModel
+  effort?: AgentEffort
 }
 
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */
