@@ -16,7 +16,7 @@ import type { Logger } from './log.ts'
 //              with the API token added only for the app's own pages (local-host.ts fromApp,
 //              Vite's own rule), so the API stays guarded exactly as in dev
 // As Vite does, it answers only a Host that is an IP, localhost or *.localhost (a page that
-// rebound its own name to this PC is refused), and it listens on localhost only.
+// rebound its own name to this PC is refused), and it listens on this PC's loopbacks only.
 
 export interface UiServerOptions {
   /** The page port (0 picks one, for tests). */
@@ -71,7 +71,7 @@ function forwardHeaders(req: IncomingMessage, apiPort: number, token: string | n
   return headers
 }
 
-export function startUiServer(o: UiServerOptions): Promise<UiServer> {
+export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
   const root = path.resolve(o.appDir)
   const log = o.log
   const sockets = new Set<Duplex>()
@@ -136,7 +136,7 @@ export function startUiServer(o: UiServerOptions): Promise<UiServer> {
     req.pipe(upstream)
   }
 
-  const server = http.createServer((req, res) => {
+  function onRequest(req: IncomingMessage, res: ServerResponse) {
     if (!hostAllowed(req.headers.host)) return plain(res, 403, BLOCKED)
     const url = new URL(req.url ?? '/', 'http://app')
     if (url.pathname === AGENT_API_PREFIX || url.pathname.startsWith(`${AGENT_API_PREFIX}/`)) return api(req, res)
@@ -145,11 +145,12 @@ export function startUiServer(o: UiServerOptions): Promise<UiServer> {
       if (!res.headersSent) plain(res, 500, 'Internal error')
       else res.destroy()
     })
-  })
+  }
 
-  // A WebSocket for /agent-api: the handshake goes on to the agent with the token added for
-  // the app's own pages, then bytes both ways; either side closing closes the other.
-  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  // A WebSocket for /agent-api (the state, a screen's pipe, the keys, the agents' terminals): the
+  // handshake goes on to the agent with the token added for the app's own pages, then bytes both
+  // ways as they come, whatever their size; either side closing closes the other.
+  function onUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
     socket.on('error', () => {})
     const url = new URL(req.url ?? '/', 'http://app')
     if (!hostAllowed(req.headers.host) || !url.pathname.startsWith(`${AGENT_API_PREFIX}/`)) {
@@ -180,25 +181,49 @@ export function startUiServer(o: UiServerOptions): Promise<UiServer> {
     })
     socket.on('close', done)
     upstream.on('close', done)
-  })
+  }
 
-  return new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(o.port, o.host ?? 'localhost', () => {
-      server.off('error', reject)
-      server.on('error', e => log?.error(e.message))
-      const port = (server.address() as net.AddressInfo).port
-      log?.info(`the app's page: http://localhost:${port} (from ${root})`)
-      resolve({
-        port,
-        close: () =>
-          new Promise<void>(r => {
-            for (const s of sockets) s.destroy()
-            sockets.clear()
-            server.close(() => r())
-            server.closeAllConnections()
-          }),
+  const make = () => http.createServer(onRequest).on('upgrade', onUpgrade)
+  const listen = (server: http.Server, port: number, host: string) =>
+    new Promise<number>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(port, host, () => {
+        server.off('error', reject)
+        server.on('error', e => log?.error(e.message))
+        resolve((server.address() as net.AddressInfo).port)
       })
     })
-  })
+
+  // localhost as Vite has it, on both loopbacks: whatever reaches localhost:5173 (a browser here,
+  // the remote gate for the phone) may come over either. Never on the network.
+  const hosts = o.host ? [o.host] : ['127.0.0.1', '::1']
+  const servers = [make()]
+  const port = await listen(servers[0], o.port, hosts[0])
+  for (const host of hosts.slice(1)) {
+    const extra = make()
+    try {
+      await listen(extra, port, host)
+      servers.push(extra)
+    } catch (e) {
+      // No IPv6 here, most often: 127.0.0.1 alone serves it.
+      log?.warn(`the page isn't on ${host} too: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  log?.info(`the app's page: http://localhost:${port} (from ${root})`)
+  return {
+    port,
+    close: async () => {
+      for (const s of sockets) s.destroy()
+      sockets.clear()
+      await Promise.all(
+        servers.map(
+          s =>
+            new Promise<void>(r => {
+              s.close(() => r())
+              s.closeAllConnections()
+            }),
+        ),
+      )
+    },
+  }
 }
