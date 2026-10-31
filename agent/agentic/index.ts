@@ -1348,6 +1348,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const files = await sessionFiles(projectsDir)
             return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
           })
+        case 'terminal':
+          return serveTerminal
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
       }
@@ -1379,6 +1381,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const files = await sessionFiles(projectsDir)
             return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
           })
+        case 'terminal':
+          return serveTerminal
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
       }
@@ -1393,6 +1397,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const sid = query.get('session') ?? ''
     return (ws: WsSocket) => {
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
+      // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
+      if (!detach && remoteTerminal(sid, ws)) return
       if (!detach) {
         ws.sendText(JSON.stringify({ t: 'exit', code: null }))
         return ws.close(1000, "That chat isn't running")
@@ -1409,6 +1415,79 @@ export function createAgentic(o: AgenticOptions): Agentic {
       })
       ws.onClose(detach)
     }
+  }
+
+  /**
+   * F-023, Use here: a chat that runs on another PC, its terminal on this PC's page. The link
+   * carries the same messages the page's socket does, one JSON line each; it keeps running
+   * there, and what is typed here goes to it. False when it isn't running on a PC within reach.
+   */
+  function remoteTerminal(sid: string, ws: WsSocket): boolean {
+    const w = whereAll()[sid]
+    if (!w || w.id === self().id) return false
+    let link: LinkPeer
+    try {
+      link = peerOf(w.id)
+    } catch {
+      return false
+    }
+    let stream: Duplex | null = null
+    let closed = false
+    const early: string[] = []
+    ws.onText(raw => {
+      if (stream) relayLine(stream, raw)
+      else early.push(raw)
+    })
+    ws.onClose(() => {
+      closed = true
+      stream?.destroy()
+    })
+    link.open({ op: 'terminal' }).then(
+      s => {
+        if (closed) return void s.destroy()
+        stream = s
+        writeLine(s, { sessionId: sid })
+        for (const raw of early.splice(0)) relayLine(s, raw)
+        readLines(s, m => ws.sendText(JSON.stringify(m)))
+        s.on('close', () => !closed && ws.close(1000, `The link to ${link.name} closed`))
+      },
+      (e: unknown) => {
+        ws.sendText(JSON.stringify({ t: 'exit', code: null }))
+        ws.close(1000, `${link.name} didn't open it: ${message(e)}`)
+      },
+    )
+    log?.info(`chat ${sid.slice(0, 8)}: used here, running on ${link.name}`)
+    return true
+  }
+
+  /** A page's terminal message on to the link; one that isn't JSON is dropped, as the local socket drops it. */
+  function relayLine(stream: Duplex, raw: string) {
+    try {
+      writeLine(stream, JSON.parse(raw))
+    } catch {
+      // Not a message.
+    }
+  }
+
+  /** F-023: the far end of Use here: this PC's chat, viewed and typed into from another PC's page. */
+  function serveTerminal(stream: Duplex) {
+    let sid: string | null = null
+    let detach: (() => void) | null = null
+    readLines(stream, raw => {
+      if (!isObject(raw)) return
+      if (sid === null) {
+        sid = typeof raw.sessionId === 'string' ? raw.sessionId : ''
+        detach = chats.attach(sid, { send: m => void writeLine(stream, m) })
+        if (!detach) {
+          writeLine(stream, { t: 'exit', code: null })
+          stream.end()
+        }
+        return
+      }
+      if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d)
+      else if (raw.t === 'size' && typeof raw.cols === 'number' && typeof raw.rows === 'number') chats.resize(sid, raw.cols, raw.rows)
+    })
+    stream.on('close', () => detach?.())
   }
 
   const mount: ApiMount = {

@@ -1396,6 +1396,15 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   this one hasn't got or has less of is pulled into the same project folder name, skipping chats
   running here. Tests: `team.test.ts` (listed with its PC, brought onto a floor, all copied).
 
+## F-023: Use here (agentic/index.ts)
+
+- The page's `/agentic/terminal?session=` for a chat running on another of the hub's PCs opens an
+  `agentic` stream `terminal` to it: first line {sessionId}, then the page's messages one JSON line
+  each, and the far end's (the replayed screen, output, exit) back. The far end attaches it as one
+  more viewer of the chat (its size messages resize it, as a local viewer's do). Messages sent
+  before the stream opens are kept and sent once it does. Test: `team.test.ts` (screen to the
+  laptop, keys to the Server, still running there).
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
