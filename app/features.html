@@ -600,6 +600,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-044",
+    "title": "Smooth scrolling in a chat terminal",
+    "said": "Now I want smooth scroll. If I scroll it should keep on scrolling until I stop. Like you know how it gradually goes down: we scroll and it keeps on scrolling. Then we stop and it stops scrolling. I want that.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built, in place of F-043's coasting (which went on after the wheel stopped). The wheel no longer jumps: what it turns is owed, and every frame (60 a second) the terminal moves a quarter of what is owed, at least a line, so it glides while the wheel turns, easing out, and stops when the wheel stops (what is left is never more than a screen and a half, gone in a few frames). A fast spin still counts for more, up to 6 times, and Alt 4 times; turning the wheel the other way, or a key, stops at once. Checked: types, lint, the page build. Code: src/agentic/Terminal.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
