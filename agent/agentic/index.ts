@@ -27,12 +27,14 @@ import {
   type OpenChatRequest,
   type TerminalClientMessage,
 } from '../../shared/agentic.ts'
+import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, type ChatPool, type PtySpawn } from './chats.ts'
+import { createChatFeeds } from './chatview.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
@@ -73,6 +75,9 @@ const TARGET_WINDOW_MAX = 6
 /** broadcast_to_chats: one per floor every 10 s. */
 const BROADCAST_COOLDOWN_MS = 10_000
 const MAX_RELAY_TEXT = 10_000
+/** F-050: the longest message the chat view types into a chat, and how long a new chat is taken to be at its start questions. */
+const MAX_SAY_TEXT = 20_000
+const SAY_FRESH_MS = 20_000
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** F-021: the hub's state to its members at least this often (their catch-up runs off it). */
 const STATE_EVERY_MS = 30_000
@@ -192,6 +197,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const log = o.log
   const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
+  // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
+  const chatFeeds = createChatFeeds({ projectsDir, log: o.log })
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
@@ -1336,6 +1343,55 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
+    // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
+    [
+      'GET',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/,
+      ([id, agentId], r) => {
+        const a = agentOf(floorOf(id), agentId)
+        const before = Number(r.query.get('before'))
+        if (!a.sessionId || !Number.isFinite(before)) return { items: [], before: null }
+        return chatFeeds.history(a.sessionId, before, Number(r.query.get('limit')) || undefined)
+      },
+      'local',
+    ],
+    [
+      'GET',
+      /^\/previews$/,
+      (): PreviewsAnswer => {
+        const previews: PreviewsAnswer['previews'] = {}
+        for (const f of allFloors()) {
+          for (const a of f.agents) {
+            const p = a.sessionId ? chatFeeds.preview(a.sessionId) : null
+            if (p) previews[a.id] = p
+          }
+        }
+        return { previews }
+      },
+      'local',
+    ],
+    [
+      'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/say$/,
+      async ([id, agentId], r): Promise<SayAnswer> => {
+        // A message typed to the agent the way the terminal does it (a paste, then Enter); a chat
+        // that isn't running is started or picked back up first, and the message follows once it is ready.
+        const body = text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)
+        const agent = agentOf(floorOf(id), agentId)
+        const at = agent.sessionId ? whereAll()[agent.sessionId] : undefined
+        if (agent.sessionId && at) {
+          const fresh = at.id === self().id && Date.now() - Date.parse(chats.info(agent.sessionId)?.startedAt ?? '') < SAY_FRESH_MS
+          // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
+          if (fresh) chats.typeWhenReady(agent.sessionId, body)
+          else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, `${agent.name}'s chat on ${at.name} can't be typed into right now`)
+          return { ok: true, started: false }
+        }
+        const opened = await openChat(id, agentId, {})
+        chats.typeWhenReady(opened.sessionId, body)
+        return { ok: true, started: true }
+      },
+      'local',
+    ],
     ['GET', /^\/floors\/([^/]+)\/memory$/, ([id], r) => ({ entries: memory.search(floorOf(id).id, r.query.get('q') ?? '', 100) })],
     [
       'POST',
@@ -1555,6 +1611,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  /** F-050: the chat view's feed for one session (chatview.ts): the end of its conversation, then what it grows by. */
+  function chatSocket(query: URLSearchParams) {
+    const sid = query.get('session') ?? ''
+    return (ws: WsSocket) => {
+      if (!UUID_RE.test(sid)) return ws.close(1008, 'Expected ?session=<the chat id>')
+      const detach = chatFeeds.attach(sid, m => ws.sendText(JSON.stringify(m)))
+      ws.onText(() => {})
+      ws.onClose(detach)
+    }
+  }
+
   /**
    * F-023, Use here: a chat that runs on another PC, its terminal on this PC's page. The link
    * carries the same messages the page's socket does, one JSON line each; it keeps running
@@ -1634,6 +1701,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     http: r => route(r, mode() === 'member' ? toHub : undefined),
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)
+      if (rest === '/chat') return chatSocket(query)
       if (rest === '/events')
         return ws => {
           events.add(ws)
@@ -1661,6 +1729,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (memberTimer) clearInterval(memberTimer)
       if (stateTimer) clearInterval(stateTimer)
       tail.close()
+      chatFeeds.close()
       chats.closeAll()
       sub?.stream.destroy()
       sub = null

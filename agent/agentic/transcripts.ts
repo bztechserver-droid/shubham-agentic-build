@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs'
 import { open, readdir, rename, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -69,11 +69,30 @@ export function readTranscript(cwd: string, sessionId: string, projectsDir = cla
   return readTranscriptFile(transcriptPath(cwd, sessionId, projectsDir))
 }
 
-/** readTranscript, for the file itself (F-021: wherever this PC keeps it). */
+/**
+ * Read from a conversation's end: enough for MAX_MESSAGES turns, never the whole file (one
+ * here is 289 MB; reading it all stalled the agent).
+ */
+export const TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024
+
+/** readTranscript, for the file itself (F-021: wherever this PC keeps it), from its last TRANSCRIPT_TAIL_BYTES. */
 export function readTranscriptFile(file: string): ChatMessage[] {
   let text: string
   try {
-    text = readFileSync(file, 'utf8')
+    const size = statSync(file).size
+    if (size <= TRANSCRIPT_TAIL_BYTES) text = readFileSync(file, 'utf8')
+    else {
+      const fd = openSync(file, 'r')
+      try {
+        const buf = Buffer.alloc(TRANSCRIPT_TAIL_BYTES)
+        const n = readSync(fd, buf, 0, TRANSCRIPT_TAIL_BYTES, size - TRANSCRIPT_TAIL_BYTES)
+        // The first line is cut where the read starts: left out.
+        text = buf.subarray(0, n).toString('utf8')
+        text = text.slice(text.indexOf('\n') + 1)
+      } finally {
+        closeSync(fd)
+      }
+    }
   } catch {
     return []
   }
