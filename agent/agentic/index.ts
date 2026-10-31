@@ -448,8 +448,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function teamInfo(): AgenticTeam | null {
     const m = mode()
     if (m === 'alone') return null
-    if (m === 'hub') return { pc: self().name, role: 'hub', hub: null, reachable: true }
-    return { pc: self().name, role: 'member', hub: team!.hub()?.name ?? null, reachable: sub !== null }
+    if (m === 'hub') return { pc: self().name, role: 'hub', hub: null, reachable: true, pcs: pcs() }
+    return { pc: self().name, role: 'member', hub: team!.hub()?.name ?? null, reachable: sub !== null, pcs: pcs() }
   }
 
   const emitWhere = () => emit({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() })
@@ -1162,6 +1162,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => openChat(id, agentId, openRequest(r.body)), 'local'],
     [
       'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/run-on$/,
+      async ([id, agentId], r) => {
+        // F-025, Run on: the chat moved to the PC named (taken over there, from wherever it runs).
+        const pc = isObject(r.body) && typeof r.body.pc === 'string' ? r.body.pc : ''
+        if (!pc || pc === self().id) return openChat(id, agentId, { takeOver: true })
+        const link = peerOf(pc)
+        return { ...(await request<ChatOpened>(link, 'open', { floorId: id, agentId }, 60_000)), on: link.name }
+      },
+      'local',
+    ],
+    [
+      'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/terminate$/,
       ([id, agentId]) => {
         const a = agentOf(floorOf(id), agentId)
@@ -1350,6 +1362,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
           })
         case 'terminal':
           return serveTerminal
+        case 'open':
+          // F-025: another PC's Run on, for this one: the chat taken over here.
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
+            return openChat(raw.floorId, raw.agentId, { takeOver: true })
+          })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
       }
@@ -1383,6 +1401,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
           })
         case 'terminal':
           return serveTerminal
+        case 'open':
+          // F-025: another PC's Run on, for this one: the chat taken over here.
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
+            return openChat(raw.floorId, raw.agentId, { takeOver: true })
+          })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
       }

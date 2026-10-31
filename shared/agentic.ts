@@ -91,6 +91,8 @@ export interface AgenticTeam {
   hub: string | null
   /** A member: whether its hub can be reached now. Without it, floors are read-only and no chat can start. */
   reachable: boolean
+  /** F-025: the PCs a chat can be run on from here now (this one first): an agent's Run on. */
+  pcs: { id: string; name: string; here: boolean }[]
 }
 
 /** GET /agentic/floors */

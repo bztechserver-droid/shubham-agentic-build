@@ -1405,6 +1405,12 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   before the stream opens are kept and sent once it does. Test: `team.test.ts` (screen to the
   laptop, keys to the Server, still running there).
 
+## F-025: Run on (agentic/index.ts)
+
+- `POST /floors/:id/agents/:agentId/run-on {pc}`: this PC: `openChat` with take-over; another:
+  an `agentic` request `open` {floorId, agentId}, which runs the same there. `team.pcs` lists the PCs
+  reachable now. Test: `team.test.ts` (from the Server to the Laptop and back).
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
