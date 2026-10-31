@@ -718,6 +718,28 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-053",
+    "title": "Phone: the bottom bar as a picker, so more tabs fit",
+    "said": "now want you to create bottom bar to e a select option please so hat i can fit more thngs but its ui has to be fannstasitic",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: on the phone, the bottom tab bar (8 tabs, already tight at 360px) becomes a picker (a select-style control that opens a sheet or menu of every page), so any number of pages fit; it must look and feel excellent. The old tab bar stays as an alternative (a setting). Asked to build; Lead gives it to Mobile after the 2026.10.31-2053 update."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-054",
+    "title": "The CRM as a page (Alt+B, and in the picker), referenced, not bundled",
+    "said": "now one mroe ting we need to do like the agentic claude manager has crk on alt b we need the crm in the seleect please but instead of wrapping the crm in thebuild we require it to be as a eferncr sothe build fil doesnt become too big",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: the CRM inside this app, as agentic-claude-manager has it (Alt+B fills the window with the CRM, Alt+B again goes back), and as an entry in F-053's page picker; but not compiled into this app's build the way agentic-claude-manager does it (its vite.config.ts aliases ../../sam-crm-fe/src, the CRM's 274 files, plus next/* shims, into its own bundle). Instead the build only refers to the CRM (for example the CRM's own site in a frame, or sam-crm-fe built and served on its own), so the build stays small. Which way is the owner's to work out and report (log-in and cookies in a frame, what the CRM's site allows). Lead hires an owner after the 2026.10.31-2053 update."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
