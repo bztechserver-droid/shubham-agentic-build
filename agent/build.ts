@@ -160,7 +160,10 @@ export function createBuild(o: BuildOptions): Build {
     const child = (running = spawn(cmd.file, cmd.args, { cwd: publish.devDir, windowsHide: true, env: { ...process.env, FORCE_COLOR: '0' } }))
     let published: BuildVersion | null = null
     const take = (chunk: Buffer) => {
-      for (const line of chunk.toString('utf8').split(/\r?\n/)) {
+      // Plain text for the page: tools colour their output even when asked not to.
+      // oxlint-disable-next-line no-control-regex
+      const text = chunk.toString('utf8').replace(/\u001b\[[0-9;]*m/g, '')
+      for (const line of text.split(/\r?\n/)) {
         if (!line.trim()) continue
         if (line.startsWith(PUBLISHED_MARK)) {
           published = parseVersion(line.slice(PUBLISHED_MARK.length))

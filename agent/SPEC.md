@@ -1241,6 +1241,61 @@ CRM goals, hooks, Skills and MCP are the later phases (features.html › F-018).
   so a chat reaches its floor and nothing else the agent does.
 - **The page** (`src/agentic/`, `/agents`, loaded on first use): DESIGN.md › Agents.
 
+## F-020: the build (build.ts, ui-server.ts, scripts/publish.ts)
+
+As agentic-claude-manager's dev → build → install. Built 2026-10-31. The README's "The build"
+says how it is used; this is how it works.
+
+- **Which**: an agent runs from a build when `RELEASE.json` is beside `agent/`
+  (`{version, commit, dirty, builtAt, source}`; the version is the local time it was built,
+  `YYYY.MM.DD-HHMM`), else from Dev. Dev on this PC (`findDevDir`): `SAD_DEV_DIR`, else the
+  folder itself or its sibling `shubham-agentic-dev`, whichever has `agent/scripts/publish.ts`
+  (which no build has). On the hub, a floor with no folder of its own works in Dev
+  (`createAgentic` `defaultCodeDir`).
+- **The page** (`--app <dir>`, `SAD_UI_PORT`, 5173 by default): `startUiServer` listens on
+  127.0.0.1 and ::1 (never the network) and refuses a Host that isn't an IP, localhost or
+  *.localhost (403, Vite's rule). `/agent-api` and below go to the agent's API on 127.0.0.1 with
+  Host rewritten and `x-sad-token` dropped, then added again only when `local-host.ts fromApp` says
+  the request is the app's own page; the API answering nothing is a 502 in its own error shape.
+  WebSocket upgrades are written on to the agent the same way, then piped byte for byte (no frame
+  limit; either side closing closes the other). Anything else is a file under `<dir>` (never
+  outside it), `index.html` for an extension-less path (the router's), `assets/*` cached for a
+  year as immutable, the rest `no-cache`; GET and HEAD only. A taken port is logged and tried
+  again every 30 s; the agent runs on without its page meanwhile.
+- **Updates** (a build that is a clone, `.git` beside it): `git fetch origin main` 30 s after the
+  start, every 15 minutes and on `POST /build/check`; HEAD against `origin/main`, the newer
+  build's version from `git show origin/main:RELEASE.json`. `POST /build/update` needs
+  `SAD_SUPERVISED=1` (set by `Start.cmd`) and answers before the agent exits with
+  `UPDATE_EXIT_CODE` (75); `Start.cmd` then runs `Update.cmd` (`git pull --ff-only`; `npm ci
+  --omit=dev` when `package-lock.json` changed) and starts it again. Any other exit: started again
+  after 5 s.
+- **Publish** (`POST /build/publish {skipChecks?}`, the hub only, one at a time): runs Dev's
+  `node agent/scripts/publish.ts [--skip-checks]` in Dev, keeps its last 400 lines (colour codes
+  stripped) for `GET /build/info`, and reads the published version from its `PUBLISHED <json>`
+  line; then checks for itself. `publish.ts`: Dev's commit and changes; `tsc -b`, `oxlint
+  --deny-warnings` and the agent's tests; `vite build`; the build in `<state>/publish/stage`
+  (tests, fakes, `agent/test`, `agent/system`, `publish.ts`, `dev-try.ts`, `build-system.ps1` and
+  `build-files/` left out; `build-files/*` at its root; `.gitattributes` `* -text`); `npm install
+  --omit=dev`; tried as a member on ports 21370–21378 with `SAD_HOME=<state>/publish/try-home`,
+  started over IPC and stopped the same way (the page, `/agent-api/agentic/floors` through the
+  page as the app, `/agent-api/build/info` naming this version, `require('node-pty')` and koffi);
+  pushed from `<state>/publish/repo`, reset to `origin/main` first, every file but `.git` replaced,
+  committed as Dev's git author (`user.name`, `user.email` from Dev), unless only `RELEASE.json`
+  changed. The repo is made (private, with `gh`) when it doesn't exist.
+- **Install** (`Install.ps1` in a build): `npm ci --omit=dev` when there are no packages; stops
+  Dev's `start-hub.cmd` loop, then the node processes holding 21221 and 5173 (not started with
+  `--app`), a previous run of this build, and agent chats left running (`claude.exe` with the app's
+  `agentic\mcp.json`); replaces the Startup launcher `shubham-agentic-hub.vbs` (Dev) with
+  `shubham-agentic.vbs` (this build's `Start hidden.vbs`); starts it through WMI (so it belongs to
+  no window or session); opens http://localhost:5173 when it answers. `-Remove` undoes it.
+- **Tests:** `ui-server.test.ts` (the page, the router's paths, caching, nothing outside the
+  folder, both loopbacks, the Host rule; the API with and without the token, a forged one dropped,
+  the agent down; a WebSocket both ways with a 2 MB message, and refused without the token) and
+  `build.test.ts` (Dev and build, the three update answers, Update's exit code and when it is
+  refused; Publish's lines, result, failure, one at a time, member or no Dev; `findDevDir`). The
+  whole loop was run on the hub: Publish from the Build page (2026.10.31-1312), Update now, the
+  agent back on it in 7 s.
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
