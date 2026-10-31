@@ -31,6 +31,16 @@ const strList = (v: unknown) =>
   Array.isArray(v) ? [...new Set(v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim().slice(0, 200)))].slice(0, LIST_MAX) : []
 const isModel = (v: unknown): v is AgentModel => typeof v === 'string' && (AGENT_MODELS as readonly string[]).includes(v)
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+/** F-021: a floor's folder on each of the hub's other PCs: device id to an absolute path. */
+const folderMap = (v: unknown): Record<string, string> =>
+  isObject(v)
+    ? Object.fromEntries(
+        Object.entries(v)
+          .filter((e): e is [string, string] => typeof e[1] === 'string' && e[1].trim() !== '' && e[0].length <= 64)
+          .slice(0, LIST_MAX)
+          .map(([k, d]) => [k, d.trim().slice(0, 1024)]),
+      )
+    : {}
 
 const LEAD_MD =
   '# Lead\n\n' +
@@ -101,6 +111,7 @@ function hydrateFloor(raw: unknown): Floor | null {
     name: str(raw.name, NAME_MAX).trim() || 'New floor',
     globalPrompt: str(raw.globalPrompt, FLOOR_PREAMBLE_MAX),
     codeDir: typeof raw.codeDir === 'string' && raw.codeDir.trim() ? raw.codeDir.trim() : null,
+    folders: folderMap(raw.folders),
     createdAt: created,
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : created,
     agents: repairAgents((Array.isArray(raw.agents) ? raw.agents : []).slice(0, MAX_AGENTS_PER_FLOOR).map(hydrateAgent)),
@@ -181,6 +192,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
         name: typeof name === 'string' && name.trim() ? name.trim().slice(0, NAME_MAX) : 'New floor',
         globalPrompt: '',
         codeDir: null,
+        folders: {},
         createdAt: t,
         updatedAt: t,
         agents: [hydrateAgent({ name: 'Lead', role: 'Orchestrator', isBoss: true, md: LEAD_MD, x: 320, y: 40 }, 0)],
@@ -204,6 +216,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       if (p.codeDir !== undefined) {
         if (p.codeDir !== null && typeof p.codeDir !== 'string') throw apiError(400, 'codeDir is a folder path, or null')
         floor.codeDir = p.codeDir && p.codeDir.trim() ? p.codeDir.trim() : null
+      }
+      if (p.folderFor !== undefined) {
+        const f = p.folderFor
+        if (!isObject(f) || typeof f.id !== 'string' || !f.id || (f.dir !== null && typeof f.dir !== 'string')) throw apiError(400, 'folderFor is {id, dir}')
+        const folders = { ...floor.folders }
+        if (f.dir && f.dir.trim()) folders[f.id] = f.dir.trim()
+        else delete folders[f.id]
+        floor.folders = folderMap(folders)
       }
       if (p.agents !== undefined) {
         if (!Array.isArray(p.agents)) throw apiError(400, 'agents is a list')

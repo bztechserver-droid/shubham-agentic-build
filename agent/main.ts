@@ -2,7 +2,8 @@ import type net from 'node:net'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
-import { createAgentic } from './agentic/index.ts'
+import { agenticOff, createAgentic } from './agentic/index.ts'
+import type { LinkPeer } from './agentic/roam.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
 import { createBuild, findDevDir, type Build } from './build.ts'
 import { CrmError } from './claude/crm.ts'
@@ -14,7 +15,7 @@ import { createDeviceStore, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
 import { startServers, type Servers } from './hub/rustdesk-server.ts'
 import { loadOrCreateIdentity } from './link/identity.ts'
-import type { Control, StreamUser } from './link/mux.ts'
+import type { Control, Mux, OpenMeta, StreamUser } from './link/mux.ts'
 import { listenTls } from './link/tls.ts'
 import { createHubLinks, createMemberLinks, type HubLinks, type MemberLinks } from './links.ts'
 import { closeLog, initLog, log as rootLog, type Logger } from './log.ts'
@@ -61,6 +62,8 @@ export interface AgentExtras {
   mounts?: ApiMount[]
   /** On the hub, a floor with no folder of its own works in Dev: the build is how Dev is edited. */
   devDir?: string | null
+  /** False: the Agents section is off here (Dev beside the build, which runs the chats). On when left out. */
+  agents?: boolean
 }
 
 export async function startAgent(config: Config, log: Logger = rootLog, extras: AgentExtras = {}): Promise<Agent> {
@@ -106,7 +109,14 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const onOpen = {
     rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, log: log.child('rustdesk') }),
     screen: appScreen.handler,
+    // F-021: the Agents section's streams between the hub's PCs (agentic/roam.ts).
+    agentic: (meta: OpenMeta) => {
+      if (!agentic) throw new Error('the Agents section is off on this PC')
+      return agentic.serve(meta)
+    },
   }
+  /** F-021: a link, as the Agents section uses it: 'agentic' streams on it. */
+  const linkPeer = (mux: Mux, id: string, name: string): LinkPeer => ({ id, name, token: mux, open: meta => mux.open('agentic', meta) })
   let screen = false
   const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready })
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
@@ -115,9 +125,15 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // F-018: the Agentic Workflow section (floors, agents and their Claude chats), at /agentic.
   // Each chat starts on the CLAUDE_CODE_OAUTH_TOKEN this account has now (F-007 keeps it there).
   const userEnv = loadUserEnv()
-  const agentic = createAgentic({
+  // Tests (e2e step 11): a pretend claude, and a scratch Claude folder for its conversations
+  // and ~/.claude.json, so the real ones are never touched.
+  const testClaudeHome = process.env.SAD_TEST_CLAUDE_HOME || null
+  const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
+    claude: process.env.SAD_TEST_CLAUDE || undefined,
+    projectsDir: testClaudeHome ? path.join(testClaudeHome, 'projects') : undefined,
+    claudeJson: testClaudeHome ? path.join(testClaudeHome, '.claude.json') : undefined,
     apiUrl: () => `http://127.0.0.1:${api?.port ?? ports.api}${AGENT_API_PREFIX}`,
     log: log.child('agentic'),
     token: () => {
@@ -126,6 +142,22 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       } catch {
         return null
       }
+    },
+    // F-021: one session used from the hub's PCs in turn; the hub keeps the floors.
+    team: {
+      self: () => ({ id: identity.id, name: config.name }),
+      role: () => role,
+      hub: () => {
+        const h = devices.hub()
+        if (role !== 'member' || !h) return null
+        const mux = member?.links.mux() ?? null
+        return { id: h.id, name: h.name, link: mux ? linkPeer(mux, h.id, h.name) : null }
+      },
+      member: id => {
+        const mux = hub?.links.mux(id) ?? null
+        const m = devices.member(id)
+        return mux && m ? linkPeer(mux, id, m.name) : null
+      },
     },
   })
 
@@ -615,7 +647,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic.mount, ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -631,7 +663,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   async function stopAll() {
     for (const t of timers) clearInterval(t)
-    agentic.close()
+    agentic?.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()
     member?.discovery.stop()
@@ -709,7 +741,10 @@ if (import.meta.main) {
       restart: code => void shutdown('updating to the newer build', code),
       supervised: process.env.SAD_SUPERVISED === '1',
     })
-    agent = await startAgent(config, log, { mounts: [build.mount], devDir })
+    // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).
+    const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
+    if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
+    agent = await startAgent(config, log, { mounts: [build.mount], devDir, agents })
     log.info(`ready: the app's Devices page talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

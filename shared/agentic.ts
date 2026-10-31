@@ -6,6 +6,12 @@
 
 export const AGENTIC_PREFIX = '/agentic'
 
+/**
+ * F-020: Dev's agent leaves this section off (the build runs the floors and their chats; Dev is
+ * where the page is changed), and every /agentic route answers this status. `--agents` turns it on.
+ */
+export const AGENTS_OFF_STATUS = 503
+
 /** The models an agent can be pinned to; '' lets the claude CLI choose. */
 export const AGENT_MODELS = ['', 'opus', 'sonnet', 'haiku'] as const
 export type AgentModel = (typeof AGENT_MODELS)[number]
@@ -45,8 +51,13 @@ export interface Floor {
   name: string
   /** The floor preamble: "the work this floor does", before every agent's brief. */
   globalPrompt: string
-  /** The folder its chats work in. Null: the default (Documents\shubham-agentic). */
+  /**
+   * The folder its chats work in on this PC. Null: the default (Documents\shubham-agentic).
+   * F-021: the hub's own; a member's page gets its own PC's folder here (from `folders`).
+   */
   codeDir: string | null
+  /** F-021: the folder on each of the hub's other PCs, by device id (kept by the hub). */
+  folders: Record<string, string>
   createdAt: string
   updatedAt: string
   agents: FloorAgent[]
@@ -55,11 +66,43 @@ export interface Floor {
 /** What a live chat is doing, read off its own terminal (the original's turn state). */
 export type ChatState = 'running' | 'question' | 'idle'
 
+/**
+ * F-021: one session, used from the hub's PCs in turn. A session's JSONL is copied to every one
+ * of them as it grows; only one runs it at a time (two writers would fork the conversation).
+ */
+export interface ChatElsewhere {
+  /** The PC running it (its name). */
+  pc: string
+  state: ChatState
+}
+
+/** F-021: where a session that is running nowhere was run last. */
+export interface ChatLast {
+  pc: string
+  at: string
+}
+
+/** F-021: this PC among the hub's: null when it is on its own (no hub). */
+export interface AgenticTeam {
+  /** This PC's name. */
+  pc: string
+  role: 'hub' | 'member'
+  /** The hub's name (a member's). */
+  hub: string | null
+  /** A member: whether its hub can be reached now. Without it, floors are read-only and no chat can start. */
+  reachable: boolean
+}
+
 /** GET /agentic/floors */
 export interface FloorsAnswer {
   floors: Floor[]
-  /** Live chats by session id; a session not here has no running claude. */
+  /** Live chats on this PC, by session id; a session not here has no running claude on this PC. */
   live: Record<string, ChatState>
+  /** F-021: chats running on the hub's other PCs. */
+  elsewhere: Record<string, ChatElsewhere>
+  /** F-021: where sessions running nowhere were run last. */
+  last: Record<string, ChatLast>
+  team: AgenticTeam | null
   /** The folder a floor without its own works in. */
   defaultCodeDir: string
 }
@@ -68,9 +111,11 @@ export interface FloorsAnswer {
 export interface FloorPatch {
   name?: string
   globalPrompt?: string
-  /** '' or null: back to the default folder. */
+  /** '' or null: back to the default folder. On a member, its own PC's folder (F-021). */
   codeDir?: string | null
   agents?: FloorAgent[]
+  /** F-021, a member to its hub: that member's folder for the floor (null: the default). */
+  folderFor?: { id: string; dir: string | null }
 }
 
 /** POST /agentic/floors/:id/agents (the sidebar's Add agent, and agent_hire). */
@@ -90,6 +135,16 @@ export interface ChatOpened {
   started: boolean
   /** True when it picked up an earlier conversation (claude --resume). */
   resumed: boolean
+  /** F-021: the PC it was taken over from (its chat there was stopped first). */
+  tookOverFrom?: string
+}
+
+/** POST /agentic/floors/:id/agents/:agentId/chat */
+export interface OpenChatRequest {
+  cols?: number
+  rows?: number
+  /** F-021: it runs on another PC: stop it there and run it here. Without this, that is a 409. */
+  takeOver?: boolean
 }
 
 /** GET /agentic/sessions: a Claude Code conversation on this PC, newest first (Bring in a Claude chat). */
@@ -153,6 +208,8 @@ export type AgenticEvent =
   | { t: 'floors'; floors: Floor[] }
   | { t: 'live'; live: Record<string, ChatState> }
   | { t: 'memory'; floorId: string }
+  /** F-021: chats on the other PCs, where idle ones ran last, and this PC among the hub's. */
+  | { t: 'where'; elsewhere: Record<string, ChatElsewhere>; last: Record<string, ChatLast>; team: AgenticTeam | null }
 
 /** The terminal WebSocket at `${AGENT_API_PREFIX}/agentic/terminal?session=<id>`, as text frames. */
 export type TerminalClientMessage =

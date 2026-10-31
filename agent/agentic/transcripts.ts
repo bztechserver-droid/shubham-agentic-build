@@ -66,9 +66,14 @@ export function findTranscriptCwd(sessionId: string, projectsDir = claudeProject
 
 /** The user and assistant turns, oldest first (the last MAX_MESSAGES); tool results and meta lines left out. */
 export function readTranscript(cwd: string, sessionId: string, projectsDir = claudeProjectsDir()): ChatMessage[] {
+  return readTranscriptFile(transcriptPath(cwd, sessionId, projectsDir))
+}
+
+/** readTranscript, for the file itself (F-021: wherever this PC keeps it). */
+export function readTranscriptFile(file: string): ChatMessage[] {
   let text: string
   try {
-    text = readFileSync(transcriptPath(cwd, sessionId, projectsDir), 'utf8')
+    text = readFileSync(file, 'utf8')
   } catch {
     return []
   }

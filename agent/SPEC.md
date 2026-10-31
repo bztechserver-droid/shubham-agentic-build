@@ -1196,6 +1196,20 @@ CRM goals, hooks, Skills and MCP are the later phases (features.html › F-018).
   `FORCE_COLOR`, the chat's key `SAD_AGENTIC_KEY` (`sad_` + 48 hex) and `SAD_AGENTIC_URL`, and
   `CLAUDE_CODE_OAUTH_TOKEN` read fresh from HKCU at each start (F-007 keeps it there). The brief
   is written at each start, so a changed preamble or brief reaches the next start.
+- **Bringing in a conversation** (`transcripts.ts`, 2026-10-31): `GET /agentic/sessions` lists
+  this account's conversations, every `<uuid>.jsonl` under `~/.claude/projects`, the 60 most
+  recently written, each with its cwd (the first line that has one), title (the newest
+  `custom-title`, else `ai-title`, else `summary`, from the first 128 KB and last 256 KB; else its
+  first typed prompt), size, time, and the agent here it already is. `POST
+  /agentic/floors/:id/import {sessionId, agentId? | name?, role?}` copies it under a new UUID
+  beside the original (same project folder), streaming, with every line's `"sessionId":"<old>"`
+  made the new id and nothing else touched (an escaped mention inside a message stays); a last
+  line that doesn't parse (the original is being written) is left out, and the copy ends with a
+  newline. Written as `<id>.jsonl.copying`, then renamed. Then a new agent (`name`, `role`; under
+  the boss) gets it, or `agentId`'s chat stops and the agent takes it; if that fails the copy is
+  deleted. Always a copy: the original may be open elsewhere (Christopher), and two claudes
+  appending to one file fork it. The copy then opens like any agent's chat: its transcript is
+  found under the folder it was held in, which becomes its cwd (409 when that folder is gone).
 - **claude's own questions** (`claude-config.ts`): before a chat starts, `~/.claude.json` gets
   `hasCompletedOnboarding: true` and `theme: "dark"` when absent (this account's config may never
   have been set up: Claude usually runs through Christopher here), and
@@ -1252,6 +1266,15 @@ says how it is used; this is how it works.
   folder itself or its sibling `shubham-agentic-dev`, whichever has `agent/scripts/publish.ts`
   (which no build has). On the hub, a floor with no folder of its own works in Dev
   (`createAgentic` `defaultCodeDir`).
+- **The Agents section is the build's** (2026-10-31): an agent from Dev starts without it
+  (`startAgent` `agents: false`) unless given `--agents` (`npm run dev:try -- --agents`): no
+  floors are read, no chat is started, and `agenticOff()` answers every `/agentic` route with
+  `AGENTS_OFF_STATUS` (503, behind the token as before) and has no WebSockets, so the page shows
+  "Agents run in the build" rather than a fault. Dev's floors (with `--agents`) are in its own
+  state folder; Claude's conversation files are the account's, shared by both.
+- **The page's name**: Publish builds the page with `VITE_SAD_KIND=build`, so it calls itself
+  shubham-agentic-build (`src/app/app-name.ts`; `index.html`'s title through a Vite plugin);
+  Dev's page is shubham-agentic-dev.
 - **The page** (`--app <dir>`, `SAD_UI_PORT`, 5173 by default): `startUiServer` listens on
   127.0.0.1 and ::1 (never the network) and refuses a Host that isn't an IP, localhost or
   *.localhost (403, Vite's rule). `/agent-api` and below go to the agent's API on 127.0.0.1 with
@@ -1295,6 +1318,69 @@ says how it is used; this is how it works.
   refused; Publish's lines, result, failure, one at a time, member or no Dev; `findDevDir`). The
   whole loop was run on the hub: Publish from the Build page (2026.10.31-1312), Update now, the
   agent back on it in 7 s.
+
+## F-021: one session used from the hub's PCs in turn (agentic/index.ts, roam.ts, mirror.ts)
+
+Built 2026-10-31, as Shubham chose: the session moves between PCs (not one PC running it and the
+others watching). A Claude session is one JSONL that claude appends to; two PCs running it at once
+would fork it, so one PC runs it at a time, and every PC keeps a copy.
+
+- **Who keeps what.** The hub keeps the floors, the memory and `sessions.json`: per session, the
+  PC holding it (running it, or granted it and starting) and where it ran last. A member shows the
+  hub's floors (its last copy in `replica.json`) and sends every change to the hub, which runs it
+  as its own page's change; with no link to the hub, the floors are read-only (503 "Server (the
+  hub) can't be reached…"), no chat starts, and chats running there go on. A member with no hub,
+  and an agent given no team, work alone as before. Its own floors (from before it joined) stay in
+  its `floors.json`, not shown.
+- **A folder per PC.** `Floor.folders` (device id → folder) holds the members'; `codeDir` stays
+  the hub's. A member's page gets its own as `codeDir`, and its folder change is checked on that
+  PC and sent as `folderFor` (a member may set only its own; the hub's `codeDir` only on the hub).
+- **The link.** Streams of kind `agentic` on the mux, newline-delimited JSON; `meta.from` (added
+  by links.ts from the paired record) says which PC opened it. A request is one line each way
+  (`{ok, value}` or `{ok: false, status, error}`). Member → hub: `subscribe` (a standing stream:
+  the hub sends `state` {floors, where, last, marks} 150 ms after any change and every 30 s, `jsonl`
+  and `memory`; the member sends `hello`/`live` (its running chats), `marks` (every 30 s) and
+  `jsonl`), `http` (a page change), `lease`, `release`, `tool`, `pull`. Hub → member: `stop`,
+  `read`, `type`, `pull`. The member opens its standing stream when its link comes up, and again
+  on a new link (a path change), checking every second.
+- **Running a chat.** The hub's page opens it on the hub after `lease`; a member's asks the hub for
+  `lease` {sessionId, takeOver}. Running elsewhere (or granted to a member within the last 60 s,
+  or held by one that can't be reached): 409 "Lead's chat is running on Laptop. Take it over…"
+  unless `takeOver`, which stops it there first (a member's `stop`: its claude ended, its last
+  write waited for (no growth for 600 ms, 5 s at most) and sent, its mark answered; the hub then
+  brings its own copy up to that mark). Granted, a member brings its copy up to the hub's mark
+  (unless it already has all of it), then starts claude. Where on the PC: the floor's folder
+  when the conversation is in its project folder; else the folder it was held in, when that exists
+  here; else (it came from another PC) the file is moved under this PC's folder for the floor, and
+  it resumes there. A chat that ends lets its session go (`release`, with its mark: the hub catches
+  up first); a member's live list without a session it held (after 60 s) lets that go too.
+- **The JSONL as it grows.** The PC running a chat looks at its file every second and sends what it
+  grew by (`jsonl` {sid, from, base64}, at most 256 KiB a piece, 16 a tick); the hub writes it into
+  its copy and passes it to the other members. Bytes are placed at `from`: appended at the end;
+  where the copy already has them, checked; past its end ('gap') or differing ('diverged'), left
+  to catch-up. A copy is only written by the PC running the session, or brought up to the others.
+- **Catch-up.** A mark is a copy's size and the sha1 of its last 4 KiB. A member brings up every
+  copy that is shorter than the hub's, or as long but different; the hub brings up its copy from a
+  member that has more of one it holds (or nobody holds). `pull` sends the asker's mark; agreeing,
+  only the rest comes; not, all of it, written beside and swapped in; a PC without one leaves the
+  asker's alone. One pull at a time.
+- **Tools.** A member's chat's tool calls go to the hub as `tool` (only for a chat that PC holds).
+  `list_chats`, `floor_roster` (with `pc`), `read_chat`, `send_to_chat` and `broadcast_to_chats`
+  reach chats on any of the hub's PCs (`read`/`type` to the member running one); memory and
+  `agent_hire` are the hub's.
+- **The page.** `FloorsAnswer` and the `where` event add `elsewhere` (chats on other PCs: pc and
+  state), `last` (where idle ones ran last) and `team` (this PC, its role, the hub, reachable). An
+  agent's status says "Working on Laptop", "Open on Laptop", "Not running · last on Laptop"; its
+  window says it runs there and offers Take over on this PC (confirmed first); its ⋯ menu has Take
+  over on this PC…; a 409 on opening offers Take over anyway, with the warning that it splits if
+  the other PC is still running it out of reach. A member without its hub shows a strip saying so.
+- **Tests:** `mirror.test.ts` (placing bytes, marks, following a file, catching up over a stream:
+  the rest, all of it, or nothing), `team.test.ts` (two Agents backends, a hub and a member, each
+  with its own API, folders and Claude projects, on an in-memory link: the floors through the hub
+  and a folder per PC; a chat moved both ways with its JSONL, refused without take-over; a member
+  chat's tools, list and message across PCs; the member without its hub; catch-up of a
+  conversation into the member's own folder) and e2e step 11 (two real agents on a real link, a
+  pretend claude: followed, taken over, the JSONL both ways, where it ran last).
 
 ## Firewall script (scripts/firewall-hub.ps1)
 

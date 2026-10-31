@@ -1,21 +1,28 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import type { Duplex } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import {
   AGENTIC_PREFIX,
+  AGENTS_OFF_STATUS,
   AGENT_MODELS,
   type AgentModel,
   type AgenticEvent,
+  type AgenticTeam,
+  type ChatElsewhere,
   type ChatImported,
+  type ChatLast,
   type ChatOpened,
+  type ChatState,
   type ClaudeSession,
   type Floor,
   type FloorAgent,
   type FloorPatch,
   type FloorsAnswer,
   type NewAgent,
+  type OpenChatRequest,
   type TerminalClientMessage,
 } from '../../shared/agentic.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
@@ -23,10 +30,21 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
-import { createChatPool, type ChatInfo, type ChatPool, type PtySpawn } from './chats.ts'
+import { createChatPool, type ChatPool, type PtySpawn } from './chats.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
-import { claudeProjectsDir, copyTranscript, findTranscriptCwd, listSessions, readTranscript, transcriptInfo } from './transcripts.ts'
+import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
+import { answer, pullFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
+import {
+  claudeProjectsDir,
+  copyTranscript,
+  encodeProjectPath,
+  findTranscript,
+  findTranscriptCwd,
+  listSessions,
+  readTranscriptFile,
+  transcriptPath,
+} from './transcripts.ts'
 
 // F-018: the Agentic Workflow section's backend (agentic-claude-manager's floors, agents and
 // their chats, and the tools those chats share), mounted on the agent's local API at /agentic.
@@ -36,6 +54,13 @@ import { claudeProjectsDir, copyTranscript, findTranscriptCwd, listSessions, rea
 //               never the app's token: a chat can reach its floor, not the rest of the API
 // State in <state>/agent/agentic: floors.json, memory/<floorId>.jsonl, briefs/<sessionId>.md,
 // and mcp.json, the --mcp-config every chat is started with.
+//
+// F-021: one session, used from the hub's PCs in turn (agent/SPEC.md › F-021). The hub keeps
+// the floors, the memory and who holds each session (sessions.json); a member shows the hub's
+// floors (a copy in replica.json, read-only while the hub can't be reached) and forwards every
+// change to it. A chat runs on one PC at a time: a member asks the hub for it first (a lease),
+// and taking it over stops it where it ran. Each session's JSONL goes to the others as it
+// grows ('jsonl' events) and is caught up in the background (pull), so every PC has it.
 
 /** send_to_chat: one message per sender→target pair every 5 s, at most 6 a minute into one chat. */
 const PAIR_COOLDOWN_MS = 5000
@@ -45,6 +70,20 @@ const TARGET_WINDOW_MAX = 6
 const BROADCAST_COOLDOWN_MS = 10_000
 const MAX_RELAY_TEXT = 10_000
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+/** F-021: the hub's state to its members at least this often (their catch-up runs off it). */
+const STATE_EVERY_MS = 30_000
+/** F-021: a member granted a session is taken to be starting it this long before its live list must show it. */
+const LEASE_GRACE_MS = 60_000
+
+/** F-021: this PC among the hub's PCs, as the Agents section needs it (main.ts gives it). */
+export interface AgenticTeamLinks {
+  self(): { id: string; name: string }
+  role(): 'hub' | 'member'
+  /** A member: its hub, and the link to it now (null while it is down); null with no hub. */
+  hub(): { id: string; name: string; link: LinkPeer | null } | null
+  /** The hub: the link to a member now, by id. */
+  member(id: string): LinkPeer | null
+}
 
 export interface AgenticOptions {
   /** <state>/agent/agentic */
@@ -56,6 +95,8 @@ export interface AgenticOptions {
   defaultCodeDir?: string
   /** CLAUDE_CODE_OAUTH_TOKEN as this account has it now (F-007). */
   token?: () => string | null
+  /** F-021: the hub's PCs; left out, this PC is on its own. */
+  team?: AgenticTeamLinks
   /** Tests: a fake node-pty (and a no-op tree kill: its pids are other processes'), a fake claude, and a scratch ~/.claude/projects. */
   spawn?: PtySpawn
   treeKill?: (pid: number) => void
@@ -63,6 +104,8 @@ export interface AgenticOptions {
   projectsDir?: string
   /** Tests: a scratch ~/.claude.json (claude-config.ts). */
   claudeJson?: string
+  /** Tests: how often a running chat's JSONL is looked at for what to send on (1 s). */
+  syncEveryMs?: number
 }
 
 export interface Agentic {
@@ -72,6 +115,8 @@ export interface Agentic {
   memory: MemoryStore
   /** What a tool call does, for the chat whose key it carries; the answer is the text the chat sees. */
   callTool(key: string, name: string, args: unknown): Promise<string>
+  /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
+  serve(meta: Record<string, unknown>): (stream: Duplex) => void
   close(): void
 }
 
@@ -82,17 +127,59 @@ const text = (v: unknown, what: string, max = MAX_RELAY_TEXT) => {
   return v
 }
 const json = (v: unknown) => JSON.stringify(v, null, 2)
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+const enc = encodeURIComponent
+const isMark = (v: unknown): v is FileMark => isObject(v) && typeof v.bytes === 'number' && typeof v.tail === 'string'
+
+/**
+ * F-020: the section switched off (Dev, beside the build that runs the chats): nothing is read
+ * or started, and every route says so, so the page can tell "off here" from "not running".
+ */
+export function agenticOff(): ApiMount {
+  return {
+    prefix: AGENTIC_PREFIX,
+    ownAuth: rest => rest === '/mcp/call',
+    http: () =>
+      Promise.reject(
+        apiError(AGENTS_OFF_STATUS, "Agents are off in Dev: the build runs them, so Dev's chats never mix with its chats. Start Dev with --agents to try them here, apart from the build's"),
+      ),
+    ws: () => null,
+  }
+}
+
+/** F-021, on the hub: who holds each session (the PC running it, or granted it) and where it ran last. */
+interface Held {
+  holder: string | null
+  holderName: string | null
+  heldAt: number
+  last: ChatLast | null
+}
+
+/** F-021, on a member: the hub's floors and sessions as it last said them. */
+interface Replica {
+  floors: Floor[]
+  where: Record<string, { id: string; name: string; state: ChatState }>
+  last: Record<string, ChatLast>
+  marks: Record<string, FileMark>
+}
 
 export function createAgentic(o: AgenticOptions): Agentic {
   const log = o.log
+  const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
   const mcpConfig = path.join(o.dir, 'mcp.json')
+  const heldFile = path.join(o.dir, 'sessions.json')
+  const replicaFile = path.join(o.dir, 'replica.json')
   const shim = fileURLToPath(new URL('./mcp-shim.ts', import.meta.url))
   // The shim is named here once; the key it needs comes from the chat's own terminal.
   writeAtomic(mcpConfig, `${json({ mcpServers: { [MCP_SERVER_NAME]: { type: 'stdio', command: process.execPath, args: [shim] } } })}\n`)
+
+  /** 'alone': no hub (as before F-021); 'hub': it keeps the floors; 'member': it shows its hub's. */
+  const mode = (): 'alone' | 'hub' | 'member' => (!team ? 'alone' : team.role() === 'hub' ? 'hub' : team.hub() ? 'member' : 'alone')
+  const self = () => team?.self() ?? { id: 'this-pc', name: os.hostname() }
 
   const events = new Set<WsSocket>()
   const emit = (e: AgenticEvent) => {
@@ -100,30 +187,70 @@ export function createAgentic(o: AgenticOptions): Agentic {
     for (const s of events) s.sendText(t)
   }
 
-  const floors = createFloorStore(path.join(o.dir, 'floors.json'), () => emit({ t: 'floors', floors: floors.list() }))
-  const memory = createMemoryStore(path.join(o.dir, 'memory'))
-  let liveTimer: NodeJS.Timeout | null = null
-  const chats = createChatPool({
-    toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
-    mcpConfig,
-    log,
-    spawn: o.spawn,
-    treeKill: o.treeKill,
-    claude: o.claude,
-    token: o.token,
-    onChange: () => {
-      // States flip several times a second while a chat paints; the page needs the settled one.
-      if (liveTimer) return
-      liveTimer = setTimeout(() => {
-        liveTimer = null
-        emit({ t: 'live', live: chats.states() })
-      }, 150)
-      liveTimer.unref()
-    },
+  const floors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
+    if (mode() === 'member') return
+    emit({ t: 'floors', floors: floors.list() })
+    pushState()
   })
+  const memory = createMemoryStore(path.join(o.dir, 'memory'))
+
+  // ---------------------------------------------------------------------------------------
+  // F-021 state: on the hub, who holds what and its members' live chats; on a member, the copy
+
+  const held = new Map<string, Held>(loadHeld())
+  const remote = new Map<string, { name: string; live: Record<string, ChatState> }>()
+  const subs = new Map<string, Duplex>()
+  let replica: Replica = loadReplica()
+  let sub: { token: object; stream: Duplex } | null = null
+  let subscribing = false
+
+  function loadHeld(): [string, Held][] {
+    try {
+      const raw: unknown = JSON.parse(readFileSync(heldFile, 'utf8'))
+      if (!isObject(raw)) return []
+      return Object.entries(raw).flatMap(([sid, v]) => {
+        if (!isObject(v)) return []
+        const last = isObject(v.last) && typeof v.last.pc === 'string' && typeof v.last.at === 'string' ? { pc: v.last.pc, at: v.last.at } : null
+        // A holder from before a restart is kept: its PC may still be running the chat.
+        const holder = typeof v.holder === 'string' ? v.holder : null
+        return [[sid, { holder, holderName: typeof v.holderName === 'string' ? v.holderName : null, heldAt: 0, last }] as [string, Held]]
+      })
+    } catch {
+      return []
+    }
+  }
+  const saveHeld = () => writeAtomic(heldFile, `${json(Object.fromEntries([...held].map(([sid, h]) => [sid, { holder: h.holder, holderName: h.holderName, last: h.last }])))}\n`)
+
+  function loadReplica(): Replica {
+    try {
+      const raw = JSON.parse(readFileSync(replicaFile, 'utf8')) as Partial<Replica>
+      return { floors: Array.isArray(raw.floors) ? raw.floors : [], where: {}, last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {}, marks: {} }
+    } catch {
+      return { floors: [], where: {}, last: {}, marks: {} }
+    }
+  }
+  let replicaTimer: NodeJS.Timeout | null = null
+  function saveReplica() {
+    if (replicaTimer) return
+    replicaTimer = setTimeout(() => {
+      replicaTimer = null
+      writeAtomic(replicaFile, `${json({ floors: replica.floors, last: replica.last })}\n`)
+    }, 500)
+    replicaTimer.unref()
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Floors, as this PC sees them
+
+  /** The floors: the hub's own, or, on a member, the hub's with this PC's folder as codeDir. */
+  function allFloors(): Floor[] {
+    if (mode() !== 'member') return floors.list()
+    const me = self().id
+    return replica.floors.map(f => ({ ...f, codeDir: f.folders?.[me] ?? null }))
+  }
 
   function floorOf(id: string): Floor {
-    const f = floors.get(id)
+    const f = allFloors().find(x => x.id === id)
     if (!f) throw apiError(404, 'No such floor')
     return f
   }
@@ -134,6 +261,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return a
   }
 
+  function bySession(sid: string): { floor: Floor; agent: FloorAgent } | null {
+    for (const floor of allFloors()) {
+      const agent = floor.agents.find(a => a.sessionId === sid)
+      if (agent) return { floor, agent }
+    }
+    return null
+  }
+
   /** The floor's folder, made when it is the default one and missing. */
   function codeDirOf(floor: Floor): string {
     if (!floor.codeDir) {
@@ -141,41 +276,469 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return defaultCodeDir
     }
     if (!existsSync(floor.codeDir) || !statSync(floor.codeDir).isDirectory()) {
-      throw apiError(409, `This floor's folder isn't there any more: ${floor.codeDir}. Change it on the Preamble tab.`)
+      throw apiError(409, `This floor's folder isn't there${mode() === 'member' ? ' on this PC' : ' any more'}: ${floor.codeDir}. Change it on the Preamble tab.`)
     }
     return floor.codeDir
   }
 
-  /** Its chat, running: started fresh, resumed from its transcript, or as it was. */
-  function openChat(floorId: string, agentId: string, size?: { cols?: number; rows?: number }): ChatOpened {
-    let floor = floorOf(floorId)
-    const agent = agentOf(floor, agentId)
-    let sid = agent.sessionId
-    if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
-    let cwd = codeDirOf(floor)
-    if (!sid) {
-      sid = randomUUID()
-      floor = floors.bindSession(floor.id, agent.id, sid)
-    }
-    let resume = transcriptInfo(cwd, sid, projectsDir).exists
-    if (!resume) {
-      // Its conversation may be in another folder (the floor's folder changed since): resume it there.
-      const elsewhere = findTranscriptCwd(sid, projectsDir)
-      if (elsewhere && existsSync(elsewhere)) {
-        cwd = elsewhere
-        resume = true
-      }
-    }
+  /** Where this PC keeps a session's JSONL, whether it has it yet or not. */
+  function fileOf(sid: string): string {
+    const found = findTranscript(sid, projectsDir)
+    if (found) return found
+    const at = bySession(sid)
+    return transcriptPath(at?.floor.codeDir ?? defaultCodeDir, sid, projectsDir)
+  }
+
+  /**
+   * Where a chat runs on this PC, and whether there is a conversation to resume: the floor's
+   * folder; else the folder the conversation was held in, when it has one here; else (it came
+   * from another PC, held in a folder this PC hasn't got) it is moved under the floor's folder.
+   */
+  function placeForRun(sid: string, folder: string): { cwd: string; resume: boolean } {
+    const found = findTranscript(sid, projectsDir)
+    if (!found) return { cwd: folder, resume: false }
+    const dir = path.dirname(found)
+    if (dir === path.join(projectsDir, encodeProjectPath(folder))) return { cwd: folder, resume: true }
+    const cwd = findTranscriptCwd(sid, projectsDir)
+    if (cwd && existsSync(cwd) && dir === path.join(projectsDir, encodeProjectPath(cwd))) return { cwd, resume: true }
+    const to = transcriptPath(folder, sid, projectsDir)
+    mkdirSync(path.dirname(to), { recursive: true })
+    renameSync(found, to)
+    return { cwd: folder, resume: true }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Chats on this PC, and their JSONL to the others
+
+  let liveTimer: NodeJS.Timeout | null = null
+  let lastLive = new Set<string>()
+  const chats = createChatPool({
+    toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
+    mcpConfig,
+    log,
+    spawn: o.spawn,
+    treeKill: o.treeKill,
+    claude: o.claude,
+    token: o.token,
+    onChange: () => {
+      // A chat that ended lets its session go (after its last write is sent on).
+      const now = new Set(Object.keys(chats.states()))
+      for (const sid of lastLive) if (!now.has(sid)) void ended(sid)
+      lastLive = now
+      // States flip several times a second while a chat paints; the page needs the settled one.
+      if (liveTimer) return
+      liveTimer = setTimeout(() => {
+        liveTimer = null
+        emit({ t: 'live', live: chats.states() })
+        emitWhere()
+        if (mode() === 'member' && sub) writeLine(sub.stream, { t: 'live', live: chats.states() })
+        pushState()
+      }, 150)
+      liveTimer.unref()
+    },
+  })
+
+  const tail = createTail({
+    everyMs: o.syncEveryMs,
+    onData(sid, from, data) {
+      const line = { t: 'jsonl', sid, from, d: data.toString('base64') }
+      if (mode() === 'member') {
+        if (sub) writeLine(sub.stream, line)
+      } else for (const s of subs.values()) writeLine(s, line)
+    },
+  })
+
+  /** A chat that ended: once its last write is in and sent on, the session is free again. */
+  const flushing = new Map<string, Promise<FileMark>>()
+  function endFlush(sid: string): Promise<FileMark> {
+    let p = flushing.get(sid)
+    if (p) return p
+    p = (async () => {
+      const file = fileOf(sid)
+      await settled(file)
+      tail.flush(sid)
+      tail.untrack(sid)
+      return markOf(file)
+    })()
+    flushing.set(sid, p)
+    void p.finally(() => setTimeout(() => flushing.delete(sid), 10_000).unref())
+    return p
+  }
+
+  async function ended(sid: string) {
+    if (!team) return
+    const mark = await endFlush(sid).catch(() => markOf(fileOf(sid)))
+    if (mode() === 'member') {
+      const link = team.hub()?.link
+      if (link) await request(link, 'release', { sessionId: sid, mark }).catch(e => log?.warn(`couldn't tell the hub chat ${sid.slice(0, 8)} ended: ${message(e)}`))
+    } else release(sid, self())
+  }
+
+  /** Starts the agent's chat on this PC (its lease already got). */
+  function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): boolean {
+    const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
     try {
       const done = prepareClaudeConfig(cwd, claudeJson)
       if (done.length) log?.info(`answered in ${claudeJson} so the chat opens on its prompt: ${done.join(', ')}`)
     } catch (e) {
-      log?.warn(`couldn't update ${claudeJson}: ${e instanceof Error ? e.message : String(e)}`)
+      log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agentOf(floor, agentId)))
-    chats.start({ sessionId: sid, floorId: floor.id, agentId, cwd, briefPath, model: agent.model, resume, cols: size?.cols, rows: size?.rows })
-    return { sessionId: sid, started: true, resumed: resume }
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent))
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, resume, cols: size.cols, rows: size.rows })
+    if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
+    return resume
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-021 on the hub: who runs what, holding and letting go, stopping a chat wherever it runs
+
+  /** Every chat running on the hub's PCs, by session. */
+  function whereAll(): Record<string, { id: string; name: string; state: ChatState }> {
+    const me = self()
+    if (mode() === 'member') {
+      const out = Object.fromEntries(Object.entries(replica.where).filter(([, w]) => w.id !== me.id))
+      for (const [sid, state] of Object.entries(chats.states())) out[sid] = { id: me.id, name: me.name, state }
+      return out
+    }
+    const out: Record<string, { id: string; name: string; state: ChatState }> = {}
+    for (const [id, r] of remote) for (const [sid, state] of Object.entries(r.live)) out[sid] = { id, name: r.name, state }
+    for (const [sid, state] of Object.entries(chats.states())) out[sid] = { id: me.id, name: me.name, state }
+    return out
+  }
+
+  function elsewhere(): Record<string, ChatElsewhere> {
+    const me = self().id
+    return Object.fromEntries(
+      Object.entries(whereAll())
+        .filter(([, w]) => w.id !== me)
+        .map(([sid, w]) => [sid, { pc: w.name, state: w.state }]),
+    )
+  }
+
+  function lastAll(): Record<string, ChatLast> {
+    const running = whereAll()
+    if (mode() === 'member') return Object.fromEntries(Object.entries(replica.last).filter(([sid]) => !running[sid]))
+    return Object.fromEntries([...held].filter(([sid, h]) => h.last && !running[sid]).map(([sid, h]) => [sid, h.last!]))
+  }
+
+  function teamInfo(): AgenticTeam | null {
+    const m = mode()
+    if (m === 'alone') return null
+    if (m === 'hub') return { pc: self().name, role: 'hub', hub: null, reachable: true }
+    return { pc: self().name, role: 'member', hub: team!.hub()?.name ?? null, reachable: sub !== null }
+  }
+
+  const emitWhere = () => emit({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() })
+  const emitFloors = () => emit({ t: 'floors', floors: allFloors() })
+
+  function hold(sid: string, who: { id: string; name: string }) {
+    held.set(sid, { holder: who.id, holderName: who.name, heldAt: Date.now(), last: held.get(sid)?.last ?? null })
+    saveHeld()
+  }
+
+  /** Lets a session go: what `who` held is free, and ran last there. */
+  function release(sid: string, who: { id: string; name: string }) {
+    const h = held.get(sid)
+    if (h?.holder && h.holder !== who.id) return
+    held.set(sid, { holder: null, holderName: null, heldAt: 0, last: { pc: who.name, at: new Date().toISOString() } })
+    saveHeld()
+    emitWhere()
+    pushState()
+  }
+
+  /** Brings the hub's copy up to `want` (a member's, where the chat ran) when it isn't there already. */
+  async function catchUpFrom(link: LinkPeer, sid: string, want: FileMark) {
+    if (!want.bytes) return
+    const file = fileOf(sid)
+    if (markOf(file).bytes >= want.bytes && sameMark(markOf(file, want.bytes), want)) return
+    await pullFrom(link, sid, file)
+  }
+
+  /** The hub: stops the session where it runs (here, or on a member, whose last bytes then come here). */
+  async function stopAt(id: string, sid: string): Promise<void> {
+    if (id === self().id) {
+      chats.kill(sid)
+      await endFlush(sid)
+      release(sid, self())
+      return
+    }
+    const link = team?.member(id) ?? null
+    const name = remote.get(id)?.name ?? held.get(sid)?.holderName ?? id
+    if (!link) {
+      // Out of reach: it is let go, on the asker's say-so (the page warned it may split).
+      log?.warn(`took chat ${sid.slice(0, 8)} from ${name}, which can't be reached`)
+      release(sid, { id, name })
+      return
+    }
+    const { mark } = await request<{ mark: FileMark }>(link, 'stop', { sessionId: sid }, 20_000)
+    await catchUpFrom(link, sid, mark)
+    release(sid, { id, name })
+  }
+
+  /** Stops a session's chat wherever it runs, not waiting (an agent taken off, a floor deleted). */
+  function stopAnywhere(sid: string) {
+    if (chats.info(sid)) {
+      chats.kill(sid)
+      return
+    }
+    const w = whereAll()[sid]
+    if (w && mode() === 'hub') void stopAt(w.id, sid).catch(e => log?.warn(`couldn't stop chat ${sid.slice(0, 8)} on ${w.name}: ${message(e)}`))
+  }
+
+  /**
+   * The hub: the session for `who`, taken over when it runs (or is held) elsewhere. Throws 409
+   * when it is elsewhere and `takeOver` wasn't asked. Answers where it was taken from.
+   */
+  async function lease(sid: string, who: { id: string; name: string }, takeOver: boolean, agentName: string): Promise<string | undefined> {
+    const there = whereAll()[sid]
+    const h = held.get(sid)
+    let from: { id: string; name: string } | null = null
+    if (there && there.id !== who.id) from = { id: there.id, name: there.name }
+    else if (h?.holder && h.holder !== who.id && (h.holder !== self().id || chats.info(sid))) {
+      const reachable = h.holder === self().id || !!team?.member(h.holder)
+      // Granted to a member that hasn't shown it running: starting, unless it is long past that.
+      if (!reachable || Date.now() - h.heldAt < LEASE_GRACE_MS || remote.get(h.holder)?.live[sid]) from = { id: h.holder, name: h.holderName ?? h.holder }
+    }
+    if (from) {
+      if (!takeOver) throw apiError(409, `${agentName}'s chat is running on ${from.name}. Take it over to run it here; it stops there first.`)
+      await stopAt(from.id, sid)
+    }
+    hold(sid, who)
+    return from?.name
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-021 on the hub: its members' standing streams
+
+  let pushTimer: NodeJS.Timeout | null = null
+  function pushState() {
+    if (mode() !== 'hub' || !subs.size || pushTimer) return
+    pushTimer = setTimeout(() => {
+      pushTimer = null
+      const state = { t: 'state', floors: floors.list(), where: whereAll(), last: lastAll(), marks: marksHere() }
+      for (const s of subs.values()) writeLine(s, state)
+    }, 150)
+    pushTimer.unref()
+  }
+
+  /** The marks of every floor session this PC has a copy of. */
+  function marksHere(): Record<string, FileMark> {
+    const out: Record<string, FileMark> = {}
+    for (const f of allFloors())
+      for (const a of f.agents) {
+        if (!a.sessionId) continue
+        const found = findTranscript(a.sessionId, projectsDir)
+        if (found) out[a.sessionId] = markOf(found)
+      }
+    return out
+  }
+
+  /** Catch-up, one at a time: a copy brought up to the far end's in the background. */
+  const pulling = new Set<string>()
+  let pulls: Promise<void> = Promise.resolve()
+  function backfill(link: LinkPeer, sid: string) {
+    if (pulling.has(sid) || chats.info(sid)) return
+    pulling.add(sid)
+    pulls = pulls
+      .then(async () => {
+        // Started here meanwhile: this PC writes it now.
+        if (chats.info(sid)) return
+        const m = await pullFrom(link, sid, fileOf(sid))
+        log?.info(`chat ${sid.slice(0, 8)}: copy brought up from ${link.name} (${m.bytes} bytes)`)
+      })
+      .catch(e => log?.warn(`couldn't bring chat ${sid.slice(0, 8)} up from ${link.name}: ${message(e)}`))
+      .finally(() => pulling.delete(sid))
+  }
+
+  function onSubscribe(from: { id: string; name: string }, stream: Duplex) {
+    subs.get(from.id)?.destroy()
+    subs.set(from.id, stream)
+    remote.set(from.id, { name: from.name, live: {} })
+    log?.info(`${from.name} is following the floors`)
+    const link = () => team?.member(from.id) ?? null
+    readLines(stream, raw => {
+      if (!isObject(raw) || subs.get(from.id) !== stream) return
+      if ((raw.t === 'hello' || raw.t === 'live') && isObject(raw.live)) {
+        const live = Object.fromEntries(Object.entries(raw.live).filter((e): e is [string, ChatState] => typeof e[1] === 'string'))
+        remote.set(from.id, { name: from.name, live })
+        // What it held and no longer runs (it stopped, or restarted): let go.
+        for (const [sid, h] of held) if (h.holder === from.id && !live[sid] && Date.now() - h.heldAt > LEASE_GRACE_MS) release(sid, from)
+        emitWhere()
+        pushState()
+      }
+      if ((raw.t === 'hello' || raw.t === 'marks') && isObject(raw.marks)) {
+        const l = link()
+        for (const [sid, m] of Object.entries(raw.marks)) {
+          if (!isMark(m) || chats.info(sid)) continue
+          const h = held.get(sid)
+          if (h?.holder && h.holder !== from.id) continue
+          if (m.bytes > markOf(fileOf(sid)).bytes && l) backfill(l, sid)
+        }
+      }
+      if (raw.t === 'jsonl' && typeof raw.sid === 'string' && typeof raw.from === 'number' && typeof raw.d === 'string') {
+        // Only from the PC running it (or granted it, starting), and never into a copy this PC writes.
+        if (chats.info(raw.sid) || (held.get(raw.sid)?.holder !== from.id && remote.get(from.id)?.live[raw.sid] === undefined)) return
+        const data = Buffer.from(raw.d, 'base64')
+        const r = appendAt(fileOf(raw.sid), raw.from, data)
+        if (r === 'ok') {
+          for (const [id, s] of subs) if (id !== from.id) writeLine(s, raw)
+        } else {
+          const l = link()
+          if (l) backfill(l, raw.sid)
+        }
+      }
+    })
+    const gone = () => {
+      if (subs.get(from.id) !== stream) return
+      subs.delete(from.id)
+      remote.delete(from.id)
+      log?.info(`${from.name} stopped following the floors`)
+      emitWhere()
+      pushState()
+    }
+    stream.on('close', gone)
+    stream.on('error', gone)
+    pushState()
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-021 on a member: its standing stream to the hub, and what comes on it
+
+  function needHub(): LinkPeer {
+    const h = team?.hub()
+    if (!h) throw apiError(409, 'This PC has no hub')
+    if (!h.link || !sub) throw apiError(503, `${h.name} (the hub) can't be reached right now, so floors are read-only here and no chat can start. Chats running here go on.`)
+    return h.link
+  }
+
+  function memberTick() {
+    if (mode() !== 'member') {
+      if (sub) dropSub()
+      return
+    }
+    const link = team!.hub()?.link ?? null
+    if (sub && (!link || sub.token !== link.token)) dropSub()
+    if (!link || sub || subscribing) return
+    subscribing = true
+    link.open({ op: 'subscribe' }).then(
+      stream => {
+        subscribing = false
+        sub = { token: link.token, stream }
+        writeLine(stream, { t: 'hello', live: chats.states(), marks: marksHere() })
+        readLines(stream, raw => onHubEvent(link, raw))
+        const gone = () => {
+          if (sub?.stream !== stream) return
+          sub = null
+          emitWhere()
+        }
+        stream.on('close', gone)
+        stream.on('error', gone)
+        log?.info(`following ${link.name}'s floors`)
+        emitWhere()
+      },
+      (e: unknown) => {
+        subscribing = false
+        log?.debug(`couldn't follow ${link.name}'s floors yet: ${message(e)}`)
+      },
+    )
+  }
+
+  function dropSub() {
+    const s = sub
+    sub = null
+    s?.stream.destroy()
+    emitWhere()
+  }
+
+  function onHubEvent(link: LinkPeer, raw: unknown) {
+    if (!isObject(raw)) return
+    if (raw.t === 'state' && Array.isArray(raw.floors)) {
+      replica = {
+        floors: raw.floors as Floor[],
+        where: isObject(raw.where) ? (raw.where as Replica['where']) : {},
+        last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {},
+        marks: isObject(raw.marks) ? (raw.marks as Record<string, FileMark>) : {},
+      }
+      saveReplica()
+      emitFloors()
+      emitWhere()
+      // Every copy here brought up to the hub's, unless this PC runs it (then it writes it).
+      for (const [sid, theirs] of Object.entries(replica.marks)) {
+        if (!isMark(theirs) || chats.info(sid)) continue
+        const mine = markOf(fileOf(sid))
+        if (mine.bytes < theirs.bytes || (mine.bytes === theirs.bytes && mine.tail !== theirs.tail)) backfill(link, sid)
+      }
+    } else if (raw.t === 'jsonl' && typeof raw.sid === 'string' && typeof raw.from === 'number' && typeof raw.d === 'string') {
+      if (chats.info(raw.sid)) return
+      // A gap or a fork is left to catch-up.
+      appendAt(fileOf(raw.sid), raw.from, Buffer.from(raw.d, 'base64'))
+    } else if (raw.t === 'memory' && typeof raw.floorId === 'string') {
+      emit({ t: 'memory', floorId: raw.floorId })
+    }
+  }
+
+  /** On a member: the agent's chat started here, the hub granting it (taken over from where it ran, when asked). */
+  async function openOnMember(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
+    const link = needHub()
+    const floor = floorOf(floorId)
+    const agent = agentOf(floor, agentId)
+    let sid = agent.sessionId
+    if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    if (!sid) {
+      sid = randomUUID()
+      const r = await request<{ floor: Floor }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/session`, body: { sessionId: sid } })
+      replica.floors = replica.floors.map(f => (f.id === r.floor.id ? r.floor : f))
+    }
+    const granted = await request<{ mark: FileMark; tookOverFrom: string | null }>(link, 'lease', { sessionId: sid, takeOver: req.takeOver === true }, 45_000)
+    try {
+      // This PC's copy brought up to the hub's first, unless it already has all of it.
+      const file = fileOf(sid)
+      const mark = isMark(granted.mark) ? granted.mark : NO_FILE
+      if (mark.bytes && !(markOf(file).bytes >= mark.bytes && sameMark(markOf(file, mark.bytes), mark))) await pullFrom(link, sid, file)
+      const now = floorOf(floorId)
+      const resumed = startHere(now, agentOf(now, agentId), sid, req)
+      return { sessionId: sid, started: true, resumed, ...(granted.tookOverFrom ? { tookOverFrom: granted.tookOverFrom } : {}) }
+    } catch (e) {
+      void request(link, 'release', { sessionId: sid, mark: markOf(fileOf(sid)) }).catch(() => {})
+      throw e
+    }
+  }
+
+  const memberTimer = team ? setInterval(memberTick, 1000) : null
+  memberTimer?.unref()
+  const stateTimer = team
+    ? setInterval(() => {
+        if (mode() === 'hub') pushState()
+        else if (mode() === 'member' && sub) writeLine(sub.stream, { t: 'marks', marks: marksHere() })
+      }, STATE_EVERY_MS)
+    : null
+  stateTimer?.unref()
+  if (team) setImmediate(memberTick)
+
+  // ---------------------------------------------------------------------------------------
+  // Opening an agent's chat
+
+  /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
+  async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
+    if (mode() === 'member') return openOnMember(floorId, agentId, req)
+    let floor = floorOf(floorId)
+    const agent = agentOf(floor, agentId)
+    let sid = agent.sessionId
+    if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    if (!sid) {
+      sid = randomUUID()
+      floor = floors.bindSession(floor.id, agent.id, sid)
+    }
+    const tookOverFrom = mode() === 'hub' ? await lease(sid, self(), req.takeOver === true, agent.name) : undefined
+    try {
+      const now = floorOf(floorId)
+      const resumed = startHere(now, agentOf(now, agentId), sid, req)
+      return { sessionId: sid, started: true, resumed, ...(tookOverFrom ? { tookOverFrom } : {}) }
+    } catch (e) {
+      if (mode() === 'hub') release(sid, self())
+      throw e
+    }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -197,8 +760,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   function rosterOf(floor: Floor, me: FloorAgent) {
     const byId = new Map(floor.agents.map(a => [a.id, a]))
+    const where = whereAll()
     const agents = floor.agents.map(a => {
-      const live = a.sessionId ? chats.info(a.sessionId) : null
+      const live = a.sessionId ? where[a.sessionId] : undefined
       return {
         name: a.name,
         role: a.role,
@@ -206,6 +770,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         reportsTo: a.reportsTo ? (byId.get(a.reportsTo)?.name ?? null) : null,
         status: live ? 'online' : a.sessionId ? 'offline' : 'never opened',
         doing: live ? live.state : null,
+        pc: live ? live.name : null,
         sessionId: live ? a.sessionId : null,
         isYou: a.id === me.id,
       }
@@ -214,44 +779,65 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { floor: floor.name, total: agents.length, online, offline: agents.length - online, agents }
   }
 
-  /** A live chat on the caller's floor, by the id list_chats gave. */
-  function siblingOf(floor: Floor, sid: unknown): ChatInfo {
+  /** A running chat on the caller's floor (on any of the hub's PCs), by the id list_chats gave. */
+  function siblingOf(floor: Floor, sid: unknown): { sessionId: string; id: string } {
     if (typeof sid !== 'string' || !sid) throw apiError(400, 'sessionId is missing')
-    const c = chats.info(sid)
-    if (!c || c.floorId !== floor.id) throw apiError(404, `No running chat ${sid} on your floor; list_chats shows the ones there are`)
-    return c
+    const w = whereAll()[sid]
+    if (!w || bySession(sid)?.floor.id !== floor.id) throw apiError(404, `No running chat ${sid} on your floor; list_chats shows the ones there are`)
+    return { sessionId: sid, id: w.id }
+  }
+
+  async function readChat(c: { sessionId: string; id: string }, lines: number): Promise<string> {
+    if (c.id === self().id) return chats.read(c.sessionId, lines) ?? ''
+    const link = team?.member(c.id)
+    if (!link) throw apiError(409, "That chat's PC can't be reached right now")
+    return request<string>(link, 'read', { sessionId: c.sessionId, lines })
+  }
+
+  async function typeInto(c: { sessionId: string; id: string }, body: string): Promise<boolean> {
+    if (c.id === self().id) return chats.type(c.sessionId, body)
+    const link = team?.member(c.id)
+    if (!link) return false
+    return request<boolean>(link, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)
   }
 
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
-    const mine = floors.bySession(me.sessionId)
+    if (mode() === 'member') return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs })
+    return toolFor(me.sessionId, name, rawArgs)
+  }
+
+  /** A tool call from the chat `sid` (running here, or on a member that passed it on). */
+  async function toolFor(sid: string, name: string, rawArgs: unknown): Promise<string> {
+    const mine = floors.bySession(sid)
     if (!mine) throw apiError(409, "This chat isn't an agent on a floor any more.")
     const { floor, agent } = mine
     const args = isObject(rawArgs) ? rawArgs : {}
-    const tag = `${agent.name}, chat ${me.sessionId.slice(0, 8)}`
+    const tag = `${agent.name}, chat ${sid.slice(0, 8)}`
 
     switch (name) {
       case 'list_chats': {
         const byId = new Map(floor.agents.map(a => [a.id, a]))
-        const others = chats
-          .live()
-          .filter(c => c.floorId === floor.id && c.sessionId !== me.sessionId)
-          .map(c => ({ sessionId: c.sessionId, agent: byId.get(c.agentId)?.name ?? '?', role: byId.get(c.agentId)?.role ?? '', doing: c.state }))
+        const others = Object.entries(whereAll())
+          .filter(([s]) => s !== sid)
+          .map(([s, w]) => ({ s, w, at: floors.bySession(s) }))
+          .filter(x => x.at?.floor.id === floor.id)
+          .map(({ s, w, at }) => ({ sessionId: s, agent: at!.agent.name, role: byId.get(at!.agent.id)?.role ?? '', doing: w.state, pc: w.name }))
         return json({ floor: floor.name, you: agent.name, chats: others })
       }
       case 'floor_roster':
         return json(rosterOf(floor, agent))
       case 'read_chat': {
         const c = siblingOf(floor, args.sessionId)
-        return chats.read(c.sessionId, typeof args.lines === 'number' ? args.lines : 100) ?? ''
+        return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
       }
       case 'send_to_chat': {
         const c = siblingOf(floor, args.sessionId)
-        if (c.sessionId === me.sessionId) throw apiError(400, "That's your own chat")
+        if (c.sessionId === sid) throw apiError(400, "That's your own chat")
         const body = text(args.text, 'text')
-        relayAllowed(me.sessionId, c.sessionId)
-        if (!chats.type(c.sessionId, `[message from ${tag}] ${body}`)) throw apiError(409, 'That chat stopped before the message reached it')
+        relayAllowed(sid, c.sessionId)
+        if (!(await typeInto(c, `[message from ${tag}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return `Sent to chat ${c.sessionId}.`
       }
@@ -260,18 +846,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const t = Date.now()
         if (t - (broadcastLast.get(floor.id) ?? 0) < BROADCAST_COOLDOWN_MS) throw apiError(429, 'This floor just had a broadcast; wait a few seconds.')
         broadcastLast.set(floor.id, t)
-        const to = chats.live().filter(c => c.floorId === floor.id && c.sessionId !== me.sessionId)
-        for (const c of to) chats.type(c.sessionId, `[broadcast from ${tag}] ${body}`)
+        const to = Object.entries(whereAll())
+          .filter(([s]) => s !== sid && floors.bySession(s)?.floor.id === floor.id)
+          .map(([s, w]) => ({ sessionId: s, id: w.id }))
+        await Promise.all(to.map(c => typeInto(c, `[broadcast from ${tag}] ${body}`)))
         return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.`
       }
       case 'memory_save': {
         const entry = memory.save(floor.id, {
           text: text(args.text, 'text'),
           tags: Array.isArray(args.tags) ? (args.tags as string[]) : [],
-          sessionId: me.sessionId,
+          sessionId: sid,
           authorName: agent.name,
         })
-        emit({ t: 'memory', floorId: floor.id })
+        memoryChanged(floor.id)
         return json({ saved: entry.id })
       }
       case 'memory_search':
@@ -297,32 +885,39 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  function memoryChanged(floorId: string) {
+    emit({ t: 'memory', floorId })
+    for (const s of subs.values()) writeLine(s, { t: 'memory', floorId })
+  }
+
   // ---------------------------------------------------------------------------------------
   // The page's routes
 
-  function answer(): FloorsAnswer {
-    return { floors: floors.list(), live: chats.states(), defaultCodeDir }
+  function answerFloors(): FloorsAnswer {
+    return { floors: allFloors(), live: chats.states(), elsewhere: elsewhere(), last: lastAll(), team: teamInfo(), defaultCodeDir }
   }
 
   function patchFloor(id: string, body: unknown) {
     if (!isObject(body)) throw apiError(400, 'Expected {name?, globalPrompt?, codeDir?, agents?}')
     const before = floorOf(id)
-    if (typeof body.codeDir === 'string' && body.codeDir.trim()) {
-      const dir = body.codeDir.trim()
-      if (!path.isAbsolute(dir)) throw apiError(400, 'Give the folder as a full path, like C:\\Users\\you\\code')
-      if (!existsSync(dir) || !statSync(dir).isDirectory()) throw apiError(400, `There is no folder ${dir}`)
-    }
+    if (typeof body.codeDir === 'string' && body.codeDir.trim()) checkFolder(body.codeDir)
     const floor = floors.patch(id, body as FloorPatch)
-    // An agent taken off the floor takes its running chat with it.
+    // An agent taken off the floor takes its running chat with it, wherever it runs.
     const kept = new Set(floor.agents.map(a => a.id))
-    for (const a of before.agents) if (!kept.has(a.id) && a.sessionId) chats.kill(a.sessionId)
+    for (const a of before.agents) if (!kept.has(a.id) && a.sessionId) stopAnywhere(a.sessionId)
     return { floor }
+  }
+
+  function checkFolder(raw: string) {
+    const dir = raw.trim()
+    if (!path.isAbsolute(dir)) throw apiError(400, 'Give the folder as a full path, like C:\\Users\\you\\code')
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) throw apiError(400, `There is no folder ${dir}${mode() === 'member' ? ' on this PC' : ''}`)
   }
 
   /** This account's Claude Code conversations, each with the agent here it already is, if any. */
   async function sessions(): Promise<ClaudeSession[]> {
     const bound = new Map<string, ClaudeSession['agent']>()
-    for (const f of floors.list()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
+    for (const f of allFloors()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
     return (await listSessions(projectsDir)).map(x => ({ ...x, agent: bound.get(x.sessionId) ?? null }))
   }
 
@@ -333,6 +928,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
     const floor = floorOf(floorId)
     if (intoId) agentOf(floor, intoId)
+    const link = mode() === 'member' ? needHub() : null
     const cwd = findTranscriptCwd(from, projectsDir)
     if (!cwd) throw apiError(404, `There is no conversation ${from} on this PC, or it never said which folder it was held in`)
     if (!existsSync(cwd)) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
@@ -341,19 +937,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       copy = (await copyTranscript(from, sid, projectsDir)).file
     } catch (e) {
-      throw apiError(500, `Couldn't copy that conversation: ${e instanceof Error ? e.message : String(e)}`)
+      throw apiError(500, `Couldn't copy that conversation: ${message(e)}`)
     }
     try {
-      // Looked up again: the floor may have changed while it copied.
       let agentId = intoId
-      if (agentId) {
-        const before = agentOf(floorOf(floorId), agentId).sessionId
-        if (before) chats.kill(before)
+      let after: Floor
+      const name = typeof body.name === 'string' ? body.name : ''
+      const role = typeof body.role === 'string' ? body.role.trim() : ''
+      if (link) {
+        // The hub keeps the floors: it seats the copy, and then brings its own copy over (marks).
+        if (!agentId) agentId = (await request<{ agent: FloorAgent }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents`, body: { name, role } })).agent.id
+        after = (await request<{ floor: Floor }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/session`, body: { sessionId: sid } })).floor
+        replica.floors = replica.floors.map(f => (f.id === after.id ? after : f))
+        if (sub) writeLine(sub.stream, { t: 'marks', marks: { [sid]: markOf(copy) } })
+        after = floorOf(floorId)
       } else {
-        const name = typeof body.name === 'string' ? body.name : ''
-        agentId = floors.addAgent(floorId, { name, role: typeof body.role === 'string' ? body.role.trim() : '' }).agent.id
+        // Looked up again: the floor may have changed while it copied.
+        if (agentId) {
+          const before = agentOf(floorOf(floorId), agentId).sessionId
+          if (before) stopAnywhere(before)
+        } else agentId = floors.addAgent(floorId, { name, role }).agent.id
+        after = floors.bindSession(floorId, agentId, sid)
       }
-      const after = floors.bindSession(floorId, agentId, sid)
       const agent = agentOf(after, agentId)
       log?.info(`brought a copy of conversation ${from.slice(0, 8)} onto ${after.name} as ${agent.name}'s chat (${sid.slice(0, 8)})`)
       return { floor: after, agent, sessionId: sid, cwd }
@@ -363,9 +968,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  const openRequest = (b: unknown): OpenChatRequest => {
+    const r = isObject(b) ? b : {}
+    return { cols: typeof r.cols === 'number' ? r.cols : undefined, rows: typeof r.rows === 'number' ? r.rows : undefined, takeOver: r.takeOver === true }
+  }
+
   type Handler = (m: string[], r: MountRequest) => unknown
-  const routes: [string, RegExp, Handler][] = [
-    ['GET', /^\/floors$/, () => answer()],
+  /** `local`: a member answers it itself; the rest it passes to its hub, which keeps the floors. */
+  const routes: [string, RegExp, Handler, 'local'?][] = [
+    ['GET', /^\/floors$/, () => answerFloors(), 'local'],
+    ['GET', /^\/sessions$/, async () => ({ sessions: await sessions() }), 'local'],
     ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined) })],
     [
       'POST',
@@ -375,14 +987,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { floors: floors.reorder(r.body.order as string[]) }
       },
     ],
-    ['GET', /^\/sessions$/, async () => ({ sessions: await sessions() })],
     ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body)],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
       ([id]) => {
         const f = floorOf(id)
-        for (const a of f.agents) if (a.sessionId) chats.kill(a.sessionId)
+        for (const a of f.agents) if (a.sessionId) stopAnywhere(a.sessionId)
         floors.remove(id)
         memory.drop(id)
         return { ok: true }
@@ -397,21 +1008,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return floors.addAgent(id, b as NewAgent)
       },
     ],
-    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body)],
-    [
-      'POST',
-      /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/,
-      ([id, agentId], r) => {
-        const b = isObject(r.body) ? r.body : {}
-        return openChat(id, agentId, { cols: typeof b.cols === 'number' ? b.cols : undefined, rows: typeof b.rows === 'number' ? b.rows : undefined })
-      },
-    ],
+    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body), 'local'],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => openChat(id, agentId, openRequest(r.body)), 'local'],
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/terminate$/,
       ([id, agentId]) => {
         const a = agentOf(floorOf(id), agentId)
-        return { killed: a.sessionId ? chats.kill(a.sessionId) : false }
+        if (!a.sessionId) return { killed: false }
+        if (chats.info(a.sessionId)) return { killed: chats.kill(a.sessionId) }
+        const running = !!whereAll()[a.sessionId]
+        stopAnywhere(a.sessionId)
+        return { killed: running }
       },
     ],
     [
@@ -422,37 +1030,35 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const floor = floorOf(id)
         const a = agentOf(floor, agentId)
         const next = r.body.sessionId.trim()
-        if (a.sessionId && a.sessionId !== next) chats.kill(a.sessionId)
+        if (a.sessionId && a.sessionId !== next) stopAnywhere(a.sessionId)
         const after = floors.bindSession(id, agentId, next || null)
-        const cwd = floor.codeDir ?? defaultCodeDir
-        return { floor: after, hasTranscript: next ? transcriptInfo(cwd, next, projectsDir).exists || !!findTranscriptCwd(next, projectsDir) : false }
+        return { floor: after, hasTranscript: next ? !!findTranscript(next, projectsDir) : false }
       },
     ],
     [
       'GET',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/messages$/,
       ([id, agentId]) => {
-        const floor = floorOf(id)
-        const a = agentOf(floor, agentId)
+        const a = agentOf(floorOf(id), agentId)
         if (!a.sessionId) return { sessionId: null, messages: [] }
-        const cwd = chats.info(a.sessionId)?.cwd ?? findTranscriptCwd(a.sessionId, projectsDir) ?? floor.codeDir ?? defaultCodeDir
-        return { sessionId: a.sessionId, messages: readTranscript(cwd, a.sessionId, projectsDir) }
+        const file = findTranscript(a.sessionId, projectsDir)
+        return { sessionId: a.sessionId, messages: file ? readTranscriptFile(file) : [] }
       },
+      'local',
     ],
     [
       'GET',
       /^\/floors\/([^/]+)\/transcripts$/,
       ([id]) => {
-        const floor = floorOf(id)
         const out: Record<string, { exists: boolean; bytes: number }> = {}
-        for (const a of floor.agents) {
+        for (const a of floorOf(id).agents) {
           if (!a.sessionId) continue
-          const cwd = chats.info(a.sessionId)?.cwd ?? findTranscriptCwd(a.sessionId, projectsDir) ?? floor.codeDir ?? defaultCodeDir
-          const t = transcriptInfo(cwd, a.sessionId, projectsDir)
-          out[a.id] = { exists: t.exists, bytes: t.bytes }
+          const file = findTranscript(a.sessionId, projectsDir)
+          out[a.id] = file ? { exists: true, bytes: statSync(file).size } : { exists: false, bytes: 0 }
         }
         return { transcripts: out }
       },
+      'local',
     ],
     ['GET', /^\/floors\/([^/]+)\/memory$/, ([id], r) => ({ entries: memory.search(floorOf(id).id, r.query.get('q') ?? '', 100) })],
     [
@@ -461,7 +1067,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id], r) => {
         const b = isObject(r.body) ? r.body : {}
         const entry = memory.save(floorOf(id).id, { text: text(b.text, 'text', 4000), tags: Array.isArray(b.tags) ? (b.tags as string[]) : [] })
-        emit({ t: 'memory', floorId: id })
+        memoryChanged(id)
         return { entry }
       },
     ],
@@ -471,7 +1077,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id, noteId], r) => {
         const b = isObject(r.body) ? r.body : {}
         const entry = memory.edit(floorOf(id).id, noteId, text(b.text, 'text', 4000))
-        emit({ t: 'memory', floorId: id })
+        memoryChanged(id)
         return { entry }
       },
     ],
@@ -480,7 +1086,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       /^\/floors\/([^/]+)\/memory\/([^/]+)$/,
       ([id, noteId]) => {
         if (!memory.remove(floorOf(id).id, noteId)) throw apiError(404, 'No such note')
-        emit({ t: 'memory', floorId: id })
+        memoryChanged(id)
         return { ok: true }
       },
     ],
@@ -493,8 +1099,128 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!isObject(r.body) || typeof r.body.name !== 'string') throw apiError(400, 'Expected {name, arguments}')
         return { text: await callTool(key, r.body.name, r.body.arguments) }
       },
+      'local',
     ],
   ]
+
+  /** Runs the route `rest` names; `forward` (a member) passes a non-local one to its hub instead. */
+  async function route(r: MountRequest, forward?: (r: MountRequest) => Promise<unknown>): Promise<unknown> {
+    let methodMismatch = false
+    for (const [method, pattern, run, where] of routes) {
+      const m = pattern.exec(r.rest)
+      if (!m) continue
+      if (r.method !== method) {
+        methodMismatch = true
+        continue
+      }
+      let params: string[]
+      try {
+        params = m.slice(1).map(decodeURIComponent)
+      } catch {
+        throw apiError(400, 'Malformed path')
+      }
+      if (forward && where !== 'local') return await forward(r)
+      return await run(params, r)
+    }
+    throw apiError(methodMismatch ? 405 : 404, methodMismatch ? `${r.method} is not allowed here` : `No such path: ${AGENTIC_PREFIX}${r.rest}`)
+  }
+
+  /** A member's change, passed to the hub; its own folder for a floor becomes `folderFor` (checked here, where it is). */
+  async function toHub(r: MountRequest): Promise<unknown> {
+    const link = needHub()
+    let body = r.body
+    if (r.method === 'PATCH' && /^\/floors\/[^/]+$/.test(r.rest) && isObject(body) && body.codeDir !== undefined) {
+      const { codeDir, ...rest } = body
+      if (typeof codeDir === 'string' && codeDir.trim()) checkFolder(codeDir)
+      body = { ...rest, folderFor: { id: self().id, dir: typeof codeDir === 'string' && codeDir.trim() ? codeDir.trim() : null } }
+    }
+    const value = await request<unknown>(link, 'http', { method: r.method, rest: r.rest, query: r.query.toString(), body })
+    // What the hub answers about a floor is in the next state push too; it is on screen now.
+    const floor = isObject(value) && isObject(value.floor) ? (value.floor as unknown as Floor) : null
+    if (!floor) return value
+    replica.floors = replica.floors.some(f => f.id === floor.id) ? replica.floors.map(f => (f.id === floor.id ? floor : f)) : [floor, ...replica.floors]
+    emitFloors()
+    // As this PC sees it: its own folder as codeDir.
+    return { ...(value as Record<string, unknown>), floor: allFloors().find(f => f.id === floor.id) ?? floor }
+  }
+
+  /** The hub: a member's page change, run here as its own page's would be. */
+  function fromMember(from: { id: string; name: string }, raw: unknown): Promise<unknown> {
+    if (!isObject(raw) || typeof raw.method !== 'string' || typeof raw.rest !== 'string') throw apiError(400, 'Expected {method, rest, body}')
+    if (raw.rest === '/mcp/call') throw apiError(403, 'Tool calls come as tool')
+    const body = raw.body
+    if (isObject(body) && isObject(body.folderFor) && body.folderFor.id !== from.id) throw apiError(403, "A PC sets only its own folder for a floor")
+    if (isObject(body) && body.codeDir !== undefined) throw apiError(403, "The hub's own folder is set on the hub")
+    return route({ method: raw.method, rest: raw.rest, query: new URLSearchParams(typeof raw.query === 'string' ? raw.query : ''), body, headers: {} })
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // F-021: what the other PCs ask of this one
+
+  function serve(meta: Record<string, unknown>): (stream: Duplex) => void {
+    const from = isObject(meta.from) && typeof meta.from.id === 'string' && typeof meta.from.name === 'string' ? { id: meta.from.id, name: meta.from.name } : null
+    if (!from) throw new Error('which PC is asking?')
+    const op = meta.op
+    const m = mode()
+    if (m === 'hub') {
+      switch (op) {
+        case 'subscribe':
+          return stream => onSubscribe(from, stream)
+        case 'http':
+          return answer(body => fromMember(from, body))
+        case 'lease':
+          return answer(async raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId, takeOver}')
+            const at = floors.bySession(raw.sessionId)
+            if (!at) throw apiError(404, "That chat isn't an agent's on a floor")
+            const tookOverFrom = (await lease(raw.sessionId, from, raw.takeOver === true, at.agent.name)) ?? null
+            return { mark: markOf(fileOf(raw.sessionId)), tookOverFrom }
+          })
+        case 'release':
+          return answer(async raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId, mark}')
+            const link = team?.member(from.id)
+            if (link && isMark(raw.mark)) await catchUpFrom(link, raw.sessionId, raw.mark).catch(e => log?.warn(`couldn't bring chat ${String(raw.sessionId).slice(0, 8)} up from ${from.name}: ${message(e)}`))
+            release(raw.sessionId, from)
+            return { ok: true }
+          })
+        case 'tool':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.name !== 'string') throw apiError(400, 'Expected {sessionId, name, arguments}')
+            // Only for a chat that PC holds: a member speaks for its own chats.
+            if (held.get(raw.sessionId)?.holder !== from.id && remote.get(from.id)?.live[raw.sessionId] === undefined) throw apiError(403, `${from.name} isn't running that chat`)
+            return toolFor(raw.sessionId, raw.name, raw.arguments)
+          })
+        case 'pull':
+          return servePull(sid => findTranscript(sid, projectsDir))
+      }
+    } else if (m === 'member' && from.id === team!.hub()?.id) {
+      switch (op) {
+        case 'stop':
+          return answer(async raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')
+            if (chats.info(raw.sessionId)) chats.kill(raw.sessionId)
+            const mark = flushing.has(raw.sessionId) ? await endFlush(raw.sessionId) : markOf(fileOf(raw.sessionId))
+            return { mark }
+          })
+        case 'read':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId, lines}')
+            const t = chats.read(raw.sessionId, typeof raw.lines === 'number' ? raw.lines : 100)
+            if (t === null) throw apiError(404, "That chat isn't running here")
+            return t
+          })
+        case 'type':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
+            return chats.type(raw.sessionId, raw.text)
+          })
+        case 'pull':
+          return servePull(sid => findTranscript(sid, projectsDir))
+      }
+    }
+    throw new Error(`this PC doesn't do ${String(op)}`)
+  }
 
   // ---------------------------------------------------------------------------------------
   // WebSockets
@@ -524,33 +1250,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const mount: ApiMount = {
     prefix: AGENTIC_PREFIX,
     ownAuth: rest => rest === '/mcp/call',
-    async http(r) {
-      let methodMismatch = false
-      for (const [method, pattern, run] of routes) {
-        const m = pattern.exec(r.rest)
-        if (!m) continue
-        if (r.method !== method) {
-          methodMismatch = true
-          continue
-        }
-        let params: string[]
-        try {
-          params = m.slice(1).map(decodeURIComponent)
-        } catch {
-          throw apiError(400, 'Malformed path')
-        }
-        return await run(params, r)
-      }
-      throw apiError(methodMismatch ? 405 : 404, methodMismatch ? `${r.method} is not allowed here` : `No such path: ${AGENTIC_PREFIX}${r.rest}`)
-    },
+    http: r => route(r, mode() === 'member' ? toHub : undefined),
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)
       if (rest === '/events')
         return ws => {
           events.add(ws)
           ws.onClose(() => events.delete(ws))
-          ws.sendText(JSON.stringify({ t: 'floors', floors: floors.list() } satisfies AgenticEvent))
+          ws.sendText(JSON.stringify({ t: 'floors', floors: allFloors() } satisfies AgenticEvent))
           ws.sendText(JSON.stringify({ t: 'live', live: chats.states() } satisfies AgenticEvent))
+          ws.sendText(JSON.stringify({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() } satisfies AgenticEvent))
         }
       return null
     },
@@ -562,9 +1271,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     chats,
     memory,
     callTool,
+    serve,
     close() {
       if (liveTimer) clearTimeout(liveTimer)
+      if (pushTimer) clearTimeout(pushTimer)
+      if (replicaTimer) clearTimeout(replicaTimer)
+      if (memberTimer) clearInterval(memberTimer)
+      if (stateTimer) clearInterval(stateTimer)
+      tail.close()
       chats.closeAll()
+      sub?.stream.destroy()
+      sub = null
+      for (const s of subs.values()) s.destroy()
+      subs.clear()
       for (const s of events) s.close(1001, 'the agent is stopping')
       events.clear()
     },
