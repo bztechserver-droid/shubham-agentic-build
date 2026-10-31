@@ -18,6 +18,7 @@ import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './c
 import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
+import { armExitWatchdog, processStartedAt } from './exit-watchdog.ts'
 import { externalServers } from './hub/external-servers.ts'
 import { startServers, type Servers } from './hub/rustdesk-server.ts'
 import { loadOrCreateIdentity } from './link/identity.ts'
@@ -742,22 +743,38 @@ if (import.meta.main) {
   let build: Build | null = null
   let ui: UiServer | null = null
   let uiTailnet: UiServer | null = null
+  let logsDir: string | null = null
   let exiting = false
+  // Each step of a stop gets so long, so one that never settles can't keep the process (agent/exit-watchdog.ts).
+  const within = async (what: string, step: Promise<unknown> | undefined, ms: number) => {
+    let timer: NodeJS.Timeout | undefined
+    const late = new Promise<'late'>(resolve => (timer = setTimeout(() => resolve('late'), ms)))
+    try {
+      if ((await Promise.race([step, late])) === 'late') log.error(`while stopping: ${what} didn't finish in ${ms / 1000} s; going on`)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
   const shutdown = async (why: string, code = 0) => {
     // A second Ctrl+C: don't wait any longer.
     if (exiting) process.exit(1)
     exiting = true
     log.info(`stopping: ${why}`)
+    // Under Start.cmd or the guard, a stop that hangs where nothing in here can run any more is ended
+    // from outside with the same code, so an update still runs and the app starts again.
+    if (process.env.SAD_SUPERVISED === '1') {
+      armExitWatchdog({ pid: process.pid, startedAt: processStartedAt(), code, ms: 20_000, logFile: logsDir ? path.join(logsDir, 'exit-watchdog.log') : undefined })
+    }
     try {
       build?.close()
-      await ui?.close()
-      await uiTailnet?.close()
-      await agent?.stop()
+      await within('closing the page', ui?.close(), 3000)
+      await within('closing the tailnet page', uiTailnet?.close(), 3000)
+      await within('stopping the agent', agent?.stop(), 10_000)
     } catch (e) {
       log.error(`while stopping: ${message(e)}`)
       code ||= 1
     }
-    await closeLog()
+    await within('closing the log', closeLog(), 2000)
     process.exit(code)
   }
   process.on('SIGINT', () => void shutdown('Ctrl+C'))
@@ -778,6 +795,7 @@ if (import.meta.main) {
 
   try {
     const config = loadConfig({ argv: process.argv.slice(2) })
+    logsDir = config.paths.logs
     // SAD_LOG_LEVEL=debug for the detail (links, streams; the app's own screen's logged-only input).
     initLog({ dir: config.paths.logs, level: process.env.SAD_LOG_LEVEL === 'debug' ? 'debug' : undefined })
     // F-020: which build this is, its updates, and Publish on the hub where Dev is beside it.

@@ -1303,7 +1303,18 @@ says how it is used; this is how it works.
   `SAD_SUPERVISED=1` (set by `Start.cmd`) and answers before the agent exits with
   `UPDATE_EXIT_CODE` (75); `Start.cmd` then runs `Update.cmd` (`git pull --ff-only`; `npm ci
   --omit=dev` when `package-lock.json` changed) and starts it again. Any other exit: started again
-  after 5 s.
+  after 5 s. (F-058: the guard does the same, within a second, and keeps 5173 open meanwhile.)
+- **A stop always ends** (`exit-watchdog.ts`, `shutdown` in `main.ts`). On 2026-10-31 at 23:37 an
+  Update now with five chats open logged `stopped` and never exited, so `Start.cmd` waited on it
+  and neither updated nor restarted; why is not known. Each step of a stop has a time limit (the
+  page 3 s, the tailnet page 3 s, `agent.stop()` 10 s, the log 2 s; a late one is logged and passed)
+  and then `process.exit(code)`. Under `SAD_SUPERVISED=1` a stop first starts a watchdog for the
+  case where `process.exit` itself hangs (it waits for worker threads and the thread pool): a
+  hidden PowerShell, an ordinary child (started detached it exits without running), which opens a
+  handle to this PID only if its start time is within 2 s of the agent's, and after 20 s calls
+  `TerminateProcess(handle, code)` with the stop's code (75 stays 75), first appending a line to
+  `<state>/agent/logs/exit-watchdog.log`. Node's job for its children ends it when the agent exits
+  by itself. Tests: `exit-watchdog.test.ts`.
 - **Publish** (`POST /build/publish {skipChecks?}`, the hub only, one at a time): runs Dev's
   `node agent/scripts/publish.ts [--skip-checks]` in Dev, keeps its last 400 lines (colour codes
   stripped) for `GET /build/info`, and reads the published version from its `PUBLISHED <json>`
@@ -1588,46 +1599,93 @@ The Tasks page (DESIGN.md › Tasks) and every chat share one list of tasks, kep
   and their key), `team.test.ts` (the laptop through the hub, and the hub out of reach), `index.test.ts`
   (the tool list), and in `shared/`: `tasks-model.test.ts`.
 
-## F-054: the CRM as a page, referenced (agentic/crm.ts, src/crm/)
+## F-054: the CRM as a page, built into the app (crm-host/, agentic/crm.ts, agentic/crmproxy.ts, src/crm/)
 
-The CRM is not compiled into the app (DESIGN.md › CRM): its own website is shown in a frame, at an
-address the hub keeps. Types: `shared/crm.ts`.
+The CRM (sam-crm-fe, a Next 15 app) is compiled into the page and shown at `/crm` and on Alt+B; its backend is
+reached through this PC's agent, with this PC's CRM session. The CRM's own website in a frame is the second
+mode, a setting the hub keeps. Types: `shared/crm.ts`. Shubham's words: the CRM inside the build, not an iframe;
+"it has to load fast"; it was already done in agentic-claude-manager (its `vite.config.ts`, `crm-shim/`).
 
-- **The address** (`createCrmStore`, `<state>/agent/agentic/crm.json` as `{url}`, written whole): `crmAddress`
-  keeps it as `new URL(..).toString()` without `#...`: https only (http for localhost, 127.0.0.1 and [::1]), no
-  user name or password, at most 300 characters; a bare host is taken as https; empty or null clears it; an
-  unreadable or odd file is no address.
-- **The check** (`checkCrm(url, {app, fetch, timeoutMs})`): one GET (redirects followed, the body cancelled,
-  8 s) and a `CrmCheck` {ok, reason, status, message, header, ms}. Reasons: `dns` (ENOTFOUND, EAI_AGAIN), `cert`
-  (CERT_HAS_EXPIRED, self-signed and unverifiable ones), `refused`, `timeout`, `network` (anything else, with the
-  code); by status: 402 or `x-vercel-error: DEPLOYMENT_DISABLED` is `disabled`, 404 `notfound`, 401 and 403 and
-  other 4xx or 5xx `status`; an answer under 400 is read for framing: `framing` when `X-Frame-Options` is DENY, or
-  SAMEORIGIN (the app is never the site's own origin), or any `Content-Security-Policy` policy's `frame-ancestors` doesn't
-  admit the app (`'none'`, an empty list, `'self'`, a scheme source, a host source with its port and `*.` wildcard,
-  `*`; with no app origin known only a list that cannot include it refuses). ALLOW-FROM is obsolete and ignored.
-  Messages are one plain sentence naming the host and the cause. Run against the real sites: scrm/sam/sam-crm-fe
-  `disabled`, crm `dns`, bcrm `cert` (expired), crmbe `framing` (X-Frame-Options: SAMEORIGIN).
-- **Routes** (`/agentic`, not `local`: a member passes them to the hub): `GET /crm?origin=<the page's origin>&fresh=1` →
-  `{url, check}` (the check of the address, kept 30 s per address and origin unless `fresh`; `{url: null,
-  check: null}` while there is none), `PATCH /crm {url}` (400 for a bad address or no `url`; sets it, forgets
-  the kept check, answers with a fresh one).
-- **The page** (`src/crm/`): `CrmHost` (eager: the Alt+B key, in the capture phase so the terminal can't stop
-  it, and the keep-alive) and `CrmFrame` (lazy: the frame, the corner button, the cards) beside `<RouterProvider>`
-  in main.tsx. The route `/crm` only gives the address a title. Two sizes of one frame: on `/crm` it is laid
-  over the app's `<main>` (its rectangle, kept by a ResizeObserver), so the menu and the top bar stay; on
-  `/crm?full=1` it covers the window. Alt+B (`isCrmShortcut`: the physical B key with Alt alone) from anywhere
-  else remembers the address in `sessionStorage` and goes to `/crm?full=1`; from the full window it goes back to
-  what was remembered (`leaveTarget`: a local address that isn't the full window, else `/`); on the CRM page it
-  goes full window and back to the CRM page. The frame is let go 10 minutes after the page was left. It has
-  `sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox
-  allow-downloads allow-modals allow-storage-access-by-user-activation"` (no top navigation).
-- **Not done, on purpose:** serving the CRM from here. sam-crm-fe has no node_modules (about 100 packages,
-  Next 15, Tailwind 3) and agentic-claude-manager needed ~45 KB of shims, copied design tokens and a
-  server proxy holding the CRM's cookie; the result is 15.6 MB. If the CRM's site stays down, that is the
-  alternative, and a decision for Shubham.
-- **Tests:** `crm.test.ts` (the address, the file, the headers matrix, the check against stand-in sites for
-  each outcome, and the routes through the API), `shared/crm-nav.test.ts` (the key, the addresses, where
-  leaving goes).
+- **The compile** (`crm-host/vite-plugin.ts`, first in `plugins`). The source is `SAD_CRM_SRC` or `../../sam-crm-fe/src`
+  from Dev (read in place; both repos stay read-only). `SAD_CRM=off` leaves it out (`virtual:crm-app` is then a stub
+  and the page says so); `SAD_CRM=required` (Publish) fails the build when the source is missing; otherwise it is in
+  when found. In the CRM's files only (importers under the source): `@/` is rewritten to `@crm/` in memory (Vite's own
+  alias plugin would take `@/` for this app's `src`; `@crm` is an alias of the CRM's source); `next/navigation`,
+  `next/link`, `next/dynamic` and `next-themes` resolve to `crm-host/shims/*.tsx` (forward-slash ids, so there is one
+  module instance); `lucide-react` is a generated shim with an explicit export list (the names the CRM uses, and
+  `Github`, drawn locally: lucide 1.x dropped brand icons); `framer-motion` is `motion/react`; a bare import is resolved
+  from this project (the CRM has no `node_modules`). `config()` defines `process.env.NEXT_PUBLIC_API_URL` as
+  `/agent-api/agentic/crm-proxy` (the CRM adds `/v1`) and the other `NEXT_PUBLIC_*` it reads, adds the source to
+  `server.fs.allow`, and raises `chunkSizeWarningLimit`. `virtual:crm-app` exports `CrmApp` (or null) and `bundled`.
+  `crm-host/` is outside `src/`: it is not type-checked or linted (`tsconfig.node.json` includes only the plugin,
+  `.oxlintrc.json` ignores `crm-host/**`).
+- **`CrmApp`** (`crm-host/CrmApp.tsx`, a chunk of its own with `crm.css`): the CRM's root providers (react-query,
+  tooltip, toaster, org, permissions), its router, and its own `app/(crm)/layout` (sidebar, header, auth guard) around
+  a `Screen`. `crm-host/routes.tsx` lists the CRM's screens as lazy chunks (`matchCrmRoute`). `bridgeSession` sets the
+  CRM's `crm_logged_in` hint (its `getToken()` answers null without it) while rendering. The CRM's portals go to a host
+  div in `.crm-app` (`window.__CRM_PORTAL__`). `ThemeBridge` keeps the app's `data-mode` and the CRM's `dark` class and
+  `localStorage.theme` one. A page that throws takes only itself down (`PageBoundary`). `crm.css` is a Tailwind v4
+  sheet (`@reference` to the app's, `@source` over the CRM's files); `.crm-app` re-points this app's tokens to the CRM's
+  palette and has `transform: translate(0)`, so the CRM's fixed sidebar and overlays are placed in its box.
+- **The router** (`shims/navigation.tsx`): the CRM's address is a path and a query in state, not the browser's (the app
+  owns `/crm`): `useRouter` (push, replace, back, no-ops for the rest), `usePathname`, `useSearchParams`, `useParams`,
+  `redirect`. Where it was left is kept in `localStorage` (`sad-crm-last-route`), never a sign-in path. A CRM route
+  asked for with `window.open` or `<a target=_blank>` is taken while the CRM is on screen. The CRM's guard sends a
+  visitor it can't use to `/login` without rendering the page, so the router itself calls `onNeedSignIn` for `login`,
+  `signup` and `forgot-*`.
+- **The proxy** (`agent/agentic/crmproxy.ts`, `createCrmProxy({file})`; the file is `<state>/agent/crm-session.json`).
+  `session()` is `{signedIn, name, username, expiresAt}` from the session file (7 days from `signedInAt`, `SESSION_MS`);
+  never its cookie. `handle(req, res, sub, search)` forwards to the CRM's own origin only (a path that leaves it is a
+  400): 401 with no session; OPTIONS answered 204; GET, HEAD, POST, PUT, PATCH and DELETE (405 for the rest). Not passed
+  on: hop-by-hop headers, `host`, `origin`, `referer`, `content-length`, `accept-encoding`, `cookie`, `x-csrf-token`,
+  `x-sad-token`, `x-sad-chat-key`, `sec-*`. The body is held whole (at most 25 MB, else 413: a CSRF retry sends it
+  again). For a mutating method the CRM's CSRF pair is made: `GET /v1/auth/csrf-token` with the session (kept in memory
+  per cookie), then `x-csrf-token` and the `crm_csrf` cookie; a 403 that mentions csrf is mended once. Not passed back:
+  hop-by-hop headers, `set-cookie`, `strict-transport-security`, `content-security-policy`, `x-frame-options`, the
+  cross-origin policies, `access-control-*`; `Cache-Control: no-store`; the body is streamed; an unreachable CRM is a
+  502 naming the host and the cause. The cookie, the CSRF token and the session are never logged and never in an answer.
+  It is an `ApiMount` `raw` route (`agent/api.ts`: an optional `raw?(rest, url)` hook before the JSON handling),
+  `/agentic/crm-proxy/*`, local to this PC (not passed to the hub: each PC has its own session).
+- **Routes** (`/agentic`): `GET /crm?origin=<the page's origin>&fresh=1` -> `{mode, url, check}` (`mode` is `bundled`, the
+  default, or `frame`; `url` and `check` are for the frame way: the check of the address, kept 30 s per address and
+  origin unless `fresh`; both null while there is no address); `PATCH /crm {url?, mode?}` (400 for a bad address or a
+  mode that isn't one of the two); `GET /crm/session` (local) -> the session's `{signedIn, ...}`. Settings are kept
+  whole in `<state>/agent/agentic/crm.json` as `{url, mode}` (`createCrmStore`: `get()`, `set(patch)`).
+- **The address** (`crmAddress`, for the frame): `new URL(..).toString()` without `#...`: https only (http for
+  localhost, 127.0.0.1 and [::1]), no user name or password, at most 300 characters; a bare host is taken as https; empty
+  or null clears it. **The check** (`checkCrm(url, {app, fetch, timeoutMs})`): one GET (redirects followed, the body
+  cancelled, 8 s) and a `CrmCheck` {ok, reason, status, message, header, ms}; reasons `dns`, `cert`, `refused`,
+  `timeout`, `network`, by status 402 or `x-vercel-error: DEPLOYMENT_DISABLED` is `disabled`, 404 `notfound`, other
+  4xx/5xx `status`, and `framing` when `X-Frame-Options` is DENY or SAMEORIGIN or a CSP `frame-ancestors` list leaves
+  the app out. Run against the real sites on 2026-10-31: scrm/sam/sam-crm-fe `disabled`, crm `dns`, bcrm `cert`, crmbe
+  `framing`.
+- **The page** (`src/crm/`): `CrmHost` (eager: Alt+B in the capture phase so the terminal can't stop it, and the
+  keep-alive; two sizes of one overlay: on `/crm` the rectangle of `<main>` kept by a ResizeObserver, on `/crm?full=1`
+  the window), `CrmFrame` (lazy: the modes, `SignInCard`, `AddressCard`, `Frame`, the corner `Pill`), `Bundled.tsx`
+  (`BundledCrm`: the `virtual:crm-app` import is a lazy chunk, loaded on the first open; `NotBuiltIn` when the build
+  was made without the source), `data.ts` (`useCrm`, `useCrmSession`). Alt+B (`isCrmShortcut`: the physical B key with
+  Alt alone) from anywhere else remembers the address in `sessionStorage` and goes to `/crm?full=1`; from the full window
+  it goes back to what was remembered (`leaveTarget`); on the CRM page it goes full window and back. The CRM is let go 10
+  minutes after the page was left. `SignInCard` posts the Devices sign-in (`claudeSignIn`: the password goes to the
+  agent, which keeps only the session); `onNeedSignIn` swaps the CRM for it, and signing in remounts the CRM.
+- **Publish and the build** (`agent/scripts/publish.ts`, `agent/build.ts`): the page is compiled on the hub PC from the
+  checkout beside Dev; the build repo gets only `app/`, so a build needs neither `sam-crm-fe` nor the CRM's packages and
+  its `package.json` has only the runtime ones. Publish stops before the checks, with a sentence, when `crmSourceDirs(DEV)`
+  is empty, builds with `SAD_CRM=required` and prints the CRM's commit; `devFingerprint(dir, git, also)` hashes the CRM
+  source's commit and changes too (a folder git can't read adds nothing), so a change there is something new.
+- **Measured** (the published build, run from its stage folder through its own page server on this PC, headless Chrome,
+  a stand-in CRM backend): the build output 51 files and 2.41 MB without the CRM, 486 files and 16.38 MB with it; what the
+  page loads at start 1030 KB raw / 311 KB gzip before, 1046 KB / 322 KB after; the CRM's stylesheet 275 KB (37.5 KB gzip);
+  first open to the CRM's first screen 792 ms, after a reload 723 ms with no JavaScript downloaded, back after leaving
+  about 84 ms, with the CPU slowed 4x 1.38 s; a crawl of the 87 CRM screens that need no id in their address: all open.
+- **Not checked:** the real CRM backend with a real session; a real phone over Tailscale; a hardware keyboard on Android.
+- **Tests:** `crm.test.ts` (the address, the file and the mode, the headers matrix, the check against stand-in sites, the
+  routes through the API), `crmproxy.test.ts` (the session file as the Devices page writes it, who is signed in and
+  signing out seen at once, a call with the session and the page's own credentials and origin left behind, the CSRF
+  pair fetched once and mended once, the CRM's answer as it is including a file byte for byte, a path that can't name
+  another host and 401 with no session, the app's token and origin rules and a 502 that names only the host),
+  `shared/crm-nav.test.ts` (the key, the addresses, where leaving goes), and in `build.test.ts` the fingerprint with
+  the CRM and `crmSourceDirs`.
 
 ## Claude subscription failover and switch (claude/failover.ts, the switch in claude/index.ts)
 
@@ -1731,6 +1789,83 @@ Claude subscription). Everything below is reads, except one write.
 - **Not yet / not done:** writing a cap (it is not the person's own assignment: Shubham raises his
   cap on Office 1 on the CRM's Code › Usage); a member PC restarting its chats from the hub's
   switch; reading his cap on a subscription he is not on (the CRM does not give it).
+
+## F-058: the guard (guard.ts, guard/supervisor.ts, hub/keeper.ts, hub/external-servers.ts, proc-tree.ts, agentic/recover.ts)
+
+Built 2026-10-31. The app was gone from 22:02 to 22:15 that night: the phone showed a dead page, and
+Control by RustDesk was out of reach too, because hbbs and hbbr were children of the agent and went with
+it. Shubham: "There has to be an auto-restart for the port and the app has to not just connect to the
+port. It has to connect to the device so that I can do remote control even when there is a crash."
+The old way (`Start.cmd`, its restart loop) is still there and still works; the guard is the new one.
+
+- **What it is**: `node agent/guard.ts [--role hub]`, the one process that runs apart from the app. Four
+  jobs: it keeps the agent running; it serves the page on 5173 itself, so 5173 never closes; it keeps
+  the hub's hbbs and hbbr running in a process of their own; it is the only one of itself.
+  `Guard.cmd` runs it in a loop (started again 2 s after it dies; exit 3 "a guard runs already" and 4
+  "asked to stop" end the loop, exit 5 "I updated myself" starts it again at once). Output goes to
+  `<state>/guard-console.log`, the agent's to `<state>/agent-console.log`.
+- **Started** by the Scheduled Task `ShubhamAgenticGuard` (`Install-Guard.cmd`, no admin): at logon
+  (10 s delay) and every minute, "ignore a new start while one runs", so a guard that is killed is back
+  within a minute and there is never more than one. The Startup launcher `shubham-agentic.vbs` runs
+  `Guard hidden.vbs` too, and so can anyone by hand (Christopher on 4740 ran the launcher at 22:15):
+  a second guard finds the lock taken and exits with code 3, harmlessly. `Install-Guard.cmd -Remove`
+  takes it all out and goes back to `Start.cmd`.
+- **One only**: the lock is the listening port 21228 (`SAD_GUARD_PORT`) on 127.0.0.1, exclusive. The
+  port goes with the process however it dies, so there is no lock file to go stale. The same port is the
+  control API: `GET /status`; `POST /stop` and `POST /restart-agent` need `x-sad-token`;
+  `node agent/guard.ts status | stop | restart`.
+- **The agent** (supervisor.ts): started as `node agent/main.ts --app app` with `SAD_SUPERVISED=1` (so
+  Update now works), `SAD_PAGE_SERVER=guard` (it doesn't open 5173), `SAD_RUSTDESK_EXTERNAL=1` (when a
+  keeper runs) and `SAD_RESUME_CHATS=1`. The policy, tested with a fake clock and fake processes:
+  start when nothing runs; *adopt* an agent that answers although the guard didn't start it (the old
+  loop's, or one started by hand): left alone and watched, started over only if it stops; start again the
+  moment it exits (the exit wakes the loop, no waiting for the next look); *hung* = it runs but its
+  `GET /agent-api/health` (2.5 s limit) fails 8 looks in a row after its 90 s boot grace: ended and
+  started again; a backoff for one that dies again and again (0, 2, 5, 10, 20, 30 s; the count starts
+  over after a minute up); exit code 75 (Update now) runs `Update.cmd` (10 minute limit), then starts at
+  once. If the update changed the guard's own files it exits with 5 and `Guard.cmd` starts the new
+  code, leaving the agent and the keeper running (the new guard adopts them).
+- **The page, always**: `ui-server.ts` (the same code the agent used for 5173, with a `handle` hook) runs
+  in the guard: the built page, `/agent-api` and its WebSockets forwarded to the agent under the same
+  rules as before (the token only for the app's own page), plus `GET /guard/status`, which the guard
+  answers by itself, JSON (`GuardStatus`: the agent's and keeper's state, restarts, `etaSeconds`, and
+  `control`: the RustDesk link and the backup page's port). While the agent is down `/agent-api` is
+  502 in its error shape and WebSockets fail, but the page loads and its sign (`src/lib/live/
+  LinkBanner.tsx`, `shared/guard-note.ts`) says "The app is restarting. Back in about N s." with Control
+  (`rustdesk://connection/new/<id>`) and Backup page (Christopher, port 4740) links. A port held by an
+  agent started the old way is tried again every second; the guard takes it when that agent ends.
+- **RustDesk apart from the agent** (`hub/keeper.ts`, the hub only): `startServers` (untouched) runs in
+  the keeper, a child of the guard. It writes `<state>/rustdesk-server/keeper-state.json` every 2 s and
+  at each change; the agent (`hub/external-servers.ts`, `SAD_RUSTDESK_EXTERNAL=1`) reads it once a
+  second, so Devices and pairing still know the servers' state and key, and starts and stops nothing.
+  A file older than 8 s, or whose process is gone, is a keeper that isn't there; the guard starts it
+  again. An agent the guard only adopted runs its own servers, so the keeper starts once the agent is
+  the guard's own. Agent killed, crashed, hung or updated: hbbs and hbbr go on.
+- **Nothing is ended by port, name or `taskkill /t`** (`proc-tree.ts`): Windows keeps the parent PID a
+  process was started with, never clears it, and reuses PIDs, so `taskkill /t` can walk into processes
+  that merely got an old parent's PID. A tree is found from the process table with start times: a child
+  counts only if it started at or after its parent; the leaves are ended first, each by its exact PID,
+  and only if its start time still matches. The guard, `agentic/chats.ts` (a chat's tree, on Update now
+  too) and `agentic/librarian.ts` do it this way.
+- **Chats come back** (`agentic/recover.ts`, `resumeChat` in `agentic/index.ts`): the agent writes
+  `<state>/agentic/open-chats.json` (v 1: sessionId, floorId, agentId, state) 400 ms after the open
+  chats change, atomically; it stays off until the previous list has been used, and is frozen when the
+  app stops, so closing the chats on the way out doesn't forget them. 4 s after the guard started the
+  agent (`SAD_RESUME_CHATS=1`; members and Dev never), each chat on the list is opened again with its
+  conversation resumed, 2 s apart, and one that was working or asking is typed
+  "The app restarted and reopened this chat. Carry on from where you were." when it is ready. A chat
+  that was stopped on purpose left the list before the app did and stays closed.
+- **Tests**: `guard/supervisor.test.ts` (policy), `guard/guard.test.ts` (the real guard with fake
+  children: restart on exit, hung, adoption, the page up while the agent is down, a second guard, update
+  and self-update, stop), `hub/keeper.test.ts`, `proc-tree.test.ts` (including a reused parent PID),
+  `agentic/recovery.test.ts`, `shared/guard-note.test.ts` (the page's reading of `/guard/status`).
+- **Run for real, on a copy** (a copy of the build in a scratch folder on ports 5391 for the page, 21579
+  guard, 21580-21582 agent, 21586/21587 hbbs/hbbr, its own state folder, a fake `claude`; started by a
+  Scheduled Task of its own, the real chain task, wscript, `Guard.cmd`, guard, agent, keeper):
+  the agent killed outright: its API answered again through the page port in 0.46 s, the page port was
+  never closed, hbbs and hbbr never went down and kept their PIDs, both chats were back in 6.6 s and
+  the one that had been working was told to carry on. The other kills and the live app: see F-058 in
+  features.html.
 
 ## Firewall script (scripts/firewall-hub.ps1)
 
