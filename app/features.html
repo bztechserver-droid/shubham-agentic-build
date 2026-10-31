@@ -640,7 +640,19 @@
     "said": "now one more issue lets say when i type effort. Then what happens is that it shows me low, medium, max but I cannot control it on the phone because there is no left, right, up arrow menu. I want the terminal to be touch-based on my phone. Please add that adjustment.",
     "added": "2026-10-31",
     "notes": [
-      "2026-10-31: Built. On a touch screen, every chat window has a row of keys under its terminal: Esc, Tab, Shift+Tab (claude's next mode), the four arrows, Enter and ^C (moved here from the title bar, F-042). claude's menus (/effort's low, medium, max; a question's options) are worked with the arrows and Enter, Esc backs out. A key is sent on the press and keeps the focus where it was, so the phone's keyboard neither opens nor closes for it; no text selection or long-press menu on them. With a mouse and keyboard the row isn't shown. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx (TouchKeys)."
+      "2026-10-31: Built. On a touch screen, every chat window has a row of keys under its terminal: Esc, Tab, Shift+Tab (claude's next mode), the four arrows, Enter and ^C (moved here from the title bar, F-042). claude's menus (/effort's low, medium, max; a question's options) are worked with the arrows and Enter, Esc backs out. A key is sent on the press and keeps the focus where it was, so the phone's keyboard neither opens nor closes for it; no text selection or long-press menu on them. With a mouse and keyboard the row isn't shown. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx (TouchKeys).",
+      "2026-10-31: Shubham said: \"can we have touch instead please\". Asked which touch: tap the option itself (Recommended), swipe gestures, or both; Shubham chose Tap the option itself. Built: while one of claude's menus is on screen (its hint line says Enter to confirm, Esc to cancel or to navigate), a tap on a phone picks the option tapped: a numbered one (\"2. No\") sends its number; one of a one-line picker (/effort's low, medium, high, xhigh, max: the chosen one drawn bold or in another colour) sends the arrows from the chosen one to it, then Enter; a hint (\"Tab to toggle\") or anything else is an ordinary tap. A pick leaves the phone's keyboard down. The key row is now the fallback, hidden until the keyboard button in the chat's title bar opens it. Checked against claude 2.1.316's own /effort screen, recorded and replayed into a headless xterm: each option gives the right keys (medium to max: right three times, Enter; medium itself: Enter), the hint nothing; types, lint, the page build. Code: src/agentic/Terminal.tsx (menuTap), ChatGrid.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-048",
+    "title": "On a phone, one bar on top: the floor's tabs and controls in the app's bar",
+    "said": "Also on the phone, in the top bar where there are stop, minimize, and maximize buttons, put the chat, design, preamble, and agents' memory there itself so that the chat can look bigger. Then put the agents at the top with the color palette and some monitor button. Let's combine the whole top so that the chat looks bigger.",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: on a phone, the floor's own row (back, the Chats, Design, Preamble, Agents and Memory tabs, the window count, Reload all) and the app's top bar (Agents, the palette and the light/dark button) become one bar, so the chat window, with its own title bar (Reload, Stop and the rest), gets the height. Built: on a phone with a floor open, the app's top bar holds back, the tab as a picker, and on Chats the window count and Reload all, beside the palette and light/dark buttons (the mark, the title and the menu placement button give way meanwhile); the floor's row is gone. Wider screens are as before. Checked: types, lint, the page build. Code: src/app/Shell.tsx (a slot in its bar), src/agentic/Agents.tsx (PhoneBar)."
     ],
     "done": null,
     "doneNote": ""
