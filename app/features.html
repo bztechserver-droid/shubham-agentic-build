@@ -453,6 +453,28 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-031",
+    "title": "Any floor's chat in any window",
+    "said": "now in the columns \ngive ability to put any floor caht current if we do open a floor then only thats floor chat sopen in windows please fix that",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Built. A chat window's agent picker now lists every floor's agents, grouped by floor (the open floor's first), so a column can hold any floor's chat; one from another floor shows that floor's name in its title bar, and starting, stopping, taking over and editing it act on its own floor. Each floor still remembers which agents its windows hold. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx, Agents.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-032",
+    "title": "Drag and drop in the Agents workflow",
+    "said": "also give a drag move move funcitionlay int eh agents workflow",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: moving chats into and between the windows by dragging. Built: drag an agent from the sidebar onto a chat window to put its chat there (any floor's); drag a window by its title bar onto another window to swap them. The window under the drag shows a primary ring. The Design tab's desks already drag (F-018). Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx, FloorList.tsx, util.ts."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
