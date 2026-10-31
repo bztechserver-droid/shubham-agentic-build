@@ -508,6 +508,29 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-036",
+    "title": "An app on the phone for the server, installed from inside the app",
+    "said": "now you need to work to make app for this so i can use on my phone\nso we can dircelty use the server\nhttps://server.tailc768e5.ts.net:5173/\nand the install app should show here in the app",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: the server's page (https://server.tailc768e5.ts.net:5173, the build through the remote gate) made installable on the phone as an app with its own icon, opening full screen without the browser's bars, straight to the server; and an Install button inside the app itself to do it. No store APK: an installable web app (manifest, service worker, icons), as Android Chrome installs it; on an iPhone, Safari's Share › Add to Home Screen, which the button explains. Shubham added: \"make the install app please / i want to use on pehon i ahte using it on the browser\".",
+      "2026-10-31: Built in Dev, not ticked (it reaches the phone with the next Publish and Update; Shubham to install it). The page is now an installable app: public/manifest.webmanifest (Shubham Agentic, short name Agentic, standalone, the >_ mark as its icon, a maskable one for Android's shapes, an apple-touch-icon for the iPhone), public/sw.js (keeps nothing, every request goes to the network as before, the agent API untouched; only when a page can't load at all does it show \"Can't reach the server\" with Try again, as an installed app has no address bar to retry from). An Install button in the top bar (src/app/install.tsx), gone once opened as the installed app: on Android Chrome it opens the browser's own install offer, one tap; with no offer (an iPhone's Safari, or Chrome before it offers) it shows the steps from the browser's menu (Share › Add to Home Screen on the iPhone). Checked in Chrome at phone size on the built page: no installability errors, the service worker running, the button and its steps, and the offline page with the server stopped."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-037",
+    "title": "Chat windows that stay when a floor is picked; drag and drop as in agentic-claude-manager",
+    "said": "nwo one more when i click a floor dont show chat in the window please \nadn the drag and drop needs to be liek teh\nC:\\Users\\Shubham(Code)\\Desktop\\Github\\28.SCRM\\1.6 AIO CRM Agentic\\agentic-claude-manager-dev\nand also if we clcik a pane in teh right adn then choose a chat then that chat shoudl come there pleae \nliek it come sin teh sagenticn claude manager deve",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Said in two messages. Read from agentic-claude-manager-dev on the server (Desktop\\\\Github\\\\CRM\\\\agentic-claude-manager-dev, read only: its Sidebar.tsx, SidebarRow.tsx, AgentTerminalGrid.tsx). Built: (1) the chat windows are the page's, one set for every floor: clicking a floor no longer changes what they show (each floor had its own set before; a new set starts from the first floor's). (2) A chat picked in the sidebar goes into the window last clicked, whatever floor it is on; one already in another window swaps with it (before, that window only took the focus). (3) Drag and drop looks and works as there: a grip at the start of each floor and agent row; the row a drag would land on gets a primary edge at its start and a tint; a window drags by a grip at its top right that shows while the pointer is over it (not the whole title bar, which would fight the terminal's text selection), the window being dragged is dimmed, and the one it would land on gets a tint and a ring. Checked: types, lint, the page build. Code: src/agentic/ChatGrid.tsx, FloorList.tsx, util.ts, Agents.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
