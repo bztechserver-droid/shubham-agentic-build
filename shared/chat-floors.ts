@@ -51,20 +51,16 @@ export function countItems(items: readonly FloorItem[]): FloorCounts {
 // --- the floors, in order ---------------------------------------------------------------------
 
 /**
- * The order the floors' headers go in: floors with a chat waiting for the person first, then the
- * rest. Each half keeps the order in which the floors first show up in `items`, which is the
- * Agents section's own (contacts come floor by floor), so a refresh never shuffles the headers.
- * Hand it the chats in that original order, not sorted by last message.
+ * The order the floors' headers go in: the Agents section's own, which is the order in which the
+ * floors first show up in `items` (contacts come floor by floor). One order everywhere (F-059): a
+ * floor moved here is moved there, and a floor that starts waiting does not jump ahead of the
+ * rest, so a refresh never shuffles the headers. Hand it the chats in that original order, not
+ * sorted by last message.
  */
 export function floorOrder(items: readonly FloorItem[]): FloorRef[] {
   const seen = new Map<string, FloorRef>()
-  const asking = new Set<string>()
-  for (const i of items) {
-    if (!seen.has(i.floor.id)) seen.set(i.floor.id, i.floor)
-    if (i.waiting) asking.add(i.floor.id)
-  }
-  const floors = [...seen.values()]
-  return [...floors.filter(f => asking.has(f.id)), ...floors.filter(f => !asking.has(f.id))]
+  for (const i of items) if (!seen.has(i.floor.id)) seen.set(i.floor.id, i.floor)
+  return [...seen.values()]
 }
 
 /**
@@ -91,6 +87,42 @@ export function groupByFloor<T extends FloorItem>(items: readonly T[], order: re
     if (!placed.has(id)) groups.push({ floor: list[0].floor, items: list, ...countItems(list) })
   }
   return groups
+}
+
+// --- moving floors and chats (F-059) ------------------------------------------------------------
+
+/** What is being dragged in the list: a floor (by its header), or a chat (by its row) with the floor it is on. */
+export type FloorDrag = { kind: 'floor'; floorId: string } | { kind: 'agent'; floorId: string; agentId: string }
+
+/**
+ * Where a drag may be dropped: a floor onto another floor (it goes before that one), a chat onto
+ * a floor other than its own (it moves there). Anything else is not a drop, so it shows no marker.
+ */
+export const canDropOn = (drag: FloorDrag, floorId: string) => drag.floorId !== floorId
+
+/**
+ * The order of the floors' ids with `floorId` put before `beforeId`, or last when `beforeId` is
+ * null. Null when that changes nothing (it is there already, or an id is not in the order), so
+ * nothing is sent. `order` is every floor of the Agents section, the ones with no chat too.
+ */
+export function moveFloor(order: readonly string[], floorId: string, beforeId: string | null): string[] | null {
+  if (!order.includes(floorId) || floorId === beforeId) return null
+  if (beforeId !== null && !order.includes(beforeId)) return null
+  const rest = order.filter(id => id !== floorId)
+  rest.splice(beforeId === null ? rest.length : rest.indexOf(beforeId), 0, floorId)
+  return rest.every((id, i) => id === order[i]) ? null : rest
+}
+
+/**
+ * A floor one place up (-1) or down (1) among the floors that show, for the keyboard. `shown` is
+ * the ids on screen, in order. Up it goes before the one above it, down before the one after the
+ * next (or last); null at either end.
+ */
+export function stepFloor(order: readonly string[], shown: readonly string[], floorId: string, step: -1 | 1): string[] | null {
+  const at = shown.indexOf(floorId)
+  const next = shown[at + step]
+  if (at < 0 || next === undefined) return null
+  return moveFloor(order, floorId, step === -1 ? next : (shown[at + 2] ?? null))
 }
 
 // --- search -----------------------------------------------------------------------------------

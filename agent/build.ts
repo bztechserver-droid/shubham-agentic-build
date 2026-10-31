@@ -19,6 +19,8 @@ import type { Logger } from './log.ts'
 const CHECK_EVERY_MS = 15 * 60 * 1000
 const FIRST_CHECK_MS = 30 * 1000
 const LOG_LINES = 400
+/** A line of a publish's output that stays however long the log gets: a step's heading ("== Checking: types", the checks' summary), the outcome. */
+const KEY_LINE = /^(==|Done\b|Publish stopped)/
 const GIT_TIMEOUT_MS = 60 * 1000
 const PUBLISHED_MARK = 'PUBLISHED '
 const DEV_EVERY_MS = 20_000
@@ -32,6 +34,33 @@ export const runGit: Git = (args, cwd) =>
       resolve({ code, stdout: String(stdout), stderr: String(stderr) })
     })
   })
+
+/**
+ * The page's copy of a publish's output, held to `max` lines. A test run prints a line of dots for every
+ * few tests, which used to push the step headings out of a 400-line window (build 2325 looked as if its
+ * checks had been skipped), so what goes first is the oldest plain line, never a key line (KEY_LINE);
+ * only when key lines alone are over the cap do the oldest of those go too.
+ */
+export function trimLog(log: string[], max = LOG_LINES): string[] {
+  let extra = log.length - max
+  if (extra <= 0) return log
+  const kept = log.filter(line => {
+    if (extra > 0 && !KEY_LINE.test(line)) {
+      extra--
+      return false
+    }
+    return true
+  })
+  return kept.length > max ? kept.slice(kept.length - max) : kept
+}
+
+/** "748 tests" from the test runner's spec summary ("ℹ pass 748"; it colours even a file), or null when there is none. */
+export function testCountOf(summary: string): string | null {
+  // oxlint-disable-next-line no-control-regex
+  const plain = summary.replace(/\u001b\[[0-9;]*m/g, '')
+  const pass = /^\S+ pass (\d+)\s*$/m.exec(plain)?.[1]
+  return pass ? `${pass} tests` : null
+}
 
 export interface BuildOptions {
   /** The folder this agent runs from (the repo or build root). */
@@ -230,7 +259,7 @@ export function createBuild(o: BuildOptions): Build {
         }
         publish.log.push(line)
       }
-      if (publish.log.length > LOG_LINES) publish.log.splice(0, publish.log.length - LOG_LINES)
+      if (publish.log.length > LOG_LINES) publish.log.splice(0, publish.log.length, ...trimLog(publish.log))
     }
     child.stdout?.on('data', take)
     child.stderr?.on('data', take)

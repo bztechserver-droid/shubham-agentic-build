@@ -1316,10 +1316,14 @@ says how it is used; this is how it works.
   `<state>/agent/logs/exit-watchdog.log`. Node's job for its children ends it when the agent exits
   by itself. Tests: `exit-watchdog.test.ts`.
 - **Publish** (`POST /build/publish {skipChecks?}`, the hub only, one at a time): runs Dev's
-  `node agent/scripts/publish.ts [--skip-checks]` in Dev, keeps its last 400 lines (colour codes
+  `node agent/scripts/publish.ts [--skip-checks]` in Dev, keeps 400 lines (colour codes
   stripped) for `GET /build/info`, and reads the published version from its `PUBLISHED <json>`
-  line; then checks for itself. `publish.ts`: Dev's commit and changes; `tsc -b`, `oxlint
-  --deny-warnings` and the agent's tests; `vite build`; the build in `<state>/publish/stage`
+  line; then checks for itself. Over the 400, the oldest plain line goes first (`trimLog`); a line
+  starting `==` (the step headings and the checks' summary), `Done` or `Publish stopped` is kept, so the
+  test run's dots, a line for every few tests, can't push "Checking: types" out of the log. `publish.ts`:
+  Dev's commit and changes; `tsc -b`, `oxlint --deny-warnings` and the agent's tests (the dot reporter
+  on the screen, the spec reporter's summary in `<state>/publish/tests-summary.txt` for the count,
+  `testCountOf`), then one line `== Checks passed in 29 s: types, lint, 913 tests`; `vite build`; the build in `<state>/publish/stage`
   (tests, fakes, `agent/test`, `agent/system`, `publish.ts`, `dev-try.ts`, `build-system.ps1` and
   `build-files/` left out; `build-files/*` at its root; `.gitattributes` `* -text`); `npm install
   --omit=dev`; tried as a member on ports 21370–21378 with `SAD_HOME=<state>/publish/try-home`,

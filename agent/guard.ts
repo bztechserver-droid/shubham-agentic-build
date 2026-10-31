@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { timingSafeEqual } from 'node:crypto'
 import { closeSync, openSync, readdirSync, statSync } from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
@@ -8,7 +8,8 @@ import { keeperAlive, readKeeperState } from './hub/keeper-state.ts'
 import { createLogger, type Logger } from './log.ts'
 import { killTree } from './proc-tree.ts'
 import { findRustdesk, getRustdeskId } from './rustdesk.ts'
-import { supervise, type Running, type Spec, type Status, type Supervisor } from './guard/supervisor.ts'
+import { updateIntent } from './guard/intent.ts'
+import { supervise, type Identity, type Running, type Spec, type Status, type Supervisor } from './guard/supervisor.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 
 // F-058: the guard keeps the app up. It is the one thing that runs apart from the app, and it does
@@ -85,6 +86,7 @@ export interface Guard {
 
 const CHRISTOPHER_PORT = 4740
 const DEFAULT_BOOT_MS = 12_000
+const DEFAULT_UPDATE_MS = 20_000
 
 const same = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b))
 const pause = (ms: number) => new Promise<void>(r => setTimeout(r, ms).unref())
@@ -104,6 +106,36 @@ async function agentAnswers(port: number): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+const alivePid = (pid: number) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Which process listens on 127.0.0.1:<port> and runs the agent: its PID and start (one PowerShell call), or
+ * null. Asked once, when an agent is found already running (the old Start.cmd's, or one that outlived the
+ * guard before this one), so that it can be seen to go and ended by its exact PID. A PID is only as good as
+ * the process behind it: it must be node running main.ts, and its start time goes with it into the kill.
+ */
+export function findListener(port: number): Promise<Identity | null> {
+  return new Promise(resolve => {
+    if (process.platform !== 'win32') return resolve(null)
+    const script =
+      `$c = Get-NetTCPConnection -State Listen -LocalAddress 127.0.0.1 -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+      `if ($c) { $p = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $c.OwningProcess); if ($p) { '{0}|{1}|{2}' -f $p.ProcessId, $(if ($p.CreationDate) { ([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds() } else { 0 }), $p.CommandLine } }`
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20_000 }, (err, stdout) => {
+      if (err) return resolve(null)
+      const m = /^(\d+)\|(\d+)\|(.*)$/m.exec(String(stdout).trim())
+      if (!m || !/node/i.test(m[3]) || !/main\.ts/.test(m[3])) return resolve(null)
+      resolve({ pid: Number(m[1]), startedAt: Number(m[2]) || undefined })
+    })
+  })
 }
 
 /** A fingerprint of the files the guard itself runs from, to see whether an update changed them. */
@@ -165,7 +197,11 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
     const fd = openSync(consoleFile, 'a')
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn(file, args, { cwd: root, env, windowsHide: true, stdio: ['ignore', fd, fd] })
+      // detached: Node ties every child it starts to a job that ends it when Node exits, however Node
+      // exits. The agent and the keeper must outlive the guard (it is killed, crashes, or updates
+      // itself): the next guard finds them answering and takes them over. (Measured 1 Nov 2026: a
+      // plain child is gone with its parent, a detached one is not.)
+      child = spawn(file, args, { cwd: root, env, windowsHide: true, detached: true, stdio: ['ignore', fd, fd] })
     } finally {
       closeSync(fd)
     }
@@ -174,6 +210,7 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
       child.once('error', () => {})
       throw new Error(`could not start ${name}: ${file}`)
     }
+    child.unref()
     const since = Date.now()
     const exited = new Promise<{ code: number | null; signal: string | null }>(resolve => {
       child.once('exit', (code, signal) => resolve({ code, signal }))
@@ -196,13 +233,45 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
     }
   }
 
+  /** A process this guard did not start (an agent the old Start.cmd began, or one that outlived the guard before this one), watched by its PID and ended, when need be, by it. */
+  const pollers = new Set<NodeJS.Timeout>()
+  function adoptPid(name: string, id: Identity): Running | null {
+    const pid = id.pid
+    if (!pid || pid === process.pid) return null
+    const exited = new Promise<{ code: number | null; signal: string | null }>(resolve => {
+      const timer = setInterval(() => {
+        if (alivePid(pid)) return
+        clearInterval(timer)
+        pollers.delete(timer)
+        // Its exit code is not ours to read (the update asks the agent's log instead).
+        resolve({ code: null, signal: null })
+      }, 500)
+      timer.unref()
+      pollers.add(timer)
+    })
+    return {
+      pid,
+      exited,
+      async stop() {
+        // Only by exact PID and start time, never on a guess: without the table the process is left alone.
+        await killTree(pid, { since: id.startedAt, log: m => log.warn(`${name}: ${m}`) }).catch(e => log.warn(`${name}: could not read the process table (${e instanceof Error ? e.message : String(e)}); leaving pid ${pid} alone`))
+        await Promise.race([exited, pause(5000)])
+      },
+    }
+  }
+
   async function runUpdate(): Promise<void> {
     const before = guardCodeStamp(root)
     if (updateCmd) {
       log.info('the app asked to update: running Update.cmd')
       const fd = openSync(consoleFile, 'a')
+      const began = Date.now()
       await new Promise<void>(resolve => {
-        const c = spawn(updateCmd.file, updateCmd.args, { cwd: root, windowsHide: true, stdio: ['ignore', fd, fd] })
+        // git must never wait for somebody: no prompt for a password, no credential window nobody sees,
+        // and a transfer that has stalled for half a minute is given up on (this build is then
+        // unchanged, and is started again, rather than the app staying down while git waits).
+        const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_HTTP_LOW_SPEED_LIMIT: '1000', GIT_HTTP_LOW_SPEED_TIME: '30' }
+        const c = spawn(updateCmd.file, updateCmd.args, { cwd: root, env, windowsHide: true, stdio: ['ignore', fd, fd] })
         const since = Date.now()
         const limit = setTimeout(() => {
           log.warn('Update.cmd ran for 10 minutes; ending it')
@@ -211,7 +280,7 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
         }, 10 * 60_000)
         c.once('close', code => {
           clearTimeout(limit)
-          log.info(`Update.cmd finished (exit ${code})`)
+          log.info(`Update.cmd finished (exit ${code}) after ${((Date.now() - began) / 1000).toFixed(1)} s`)
           resolve()
         })
         c.once('error', e => {
@@ -238,6 +307,11 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
         return launch('agent', agentCmd.file, agentCmd.args, agentEnv())
       },
       probe: () => agentAnswers(config.ports.api),
+      // An agent found already running: whose it is (for an exact-PID end, and to see it go).
+      find: () => findListener(config.ports.api),
+      adopt: id => adoptPid('agent', id),
+      // An agent that said "stopping: updating to the newer build" and then went (or hangs) is updated.
+      intent: since => updateIntent(config.paths.logs, since),
       graceMs: o.agentGraceMs ?? 90_000,
       hungAfter: o.agentHungAfter ?? 8,
       updateCodes: [75],
@@ -253,8 +327,12 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
             log.info(`starting the RustDesk keeper: ${why}`)
             return launch('keeper', keeperCmd.file, keeperCmd.args, { ...process.env })
           },
-          // The keeper is there when its state file is fresh and its process exists.
-          probe: async () => keeperAlive(readKeeperState(config.paths.rustdeskServer)),
+          // The keeper is there when its state file is fresh and its process exists; the file says which process.
+          probe: async () => {
+            const state = readKeeperState(config.paths.rustdeskServer)
+            return keeperAlive(state) ? { pid: state.pid, startedAt: Date.parse(state.startedAt) || undefined } : false
+          },
+          adopt: id => adoptPid('keeper', id),
           graceMs: 20_000,
           hungAfter: 6,
         } satisfies Spec,
@@ -271,9 +349,10 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
     const now = Date.now()
     let eta = 0
     if (a.state !== 'up') {
-      const boot = a.lastDowntimeMs ?? DEFAULT_BOOT_MS
+      // How long it was away the last time (an update takes the pull and the start: about 7 s), else a guess.
+      const boot = a.lastDowntimeMs ?? (a.state === 'updating' ? DEFAULT_UPDATE_MS : DEFAULT_BOOT_MS)
       const away = a.downSince === null ? 0 : now - a.downSince
-      eta = a.state === 'updating' ? 60 : a.state === 'stopped' ? 0 : Math.max(2, Math.min(90, Math.round((boot - away) / 1000) + (a.nextTryAt && a.nextTryAt > now ? Math.round((a.nextTryAt - now) / 1000) : 0)))
+      eta = a.state === 'stopped' ? 0 : Math.max(2, Math.min(90, Math.round((boot - away) / 1000) + (a.nextTryAt && a.nextTryAt > now ? Math.round((a.nextTryAt - now) / 1000) : 0)))
     }
     return {
       guard: { pid: process.pid, startedAt, port: o.guardPort, uiPort: front?.port ?? null },
@@ -374,6 +453,8 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
       } else {
         await Promise.all([agent.stop(), keeper?.stop()])
       }
+      for (const t of pollers) clearInterval(t)
+      pollers.clear()
       await front?.close()
       await new Promise<void>(r => {
         control.close(() => r())

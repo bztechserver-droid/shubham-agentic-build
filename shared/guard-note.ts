@@ -44,12 +44,12 @@ export function parseGuardNote(body: unknown, at: number): GuardNote | null {
 export function restartLine(note: GuardNote, now: number): string | null {
   if (note.state === 'up') return null
   if (note.state === 'stopped') return 'The app is stopped.'
-  if (note.state === 'updating') return 'The app is updating. Back in about a minute.'
+  const what = note.state === 'updating' ? 'updating' : 'restarting'
   // `now` can be a second behind an answer that has just arrived: time never runs backwards here.
   const left = Math.max(0, note.etaSeconds - Math.round(Math.max(0, now - note.at) / 1000))
-  if (left <= 1) return 'The app is restarting. Back any moment.'
-  if (left >= 60) return 'The app is restarting. Back in about a minute.'
-  return `The app is restarting. Back in about ${left} s.`
+  if (left <= 1) return `The app is ${what}. Back any moment.`
+  if (left >= 60) return `The app is ${what}. Back in about a minute.`
+  return `The app is ${what}. Back in about ${left} s.`
 }
 
 /** The sign offers Control and the backup page whenever the app is not answering. */

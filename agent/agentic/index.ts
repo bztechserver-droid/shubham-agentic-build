@@ -904,8 +904,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       while (chats.info(sid) && Date.now() < until) await new Promise(r => setTimeout(r, 200))
     }
     await stopAt(self().id, sid)
-    const opened = await openChat(at.floor.id, at.agent.id, {})
-    return opened.started || chats.info(sid) !== null
+    // Opened again the way F-058 brings chats back after a crash (resumeChat, below): one way to open a chat again.
+    return await resumeChat(sid)
   }
 
   // ---------------------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
 import { armExitWatchdog, processStartedAt } from './exit-watchdog.ts'
+import { hardExit } from './hard-exit.ts'
 import { externalServers } from './hub/external-servers.ts'
 import { startServers, type Servers } from './hub/rustdesk-server.ts'
 import { loadOrCreateIdentity } from './link/identity.ts'
@@ -775,7 +776,9 @@ if (import.meta.main) {
       code ||= 1
     }
     await within('closing the log', closeLog(), 2000)
-    process.exit(code)
+    // F-058: not process.exit(): it waits for worker threads, and one stuck in a call into Windows
+    // holds it (and loses the code 75 an update needs). Everything is closed by now.
+    hardExit(code)
   }
   process.on('SIGINT', () => void shutdown('Ctrl+C'))
   process.on('SIGTERM', () => void shutdown('SIGTERM'))
