@@ -622,6 +622,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-046",
+    "title": "On a phone, holding a floor or an agent drags it, not the browser menu",
+    "said": "Also on the phone, when I want to move or drag the agents or the flows, holding it triggers the right click and it shows back, forward, and all of that. That should not trigger. I should only be able to do the dragging with the right click. If I want to do any options I'll just click on the three dots that you have made for each chat or each flow floor. You know what I'm saying?",
+    "added": "2026-10-31",
+    "notes": [
+      "2026-10-31: Read as: a long press on a floor or an agent in the sidebar (or a window's grip) must start dragging it, not open the browser's own menu (back, forward, copy...), which cancelled the drag; the options are in the three-dot menus. Built: those rows and the grip turn that menu off (contextmenu), and don't select text or show the iPhone callout on a long press, so the press is the drag's. Checked: types, lint, the page build. Not seen on a phone yet: if a long press still doesn't drag there, a touch drag of the page's own comes next. Code: src/agentic/FloorList.tsx, ChatGrid.tsx."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
