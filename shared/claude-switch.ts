@@ -104,7 +104,11 @@ export interface ClaudeSwitchInfo {
   note: string | null
   /** The office's subscriptions, the active one marked. Empty until read. */
   choices: SwitchChoice[]
-  /** The one the person runs on, and since when the app has had them on it (the last switch it made; null: it never switched them). */
+  /**
+   * The one the person runs on, and since when: the last switch the app made (`by` says who chose it),
+   * else, when someone moved them in the CRM itself (`by` null), when the app noticed and put its token in.
+   * `since` is null only when neither is known.
+   */
   current: (SwitchSubscription & { since: string | null; by: SwitchBy | null }) | null
   /** Newest first. */
   log: SwitchRecord[]

@@ -294,11 +294,13 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
           ? { id: placed.subscription.id, name: placed.subscription.name, hint: placed.hint }
           : null
     const since = cur && st.since && st.since.subscriptionId === cur.id ? st.since : null
+    // Moved in the CRM by someone else (no switch of the app's on record): since when the app has run on it, i.e. when its token went in.
+    const noticed = !since && cur && placed && placed.subscription.id === cur.id ? placed.setAt : null
     return {
       allowed,
       note,
       choices,
-      current: cur ? { ...cur, since: since?.at ?? null, by: since && since.by !== 'crm' ? since.by : null } : null,
+      current: cur ? { ...cur, since: since?.at ?? noticed, by: since && since.by !== 'crm' ? since.by : null } : null,
       log: st.log.slice(0, STATUS_LOG),
       auto: st.auto,
       watch: watch ?? (st.auto ? { state: 'watching', message: '' } : { state: 'off', message: 'Switching by itself is turned off.' }),

@@ -2,8 +2,8 @@ import { createRequire } from 'node:module'
 import type * as Koffi from 'koffi'
 
 // F-058: ending the process must not wait for anything. process.exit() first joins the worker threads,
-// and a worker that sits in a call into Windows that does not come back (the text-focus worker asking
-// an app that hangs, the key grab) holds the exit for as long as that call lasts - and when it finally
+// and a worker that sits in a call into Windows that does not come back (the text-focus asking of an
+// app that hangs, when it still ran as a thread; the key grab) holds the exit for as long as that call lasts - and when it finally
 // returns, the exit code is lost. Measured on 1 Nov 2026, a worker in kernel32!Sleep(10 s) and the main
 // thread calling process.exit(75): the process ended after 10.5 s with code 3221226505 (0xC0000409),
 // not 75; with TerminateProcess on itself: after 0.4 s with code 75. That is what happened at 23:37 on

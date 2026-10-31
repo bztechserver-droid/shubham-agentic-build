@@ -55,6 +55,8 @@ export interface GuardOptions {
   consoleFile?: string
   agentGraceMs?: number
   agentHungAfter?: number
+  /** The command line of an agent found already running must match this to be taken over by its PID. Default: node running main.ts. */
+  agentPattern?: RegExp
   tickMs?: number
   /** The RustDesk ID for the Control link; looked up when left out. */
   rustdeskId?: string | null
@@ -123,7 +125,7 @@ const alivePid = (pid: number) => {
  * guard before this one), so that it can be seen to go and ended by its exact PID. A PID is only as good as
  * the process behind it: it must be node running main.ts, and its start time goes with it into the kill.
  */
-export function findListener(port: number): Promise<Identity | null> {
+export function findListener(port: number, pattern: RegExp = /main\.ts/): Promise<Identity | null> {
   return new Promise(resolve => {
     if (process.platform !== 'win32') return resolve(null)
     const script =
@@ -132,7 +134,7 @@ export function findListener(port: number): Promise<Identity | null> {
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20_000 }, (err, stdout) => {
       if (err) return resolve(null)
       const m = /^(\d+)\|(\d+)\|(.*)$/m.exec(String(stdout).trim())
-      if (!m || !/node/i.test(m[3]) || !/main\.ts/.test(m[3])) return resolve(null)
+      if (!m || !/node/i.test(m[3]) || !pattern.test(m[3])) return resolve(null)
       resolve({ pid: Number(m[1]), startedAt: Number(m[2]) || undefined })
     })
   })
@@ -308,7 +310,7 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
       },
       probe: () => agentAnswers(config.ports.api),
       // An agent found already running: whose it is (for an exact-PID end, and to see it go).
-      find: () => findListener(config.ports.api),
+      find: () => findListener(config.ports.api, o.agentPattern),
       adopt: id => adoptPid('agent', id),
       // An agent that said "stopping: updating to the newer build" and then went (or hangs) is updated.
       intent: since => updateIntent(config.paths.logs, since),

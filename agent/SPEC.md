@@ -1157,7 +1157,7 @@ Built 2026-10-30, both for the phone's Control screen (F-014).
   (the other PC's own shape from its CursorData, or a plain arrow), since a phone has none.
   Both: double-tap and slide drags with the left button held; two fingers scroll. One tracked
   pointer serves the mouse too, so switching modes never makes it jump.
-- **F-017, the keyboard by itself** (`agent/screen/text-focus.ts`, `text-focus-worker.ts`): ours,
+- **F-017, the keyboard by itself** (`agent/screen/text-focus.ts`, `text-focus-process.ts`, `text-focus-uia.ts`, `text-focus-worker.ts`): ours,
   not RustDesk's. The viewer sends `Misc.plugin_request` with id `sad.text-focus` and JSON
   `{"watch": true}` (`false` to stop); the app's own screen then answers `{"editable": bool}` at
   each change of "a text box has the keyboard focus here". RustDesk carries plugin messages this
@@ -1165,10 +1165,18 @@ Built 2026-10-30, both for the phone's Control screen (F-014).
   The phone's page asks only while its key row shows, and only through the app's own screen.
   The answer comes from Windows UI Automation (what Windows' own touch keyboard asks):
   `GetFocusedElement`, then its control type and Value pattern; an Edit that isn't read-only, or
-  a Document or ComboBox whose value can change (`editableOf`). It runs on its own worker thread,
-  polled every 300 ms while any session watches and looked at again 120 ms and 400 ms after each
-  mouse button comes up; the thread ends with the last watcher (UI Automation makes Chrome turn
-  its accessibility support on, so never longer than needed). The page focuses its hidden
+  a Document or ComboBox whose value can change (`editableOf`). It runs in a **child process** of
+  its own (F-058: `text-focus-process.ts`, started with `fork` and spoken to over IPC; the asking
+  itself is `text-focus-uia.ts`), polled every 300 ms while any session watches and looked at
+  again 120 ms and 400 ms after each mouse button comes up; the process is ended, by its handle,
+  with the last watcher (UI Automation makes Chrome turn its accessibility support on, so never
+  longer than needed). If it ends any other way (koffi can end the process it runs in with
+  `FATAL ERROR: Error::ThrowAsJavaScriptException napi_throw`, which no try/catch sees) the agent
+  goes on, logs it, and asks again after 0.5, 1.5, 5, 15, 30 s; more than 5 endings in 2 minutes
+  are given up on until the app starts again. It used to be a worker thread of the agent, and
+  stopping that thread while it was in a koffi call ended the whole agent (exit code 134; 3 of 3
+  runs of a loop of start, click and stop died within 6 rounds, 40 of 40 are fine as a process);
+  `SAD_TEXT_FOCUS=worker` brings the thread back. The page focuses its hidden
   keyboard field when told `true`, within the few seconds the tap that caused it lets a page open
   the phone's keyboard, and blurs it on `false` only if it opened by itself.
 
@@ -1821,14 +1829,32 @@ The old way (`Start.cmd`, its restart loop) is still there and still works; the 
 - **The agent** (supervisor.ts): started as `node agent/main.ts --app app` with `SAD_SUPERVISED=1` (so
   Update now works), `SAD_PAGE_SERVER=guard` (it doesn't open 5173), `SAD_RUSTDESK_EXTERNAL=1` (when a
   keeper runs) and `SAD_RESUME_CHATS=1`. The policy, tested with a fake clock and fake processes:
-  start when nothing runs; *adopt* an agent that answers although the guard didn't start it (the old
-  loop's, or one started by hand): left alone and watched, started over only if it stops; start again the
-  moment it exits (the exit wakes the loop, no waiting for the next look); *hung* = it runs but its
-  `GET /agent-api/health` (2.5 s limit) fails 8 looks in a row after its 90 s boot grace: ended and
-  started again; a backoff for one that dies again and again (0, 2, 5, 10, 20, 30 s; the count starts
-  over after a minute up); exit code 75 (Update now) runs `Update.cmd` (10 minute limit), then starts at
-  once. If the update changed the guard's own files it exits with 5 and `Guard.cmd` starts the new
-  code, leaving the agent and the keeper running (the new guard adopts them).
+  start when nothing runs; *take over* an agent that answers although this guard didn't start it (the
+  old loop's, or one that outlived the guard before this one): it is left alone and watched, and
+  found once (one PowerShell call: the process that listens on 127.0.0.1:<API port> and is node running
+  main.ts) so that its PID and start time are known, it is seen to go within half a second, and it can
+  be ended by that PID; start again the moment it exits (the exit wakes the loop, no waiting for the
+  next look); *hung* = it runs but its `GET /agent-api/health` (2.5 s limit) fails 8 looks in a row
+  after its 90 s boot grace: ended and started again; a backoff for one that dies again and again (0,
+  2, 5, 10, 20, 30 s; the count starts over after a minute up); exit code 75 (Update now) runs
+  `Update.cmd` (10 minute limit; git runs with no prompt for a password, no credential window and a
+  stall limit of 30 s, so it gives up rather than keep the app down), then starts at once; how long
+  the update took is in `guard-console.log`. If the update changed the guard's own files it exits
+  with 5 and `Guard.cmd` starts the new code, leaving the agent and the keeper running (the new
+  guard takes them over).
+- **Update now when the exit code is not seen** (`guard/intent.ts`): an agent the guard did not start
+  leaves no exit code to read, and one that hangs on its way out has to be ended. For both the
+  agent's own log says what it meant: `stopping: updating to the newer build` after the process
+  started (today's `agent-YYYYMMDD.log`, and yesterday's across midnight). The update step then runs
+  as for code 75, and an agent that has said so and stops answering is ended after 5 looks, not 8.
+  An agent that went without saying it is only started again.
+- **Outliving the guard**: the agent and the keeper are started *detached*. Node ties every plain child
+  to a job object that ends it when Node exits, however Node exits (measured on 1 Nov 2026: a plain
+  child is gone with its parent, a detached one is not), so without this the agent and RustDesk would
+  go with the guard whenever it is killed, crashes or updates itself, and "the next guard takes them
+  over" would never have anything to take over. `guard.test.ts › a guard that really dies` runs the
+  guard in a process of its own and ends it: the agent goes on answering, the next guard takes it over
+  by its PID and starts nothing; the test fails without `detached`.
 - **The page, always**: `ui-server.ts` (the same code the agent used for 5173, with a `handle` hook) runs
   in the guard: the built page, `/agent-api` and its WebSockets forwarded to the agent under the same
   rules as before (the token only for the app's own page), plus `GET /guard/status`, which the guard
@@ -1838,8 +1864,18 @@ The old way (`Start.cmd`, its restart loop) is still there and still works; the 
   LinkBanner.tsx`, `shared/guard-note.ts`) says "The app is restarting. Back in about N s." with Control
   (`rustdesk://connection/new/<id>`) and Backup page (Christopher, port 4740) links. A port held by an
   agent started the old way is tried again every second; the guard takes it when that agent ends.
+- **The agent exits at once** (`agent/hard-exit.ts`, used at the end of `shutdown` in `main.ts`):
+  `process.exit()` first waits for the worker threads, and a worker sitting in a call into Windows
+  that does not return (UI Automation asking an app that hangs, the key grab) holds the exit for as
+  long as the call lasts, and then the process dies with 0xC0000409 instead of the exit code. Measured
+  on 1 Nov 2026: a worker in `kernel32!Sleep(10 s)` and `process.exit(75)` at 0.3 s: the process ended
+  after 10.5 s with code 3221226505; `TerminateProcess` on itself: after 0.4 s with code 75. That is
+  what held Update now on 31 Oct at 23:37: the agent logged "stopped" and never exited, so `Start.cmd`,
+  waiting for code 75, never ran `Update.cmd` and nothing started the app again until somebody did at
+  23:53 (15 minutes; `Update.cmd` itself takes about 2 s). `agent/exit-watchdog.ts` stays behind it as
+  a backstop: a hidden PowerShell that ends the agent with the same code 20 s after a stop began.
 - **RustDesk apart from the agent** (`hub/keeper.ts`, the hub only): `startServers` (untouched) runs in
-  the keeper, a child of the guard. It writes `<state>/rustdesk-server/keeper-state.json` every 2 s and
+  the keeper, a detached child of the guard. It writes `<state>/rustdesk-server/keeper-state.json` every 2 s and
   at each change; the agent (`hub/external-servers.ts`, `SAD_RUSTDESK_EXTERNAL=1`) reads it once a
   second, so Devices and pairing still know the servers' state and key, and starts and stops nothing.
   A file older than 8 s, or whose process is gone, is a keeper that isn't there; the guard starts it
@@ -1859,10 +1895,13 @@ The old way (`Start.cmd`, its restart loop) is still there and still works; the 
   conversation resumed, 2 s apart, and one that was working or asking is typed
   "The app restarted and reopened this chat. Carry on from where you were." when it is ready. A chat
   that was stopped on purpose left the list before the app did and stays closed.
-- **Tests**: `guard/supervisor.test.ts` (policy), `guard/guard.test.ts` (the real guard with fake
-  children: restart on exit, hung, adoption, the page up while the agent is down, a second guard, update
-  and self-update, stop), `hub/keeper.test.ts`, `proc-tree.test.ts` (including a reused parent PID),
-  `agentic/recovery.test.ts`, `shared/guard-note.test.ts` (the page's reading of `/guard/status`).
+- **Tests**: `guard/supervisor.test.ts` (policy, with processes it did not start), `guard/intent.test.ts`
+  (what the log says), `guard/guard.test.ts` (the real guard with fake children: restart on exit, hung,
+  taking over, the page up while the agent is down, a second guard, update and self-update, stop; and
+  a guard in a process of its own that dies), `hard-exit.test.ts` (ends at once with its code while a
+  worker is stuck in a native call), `hub/keeper.test.ts`, `proc-tree.test.ts` (including a reused
+  parent PID), `agentic/recovery.test.ts`, `shared/guard-note.test.ts` (the page's reading of
+  `/guard/status`). The tests ask the OS for free ports; fixed ones clashed when two runs overlapped.
 - **Run for real, on a copy** (a copy of the build in a scratch folder on ports 5391 for the page, 21579
   guard, 21580-21582 agent, 21586/21587 hbbs/hbbr, its own state folder, a fake `claude`; started by a
   Scheduled Task of its own, the real chain task, wscript, `Guard.cmd`, guard, agent, keeper):
