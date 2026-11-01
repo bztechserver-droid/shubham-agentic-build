@@ -48,6 +48,8 @@ import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
 import { createChatFeeds } from './chatview.ts'
+import { createUiBridge } from './ui-bridge.ts'
+import { createOrders, isAssistantAgent, scanMessages } from './orders.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
@@ -147,6 +149,8 @@ export interface AgenticOptions {
    * use. The rest are for tests.
    */
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
+  /** F-072: the Assistant's orders get their answers carried back to it by the app. Off until Shubham says yes: tests, or SAD_ORDER_REPLIES=1, or an order-replies.on file in this folder turn it on. */
+  orderReplies?: boolean
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
   restartGraceMs?: number
   /**
@@ -282,6 +286,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const self = () => team?.self() ?? { id: 'this-pc', name: os.hostname() }
 
   const events = new Set<WsSocket>()
+  // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
+  const ui = createUiBridge()
   const emit = (e: AgenticEvent) => {
     const t = JSON.stringify(e)
     for (const s of events) s.sendText(t)
@@ -557,7 +563,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       log?.warn(`couldn't update ${claudeJson}: ${message(e)}`)
     }
     // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on.
-    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : ''))
+    const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies()))
     // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
     const dflt = defaultsNow()
     const effort = agent.effort || dflt.effort
@@ -1121,6 +1127,40 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return request<boolean>(link, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)
   }
 
+  // F-072: the orders the overlay Assistant gives, and the replies that come back to it (orders.ts).
+  // Only the hub keeps them: a member's tool calls are run by the hub (callTool).
+  const orders = createOrders({
+    now: Date.now,
+    file: path.join(o.dir, 'orders.json'),
+    log,
+    stateOf: sid => whereAll()[sid]?.state,
+    scan: (sid, id) => {
+      const file = findTranscript(sid, projectsDir)
+      return file ? scanMessages(readTranscriptFile(file), id) : { started: false, answer: '' }
+    },
+    deliver: async (assistantSid, body) => {
+      const w = whereAll()[assistantSid]
+      return w ? typeInto({ sessionId: assistantSid, id: w.id }, body) : false
+    },
+  })
+  function orderReplies(): boolean {
+    return o.orderReplies ?? (process.env.SAD_ORDER_REPLIES === '1' || existsSync(path.join(o.dir, 'order-replies.on')))
+  }
+  const ordersTimer = setInterval(() => void orders.tick(), 1000)
+  ordersTimer.unref?.()
+
+  /** The id of the order a message from `agent` to `toSid` is, or null when it is none (not the Assistant's, or an acknowledgement or a reply). */
+  function orderFrom(floor: Floor, agent: FloorAgent, sid: string, toSid: string, body: string): string | null {
+    if (!orderReplies() || mode() === 'member' || !isAssistantAgent(floor.name, agent.name)) return null
+    const target = bySession(toSid)
+    if (!target || isAssistantAgent(target.floor.name, target.agent.name)) return null
+    return orders.plan(sid, toSid, body)
+  }
+  function openOrder(id: string, fromSid: string, toSid: string, body: string) {
+    const target = bySession(toSid)
+    if (target) orders.open(id, fromSid, { sessionId: toSid, agent: target.agent.name, floor: target.floor.name }, body)
+  }
+
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
@@ -1176,9 +1216,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
         const body = text(args.text, 'text')
         relayAllowed(sid, target.sessionId)
-        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
+        const order = orderFrom(floor, agent, sid, target.sessionId, body)
+        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
-        return `Sent to chat ${target.sessionId}.`
+        return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
       }
       case 'app_open_chat': {
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
@@ -1235,9 +1278,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (c.sessionId === sid) throw apiError(400, "That's your own chat")
         const body = text(args.text, 'text')
         relayAllowed(sid, c.sessionId)
-        if (!(await typeInto(c, `[message from ${tag}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        const order = orderFrom(floor, agent, sid, c.sessionId, body)
+        if (!(await typeInto(c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
-        return `Sent to chat ${c.sessionId}.`
+        return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
       }
       case 'broadcast_to_chats': {
         const body = text(args.text, 'text')
@@ -1306,6 +1351,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
         })
         const task = await tasks.update(id, patch)
         return json({ id: task.id, text: task.text, done: task.done, deleted: task.deletedAt !== null })
+      }
+      // F-070: the overlay assistant's hands. Only that agent: nobody else moves Shubham's screen.
+      case 'ui_screen':
+      case 'ui_control':
+      case 'ui_modules':
+      case 'ui_invoke': {
+        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
+        const out = await ui.call(
+          name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
+          args,
+        )
+        return typeof out === 'string' ? out : json(out)
       }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
@@ -2416,6 +2473,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)
       if (rest === '/chat') return chatSocket(query)
+      if (rest === '/ui') return ui.socket()
       if (rest === '/events')
         return ws => {
           events.add(ws)
@@ -2458,6 +2516,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       for (const s of subs.values()) s.destroy()
       subs.clear()
       for (const s of events) s.close(1001, 'the agent is stopping')
+      ui.close()
+      clearInterval(ordersTimer)
       events.clear()
     },
   }

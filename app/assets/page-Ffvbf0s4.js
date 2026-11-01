@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-BC_1VpEe.js";function t(){e(`/goals`)}export{t as default};

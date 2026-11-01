@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-D_3p7pX5.js";function t(){e(`/wpages`)}export{t as default};

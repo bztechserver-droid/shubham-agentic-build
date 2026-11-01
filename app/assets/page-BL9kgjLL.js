@@ -1,1 +1,0 @@
-import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./react-B8SKf8RM.js";import{t as n}from"./jsx-runtime-DePvh3-m.js";import{x as r}from"./legacy-views-_-NuFC3a.js";var i=e(t()),a=n();function o(){let[e]=(0,i.useState)(0);return(0,a.jsx)(r,{refreshKey:e})}export{o as default};

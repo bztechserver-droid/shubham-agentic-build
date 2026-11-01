@@ -211,6 +211,58 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // F-070: the overlay assistant's hands: the screen the person is looking at, right now, on their device.
+  {
+    name: 'ui_screen',
+    description:
+      "Look at the app's screen on the device Shubham is using right now (only the overlay assistant can; he must have the overlay open): the page, what can be pressed or filled (each with a ref like e3), and the words on screen. Read it before you act, and again after the screen changes. all=true also lists what is below the fold.",
+    inputSchema: { type: 'object', properties: { all: { type: 'boolean', description: 'Also list what is off screen (below or above).' } }, additionalProperties: false },
+  },
+  {
+    name: 'ui_control',
+    description:
+      "Do something on the app's screen, live, where Shubham watches it happen (a marker moves to what you press). action: goto (path: an app page like /chats, /tasks, /agents, /crm, /devices, /settings), crm_goto (path: a CRM page like dashboard, goals, leads, clients, invoices; opens the CRM first), click (ref from ui_screen), type (ref, text; clear:false to add; submit:true presses Enter), key (key: Enter, Escape, Tab, ArrowDown...; optional ref), scroll (direction up/down/top/bottom; amount in px; optional ref of something inside the scroller), wait (ms). Every action answers with the screen as it is afterwards (refs are then fresh); pass screen:false to skip that. Refs go stale when the page changes: if one is refused, read the screen again.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['goto', 'crm_goto', 'click', 'type', 'key', 'scroll', 'wait'] },
+        path: { type: 'string', description: 'goto: /chats. crm_goto: dashboard, goals/123.' },
+        ref: { type: 'string', description: 'An element from ui_screen, like e3.' },
+        text: { type: 'string', description: 'type: what to write (for a <select>, the option).' },
+        clear: { type: 'boolean', description: 'type: replace what is there (default true).' },
+        submit: { type: 'boolean', description: 'type: press Enter after.' },
+        key: { type: 'string' },
+        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
+        amount: { type: 'number' },
+        ms: { type: 'number', description: 'wait: milliseconds (100-10000).' },
+        screen: { type: 'boolean', description: 'false: do not read the screen afterwards.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'ui_modules',
+    description: "The CRM's own handlers on screen right now (the pages of the CRM register them while they are open): module -> handler names. Open a CRM page first with ui_control crm_goto.",
+    inputSchema: none,
+  },
+  {
+    name: 'ui_invoke',
+    description:
+      "Call one of the CRM page's own handlers (from ui_modules), e.g. to read a table's rows or open a form, without clicking through it. Lists come back trimmed to limit/offset.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        module: { type: 'string' },
+        method: { type: 'string' },
+        args: { type: 'array', items: {}, description: 'Arguments for the handler.' },
+        limit: { type: 'number', description: 'Rows at most (default 25, max 200).' },
+        offset: { type: 'number' },
+      },
+      required: ['module', 'method'],
+      additionalProperties: false,
+    },
+  },
   {
     name: 'agent_hire',
     description:
