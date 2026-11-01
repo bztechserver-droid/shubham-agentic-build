@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-D_3p7pX5.js";function t(){e(`/goals`)}export{t as default};

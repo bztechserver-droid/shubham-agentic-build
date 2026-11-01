@@ -87,6 +87,15 @@ export function voiceError(code: string): string | null {
   }
 }
 
+/**
+ * Whether an error is only the engine ending a stretch of listening (it hears nothing for several seconds, or it
+ * was stopped): the recording goes on, with a new stretch started at once. Any other error is a real one.
+ */
+export const voiceKeepsGoing = (code: string) => code === 'no-speech' || code === 'aborted'
+
+/** The longest the microphone is left on with nobody speaking (ms): it is not left open for ever by a phone put down. */
+export const VOICE_IDLE_MS = 2 * 60 * 1000
+
 /** The sentence the mic button says when the page can't listen. */
 export function voiceWhy(support: VoiceSupport, here: { protocol: string; host: string }, secureAddress = 'https://server.tailc768e5.ts.net:5173'): string | null {
   if (support === 'ok') return null
