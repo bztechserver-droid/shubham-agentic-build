@@ -1,0 +1,1 @@
+var e=`/agentic`,t=[``,`opus`,`sonnet`,`haiku`],n=[``,`low`,`medium`,`high`,`xhigh`,`max`],r=[``,`on`,`off`],i={model:``,effort:``,ultracode:!1},a=8e3,o=2e4;export{r as a,t as i,o as n,a as o,n as r,i as s,e as t};

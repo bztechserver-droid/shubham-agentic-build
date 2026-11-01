@@ -50,6 +50,8 @@ import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chat
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
 import { createOrders, isAssistantAgent, scanMessages } from './orders.ts'
+import { answerable, createApprovalLog, promptOf } from './approvals.ts'
+import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
@@ -1127,6 +1129,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return request<boolean>(link, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)
   }
 
+  // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
+  const approvalLog = createApprovalLog(path.join(o.dir, 'approvals.jsonl'))
+  const prepared = new Map<string, PreparedCard>()
+  const PREPARED_MAX = 20
   // F-072: the orders the overlay Assistant gives, and the replies that come back to it (orders.ts).
   // Only the hub keeps them: a member's tool calls are run by the hub (callTool).
   const orders = createOrders({
@@ -1233,6 +1239,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
             ? await request<ChatOpened>(peerOf(pc.id), 'open', { floorId: f.id, agentId: a.id }, 60_000)
             : await openChat(f.id, a.id, { takeOver: args.takeOver === true })
         return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
+      }
+      case 'prepare_send': {
+        // F-076: only the overlay Assistant, and only a proposal: nothing is typed anywhere. Shubham sees the card and sends it with his own tap.
+        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, 'Only the overlay assistant prepares cards for Shubham to send.')
+        const card = prepareCard(args.floor, args.agent, args.text, args.why)
+        log?.info(`${agent.name} prepared a card for ${card.agentName} on ${card.floorName}`)
+        return `Prepared for Shubham: "${card.text.slice(0, 120)}" to ${card.agentName} on ${card.floorName}. It is on his Send tab; only his own tap sends it.`
       }
       case 'app_set_effort': {
         // F-049: kept on the agent (its chat starts with --effort every time) and, when its chat
@@ -1590,6 +1603,108 @@ export function createAgentic(o: AgenticOptions): Agentic {
     throw apiError(404, "That file isn't on this PC or the one the chat is on")
   }
 
+  // ---------------------------------------------------------------------------------------
+  // F-076: approvals and send-as-me. Human-only: these routes take the page's own request; a request that carries
+  // a chat's key (what an agent's tools use) is refused here, and no MCP tool answers a prompt or sends as the person.
+
+  function humanOnly(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw apiError(403, "Only the person's own taps answer a prompt or send as them: this is not for a chat.")
+  }
+  const byOf = (r: MountRequest) => `the app (${String(r.headers['user-agent'] ?? 'a browser').replace(/\s+/g, ' ').slice(0, 90)})`
+
+  /** A message typed to the agent the way the terminal does it (a paste, then Enter); a chat that isn't running is started or picked back up first, and the message follows once it is ready. */
+  async function sayTo(id: string, agentId: string, body: string): Promise<SayAnswer> {
+    const agent = agentOf(floorOf(id), agentId)
+    const at = agent.sessionId ? whereAll()[agent.sessionId] : undefined
+    if (agent.sessionId && at) {
+      const fresh = at.id === self().id && Date.now() - Date.parse(chats.info(agent.sessionId)?.startedAt ?? '') < SAY_FRESH_MS
+      // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
+      if (fresh) chats.typeWhenReady(agent.sessionId, body)
+      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, `${agent.name}'s chat on ${at.name} can't be typed into right now`)
+      return { ok: true, started: false }
+    }
+    // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
+    const opened = await openChat(id, agentId, { say: body })
+    if (!opened.on) chats.typeWhenReady(opened.sessionId, body)
+    return { ok: true, started: true }
+  }
+
+  /** The keys of a numbered choice, into a chat anywhere (this PC's, or through the link). */
+  async function typeKeys(c: { sessionId: string; id: string }, data: string): Promise<boolean> {
+    if (c.id === self().id) return chats.input(c.sessionId, data)
+    const link = team?.member(c.id)
+    if (!link) return false
+    return request<boolean>(link, 'keys', { sessionId: c.sessionId, data }).catch(() => false)
+  }
+
+  /** Every chat waiting at a prompt, on every floor and PC, with what its screen says. */
+  async function listApprovals(): Promise<ApprovalsAnswer> {
+    const where = whereAll()
+    const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
+    const items = await Promise.all(
+      waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
+        const screen = await readChat({ sessionId: sid, id: w.id }, 60).catch(() => '')
+        const p = promptOf(screen)
+        return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu) }
+      }),
+    )
+    return { items, prepared: [...prepared.values()].sort((x, y) => y.at.localeCompare(x.at)) }
+  }
+
+  /** His tap on option n of the prompt he was shown: typed into that chat exactly as pressing it there. Refused when the prompt has changed since. */
+  async function answerApproval(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string' || typeof raw.n !== 'number') throw apiError(400, 'Expected {sessionId, id, n}')
+    const req = raw as unknown as AnswerRequest
+    const at = floors.bySession(req.sessionId)
+    const w = whereAll()[req.sessionId]
+    if (!at || !w) throw apiError(404, "That chat isn't running any more")
+    if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
+    const p = promptOf(await readChat({ sessionId: req.sessionId, id: w.id }, 60))
+    if (!answerable(p.menu)) throw apiError(409, 'That prompt can only be answered in the chat itself.')
+    if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
+    const option = p.menu!.options.find(x => x.n === req.n)
+    if (!option) throw apiError(400, `The prompt has no option ${req.n}`)
+    if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, String(req.n)))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be answered right now`)
+    const detail = `${p.menu!.question || 'A prompt'} → ${option.n}. ${option.label}${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
+    approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
+    log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}`)
+    return { ok: true, answered: `${option.n}. ${option.label}`, agent: at.agent.name, floor: at.floor.name }
+  }
+
+  /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
+  async function sendAsMe(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId, text}')
+    const req = raw as unknown as SendAsMeRequest
+    const body = text(req.text, 'text', MAX_SAY_TEXT)
+    const at = agentOf(floorOf(req.floorId), req.agentId)
+    const floor = floorOf(req.floorId)
+    const r = await sayTo(req.floorId, req.agentId, body)
+    const w = at.sessionId ? whereAll()[at.sessionId] : undefined
+    approvalLog.add({ kind: 'send', floor: floor.name, agent: at.name, pc: w?.name ?? self().name, sessionId: at.sessionId ?? '', detail: body, by })
+    if (typeof req.card === 'string') prepared.delete(req.card)
+    log?.info(`sent as the person to ${at.name} on ${floor.name}`)
+    return { ...r, agent: at.name, floor: floor.name }
+  }
+
+  /** The assistant's proposal: stored, shown to the person, never sent by anything but his tap. */
+  function prepareCard(floorRef: unknown, agentRef: unknown, textArg: unknown, why: unknown): PreparedCard {
+    const { floor: f, agent: a } = findAgent(floorRef, agentRef)
+    const card: PreparedCard = {
+      id: randomUUID(),
+      floorId: f.id,
+      floorName: f.name,
+      agentId: a.id,
+      agentName: a.name,
+      text: text(textArg, 'text', MAX_SAY_TEXT),
+      why: typeof why === 'string' ? why.trim().slice(0, 300) : '',
+      at: new Date().toISOString(),
+    }
+    prepared.set(card.id, card)
+    while (prepared.size > PREPARED_MAX) prepared.delete(prepared.keys().next().value as string)
+    emit({ t: 'floors', floors: allFloors() })
+    return card
+  }
+
   /** F-067: pauses between the commands typed into one chat, so claude has taken the first before the next arrives. */
   const TUNE_GAP_MS = o.tuneGapMs ?? 800
 
@@ -1862,6 +1977,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['PUT', /^\/defaults$/, (_, r) => ({ defaults: chatDefaults.set(r.body) })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
+    // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
+    ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals())],
+    ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r)))],
+    ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r)))],
+    ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],
     [
       'DELETE',
       /^\/floors\/([^/]+)$/,
@@ -2074,24 +2194,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/say$/,
-      async ([id, agentId], r): Promise<SayAnswer> => {
-        // A message typed to the agent the way the terminal does it (a paste, then Enter); a chat
-        // that isn't running is started or picked back up first, and the message follows once it is ready.
-        const body = text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)
-        const agent = agentOf(floorOf(id), agentId)
-        const at = agent.sessionId ? whereAll()[agent.sessionId] : undefined
-        if (agent.sessionId && at) {
-          const fresh = at.id === self().id && Date.now() - Date.parse(chats.info(agent.sessionId)?.startedAt ?? '') < SAY_FRESH_MS
-          // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
-          if (fresh) chats.typeWhenReady(agent.sessionId, body)
-          else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, `${agent.name}'s chat on ${at.name} can't be typed into right now`)
-          return { ok: true, started: false }
-        }
-        // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
-        const opened = await openChat(id, agentId, { say: body })
-        if (!opened.on) chats.typeWhenReady(opened.sessionId, body)
-        return { ok: true, started: true }
-      },
+      ([id, agentId], r): Promise<SayAnswer> => sayTo(id, agentId, text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)),
       'local',
     ],
     ['GET', /^\/floors\/([^/]+)\/memory$/, ([id], r) => ({ entries: memory.search(floorOf(id).id, r.query.get('q') ?? '', 100) })],
@@ -2328,6 +2431,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(raw => attachPutPeer(raw))
         case 'attach-get':
           return answer(raw => attachGetPeer(raw))
+        case 'keys':
+          // F-076: the hub answering a prompt in a chat that runs here: one or two digits (a numbered choice), nothing else.
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.data !== 'string' || !/^\d{1,2}$/.test(raw.data)) throw apiError(400, 'Expected {sessionId, data: a number}')
+            return chats.input(raw.sessionId, raw.data)
+          })
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {

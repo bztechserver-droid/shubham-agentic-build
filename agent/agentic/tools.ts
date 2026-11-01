@@ -54,6 +54,17 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: 'prepare_send',
+    description:
+      "ONLY the overlay Assistant. Prepare words for Shubham to send AS HIMSELF into an agent's chat (for a safety check that accepts only his own words, e.g. 'Yes, install Windows-MCP for the Assistant only'). This stores a card on his Send tab with the target and your proposed words; he reads it, can edit it and sends it with his own tap. Nothing is typed anywhere by this call, and you can never send as him. Say why in one line.",
+    inputSchema: {
+      type: 'object',
+      properties: { ...agentRef, text: { type: 'string', description: 'The words he would say, in his voice.' }, why: { type: 'string', description: 'One line: why he should send it.' } },
+      required: ['floor', 'agent', 'text'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'app_set_effort',
     description:
       "Set how hard an agent's chat thinks (claude's effort: low, medium, high, xhigh or max; default for the CLI's own), on any floor and PC. Kept on the agent, so its chat starts on it every time; if its chat is running and waiting, it is set there at once too (this session's /effort). A chat that is working keeps its effort until it starts again.",
