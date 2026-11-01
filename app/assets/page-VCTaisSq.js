@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-DePvh3-m.js";import{o as t}from"./navigation-BlPSlfqd.js";import{t as n}from"./source-of-truth-key-BH0IhxIa.js";import{t as r}from"./source-of-truth-BG3kzfxh.js";var i=e();function a(){let e=t(),{companyId:a,source:o}=n(e?.key??``);return(0,i.jsx)(r,{companyId:a,source:o})}export{a as default};

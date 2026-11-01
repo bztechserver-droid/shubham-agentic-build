@@ -1,1 +1,0 @@
-import{t as e}from"./jsx-runtime-DePvh3-m.js";import{i as t}from"./legacy-views-ggpJqS7O.js";var n=e();function r(){return(0,n.jsx)(t,{})}export{r as default};
