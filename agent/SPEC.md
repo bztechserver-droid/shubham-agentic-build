@@ -1636,7 +1636,7 @@ mode, a setting the hub keeps. Types: `shared/crm.ts`. Shubham's words: the CRM 
   a `Screen`. `crm-host/routes.tsx` lists the CRM's screens as lazy chunks (`matchCrmRoute`). `bridgeSession` sets the
   CRM's `crm_logged_in` hint (its `getToken()` answers null without it) while rendering. The CRM's portals go to a host
   div in `.crm-app` (`window.__CRM_PORTAL__`). `ThemeBridge` keeps the app's `data-mode` and the CRM's `dark` class and
-  `localStorage.theme` one. A page that throws takes only itself down (`PageBoundary`). `crm.css` is a Tailwind v4
+  `localStorage.theme` one. A page that throws takes only itself down (`PageBoundary`). The box `.crm-app` is `overflow-hidden` and the CRM scrolls in `[data-crm-scroll]` inside it, with the portal host beside that element, not in it: a fixed element inside a scrolled, transformed box is placed against the content, so with the box as the scroller the sidebar and any dialog opened after scrolling landed off screen (F-061 found it on the Usage page; `aside.fixed` and the `.min-h-screen` rule are sized to the box, not the window). `crm.css` is a Tailwind v4
   sheet (`@reference` to the app's, `@source` over the CRM's files); `.crm-app` re-points this app's tokens to the CRM's
   palette and has `transform: translate(0)`, so the CRM's fixed sidebar and overlays are placed in its box.
 - **The router** (`shims/navigation.tsx`): the CRM's address is a path and a query in state, not the browser's (the app
@@ -1801,6 +1801,66 @@ Claude subscription). Everything below is reads, except one write.
 - **Not yet / not done:** writing a cap (it is not the person's own assignment: Shubham raises his
   cap on Office 1 on the CRM's Code › Usage); a member PC restarting its chats from the hub's
   switch; reading his cap on a subscription he is not on (the CRM does not give it).
+
+## F-057: the live link (shared/live-socket.ts, link-state.ts, version-watch.ts, guard-note.ts, chat-resume.ts, src/lib/live/, agent/ws-live.ts, public/sw.js)
+
+Built 2026-10-31 and 2026-11-01. Shubham: "we need a persistent connection between the server and my
+phone so that I don't have to reload my page again and again."
+
+- **What was broken.** Every socket of the page (the device state, the floors and live chats, a chat's
+  conversation, a chat's terminal) was brought back only when its socket *closed*. A phone that locks,
+  a VPN that drops or a path that goes quiet leaves the socket OPEN, without a FIN or RST, for minutes:
+  the page showed old data and never came back. The wake-ups (tab shown, network back) only acted on a
+  store already marked down; nothing sent a heartbeat, and the agent never dropped a client that had
+  gone silent; a terminal took any drop for "the chat ended"; what changed while away (memory, tasks)
+  was not asked for again; nothing told the person; after Update now the old page ran on; the service
+  worker's offline page needed a tap.
+- **One helper** (`shared/live-socket.ts` `openLive`, pure: the socket, timers and clock are passed
+  in, so it is tested with fake ones; `src/lib/live/index.ts` binds it to the browser as
+  `openChannel(label, options)`). A channel reconnects with a back-off of 250, 500, 1000, 2000, 3000
+  and 5000 ms (±20 %), forever. A dead-but-open socket is found by a ping, `{"t":"ping","n":N}`, after
+  20 s of silence (only while the page is shown; any message counts as life, so a busy socket is never
+  pinged), 8 s to answer; the agent answers `{"t":"pong","n":N}` on every text WebSocket
+  (`agent/ws-live.ts`, also a ping frame every 20 s and a drop of a client silent for 65 s). A
+  handshake that hangs is given up after 10 s. When the page wakes (`visibilitychange` to visible,
+  `pageshow`, `focus`, `resume`, `online`) every channel waiting reconnects at once, and every open one
+  is checked with a ping that has 3.5 s to be answered; a timer that fires late says the page itself was
+  paused, so it asks once more before giving up. `onOpen({again, awayMs})` is where a channel catches up;
+  `retry(drop)` lets a channel end for good (a chat that ended).
+- **The sign** (`shared/link-state.ts`, `src/lib/live/LinkBanner.tsx`, mounted once in `main.tsx`):
+  nothing while the link is fine, and nothing for the first 2 s of trouble (1.2 s of the browser saying
+  offline); then one small pill: "Connecting…" before any channel has been up, "Reconnecting…" while
+  one that was up is down, "Offline" when the browser has no network. While the link is down the page asks
+  the guard (`GET /guard/status`, every 2 s; absent without a guard) and says "The app is
+  restarting|updating. Back in about N s." with Control and Backup page links (F-058); when the guard says
+  the app is up and a channel is still waiting out its back-off, that channel tries at once.
+- **A newer build** (`shared/version-watch.ts`, `src/lib/live/version.ts`): the page compares the entry
+  script it was loaded with against the one in a fresh no-store `GET /` (every minute while shown, when it
+  wakes, when the link is back, when a lazy chunk is gone). A different one: it reloads, but not while
+  the person is typing in a field with text (it waits and asks again every 2 s), not while the page is
+  hidden, and never twice in 30 s. A dev server or an error page names no entry: nothing happens. A
+  text box that keeps its own draft writes it on the `sad:before-reload` event.
+- **Catch-up**, per channel: the floors and chats socket gets the floors, the live chats and where they
+  run from the agent on every connect, and after a reconnect every floor's memory counter is bumped (the
+  Tasks tab looks again when the socket is up again); a conversation's feed gets `hello` (the end of the
+  conversation) on every connect and `shared/chat-resume.ts applyHello` merges it with what is on
+  screen (the older pages scrolled to stay, nothing shows twice, a replaced or cut file replaces it); a
+  terminal is cleared and takes the agent's replay of the recent screen again, and only the agent's `exit`
+  ends it; the Build page looks at once when the phone wakes. What was typed into a chat's box and not
+  sent is also kept in the browser (`src/lib/live/drafts.ts`, 7 days, 20 000 characters), so a reload
+  does not take it.
+- **The old way** stays: `?live=old` (remembered in the browser as `sad-live`; `?live=new` returns) makes
+  every channel run the code it had before, and shows no sign and no version watch.
+- **Checked** in headless Chrome as a phone (412 × 915, touch, Android user agent) through a proxy that
+  resets, stalls, goes mute or cuts, on build 2026.11.01-0116 and -0143's page against the current
+  agent: a connection reset: the sockets are back in 0.4 s; a path mute for 45 s: the sign after 28.7 s,
+  everything back 3.5 s after the path returned, every message of the conversation there once; a tab
+  frozen for 40 s while the server gave up on its connections: back 1.2 s after thaw; a tab hidden for
+  40 s: back 3.3 s after it was shown; offline: the sign after 1.3 s, gone as the network returned; a
+  server restart: the sign after 4 s, back 4.6 s after the server answered (with `?live=old`: 25.7 s, no sign); a
+  terminal on the Agents page: back by itself in 0.8-3.1 s and its size sent again (with `?live=old` it
+  never came back); a newer build after a restart: the page took it by itself 2.7 s after the server
+  answered, no reload loop, and the half-typed message was in the box afterwards. Not checked: a real phone, Tailscale and the gate.
 
 ## F-058: the guard (guard.ts, guard/supervisor.ts, hub/keeper.ts, hub/external-servers.ts, proc-tree.ts, agentic/recover.ts)
 

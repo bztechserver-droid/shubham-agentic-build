@@ -46,6 +46,11 @@ without stopping the app that is running: the guard adopts it. What it does:
   while the app is down**;
 - brings back the chats that were open, and tells the ones that were working to carry on.
 
+Installed over an app that is running (started the old way), the guard takes it over without
+stopping it: it goes on as it was (serving the page and RustDesk itself) until it next restarts, an
+Update or `node agent\guard.ts restart` at a quiet moment; from then on 5173 never closes while it
+restarts, RustDesk goes on apart from it, and the chats that were open come back by themselves.
+
 It ends processes only by exact PID (never by port or name, never with `taskkill /t`). Its log is
 `%LOCALAPPDATA%\shubham-agentic\guard-console.log`. `node agent/guard.ts status` says what it is
 doing, `restart` restarts the app, `stop` stops the app and the guard.

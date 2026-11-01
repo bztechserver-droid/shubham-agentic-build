@@ -134,7 +134,13 @@ for ($i = 0; $i -lt 90 -and -not $up; $i++) {
 }
 if ($up) {
   "  The guard runs (pid $($up.guard.pid)); the app answers$(if ($up.agent.adopted) { ' (it was already running; the guard watches it, and starts it again if it ever stops)' } else { '' })."
-  "  The page is on port $($up.guard.uiPort), served by the guard: it stays open while the app restarts."
+  if ($up.agent.adopted) {
+    "  That app was started the old way, so for now it still serves the page and runs RustDesk's servers itself. It goes under the guard completely"
+    "  the next time it restarts (an Update, or at a quiet moment: node agent\guard.ts restart): then the page on $($up.guard.uiPort) never closes while it restarts,"
+    "  RustDesk goes on apart from it, and the chats that were open come back by themselves."
+  } else {
+    "  The page is on port $($up.guard.uiPort), served by the guard: it stays open while the app restarts."
+  }
 } else {
   "  The guard has not reported the app up yet: see $stateRoot\guard-console.log and agent-console.log"
 }

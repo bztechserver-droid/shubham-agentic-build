@@ -85,7 +85,10 @@ export interface Live {
   close(): void
 }
 
-export const BACKOFF_MS: readonly number[] = [250, 500, 1000, 2000, 4000, 8000, 10_000]
+// Never longer than 5 s between tries: the server of an update or a restart is back within seconds, and a refused
+// connection costs nothing. (A page that knows better, the guard's /guard/status saying the app is up, asks to
+// reconnect at once: src/lib/live/guard.ts.)
+export const BACKOFF_MS: readonly number[] = [250, 500, 1000, 2000, 3000, 5000]
 export const HEARTBEAT = { everyMs: 20_000, replyMs: 8000, resumeReplyMs: 3500 }
 export const CONNECT_TIMEOUT_MS = 10_000
 /** A handshake older than this when the page comes back is hung on a dead path: start again. */
