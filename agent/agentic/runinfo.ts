@@ -23,9 +23,32 @@ export interface FileRun {
   mtimeMs: number
 }
 
-const cache = new Map<string, { key: string; value: FileRun }>()
+const cache = new Map<string, { size: number; mtimeMs: number; value: FileRun }>()
 
-/** What the end of one conversation file says; null when it can't be read. */
+/** An effort set long ago, in a long conversation, is looked for this far back, once. */
+const FAR_BYTES = 16 * 1024 * 1024
+
+/** Reads bytes [from, to) of a file as text. */
+function readRange(file: string, from: number, to: number): string {
+  const len = to - from
+  const fd = openSync(file, 'r')
+  try {
+    const buf = Buffer.alloc(len)
+    readSync(fd, buf, 0, len, from)
+    return buf.toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/** The text of a range with the row it starts in the middle of dropped (when it does not start the file). */
+const wholeRows = (text: string, from: number) => (from > 0 ? text.slice(text.indexOf('\n') + 1) : text)
+
+/**
+ * What the end of one conversation file says; null when it can't be read. What was found is kept:
+ * when the file grows only the new bytes are read, and what they don't say stays as it was. A first
+ * look that finds no /effort in the end of a long file looks further back, once.
+ */
 export function readFileRun(file: string): FileRun | null {
   let st
   try {
@@ -33,28 +56,33 @@ export function readFileRun(file: string): FileRun | null {
   } catch {
     return null
   }
-  const key = `${st.size}:${st.mtimeMs}`
   const hit = cache.get(file)
-  if (hit?.key === key) return hit.value
-  let text: string
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.value
   try {
-    const len = Math.min(st.size, TAIL_BYTES)
-    const fd = openSync(file, 'r')
-    try {
-      const buf = Buffer.alloc(len)
-      readSync(fd, buf, 0, len, st.size - len)
-      text = buf.toString('utf8')
-    } finally {
-      closeSync(fd)
+    let value: FileRun
+    if (hit && st.size > hit.size && st.size - hit.size <= TAIL_BYTES) {
+      // What was added starts at a row's start (it is where the last read ended); a torn one fails to parse and is skipped.
+      const fresh = scanRun(readRange(file, hit.size, st.size), st.mtimeMs)
+      value = {
+        model: fresh.model ?? hit.value.model,
+        effort: fresh.effort ?? hit.value.effort,
+        effortAt: fresh.effort ? fresh.effortAt : hit.value.effortAt,
+        mtimeMs: st.mtimeMs,
+      }
+    } else {
+      const from = Math.max(0, st.size - TAIL_BYTES)
+      value = scanRun(wholeRows(readRange(file, from, st.size), from), st.mtimeMs)
+      if (value.effort === null && from > 0) {
+        const far = Math.max(0, st.size - FAR_BYTES)
+        const older = scanRun(wholeRows(readRange(file, far, from), far), st.mtimeMs)
+        value = { ...value, model: value.model ?? older.model, effort: older.effort, effortAt: older.effortAt }
+      }
     }
-    // A tail starts in the middle of a row: drop that one.
-    if (st.size > len) text = text.slice(text.indexOf('\n') + 1)
+    cache.set(file, { size: st.size, mtimeMs: st.mtimeMs, value })
+    return value
   } catch {
     return null
   }
-  const value = scanRun(text, st.mtimeMs)
-  cache.set(file, { key, value })
-  return value
 }
 
 /** The newest model and effort in conversation rows (newline separated JSON). */

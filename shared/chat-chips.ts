@@ -85,9 +85,13 @@ export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel
   } else if (pinned) {
     model = { text: pinned, title: `Model: ${pinned}, pinned on the agent. It has not answered yet.`, kind: 'known' }
   } else if (defaultModel) {
+    // Configured (the environment, claude's settings): the default. Inferred from another chat: a guess, which can differ per chat and per subscription.
+    const guess = defaultModel.from === 'a chat that inherited it'
     model = {
-      text: `${modelLabel(defaultModel.model)} (default)`,
-      title: `Model: ${defaultModel.model}, the default claude chooses. Known from ${defaultModel.from === 'a chat that inherited it' ? 'the newest chat that did not pin one' : `claude's ${defaultModel.from}`}.`,
+      text: `${modelLabel(defaultModel.model)} (default${guess ? '?' : ''})`,
+      title: guess
+        ? `Model: probably ${defaultModel.model}: what the newest chat that pinned none ran on. It can differ per chat and per subscription; it is named for certain once this chat answers.`
+        : `Model: ${defaultModel.model}, the default claude chooses, from claude's ${defaultModel.from}.`,
       kind: 'default',
     }
   } else {
