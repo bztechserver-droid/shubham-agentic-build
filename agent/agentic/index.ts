@@ -149,7 +149,7 @@ export interface AgenticOptions {
    * use. The rest are for tests.
    */
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
-  /** F-072: the Assistant's orders get their answers carried back to it by the app. Off until Shubham says yes: tests, or SAD_ORDER_REPLIES=1, or an order-replies.on file in this folder turn it on. */
+  /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
   orderReplies?: boolean
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
   restartGraceMs?: number
@@ -1144,7 +1144,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
   })
   function orderReplies(): boolean {
-    return o.orderReplies ?? (process.env.SAD_ORDER_REPLIES === '1' || existsSync(path.join(o.dir, 'order-replies.on')))
+    return o.orderReplies ?? !(process.env.SAD_ORDER_REPLIES === '0' || existsSync(path.join(o.dir, 'order-replies.off')))
   }
   const ordersTimer = setInterval(() => void orders.tick(), 1000)
   ordersTimer.unref?.()
