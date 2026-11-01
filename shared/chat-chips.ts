@@ -11,6 +11,8 @@ export interface ChipAgent {
   /** Effort its chat starts with ('' is the CLI's own). */
   effort: string
   sessionId: string | null
+  /** F-064: the PC its chat lives on (its name), once a PC has started it. */
+  homePcName?: string | null
 }
 
 /** Where chats run, as the app's store has it. */
@@ -117,13 +119,15 @@ export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel
     ? { text: level, title: `Effort: ${level}, ${how}.`, kind: 'known' }
     : { text: 'default', title: `Effort: the one claude chooses, ${how === 'what it started with' ? 'as it started' : 'nothing set on the agent'}.`, kind: 'default' }
 
-  // --- PC: where it runs, else where it ran last ---
+  // --- PC: where it runs; stopped, its home (F-064: every resume goes there), else where it ran last ---
+  const home = agent.homePcName?.trim() || null
   let pc: Chip
   if (sid === null) pc = { text: 'no chat', title: 'PC: this agent has not had a chat yet.', kind: 'unknown' }
   else if (runningHere) {
     const name = where.team?.pc ?? 'This PC'
-    pc = { text: name, title: `PC: its chat runs on ${name}.`, kind: 'known' }
-  } else if (away) pc = { text: away.pc, title: `PC: its chat runs on ${away.pc}.`, kind: 'known' }
+    pc = { text: name, title: `PC: its chat runs on ${name}.${home && home !== name ? ` Its home is ${home}: it resumes there.` : ''}`, kind: 'known' }
+  } else if (away) pc = { text: away.pc, title: `PC: its chat runs on ${away.pc}.${home && home !== away.pc ? ` Its home is ${home}: it resumes there.` : ''}`, kind: 'known' }
+  else if (home) pc = { text: `${home} · home`, title: `PC: its chat is not running. Its home is ${home}: it resumes there, until you switch the computer (right-click or long-press the agent).`, kind: 'known' }
   else if (where.last[sid]) pc = { text: `${where.last[sid].pc} · last`, title: `PC: its chat is not running; it ran last on ${where.last[sid].pc}.`, kind: 'default' }
   else pc = { text: 'stopped', title: 'PC: its chat is not running, and where it ran last is not known.', kind: 'unknown' }
 

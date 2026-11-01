@@ -873,7 +873,43 @@
     "said": "now two feasuters to add one is the when a caht is not started \nthe resume should naturally ruseume session on pc where it belongs to",
     "added": "2026-11-01",
     "notes": [
-      "2026-11-01: Read as (Lead): when a chat is not running and is started/resumed (Resume button, opening it, auto-reopen after an Update or by the guard F-058), it resumes its own claude session (--resume) on the PC where that session lives (the server or the laptop, from where it ran last, F-021/F-022/F-062's PC chip), not on whichever PC the click came from or the server by default. If that PC is offline: say so plainly and offer to start it here instead (the old way stays as the alternative). Shubham said \"two features\" but gave one; the second is still to come."
+      "2026-11-01: Read as (Lead): when a chat is not running and is started/resumed (Resume button, opening it, auto-reopen after an Update or by the guard F-058), it resumes its own claude session (--resume) on the PC where that session lives (the server or the laptop, from where it ran last, F-021/F-022/F-062's PC chip), not on whichever PC the click came from or the server by default. If that PC is offline: say so plainly and offer to start it here instead (the old way stays as the alternative). Shubham said \"two features\" but gave one; the second is still to come.",
+      "2026-11-01: Shubham, later: \"now please do this when we resuem caht it shoudl resuem on pc which strated it until i dont do a right click on agent adn switch the computer\" (and the second feature is dropped). Read as (Lead): each chat has a home PC = the PC that started it. Every resume (any button, any device, auto-reopen) goes back to the home PC. The home changes ONLY when Shubham right-clicks the agent (on Agents/floor list/Chats; long-press on the phone) and picks \"Switch computer\" → a PC; the chat then moves there (stop + resume there) and that PC becomes its new home. The PC chip (F-062) shows the home. Given to Web after F-063.",
+      "2026-11-01 (Web): BUILT. Every chat has a home PC (FloorAgent.homePc / homePcName, kept by the hub, never taken from a page): the first PC to run a chat is its home (a chat with none gets one the next time a PC runs it). Every resume brings it back there, whichever PC or device asks: openChat now asks resumeAtHome first: the hub sends 'open' to the home member, a member goes through the hub's run-on route, so any PC reaches any PC. This covers the Resume button, opening a chat, a message sent to a stopped chat (the message is passed on and typed by the home PC once its prompt is up), Agents, Chats, and the agent tool app_open_chat without a PC. A chat running anywhere is the old take-over question (409 / takeOver), unchanged. The app starting again (F-058) and a subscription restart reopen a chat on the PC it was open on (here: true), which is its home or the take-over case. Switch computer is the one way to change the home: right-click an agent in Chats (a long press on a phone: in the grouped list, the 300 ms hold that picks a row up opens it when let go without moving; the flat list and the Agents rows have their own 500 ms long press), the Agents row's menu (the old Run on submenu, renamed, its check now the home), and a conversation's ⋮ menu, which opens a dialog listing the PCs within reach; it uses the existing run-on route, which now also sets the home, and from a member goes through the hub. The PC chip (F-062) says \"<PC> · home\" for a stopped chat, and the title says the home when the chat runs on another PC. Home offline: a resume answers 424 with the PC's name (\"Laptop is offline, and Lead's chat lives there. Start it on this PC instead? Its home stays Laptop.\"), the page shows it as a 15 s toast with a Start it here button, which asks again with here: true (the old way: starts on this PC, home unchanged). Switching to a PC that cannot be reached is refused the same way. Checked: 5 new tests through two real backends (a server hub and a laptop member over an in-memory link): the starter becomes the home, resume from the other PC goes home, Switch computer moves and sets the home (from a member too), offline home says 424 and Start here works and keeps the home, a startup reopen stays on the PC, a message to a stopped chat is typed on the home PC; 1 floors-store test; 1 chip test; the UI at 1280 (right-click) and 360 touch (hold and let go) on the /chats?mock fixture (a hub with two PCs). NOT checked: two real PCs, a real phone's long press on iOS, the Agents page's right-click in Chrome (same code as the menu button)."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-065",
+    "title": "Chats: every floor collapsed by default, remembered, with Collapse all / Expand all",
+    "said": "and also we need one more thign that is \nall chats should be collpased by default and remember and we need button to collapse all expand all also",
+    "added": "2026-11-01",
+    "notes": [
+      "2026-11-01: Read as (Lead): in Chats, the floor dropdowns (F-055) start collapsed (chats hidden under each floor) the first time. Whatever Shubham opens or closes is remembered (survives reload, Update and coming back to the page). A Collapse all and an Expand all button at the top of the list (fits 360 px; touch-sized). Drag (F-059) keeps working; dropping onto a collapsed floor still works. Given to Web.",
+      "2026-11-01 (Web): BUILT. In Chats every floor starts collapsed; what is opened or closed is remembered in this browser (sad-chat-floors-2: a new key, so what the old rule had opened by itself is forgotten once; after that it survives reload and Update). Opening a conversation still opens its floor. Collapse all and Expand all are now a button each beside the search field (the one that would change nothing is dimmed), 44 px each, and with Group by floor they fit 360 px with the search field 190 px wide. The old start (a floor never seen is open if something waits there or holds the open conversation) is kept as a setting: Settings > Chats > Open if waiting (shared/chat-floors.ts StartRule; default closed). Drag (F-059) works onto a collapsed floor: a chat held 450 ms and dragged from an open floor onto a collapsed floor's header lands last on that floor (checked by touch at 360 on the fixture: the toast said it moved). Checked: 360 touch on /chats?mock: 3 floors, 0 open at first sight; Expand all opens 3; reload keeps 3; Collapse all gives 0 and reload keeps 0; one opened by its header stays opened after reload; no sideways scroll; 55 unit tests in chat-floors. NOT checked: 720 px, light mode, a real phone."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-066",
+    "title": "Web (desktop browser): no top bar either, like the phone (F-060)",
+    "said": "also you rmemrbe the feature of removing the top bar in th ephoen do it for the web also please",
+    "added": "2026-11-01",
+    "notes": [
+      "2026-11-01: Read as (Lead): F-060's phone rule now on the desktop/laptop browser too: no top bar on any page (no page name, Install, Menu, palette, light/dark). Theme, palette, how pages are picked and Install live on the Settings page. Pages are picked from the page picker (and Ctrl+B, F-063). Controls a page put in the top bar (Agents' Chats/windows/Columns/reload, F-048) move into the chat windows' own title bars / ⋯ sheet as on the phone. The old top bar stays as an option in Settings (keep the old way). Given to Web."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-067",
+    "title": "Long-press a chat to change its model and effort; defaults in Settings",
+    "said": "Now can we have the ability to long-press a chat and change the effort and the model please? In the settings we should have a place where we can put the default model and default effort, right? Can we do that please?",
+    "added": "2026-11-01",
+    "notes": [
+      "2026-11-01: Read as (Lead): long-press a chat (right-click on the desktop) wherever a chat appears (Chats list, floor list, Agents chat window) opens the same menu as F-064's \"Switch computer\", with Model (the models claude offers, plus \"Default\") and Effort (low/medium/high/xhigh/max, plus \"Default\"). Changing them on a running chat applies at once (as app_set_effort does: /model and /effort typed into it when it is waiting, else at its next start; say which). The F-062 chips update. Settings gets a \"Chats\" section with the default model and default effort for new chats and for agents set to \"Default\". Given to Web, in the same menu work as F-064."
     ],
     "done": null,
     "doneNote": ""

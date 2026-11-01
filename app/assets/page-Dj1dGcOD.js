@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-CD_u2PXg.js";function t(){e(`/wpages`)}export{t as default};

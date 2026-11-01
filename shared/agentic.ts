@@ -40,6 +40,15 @@ export interface FloorAgent {
   md: string
   /** Its chat, once opened: the claude session id. The one live binding. */
   sessionId: string | null
+  /**
+   * F-064: the PC its chat lives on, by device id: the one that started it. Every resume (any button,
+   * any device, the app starting again) brings the chat back there, until it is moved with Switch
+   * computer. Null: not started on a PC of the hub's yet (its next start makes that PC its home).
+   * Set by the hub only, never taken from a page.
+   */
+  homePc: string | null
+  /** F-064: that PC's name, for when it is offline and its id says nothing. */
+  homePcName: string | null
   model: AgentModel
   /** F-049: its chat starts with claude --effort this. */
   effort: AgentEffort
@@ -139,6 +148,8 @@ export interface NewAgent {
 
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */
 export interface ChatOpened {
+  /** F-064: the PC it is on, when it was started or found on another PC than this one (its home). */
+  on?: string
   sessionId: string
   /** True when this call started the claude process. */
   started: boolean
@@ -154,7 +165,20 @@ export interface OpenChatRequest {
   rows?: number
   /** F-021: it runs on another PC: stop it there and run it here. Without this, that is a 409. */
   takeOver?: boolean
+  /**
+   * F-064: start it on this PC even though its home is another (the home is offline, and Shubham
+   * said to start it here instead; or the hub has already chosen this PC). Its home is not changed.
+   */
+  here?: boolean
+  /** F-064, between PCs only: a message to type into the chat once it is up (a resume sent on to its home PC). */
+  say?: string
 }
+
+/**
+ * F-064: the status a resume is answered with when the chat's home PC can't be reached. The message
+ * names the PC; the page offers to start the chat on this PC instead (OpenChatRequest.here).
+ */
+export const HOME_OFFLINE_STATUS = 424
 
 /** GET /agentic/sessions: a Claude Code conversation on this PC, newest first (Bring in a Claude chat). */
 export interface ClaudeSession {

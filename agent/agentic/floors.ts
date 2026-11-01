@@ -64,6 +64,8 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     reportsTo: typeof a.reportsTo === 'string' && a.reportsTo ? a.reportsTo : null,
     md: str(a.md, AGENT_BRIEF_MAX),
     sessionId: typeof a.sessionId === 'string' && SESSION_ID_RE.test(a.sessionId) ? a.sessionId : null,
+    homePc: typeof a.homePc === 'string' && a.homePc.trim() ? a.homePc.trim().slice(0, 64) : null,
+    homePcName: typeof a.homePc === 'string' && a.homePc.trim() && typeof a.homePcName === 'string' && a.homePcName.trim() ? a.homePcName.trim().slice(0, NAME_MAX) : null,
     model: isModel(a.model) ? a.model : '',
     effort: isEffort(a.effort) ? a.effort : '',
     skills: strList(a.skills),
@@ -138,8 +140,10 @@ export interface FloorStore {
    */
   moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null): { from: Floor; to: Floor }
   addAgent(floorId: string, req: NewAgent): { floor: Floor; agent: FloorAgent }
-  /** Binds (or with null unbinds) an agent's chat. */
+  /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
+  /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
+  setHome(floorId: string, agentId: string, home: { id: string; name: string } | null): Floor
   /** The floor and agent a chat belongs to: how a tool call knows who is calling. */
   bySession(sessionId: string): { floor: Floor; agent: FloorAgent } | null
 }
@@ -245,6 +249,9 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           const a = hydrateAgent(raw, i)
           // The binding is the server's: kept from what was there, never taken from the page.
           a.sessionId = before.get(a.id)?.sessionId ?? null
+          // F-064: and so is the PC it lives on.
+          a.homePc = before.get(a.id)?.homePc ?? null
+          a.homePcName = before.get(a.id)?.homePcName ?? null
           return a
         })
         const names = new Set<string>()
@@ -353,7 +360,25 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
         // One chat, one agent: taking it from whoever had it.
         for (const f of floors) for (const a of f.agents) if (a.sessionId === sessionId && a !== agent) a.sessionId = null
       }
+      // A different chat starts without a home: the PC that starts it becomes it (F-064).
+      if (agent.sessionId !== sessionId) {
+        agent.homePc = null
+        agent.homePcName = null
+      }
       agent.sessionId = sessionId
+      floor.updatedAt = now()
+      save()
+      return clone(floor)
+    },
+
+    setHome(floorId, agentId, home) {
+      const floor = find(floorId)
+      const agent = agentOf(floor, agentId)
+      const id = home?.id.trim().slice(0, 64) || null
+      const name = id ? home!.name.trim().slice(0, NAME_MAX) || id : null
+      if (agent.homePc === id && agent.homePcName === name) return clone(floor)
+      agent.homePc = id
+      agent.homePcName = name
       floor.updatedAt = now()
       save()
       return clone(floor)

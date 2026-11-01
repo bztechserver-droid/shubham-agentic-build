@@ -232,8 +232,16 @@ export interface FloorFacts {
   holdsSelected: boolean
 }
 
-/** A floor never seen before starts open only if something waits for the person there, or it holds the open conversation. */
-export const initialOpen = (f: Pick<FloorFacts, 'waiting' | 'holdsSelected'>) => f.waiting > 0 || f.holdsSelected
+/**
+ * How a floor never seen before starts (F-065). `closed`, the default: every floor starts collapsed, and
+ * what the person opens or closes is remembered. `waiting`, the way it was (F-055): open only if something
+ * waits for the person there, or it holds the open conversation.
+ */
+export type StartRule = 'closed' | 'waiting'
+
+export const parseStartRule = (raw: string | null | undefined): StartRule => (raw === 'waiting' ? 'waiting' : 'closed')
+
+export const initialOpen = (f: Pick<FloorFacts, 'waiting' | 'holdsSelected'>, rule: StartRule = 'closed') => rule === 'waiting' && (f.waiting > 0 || f.holdsSelected)
 
 /** The facts of every floor that has a chat, in `order`. `items` are all the chats: a search never narrows them. */
 export function floorFacts(items: readonly FloorItem[], order: readonly FloorRef[], selectedKey: string | null): FloorFacts[] {
@@ -276,13 +284,13 @@ export function floorIsOpen(o: { searching: boolean; stored: OpenMap; closedInSe
  * that are remembered are left alone. Returns `stored` itself when nothing was new, so a caller
  * can tell that there is nothing to write.
  */
-export function seedOpen(stored: OpenMap, floors: readonly FloorFacts[]): OpenMap {
+export function seedOpen(stored: OpenMap, floors: readonly FloorFacts[], rule: StartRule = 'closed'): OpenMap {
   // Built through a Map, so that no floor id (not even "__proto__") is taken for a property setter.
   let next: Map<string, boolean> | null = null
   for (const f of floors) {
     if (next ? next.has(f.id) : rememberedOpen(stored, f.id) !== undefined) continue
     next ??= new Map(Object.entries(stored))
-    next.set(f.id, initialOpen(f))
+    next.set(f.id, initialOpen(f, rule))
   }
   return next ? Object.fromEntries(next) : stored
 }

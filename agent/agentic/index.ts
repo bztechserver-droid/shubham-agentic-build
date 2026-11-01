@@ -9,6 +9,7 @@ import {
   AGENTS_OFF_STATUS,
   AGENT_EFFORTS,
   AGENT_MODELS,
+  HOME_OFFLINE_STATUS,
   type AgentEffort,
   type AgentModel,
   type AgenticEvent,
@@ -585,6 +586,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function hold(sid: string, who: { id: string; name: string }) {
     held.set(sid, { holder: who.id, holderName: who.name, heldAt: Date.now(), last: held.get(sid)?.last ?? null })
     saveHeld()
+    // F-064: the first PC to run a chat is its home (a chat that has one keeps it, however it is run later).
+    const at = floors.bySession(sid)
+    if (at && !at.agent.homePc) floors.setHome(at.floor.id, at.agent.id, who)
   }
 
   /** Lets a session go: what `who` held is free, and ran last there. */
@@ -838,6 +842,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
     if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    const atHome = await resumeAtHome(floor, agent, sid, req)
+    if (atHome) return atHome
     if (!sid) {
       sid = randomUUID()
       const r = await request<{ floor: Floor }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/session`, body: { sessionId: sid } })
@@ -872,6 +878,38 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // Opening an agent's chat
 
+  /** F-064: this PC's name for a PC's id (the hub's own, a member's, or the name the agent kept). */
+  const homeName = (agent: FloorAgent, id: string) => (id === self().id ? self().name : (remote.get(id)?.name ?? (team?.hub()?.id === id ? team.hub()!.name : null) ?? agent.homePcName ?? id))
+
+  /**
+   * F-064: a chat that isn't running is resumed on its HOME PC, whichever PC the click, the message
+   * or the app starting again came from. Nothing to do here (null) when this PC is its home, it has
+   * none yet, or it was asked for here (`here`: the home is offline and Shubham chose to start it
+   * here, or the hub has already chosen). A chat that is running anywhere is the take-over question
+   * as before (the caller's 409, or `takeOver`). When the home can't be reached the answer is 424,
+   * naming it (the page offers here).
+   */
+  async function resumeAtHome(floor: Floor, agent: FloorAgent, sid: string | null, req: OpenChatRequest): Promise<ChatOpened | null> {
+    if (req.here || mode() === 'alone') return null
+    const home = agent.homePc
+    if (!home || home === self().id) return null
+    const name = homeName(agent, home)
+    // Running somewhere already (at its home, or started elsewhere): that is the take-over question, as before.
+    if (sid && whereAll()[sid]) return null
+    const offline = () => apiError(HOME_OFFLINE_STATUS, `${name} is offline, and ${agent.name}'s chat lives there. Start it on this PC instead? Its home stays ${name}.`)
+    if (mode() === 'hub') {
+      const link = team?.member(home) ?? null
+      if (!link) throw offline()
+      return { ...(await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, text: req.say }, 60_000)), on: name }
+    }
+    // A member reaches every other PC through the hub, which does the same for it (the run-on route).
+    if (!team?.hub()?.link || !sub) throw offline()
+    const via = await request<ChatOpened>(needHub(), 'http', { method: 'POST', rest: `/floors/${enc(floor.id)}/agents/${enc(agent.id)}/run-on`, body: { pc: home, say: req.say } }, 60_000).catch((e: unknown) => {
+      throw (e as { status?: unknown }).status === HOME_OFFLINE_STATUS ? offline() : e
+    })
+    return { ...via, on: name }
+  }
+
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
     if (mode() === 'member') return openOnMember(floorId, agentId, req)
@@ -879,6 +917,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
     if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    const atHome = await resumeAtHome(floor, agent, sid, req)
+    if (atHome) return atHome
     if (!sid) {
       sid = randomUUID()
       floor = floors.bindSession(floor.id, agent.id, sid)
@@ -923,7 +963,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = floors.bySession(sid)
     if (!at) return false
     try {
-      const opened = await openChat(at.floor.id, at.agent.id, {})
+      // Here: it was open on this PC when the app stopped (or needs its token again), so it comes back on this PC.
+      const opened = await openChat(at.floor.id, at.agent.id, { here: true })
       if (opened.started && text) chats.typeWhenReady(sid, text)
       return opened.started || chats.info(sid) !== null
     } catch (e) {
@@ -1499,7 +1540,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   const openRequest = (b: unknown): OpenChatRequest => {
     const r = isObject(b) ? b : {}
-    return { cols: typeof r.cols === 'number' ? r.cols : undefined, rows: typeof r.rows === 'number' ? r.rows : undefined, takeOver: r.takeOver === true }
+    return { cols: typeof r.cols === 'number' ? r.cols : undefined, rows: typeof r.rows === 'number' ? r.rows : undefined, takeOver: r.takeOver === true, here: r.here === true }
   }
 
   type Handler = (m: string[], r: MountRequest) => unknown
@@ -1563,11 +1604,26 @@ export function createAgentic(o: AgenticOptions): Agentic {
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/run-on$/,
       async ([id, agentId], r) => {
-        // F-025, Run on: the chat moved to the PC named (taken over there, from wherever it runs).
-        const pc = isObject(r.body) && typeof r.body.pc === 'string' ? r.body.pc : ''
-        if (!pc || pc === self().id) return openChat(id, agentId, { takeOver: true })
-        const link = peerOf(pc)
-        return { ...(await request<ChatOpened>(link, 'open', { floorId: id, agentId }, 60_000)), on: link.name }
+        // F-025, Run on; F-064, Switch computer: the chat moved to the PC named (taken over there, from wherever it
+        // runs), and that PC is its home from then on. A member asks the hub, which can reach every PC.
+        const pc = (isObject(r.body) && typeof r.body.pc === 'string' ? r.body.pc : '') || self().id
+        // A message to type once it is up (a message sent to a stopped chat that lives on another PC).
+        const say = isObject(r.body) && typeof r.body.say === 'string' ? r.body.say.slice(0, MAX_SAY_TEXT) : undefined
+        if (mode() === 'member') return await request<ChatOpened>(needHub(), 'http', { method: 'POST', rest: `/floors/${enc(id)}/agents/${enc(agentId)}/run-on`, body: { pc, say } }, 60_000)
+        const agent = agentOf(floorOf(id), agentId)
+        let opened: ChatOpened
+        let name = self().name
+        if (pc === self().id) {
+          opened = await openChat(id, agentId, { takeOver: true, here: true })
+          if (say && opened.started) chats.typeWhenReady(opened.sessionId, say)
+        } else {
+          const link = mode() === 'hub' ? (team?.member(pc) ?? null) : null
+          if (!link) throw apiError(HOME_OFFLINE_STATUS, `${homeName(agent, pc)} can't be reached right now, so ${agent.name}'s chat can't move there.`)
+          name = link.name
+          opened = { ...(await request<ChatOpened>(link, 'open', { floorId: id, agentId, text: say }, 60_000)), on: link.name }
+        }
+        if (mode() === 'hub') floors.setHome(id, agentId, { id: pc, name })
+        return opened
       },
       'local',
     ],
@@ -1728,8 +1784,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
           else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, `${agent.name}'s chat on ${at.name} can't be typed into right now`)
           return { ok: true, started: false }
         }
-        const opened = await openChat(id, agentId, {})
-        chats.typeWhenReady(opened.sessionId, body)
+        // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
+        const opened = await openChat(id, agentId, { say: body })
+        if (!opened.on) chats.typeWhenReady(opened.sessionId, body)
         return { ok: true, started: true }
       },
       'local',
@@ -1922,7 +1979,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
-            return openChat(raw.floorId, raw.agentId, { takeOver: true })
+            return openChat(raw.floorId, raw.agentId, { takeOver: true, here: true }).then(opened => {
+              if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
+              return opened
+            })
           })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
@@ -1961,7 +2021,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
-            return openChat(raw.floorId, raw.agentId, { takeOver: true })
+            return openChat(raw.floorId, raw.agentId, { takeOver: true, here: true }).then(opened => {
+              if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
+              return opened
+            })
           })
         case 'pull':
           return servePull(sid => findTranscript(sid, projectsDir))
