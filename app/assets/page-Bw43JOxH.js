@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-DSZH-q5D.js";function t(){e(`/goals`)}export{t as default};
