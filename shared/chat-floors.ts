@@ -91,15 +91,6 @@ export function groupByFloor<T extends FloorItem>(items: readonly T[], order: re
 
 // --- moving floors and chats (F-059) ------------------------------------------------------------
 
-/** What is being dragged in the list: a floor (by its header), or a chat (by its row) with the floor it is on. */
-export type FloorDrag = { kind: 'floor'; floorId: string } | { kind: 'agent'; floorId: string; agentId: string }
-
-/**
- * Where a drag may be dropped: a floor onto another floor (it goes before that one), a chat onto
- * a floor other than its own (it moves there). Anything else is not a drop, so it shows no marker.
- */
-export const canDropOn = (drag: FloorDrag, floorId: string) => drag.floorId !== floorId
-
 /**
  * The order of the floors' ids with `floorId` put before `beforeId`, or last when `beforeId` is
  * null. Null when that changes nothing (it is there already, or an id is not in the order), so
@@ -123,6 +114,93 @@ export function stepFloor(order: readonly string[], shown: readonly string[], fl
   const next = shown[at + step]
   if (at < 0 || next === undefined) return null
   return moveFloor(order, floorId, step === -1 ? next : (shown[at + 2] ?? null))
+}
+
+// --- where a drag lands (F-059) -----------------------------------------------------------------
+//
+// The page measures the list (the rectangles of its floors and chat rows, in screen coordinates)
+// and asks these where a dragged floor or chat would go for a pointer at `y`. Pure arithmetic on
+// numbers, so every case is tested without a browser.
+
+export interface DropRow {
+  id: string
+  top: number
+  bottom: number
+  mid: number
+  /** The floor's boss: always first, so nothing is dropped before it. */
+  boss: boolean
+}
+
+export interface DropSection {
+  id: string
+  /** The whole floor: its header and, while it is open, its chats. */
+  top: number
+  bottom: number
+  left: number
+  width: number
+  headerTop: number
+  headerBottom: number
+  headerMid: number
+  /** Its chats as drawn, top to bottom (none while it is closed). */
+  rows: DropRow[]
+}
+
+/** A floor dragged to `y`: the floor it goes before (null: last). The floor itself is skipped. */
+export function floorDropBefore(sections: readonly DropSection[], draggedId: string, y: number): string | null {
+  for (const s of sections) {
+    if (s.id !== draggedId && y < s.headerMid) return s.id
+  }
+  return null
+}
+
+export interface AgentDrop {
+  floorId: string
+  /** The chat it goes before (null: last on that floor). */
+  beforeId: string | null
+}
+
+/**
+ * A chat dragged to `y`: over a floor's header it goes into that floor (last; on its own floor,
+ * first after the boss); over its chats, before the first one whose middle is below the pointer,
+ * or last. The chat itself is skipped, and nothing goes before a floor's boss.
+ */
+export function agentDropAt(sections: readonly DropSection[], dragged: { id: string; floorId: string }, y: number): AgentDrop | null {
+  if (sections.length === 0) return null
+  // The floor under the pointer: the last one that has started; above the first, the first.
+  let s = sections[0]
+  for (const t of sections) if (t.top <= y) s = t
+  const rows = s.rows.filter(r => r.id !== dragged.id)
+  const afterBoss = rows.find(r => !r.boss)?.id ?? null
+  if (y < s.headerBottom || rows.length === 0) return { floorId: s.id, beforeId: s.id === dragged.floorId ? afterBoss : null }
+  let before: string | null = null
+  for (const r of rows) {
+    if (y < r.mid) {
+      before = r.id
+      break
+    }
+  }
+  if (before !== null && rows.find(r => r.id === before)?.boss) before = afterBoss
+  return { floorId: s.id, beforeId: before }
+}
+
+/** Whether dropping there changes nothing: the same floor, and it would stay where it is. `ids`: that floor's chats in the order drawn. */
+export function agentDropIsNoop(ids: readonly string[], draggedId: string, from: string, drop: AgentDrop): boolean {
+  if (drop.floorId !== from) return false
+  const at = ids.indexOf(draggedId)
+  if (at < 0) return false
+  return drop.beforeId === draggedId || drop.beforeId === (ids[at + 1] ?? null)
+}
+
+/**
+ * The keyboard: a chat one place up (-1) or down (1) on its floor, as the `before` the move takes
+ * (null: last). Null where it cannot go: past the ends, or above the boss.
+ */
+export function stepAgentBefore(rows: readonly { id: string; boss: boolean }[], id: string, step: -1 | 1): { beforeId: string | null } | null {
+  const at = rows.findIndex(r => r.id === id)
+  if (at < 0) return null
+  const to = at + step
+  if (to < 0 || to >= rows.length || rows[to].boss) return null
+  return { beforeId: step === -1 ? rows[to].id : (rows[to + 1]?.id ?? null) }
 }
 
 // --- search -----------------------------------------------------------------------------------
