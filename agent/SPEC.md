@@ -1546,7 +1546,10 @@ MB (`GET .../messages` was bounded to its last 8 MB for the same reason).
 - **API** (`/agentic`, token as the rest): WebSocket `/chat?session=<id>` sends `hello {items, before, size}`
   then `add {items}`, `patch {id, patch}`, `menu {menu|null}`, `status {status|null}`; `GET /floors/:f/agents/:a/chat?before=&limit=`
   (an older page, `local`), `GET /previews` (`ChatPreview` per agent: the last thing said, cached by file size
-  and time, `local`), `POST /floors/:f/agents/:a/say {text}` (at most 20,000 characters: typed as a paste and
+  and time, `local`), `GET /runs` (F-062, `RunsAnswer`: per agent what its chat really runs on, from the end of
+  its conversation file (`runinfo.ts`): the model of its newest answer, its newest `/effort` and when, and the effort
+  this PC started the running chat with; plus the default model: `ANTHROPIC_MODEL`, else `model` in claude's
+  settings.json, else what the newest chat that pinned none ran on; `local`), `POST /floors/:f/agents/:a/say {text}` (at most 20,000 characters: typed as a paste and
   Enter, as `send_to_chat`; a chat started less than 20 s ago waits for its prompt, one not running is started
   or resumed first and the text follows once it is ready; `local`).
 - **The screen** (`screen.ts`, a terminal model: cursor, print, wrap, scroll, erase/insert/delete; colours

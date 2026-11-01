@@ -259,3 +259,29 @@ export type TerminalServerMessage =
   | { t: 'out'; d: string }
   /** The claude process ended. */
   | { t: 'exit'; code: number | null }
+
+// F-062: what a chat really runs on, for the three chips every chat shows (model, effort, PC).
+
+/** What its conversation file says a chat runs on (agent/agentic/runinfo.ts), by agent id in {@link RunsAnswer}. */
+export interface ChatRun {
+  /** The model of its newest answer ("claude-sonnet-5-5"); null before it has answered. */
+  model: string | null
+  /** Its newest `/effort` in the conversation (low ... max), and when it was set. */
+  effort: string | null
+  effortAt: string | null
+  /** The effort this PC started its running chat with ('' is the CLI's own), and when; null when it doesn't run here. */
+  launchedEffort: string | null
+  startedAt: string | null
+}
+
+/** The model a chat without a pinned one runs on, and how the agent came to know it. */
+export interface DefaultModel {
+  model: string
+  from: 'environment' | 'settings' | 'a chat that inherited it'
+}
+
+/** GET /agentic/runs */
+export interface RunsAnswer {
+  runs: Record<string, ChatRun>
+  defaultModel: DefaultModel | null
+}

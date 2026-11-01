@@ -17,6 +17,7 @@ import {
   type ChatImported,
   type ChatLast,
   type ChatOpened,
+  type ChatRun,
   type ChatState,
   type ClaudeSession,
   type Floor,
@@ -24,7 +25,9 @@ import {
   type FloorPatch,
   type FloorsAnswer,
   type NewAgent,
+  type DefaultModel,
   type OpenChatRequest,
+  type RunsAnswer,
   type TerminalClientMessage,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
@@ -38,6 +41,7 @@ import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
 import { createChatFeeds } from './chatview.ts'
+import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
@@ -239,6 +243,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
   // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
   const chatFeeds = createChatFeeds({ projectsDir, log: o.log, screen: sid => chats.screen(sid) })
+  // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
+  const launched = new Map<string, { effort: string; at: string }>()
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
@@ -529,6 +535,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on.
     const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : ''))
     chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, effort: agent.effort, resume, cols: size.cols, rows: size.rows })
+    launched.set(sid, { effort: agent.effort, at: new Date().toISOString() })
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
     return resume
   }
@@ -1678,6 +1685,30 @@ export function createAgentic(o: AgenticOptions): Agentic {
           }
         }
         return { previews }
+      },
+      'local',
+    ],
+    [
+      // F-062: what each chat really runs on (its conversation file says), for the chips on every chat.
+      'GET',
+      /^\/runs$/,
+      (): RunsAnswer => {
+        const live = chats.states()
+        const runs: Record<string, ChatRun> = {}
+        let inherited: { model: string; mtimeMs: number } | null = null
+        for (const f of allFloors()) {
+          for (const a of f.agents) {
+            const file = a.sessionId ? findTranscript(a.sessionId, projectsDir) : null
+            const r = file ? readFileRun(file) : null
+            const l = a.sessionId && live[a.sessionId] !== undefined ? launched.get(a.sessionId) : undefined
+            if (!r && !l) continue
+            runs[a.id] = { model: r?.model ?? null, effort: r?.effort ?? null, effortAt: r?.effortAt ?? null, launchedEffort: l?.effort ?? null, startedAt: l?.at ?? null }
+            // A chat that chose its own model shows what the CLI chose: the newest of them says what the default is.
+            if (!a.model && r?.model && (!inherited || r.mtimeMs > inherited.mtimeMs)) inherited = { model: r.model, mtimeMs: r.mtimeMs }
+          }
+        }
+        const defaultModel: DefaultModel | null = configuredModel() ?? (inherited ? { model: inherited.model, from: 'a chat that inherited it' } : null)
+        return { runs, defaultModel }
       },
       'local',
     ],
