@@ -1,3 +1,4 @@
+import type { ChatAttachment } from './attachments.ts'
 import type { ChatAssistantItem, ChatItem, ChatNoticeItem, ChatToolItem, ChatUserItem } from './chat.ts'
 
 // F-050: what the conversation list draws: chat items turned into rows. Consecutive tool calls
@@ -15,6 +16,10 @@ export interface PendingMessage {
   known: ReadonlySet<string>
   state: 'sending' | 'sent' | 'failed'
   error?: string
+  /** F-069: the files sent with it (the text is only the person's words; the lines naming the files are added when it is said). */
+  attachments?: ChatAttachment[]
+  /** F-069: where each is kept (the PC the chat runs on), to say it again when sending is retried. */
+  paths?: string[]
 }
 
 /**
@@ -130,7 +135,7 @@ export function toRows(items: ChatItem[], pending: PendingMessage[] = []): ChatR
   })
 
   for (const p of open) {
-    const item: ChatUserItem = { kind: 'user', id: `pending:${p.id}`, at: p.sentAt, text: p.text, from: null, command: false }
+    const item: ChatUserItem = { kind: 'user', id: `pending:${p.id}`, at: p.sentAt, text: p.text, from: null, command: false, ...(p.attachments?.length ? { attachments: p.attachments } : {}) }
     day(p.sentAt)
     rows.push({ k: 'msg', id: item.id, key: item.id, item, mine: true, sender: null, first: true, last: true, ticks: p.state === 'failed' ? 'failed' : p.state === 'sent' ? 'sent' : 'sending', pending: p })
   }

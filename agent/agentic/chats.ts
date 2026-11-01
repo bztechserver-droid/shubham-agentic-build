@@ -144,6 +144,8 @@ export interface ChatPoolOptions {
   treeKill?: (pid: number, startedAt?: number) => void
   /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
   settings?: string
+  /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
+  addDirs?: string[]
 }
 
 /**
@@ -337,6 +339,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
 
       const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', o.mcpConfig]
+      // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
+      for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
       if (s.model) args.push('--model', s.model)
       if (s.effort) args.push('--effort', s.effort)
       if (o.settings) args.push('--settings', o.settings)

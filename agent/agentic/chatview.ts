@@ -11,6 +11,7 @@ import {
   type ChatSender,
   type ChatToolItem,
 } from '../../shared/chat.ts'
+import { splitAttachments } from '../../shared/attachments.ts'
 import type { Logger } from '../log.ts'
 import { readMenu, readStatus } from './screen.ts'
 import { claudeProjectsDir, findTranscript } from './transcripts.ts'
@@ -278,8 +279,13 @@ export class Converter {
       return out ? [add(notice(uuid, at, cap(out, NOTICE_MAX), 'info'))] : []
     }
     const sibling = SIBLING_RE.exec(t)
-    const body = sibling ? t.slice(sibling[0].length) : t
-    return [add({ kind: 'user', id: uuid, at, text: cap(body, TEXT_MAX), from: sibling ? senderOf(sibling[1]) : null, command: false })]
+    const said = sibling ? t.slice(sibling[0].length) : t
+    // F-069: the lines that name the files sent with it are taken out and shown as thumbnails.
+    const { text: body, files } = splitAttachments(said)
+    if (!body.trim() && !files.length) return []
+    const item: ChatItem = { kind: 'user', id: uuid, at, text: cap(body, TEXT_MAX), from: sibling ? senderOf(sibling[1]) : null, command: false }
+    if (files.length) item.attachments = files
+    return [add(item)]
   }
 }
 

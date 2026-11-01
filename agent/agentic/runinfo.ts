@@ -8,17 +8,23 @@ import type { DefaultModel } from '../../shared/agentic.ts'
 //     one that is not claude's own placeholder ("<synthetic>") is what it runs on now
 //   - the effort: a /effort in the chat leaves a local-command row, "Set effort level to max (...)";
 //     the newest one is what it was set to
+//   - ultracode (F-067): `/effort ultracode` leaves "Ultracode on ...", `/effort ultracode off` "Ultracode off ...";
+//     a `/effort <level>` turns it off too. The newest of these three says whether it is on
 // Only the end of the file is read (a conversation can be hundreds of MB), and what was read is
 // kept until the file grows.
 
 /** How much of the end of a conversation is looked at. */
 const TAIL_BYTES = 2 * 1024 * 1024
 const EFFORT_RE = /Set effort level to (low|medium|high|xhigh|max)\b/i
+const ULTRA_RE = /\bUltracode (on|off)\b/i
 
 export interface FileRun {
   model: string | null
   effort: string | null
   effortAt: string | null
+  /** F-067: whether ultracode is on, as its newest command said; null when none did. */
+  ultracode: boolean | null
+  ultracodeAt: string | null
   /** When the file last changed (ms), to tell which conversation is the newest. */
   mtimeMs: number
 }
@@ -67,6 +73,8 @@ export function readFileRun(file: string): FileRun | null {
         model: fresh.model ?? hit.value.model,
         effort: fresh.effort ?? hit.value.effort,
         effortAt: fresh.effort ? fresh.effortAt : hit.value.effortAt,
+        ultracode: fresh.ultracode ?? hit.value.ultracode,
+        ultracodeAt: fresh.ultracode !== null ? fresh.ultracodeAt : hit.value.ultracodeAt,
         mtimeMs: st.mtimeMs,
       }
     } else {
@@ -75,7 +83,14 @@ export function readFileRun(file: string): FileRun | null {
       if (value.effort === null && from > 0) {
         const far = Math.max(0, st.size - FAR_BYTES)
         const older = scanRun(wholeRows(readRange(file, far, from), far), st.mtimeMs)
-        value = { ...value, model: value.model ?? older.model, effort: older.effort, effortAt: older.effortAt }
+        value = {
+          ...value,
+          model: value.model ?? older.model,
+          effort: older.effort,
+          effortAt: older.effortAt,
+          ultracode: value.ultracode ?? older.ultracode,
+          ultracodeAt: value.ultracode !== null ? value.ultracodeAt : older.ultracodeAt,
+        }
       }
     }
     cache.set(file, { size: st.size, mtimeMs: st.mtimeMs, value })
@@ -91,13 +106,16 @@ export function scanRun(text: string, mtimeMs = 0): FileRun {
   let model: string | null = null
   let effort: string | null = null
   let effortAt: string | null = null
-  for (let i = lines.length - 1; i >= 0 && (model === null || effort === null); i--) {
+  let ultracode: boolean | null = null
+  let ultracodeAt: string | null = null
+  for (let i = lines.length - 1; i >= 0 && (model === null || effort === null || ultracode === null); i--) {
     const line = lines[i]
     if (!line) continue
     // A cheap test first: most rows are neither.
     const isAnswer = model === null && line.includes('"model"')
-    const isEffort = effort === null && line.includes('Set effort level')
-    if (!isAnswer && !isEffort) continue
+    const isEffort = (effort === null || ultracode === null) && line.includes('Set effort level')
+    const isUltra = ultracode === null && line.includes('ltracode')
+    if (!isAnswer && !isEffort && !isUltra) continue
     let row: unknown
     try {
       row = JSON.parse(line)
@@ -107,15 +125,27 @@ export function scanRun(text: string, mtimeMs = 0): FileRun {
     if (typeof row !== 'object' || row === null) continue
     const r = row as { type?: unknown; subtype?: unknown; content?: unknown; timestamp?: unknown; message?: { model?: unknown } }
     if (isAnswer && r.type === 'assistant' && typeof r.message?.model === 'string' && r.message.model && r.message.model !== '<synthetic>') model = r.message.model
-    if (isEffort && r.type === 'system' && r.subtype === 'local_command' && typeof r.content === 'string') {
+    if ((isEffort || isUltra) && r.type === 'system' && r.subtype === 'local_command' && typeof r.content === 'string') {
+      const at = typeof r.timestamp === 'string' ? r.timestamp : null
       const m = EFFORT_RE.exec(r.content)
-      if (m) {
+      if (m && effort === null) {
         effort = m[1].toLowerCase()
-        effortAt = typeof r.timestamp === 'string' ? r.timestamp : null
+        effortAt = at
+      }
+      // The newest of "Ultracode on/off" and "Set effort level to" says: a level turns ultracode off.
+      if (ultracode === null) {
+        const u = ULTRA_RE.exec(r.content)
+        if (u) {
+          ultracode = u[1].toLowerCase() === 'on'
+          ultracodeAt = at
+        } else if (m) {
+          ultracode = false
+          ultracodeAt = at
+        }
       }
     }
   }
-  return { model, effort, effortAt, mtimeMs }
+  return { model, effort, effortAt, ultracode, ultracodeAt, mtimeMs }
 }
 
 /**

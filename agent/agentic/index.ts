@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
@@ -10,12 +10,16 @@ import {
   AGENT_EFFORTS,
   AGENT_MODELS,
   HOME_OFFLINE_STATUS,
+  AGENT_ULTRACODES,
+  NO_DEFAULTS,
   type AgentEffort,
   type AgentModel,
+  type AgentUltracode,
   type AgenticEvent,
   type AgenticTeam,
   type ChatElsewhere,
   type ChatImported,
+  type ChatDefaults,
   type ChatLast,
   type ChatOpened,
   type ChatRun,
@@ -30,6 +34,8 @@ import {
   type OpenChatRequest,
   type RunsAnswer,
   type TerminalClientMessage,
+  type TuneAnswer,
+  type TuneRequest,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
@@ -44,6 +50,10 @@ import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chat
 import { createChatFeeds } from './chatview.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
+import { createDefaultsStore, parseDefaults } from './defaults.ts'
+import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
+import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shared/attachments.ts'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
@@ -127,6 +137,8 @@ export interface AgenticOptions {
   projectsDir?: string
   /** Tests: a scratch ~/.claude.json (claude-config.ts). */
   claudeJson?: string
+  /** Tests: the pause between the commands a tune types into one chat (F-067; 800 ms). */
+  tuneGapMs?: number
   /** Tests: how often a running chat's JSONL is looked at for what to send on (1 s). */
   syncEveryMs?: number
   /**
@@ -233,6 +245,8 @@ interface Held {
 /** F-021, on a member: the hub's floors and sessions as it last said them. */
 interface Replica {
   floors: Floor[]
+  /** F-067: the hub's defaults for model, effort and ultracode. */
+  defaults?: ChatDefaults
   where: Record<string, { id: string; name: string; state: ChatState }>
   last: Record<string, ChatLast>
   marks: Record<string, FileMark>
@@ -245,7 +259,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
   const chatFeeds = createChatFeeds({ projectsDir, log: o.log, screen: sid => chats.screen(sid) })
   // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
-  const launched = new Map<string, { effort: string; at: string }>()
+  const launched = new Map<string, { effort: string; at: string; ultracode: boolean }>()
   const claudeJson = o.claudeJson ?? claudeJsonPath()
   const defaultCodeDir = o.defaultCodeDir ?? path.join(os.homedir(), 'Documents', 'shubham-agentic')
   const briefsDir = path.join(o.dir, 'briefs')
@@ -278,6 +292,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     emit({ t: 'floors', floors: floors.list() })
     pushState()
   })
+  // F-067: what "Default" means for a chat's model, effort and ultracode, kept on the hub (a member gets a copy with the state).
+  const chatDefaults = createDefaultsStore(path.join(o.dir, 'chat-defaults.json'), () => {
+    if (mode() !== 'member') pushState()
+  })
+  const defaultsNow = (): ChatDefaults => (mode() === 'member' ? (replica.defaults ?? NO_DEFAULTS) : chatDefaults.get())
   const memory = createMemoryStore(path.join(o.dir, 'memory'))
   // F-056: the task list (the Tasks tab, and the chats' task tools), kept on the hub like the floors.
   // Behind TaskStore (tasks.ts): a hosted database can take its place without anything else changing.
@@ -367,7 +386,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function loadReplica(): Replica {
     try {
       const raw = JSON.parse(readFileSync(replicaFile, 'utf8')) as Partial<Replica>
-      return { floors: Array.isArray(raw.floors) ? raw.floors : [], where: {}, last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {}, marks: {} }
+      return { floors: Array.isArray(raw.floors) ? raw.floors : [], defaults: parseDefaults(raw.defaults), where: {}, last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {}, marks: {} }
     } catch {
       return { floors: [], where: {}, last: {}, marks: {} }
     }
@@ -377,7 +396,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (replicaTimer) return
     replicaTimer = setTimeout(() => {
       replicaTimer = null
-      writeAtomic(replicaFile, `${json({ floors: replica.floors, last: replica.last })}\n`)
+      writeAtomic(replicaFile, `${json({ floors: replica.floors, defaults: replica.defaults, last: replica.last })}\n`)
     }, 500)
     replicaTimer.unref()
   }
@@ -458,7 +477,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-058: the list of open chats the next start will reopen (see resumeAll below).
   let recovery: Recovery | null = null
   let closing = false
+  // F-069: the files sent to the chats that run on this PC (the page's photos, pictures and files).
+  const uploads = createUploadStore(path.join(o.dir, 'uploads'))
+  uploads.prune()
   const chats = createChatPool({
+    addDirs: [uploads.dir],
     toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
     mcpConfig,
     log,
@@ -535,8 +558,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     // F-051: the memory's section (what it is, core.md, the wiki's pages) once the layer is on.
     const briefPath = writeBrief(briefsDir, sid, composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : ''))
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model, effort: agent.effort, resume, cols: size.cols, rows: size.rows })
-    launched.set(sid, { effort: agent.effort, at: new Date().toISOString() })
+    // F-067: an agent set to Default gets Settings › Chats' model, effort and ultracode.
+    const dflt = defaultsNow()
+    const effort = agent.effort || dflt.effort
+    const ultracode = agent.ultracode ? agent.ultracode === 'on' : dflt.ultracode
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    launched.set(sid, { effort, at: new Date().toISOString(), ultracode })
+    // Ultracode is claude's own mode, on for the session only: asked for once its prompt is up (`/effort ultracode`).
+    if (ultracode) chats.typeWhenReady(sid, '/effort ultracode')
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
     return resume
   }
@@ -670,7 +699,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() !== 'hub' || !subs.size || pushTimer) return
     pushTimer = setTimeout(() => {
       pushTimer = null
-      const state = { t: 'state', floors: floors.list(), where: whereAll(), last: lastAll(), marks: marksHere() }
+      const state = { t: 'state', floors: floors.list(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere() }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -810,6 +839,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (raw.t === 'state' && Array.isArray(raw.floors)) {
       replica = {
         floors: raw.floors as Floor[],
+        defaults: parseDefaults(raw.defaults),
         where: isObject(raw.where) ? (raw.where as Replica['where']) : {},
         last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {},
         marks: isObject(raw.marks) ? (raw.marks as Record<string, FileMark>) : {},
@@ -1361,6 +1391,203 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { floor }
   }
 
+  // ---------------------------------------------------------------------------------------
+  // F-069: the files sent to a chat. The page sends one to the PC it is on; that PC passes it to the PC the
+  // chat runs on (or, if it is not running, lives on) a megabyte at a time through the hub, where claude is
+  // told to read it by its path. One already sent is fetched the same way for its thumbnail.
+
+  /** The PC a file for this agent's chat goes to: where it runs, else where it lives (its home), else this one. */
+  function attachTarget(agent: FloorAgent): { id: string; name: string } {
+    const w = agent.sessionId ? whereAll()[agent.sessionId] : undefined
+    if (w) return { id: w.id, name: w.name }
+    if (agent.homePc && agent.homePc !== self().id) {
+      const home = pcs().find(p => p.id === agent.homePc)
+      if (!home) throw apiError(HOME_OFFLINE_STATUS, `${agent.homePcName ?? 'Its PC'} is offline, and ${agent.name}'s chat lives there, so a file can't be sent to it now`)
+      return { id: home.id, name: home.name }
+    }
+    return { id: self().id, name: self().name }
+  }
+
+  /** Where the pieces of a file for `to` are sent from this PC: straight to it, or (a member) through the hub. */
+  function attachLink(to: string): LinkPeer {
+    return mode() === 'member' ? needHub() : peerOf(to)
+  }
+
+  async function deliverFile(to: { id: string; name: string }, file: string, bytes: Buffer): Promise<string> {
+    const n = Math.max(1, Math.ceil(bytes.length / PIECE_BYTES))
+    if (to.id === self().id) {
+      for (let i = 0; i < n; i++) uploads.put(file, i, n, bytes.subarray(i * PIECE_BYTES, (i + 1) * PIECE_BYTES))
+      return uploads.pathOf(file)
+    }
+    const link = attachLink(to.id)
+    let where = ''
+    for (let i = 0; i < n; i++) {
+      const data = bytes.subarray(i * PIECE_BYTES, (i + 1) * PIECE_BYTES).toString('base64')
+      const r = await request<{ done: boolean; path?: string }>(link, 'attach-put', { to: to.id, file, i, n, data }, 60_000).catch((e: unknown) => {
+        throw apiError(503, `${to.name} can't take the file now: ${message(e)}`)
+      })
+      if (r.path) where = r.path
+    }
+    return where
+  }
+
+  /** A piece of a file arriving over the link: kept here, or (the hub, for another PC) passed on. */
+  async function attachPutPeer(raw: unknown): Promise<{ done: boolean; path?: string }> {
+    if (!isObject(raw) || typeof raw.file !== 'string' || typeof raw.data !== 'string' || typeof raw.i !== 'number' || typeof raw.n !== 'number') throw apiError(400, 'Expected {file, i, n, data}')
+    if (typeof raw.to === 'string' && raw.to !== self().id) {
+      if (mode() !== 'hub') throw apiError(403, 'Only the hub passes files on')
+      return request(peerOf(raw.to), 'attach-put', raw, 60_000)
+    }
+    if (!isStoredName(raw.file)) throw apiError(400, 'That is not a name this PC keeps files under')
+    const done = uploads.put(raw.file, raw.i, raw.n, Buffer.from(raw.data, 'base64'))
+    return done ? { done, path: uploads.pathOf(raw.file) } : { done }
+  }
+
+  async function attachGetPeer(raw: unknown): Promise<{ data: string; size: number }> {
+    if (!isObject(raw) || typeof raw.file !== 'string' || typeof raw.offset !== 'number') throw apiError(400, 'Expected {file, offset}')
+    if (typeof raw.to === 'string' && raw.to !== self().id) {
+      if (mode() !== 'hub') throw apiError(403, 'Only the hub passes files on')
+      return request(peerOf(raw.to), 'attach-get', raw, 60_000)
+    }
+    const size = uploads.size(raw.file)
+    if (size === null) throw apiError(404, "That file isn't here")
+    return { data: uploads.read(raw.file, raw.offset, PIECE_BYTES).toString('base64'), size }
+  }
+
+  async function readBody(req: IncomingMessage, max: number): Promise<Buffer> {
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length
+      if (size > max) throw apiError(413, `A file may be ${Math.round(max / 1024 / 1024)} MB at most`)
+      chunks.push(chunk as Buffer)
+    }
+    return Buffer.concat(chunks)
+  }
+
+  const reply = (res: ServerResponse, status: number, data: unknown) => {
+    const body = JSON.stringify(data)
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) })
+    res.end(body)
+  }
+
+  /** POST …/agents/:id/attach?name=photo.jpg, the file as the body: kept on the chat's PC; answers where. */
+  async function attachUpload(req: IncomingMessage, res: ServerResponse, floorId: string, agentId: string, url: URL) {
+    if (req.method !== 'POST') throw apiError(405, 'POST the file')
+    const agent = agentOf(floorOf(floorId), agentId)
+    const bytes = await readBody(req, ATTACH_MAX_BYTES)
+    if (!bytes.length) throw apiError(400, 'That file is empty')
+    const name = safeName(url.searchParams.get('name') ?? 'file')
+    const to = attachTarget(agent)
+    const file = storedName(name)
+    const where = await deliverFile(to, file, bytes)
+    log?.info(`a file for ${agent.name}'s chat (${bytes.length} bytes) kept on ${to.name}`)
+    reply(res, 200, { file, path: where, name, size: bytes.length, pc: to.name })
+  }
+
+  /** GET …/agents/:id/attachment/:file: a file sent to that chat: from this PC, else from the PC the chat is on. */
+  async function attachDownload(req: IncomingMessage, res: ServerResponse, floorId: string, agentId: string, file: string) {
+    if (req.method !== 'GET') throw apiError(405, 'GET the file')
+    if (!isStoredName(file)) throw apiError(400, 'That is not a name this PC keeps files under')
+    const agent = agentOf(floorOf(floorId), agentId)
+    const { type, inline } = contentTypeOf(file)
+    const headers = {
+      'Content-Type': type,
+      'Cache-Control': 'private, max-age=86400, immutable',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${file.replace(/^[^-]+-[^-]+-/, '').replace(/"/g, '')}"`,
+    }
+    const size = uploads.size(file)
+    if (size !== null) {
+      res.writeHead(200, { ...headers, 'Content-Length': size })
+      createReadStream(uploads.pathOf(file)).pipe(res)
+      return
+    }
+    // Not here: the PC the chat runs on, or lives on, may have it.
+    const w = agent.sessionId ? whereAll()[agent.sessionId] : undefined
+    const holders = [w?.id, agent.homePc].filter((id, i, all): id is string => !!id && id !== self().id && all.indexOf(id) === i)
+    for (const id of holders) {
+      let link: LinkPeer
+      try {
+        link = attachLink(id)
+      } catch {
+        continue
+      }
+      try {
+        const parts: Buffer[] = []
+        let total = 0
+        for (;;) {
+          const r = await request<{ data: string; size: number }>(link, 'attach-get', { to: id, file, offset: total }, 60_000)
+          const buf = Buffer.from(r.data, 'base64')
+          parts.push(buf)
+          total += buf.length
+          if (!buf.length || total >= r.size) break
+        }
+        res.writeHead(200, { ...headers, 'Content-Length': total })
+        res.end(Buffer.concat(parts))
+        return
+      } catch {
+        // That PC hasn't got it (or can't be reached): the next.
+      }
+    }
+    throw apiError(404, "That file isn't on this PC or the one the chat is on")
+  }
+
+  /** F-067: pauses between the commands typed into one chat, so claude has taken the first before the next arrives. */
+  const TUNE_GAP_MS = o.tuneGapMs ?? 800
+
+  /**
+   * F-067: changes an agent's model, effort and/or ultracode (kept on the agent: its chat starts with them every time)
+   * and, when its chat runs and is waiting for the person, types the commands that change them in that chat now
+   * (`/model`, `/effort`, `/effort ultracode`). A chat that is working, or at a question, or stopped, takes
+   * them at its next start; the answer says which.
+   */
+  async function tuneAgent(floorId: string, agentId: string, raw: unknown): Promise<TuneAnswer> {
+    if (!isObject(raw)) throw apiError(400, 'Expected {model?, effort?, ultracode?}')
+    const req: TuneRequest = {}
+    if (raw.model !== undefined) {
+      if (!(AGENT_MODELS as readonly unknown[]).includes(raw.model)) throw apiError(400, 'model is opus, sonnet, haiku, or "" for the default')
+      req.model = raw.model as AgentModel
+    }
+    if (raw.effort !== undefined) {
+      if (!(AGENT_EFFORTS as readonly unknown[]).includes(raw.effort)) throw apiError(400, 'effort is low, medium, high, xhigh, max, or "" for the default')
+      req.effort = raw.effort as AgentEffort
+    }
+    if (raw.ultracode !== undefined) {
+      if (!(AGENT_ULTRACODES as readonly unknown[]).includes(raw.ultracode)) throw apiError(400, 'ultracode is "on", "off", or "" for the default')
+      req.ultracode = raw.ultracode as AgentUltracode
+    }
+    if (req.model === undefined && req.effort === undefined && req.ultracode === undefined) throw apiError(400, 'Nothing to change: give model, effort or ultracode')
+    const before = floorOf(floorId)
+    const a = agentOf(before, agentId)
+    const model = req.model ?? a.model
+    const effort = req.effort ?? a.effort
+    const ultracode = req.ultracode ?? a.ultracode
+    const floor = floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, model, effort, ultracode } : x)) })
+
+    const d = defaultsNow()
+    const effUltra = ultracode ? ultracode === 'on' : d.ultracode
+    // What to type: a /effort level turns ultracode off, so with ultracode wanted it is asked for again after one.
+    const commands: string[] = []
+    if (req.model !== undefined) commands.push(`/model ${model || d.model || 'default'}`)
+    if (req.effort !== undefined) {
+      commands.push(`/effort ${effort || d.effort || 'auto'}`)
+      if (effUltra) commands.push('/effort ultracode')
+    } else if (req.ultracode !== undefined) commands.push(effUltra ? '/effort ultracode' : '/effort ultracode off')
+    const what = [req.model !== undefined && 'model', req.effort !== undefined && 'effort', req.ultracode !== undefined && 'ultracode'].filter(Boolean).join(' and ')
+
+    const w = a.sessionId ? whereAll()[a.sessionId] : undefined
+    if (!w || !a.sessionId) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat isn't running, so it applies when the chat next starts.` }
+    if (w.state === 'running') return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat is working right now, so it applies at its next start. Change it again once the chat is waiting to apply it at once.` }
+    if (w.state === 'question') return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat is at a question, so it applies at its next start. Answer it, then change it again to apply it at once.` }
+    for (const [i, c] of commands.entries()) {
+      if (i > 0) await new Promise(r => setTimeout(r, TUNE_GAP_MS))
+      if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, c))) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat stopped before it could be set now, so it applies at its next start.` }
+    }
+    log?.info(`${a.name}: ${commands.join(', ')}`)
+    return { floor, applied: 'now', detail: `${a.name}'s ${what} is set in its running chat (on ${w.name}) now: ${commands.join(', ')} ${commands.length > 1 ? 'were' : 'was'} typed into it.` }
+  }
+
   function checkFolder(raw: string) {
     const dir = raw.trim()
     if (!path.isAbsolute(dir)) throw apiError(400, 'Give the folder as a full path, like C:\\Users\\you\\code')
@@ -1569,6 +1796,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body)],
     [
+      // F-067: Settings › Chats: what an agent set to Default gets. Read from this PC's copy; changed on the hub.
+      'GET',
+      /^\/defaults$/,
+      () => ({ defaults: defaultsNow() }),
+      'local',
+    ],
+    ['PUT', /^\/defaults$/, (_, r) => ({ defaults: chatDefaults.set(r.body) })],
+    // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
+    [
       'DELETE',
       /^\/floors\/([^/]+)$/,
       ([id]) => {
@@ -1758,13 +1995,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const r = file ? readFileRun(file) : null
             const l = a.sessionId && live[a.sessionId] !== undefined ? launched.get(a.sessionId) : undefined
             if (!r && !l) continue
-            runs[a.id] = { model: r?.model ?? null, effort: r?.effort ?? null, effortAt: r?.effortAt ?? null, launchedEffort: l?.effort ?? null, startedAt: l?.at ?? null }
+            runs[a.id] = {
+              model: r?.model ?? null,
+              effort: r?.effort ?? null,
+              effortAt: r?.effortAt ?? null,
+              launchedEffort: l?.effort ?? null,
+              startedAt: l?.at ?? null,
+              ultracode: r?.ultracode ?? null,
+              ultracodeAt: r?.ultracodeAt ?? null,
+              launchedUltracode: l?.ultracode ?? null,
+            }
             // A chat that chose its own model shows what the CLI chose: the newest of them says what the default is.
-            if (!a.model && r?.model && (!inherited || r.mtimeMs > inherited.mtimeMs)) inherited = { model: r.model, mtimeMs: r.mtimeMs }
+            if (!a.model && !defaultsNow().model && r?.model && (!inherited || r.mtimeMs > inherited.mtimeMs)) inherited = { model: r.model, mtimeMs: r.mtimeMs }
           }
         }
         const defaultModel: DefaultModel | null = configuredModel() ?? (inherited ? { model: inherited.model, from: 'a chat that inherited it' } : null)
-        return { runs, defaultModel }
+        return { runs, defaultModel, defaults: defaultsNow() }
       },
       'local',
     ],
@@ -1975,6 +2221,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
           })
         case 'terminal':
           return serveTerminal
+        case 'attach-put':
+          return answer(raw => attachPutPeer(raw))
+        case 'attach-get':
+          return answer(raw => attachGetPeer(raw))
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
@@ -2017,6 +2267,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
           })
         case 'terminal':
           return serveTerminal
+        case 'attach-put':
+          return answer(raw => attachPutPeer(raw))
+        case 'attach-get':
+          return answer(raw => attachGetPeer(raw))
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
@@ -2149,7 +2403,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
-    raw: (rest, url) => (rest.startsWith('/crm-proxy/') ? (req, res) => crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search) : null),
+    raw: (rest, url) => {
+      if (rest.startsWith('/crm-proxy/')) return (req, res) => crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search)
+      // F-069: a file sent to a chat (the body is the file), and one already sent, for its thumbnail.
+      const up = /^\/floors\/([^/]+)\/agents\/([^/]+)\/attach$/.exec(rest)
+      if (up) return (req, res) => attachUpload(req, res, decodeURIComponent(up[1]), decodeURIComponent(up[2]), url)
+      const down = /^\/floors\/([^/]+)\/agents\/([^/]+)\/attachment\/([^/]+)$/.exec(rest)
+      if (down) return (req, res) => attachDownload(req, res, decodeURIComponent(down[1]), decodeURIComponent(down[2]), decodeURIComponent(down[3]))
+      return null
+    },
     http: r => route(r, mode() === 'member' ? toHub : undefined),
     ws(rest, query) {
       if (rest === '/terminal') return terminal(query)

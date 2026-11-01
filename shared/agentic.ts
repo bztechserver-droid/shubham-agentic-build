@@ -20,6 +20,21 @@ export type AgentModel = (typeof AGENT_MODELS)[number]
 export const AGENT_EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type AgentEffort = (typeof AGENT_EFFORTS)[number]
 
+/**
+ * F-067: whether an agent's chat runs in ultracode (claude's dynamic workflows mode, `/effort ultracode`).
+ * '' follows the default in Settings (off unless it is changed there); 'on' and 'off' are the agent's own.
+ */
+export const AGENT_ULTRACODES = ['', 'on', 'off'] as const
+export type AgentUltracode = (typeof AGENT_ULTRACODES)[number]
+
+/** F-067: what an agent set to "Default" gets (Settings › Chats): a model, an effort ('' the CLI's own), ultracode on or off. */
+export interface ChatDefaults {
+  model: AgentModel
+  effort: AgentEffort
+  ultracode: boolean
+}
+export const NO_DEFAULTS: ChatDefaults = { model: '', effort: '', ultracode: false }
+
 /** At most this many agents on one floor (agentic-claude-manager's limit). */
 export const MAX_AGENTS_PER_FLOOR = 24
 /** A floor's preamble, given to every chat on it before the agent's own brief. */
@@ -52,6 +67,8 @@ export interface FloorAgent {
   model: AgentModel
   /** F-049: its chat starts with claude --effort this. */
   effort: AgentEffort
+  /** F-067: ultracode on or off for its chat; '' follows the default (Settings › Chats). */
+  ultracode: AgentUltracode
   /** Skills and MCP servers it was given; named in its brief (advisory, as in the original). */
   skills: string[]
   mcpServers: string[]
@@ -296,6 +313,11 @@ export interface ChatRun {
   /** The effort this PC started its running chat with ('' is the CLI's own), and when; null when it doesn't run here. */
   launchedEffort: string | null
   startedAt: string | null
+  /** F-067: whether its newest `/effort ultracode` in the conversation turned ultracode on (or a `/effort <level>` or `ultracode off` turned it off), and when; null when it never said. */
+  ultracode?: boolean | null
+  ultracodeAt?: string | null
+  /** F-067: whether this PC started its running chat in ultracode; null when it doesn't run here. */
+  launchedUltracode?: boolean | null
 }
 
 /** The model a chat without a pinned one runs on, and how the agent came to know it. */
@@ -308,4 +330,22 @@ export interface DefaultModel {
 export interface RunsAnswer {
   runs: Record<string, ChatRun>
   defaultModel: DefaultModel | null
+  /** F-067: what "Default" means for model, effort and ultracode (Settings › Chats). */
+  defaults?: ChatDefaults
+}
+
+/** F-067: POST /agentic/floors/:id/agents/:agentId/tune: what to change (what is left out stays). */
+export interface TuneRequest {
+  model?: AgentModel
+  effort?: AgentEffort
+  ultracode?: AgentUltracode
+}
+
+/** F-067: what a tune did to a running chat: `now` (typed into it), or `next` (at its next start). */
+export interface TuneAnswer {
+  floor: Floor
+  /** now: it was waiting, and the new setting was typed into it; next: it applies when the chat next starts. */
+  applied: 'now' | 'next'
+  /** One plain sentence saying which, and why. */
+  detail: string
 }

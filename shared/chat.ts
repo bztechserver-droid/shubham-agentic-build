@@ -6,6 +6,8 @@
 // /floors/:f/agents/:a/say` and `GET /previews`.
 
 /** How many messages (not tool calls) the first answer and a history page hold. */
+import type { ChatAttachment } from './attachments.ts'
+
 export const CHAT_WINDOW_MESSAGES = 40
 
 /** Who sent a message that is not the person: a sibling chat, as `[message from Lead on Final, chat e7d3dd12]` says. */
@@ -27,6 +29,8 @@ interface ChatItemBase {
 export interface ChatUserItem extends ChatItemBase {
   kind: 'user'
   text: string
+  /** F-069: the files sent with it (a photo, a pasted picture, any file), named as the agent keeps them. */
+  attachments?: ChatAttachment[]
   from: ChatSender | null
   command: boolean
 }

@@ -2,7 +2,7 @@
 // on. The rules are here, apart from the page, so they are tested without one (chat-chips.test.ts).
 // Types only from the contract; nothing here imports from the app.
 
-import type { ChatElsewhere, ChatLast, ChatRun, ChatState, DefaultModel } from './agentic.ts'
+import { NO_DEFAULTS, type ChatDefaults, type ChatElsewhere, type ChatLast, type ChatRun, type ChatState, type DefaultModel } from './agentic.ts'
 
 /** What the chips need of an agent. */
 export interface ChipAgent {
@@ -10,6 +10,8 @@ export interface ChipAgent {
   model: string
   /** Effort its chat starts with ('' is the CLI's own). */
   effort: string
+  /** F-067: 'on' or 'off' for its chat; '' follows the default (Settings › Chats). */
+  ultracode?: string
   sessionId: string | null
   /** F-064: the PC its chat lives on (its name), once a PC has started it. */
   homePcName?: string | null
@@ -36,6 +38,8 @@ export interface Chip {
 export interface Chips {
   model: Chip
   effort: Chip
+  /** F-067: ultracode on or off. */
+  ultracode: Chip
   pc: Chip
 }
 
@@ -69,23 +73,34 @@ export function modelLabel(id: string): string {
 /** The effort levels, quietest first. */
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
-export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel: DefaultModel | null, where: ChipWhere): Chips {
+export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel: DefaultModel | null, where: ChipWhere, defaults: ChatDefaults = NO_DEFAULTS): Chips {
   const sid = agent.sessionId
   const runningHere = sid !== null && where.live[sid] !== undefined
   const away = sid !== null && !runningHere ? where.elsewhere[sid] : undefined
 
   // --- model: what its newest answer ran on, else what it is pinned to, else the default ---
+  // F-067: an agent set to Default has the model set in Settings › Chats, if one is.
   let model: Chip
-  const pinned = agent.model ? modelLabel(agent.model) : null
+  const want = agent.model || defaults.model
+  const pinned = want ? modelLabel(want) : null
+  const from = agent.model ? 'pinned on the agent' : 'the default set in Settings'
   if (run?.model) {
     const label = modelLabel(run.model)
-    model = {
-      text: agent.model ? label : `${label} (default)`,
-      title: `Model: ${run.model}, from its newest answer. ${agent.model ? `The agent is pinned to ${pinned}.` : "Not pinned on the agent: the one claude chooses."}`,
-      kind: agent.model ? 'known' : 'default',
-    }
+    // Pinned to another model than its newest answer ran on: a switch just made (it answers on it next), or one waiting for its next start.
+    const other = want !== '' && !run.model.toLowerCase().includes(want)
+    model = other
+      ? {
+          text: `${label} → ${pinned}`,
+          title: `Model: ${run.model} in its newest answer. ${pinned} is ${from}: its chat answers on it from its next answer if it was switched while waiting, else from its next start.`,
+          kind: 'known',
+        }
+      : {
+          text: want ? label : `${label} (default)`,
+          title: `Model: ${run.model}, from its newest answer. ${want ? `It is ${from}: ${pinned}.` : "Not pinned on the agent: the one claude chooses."}`,
+          kind: want ? 'known' : 'default',
+        }
   } else if (pinned) {
-    model = { text: pinned, title: `Model: ${pinned}, pinned on the agent. It has not answered yet.`, kind: 'known' }
+    model = { text: pinned, title: `Model: ${pinned}, ${from}. It has not answered yet.`, kind: 'known' }
   } else if (defaultModel) {
     // Configured (the environment, claude's settings): the default. Inferred from another chat: a guess, which can differ per chat and per subscription.
     const guess = defaultModel.from === 'a chat that inherited it'
@@ -112,8 +127,9 @@ export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel
     level = run.launchedEffort
     how = 'what it started with'
   } else {
-    level = agent.effort
-    how = runningHere || away ? 'set on the agent' : 'set on the agent; its next start uses it'
+    level = agent.effort || defaults.effort
+    const source = agent.effort ? 'set on the agent' : level ? 'the default set in Settings' : 'set on the agent'
+    how = runningHere || away ? source : `${source}; its next start uses it`
   }
   const effort: Chip = level
     ? { text: level, title: `Effort: ${level}, ${how}.`, kind: 'known' }
@@ -131,5 +147,32 @@ export function chipsOf(agent: ChipAgent, run: ChatRun | undefined, defaultModel
   else if (where.last[sid]) pc = { text: `${where.last[sid].pc} · last`, title: `PC: its chat is not running; it ran last on ${where.last[sid].pc}.`, kind: 'default' }
   else pc = { text: 'stopped', title: 'PC: its chat is not running, and where it ran last is not known.', kind: 'unknown' }
 
-  return { model, effort, pc }
+  // --- ultracode (F-067): a running chat's newest word on it (after it started), else what it started with, else what the agent has ---
+  const ultraTyped =
+    run?.ultracode !== undefined &&
+    run.ultracode !== null &&
+    (!runningHere || !run.startedAt || !run.ultracodeAt || run.ultracodeAt >= run.startedAt) &&
+    (runningHere || away !== undefined)
+      ? run.ultracode
+      : null
+  let ultra: boolean
+  let ultraHow: string
+  if (ultraTyped !== null) {
+    ultra = ultraTyped
+    ultraHow = 'set in the chat with /effort'
+  } else if (runningHere && run?.launchedUltracode !== null && run?.launchedUltracode !== undefined) {
+    ultra = run.launchedUltracode
+    ultraHow = 'what it started with'
+  } else {
+    ultra = agent.ultracode ? agent.ultracode === 'on' : defaults.ultracode
+    const source = agent.ultracode ? 'set on the agent' : 'the default (off unless Settings says on)'
+    ultraHow = runningHere || away ? source : `${source}; its next start uses it`
+  }
+  const ultracode: Chip = {
+    text: ultra ? 'Ultracode on' : 'Ultracode off',
+    title: `Ultracode: ${ultra ? 'on' : 'off'}, ${ultraHow}.`,
+    kind: ultra ? 'known' : 'default',
+  }
+
+  return { model, effort, ultracode, pc }
 }

@@ -4,10 +4,12 @@ import {
   AGENT_BRIEF_MAX,
   AGENT_EFFORTS,
   AGENT_MODELS,
+  AGENT_ULTRACODES,
   FLOOR_PREAMBLE_MAX,
   MAX_AGENTS_PER_FLOOR,
   type AgentEffort,
   type AgentModel,
+  type AgentUltracode,
   type Floor,
   type FloorAgent,
   type FloorPatch,
@@ -32,6 +34,7 @@ const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.i
 const strList = (v: unknown) =>
   Array.isArray(v) ? [...new Set(v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim().slice(0, 200)))].slice(0, LIST_MAX) : []
 const isModel = (v: unknown): v is AgentModel => typeof v === 'string' && (AGENT_MODELS as readonly string[]).includes(v)
+const isUltracode = (v: unknown): v is AgentUltracode => typeof v === 'string' && (AGENT_ULTRACODES as readonly string[]).includes(v)
 const isEffort = (v: unknown): v is AgentEffort => typeof v === 'string' && (AGENT_EFFORTS as readonly string[]).includes(v)
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 /** F-021: a floor's folder on each of the hub's other PCs: device id to an absolute path. */
@@ -68,6 +71,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     homePcName: typeof a.homePc === 'string' && a.homePc.trim() && typeof a.homePcName === 'string' && a.homePcName.trim() ? a.homePcName.trim().slice(0, NAME_MAX) : null,
     model: isModel(a.model) ? a.model : '',
     effort: isEffort(a.effort) ? a.effort : '',
+    ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
     skills: strList(a.skills),
     mcpServers: strList(a.mcpServers),
     x: num(a.x, 80 + (index % 4) * 250),
