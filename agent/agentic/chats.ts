@@ -324,10 +324,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   }
   /**
    * What is typed in the idle input box (the lowest one drawn) and not sent yet: a draft. '' when no box is drawn or it is empty.
-   * claude's own grey suggestion for a fresh chat ('Try "write a test"') is not a draft. Anything pasted now would join it,
+   * claude's own grey suggestions are not a draft: the placeholder of a fresh chat ('Try "write a test"') and the SUGGESTED NEXT PROMPT
+   * it draws there after most turns ("Merge the guard fix and run the gate"), both printed dim or grey. `typed` is the same screen with
+   * those cells blanked (Screen.typedLines); what is left is what a person typed. Anything pasted now would join a draft,
    * and the Enter would send both as one message.
    */
-  function boxText(lines: string[]): string {
+  function boxText(lines: string[], typed: string[] = lines): string {
     for (let j = lines.length - 1; j >= 1; j--) {
       if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
       let end = -1
@@ -338,19 +340,20 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         }
       }
       if (end < 0) continue
-      const text = [lines[j].replace(/^\s*❯/, ''), ...lines.slice(j + 1, end)].join(' ').replace(/\s+/g, ' ').trim()
+      const text = [typed[j].replace(/^\s*❯/, ''), ...typed.slice(j + 1, end)].join(' ').replace(/\s+/g, ' ').trim()
       return /^Try "/.test(text) ? '' : text
     }
     return ''
   }
   function draftOnScreen(c: Chat): boolean {
     try {
-      return !menuOnScreen(c) && boxText(c.screen.lines()) !== ''
+      return !menuOnScreen(c) && boxText(c.screen.lines(), c.screen.typedLines()) !== ''
     } catch {
       return false
     }
   }
-  function menuOnScreen(c: Chat): boolean {
+  /** Whether a menu is on the live screen; null when the screen cannot be read. */
+  function menuSeen(c: Chat): boolean | null {
     try {
       const lines = c.screen.lines()
       let last = -1
@@ -358,8 +361,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (last < 0) return false
       return !inputBoxBelow(lines, last)
     } catch {
-      return true
+      return null
     }
+  }
+  function menuOnScreen(c: Chat): boolean {
+    return menuSeen(c) ?? true
   }
 
   /** A state of 'question' that no menu backs is a phantom: put right (working if it can be interrupted, else idle). */
@@ -378,7 +384,18 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   /** What is shown to others (Approvals, the roster, the phone): a phantom question is corrected once it has stood a few seconds (a prompt still being drawn is not). */
   function settle(c: Chat) {
-    if (c.state !== 'question' || Date.now() - (c.questionAt ?? 0) < 3_000 || menuOnScreen(c)) return
+    if (c.state !== 'question') {
+      // The other way round: a menu stands on the screen but the words never said "question" (a dialog with no such words, like the
+      // setup screen of "Teach auto mode about your environment?"). The screen decides: it is a question, so Approvals lists it.
+      if (!c.exited && menuSeen(c) === true) {
+        c.state = 'question'
+        c.questionAt = Date.now()
+        log?.info(`chat ${c.info.sessionId.slice(0, 8)}: a menu is on its screen; now a question`)
+        changed()
+      }
+      return
+    }
+    if (Date.now() - (c.questionAt ?? 0) < 3_000 || menuOnScreen(c)) return
     correct(c)
   }
 

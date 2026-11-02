@@ -15,7 +15,21 @@ export interface Screen {
   resize(cols: number, rows: number): void
   /** The visible lines, top to bottom, trailing spaces cut. */
   lines(): string[]
+  /**
+   * The visible lines as typed: the dim and grey cells (claude's placeholder and its suggested next prompt, which sit in the
+   * input box but are not text anyone typed) blanked out. A cursor drawn in reverse video on a line that has such text
+   * (the first letter of a suggestion) is blanked too; on a line without any it stays (a draft with the cursor in it).
+   */
+  typedLines(): string[]
 }
+
+// A cell is its character, plus one of these when it was printed dim or grey (GHOST) or in reverse video (INVERSE). The marks ride along
+// with the character through every move, erase, insert and scroll below, and are cut off again when the lines are read.
+const GHOST = '\u0001'
+const INVERSE = '\u0002'
+const unmark = (s: string) => s.replaceAll(GHOST, '').replaceAll(INVERSE, '')
+/** Whether an RGB colour is a grey in the range claude uses for its quiet text (153,153,153 and 136,136,136 in the recordings); white and black are not. */
+const greyRgb = (r: number, g: number, b: number) => Math.max(r, g, b) - Math.min(r, g, b) <= 12 && r >= 60 && r <= 200
 
 const blank = (cols: number) => Array.from({ length: cols }, () => ' ')
 const grid = (cols: number, rows: number) => Array.from({ length: rows }, () => blank(cols))
@@ -34,6 +48,10 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
   let y = 0
   let wrapNext = false
   let saved = { x: 0, y: 0 }
+  // How the next character is printed (SGR): dim, a grey foreground, reverse video.
+  let dim = false
+  let grey = false
+  let inverse = false
   // The parser: plain text, after an escape, inside a CSI (its parameters), or inside a string (OSC and friends) up to its end.
   let mode: 'text' | 'esc' | 'csi' | 'str' | 'skip1' = 'text'
   let params = ''
@@ -65,7 +83,7 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
       lineFeed()
       wrapNext = false
     }
-    cells[y][x] = ch
+    cells[y][x] = ch + (dim || grey ? GHOST : '') + (inverse ? INVERSE : '')
     if (x === cols - 1) wrapNext = true
     else x++
   }
@@ -171,8 +189,31 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
         x = saved.x
         y = saved.y
         break
+      case 'm':
+        for (let i = 0; i < nums.length; i++) {
+          const v = nums[i]
+          if (v === 0) dim = grey = inverse = false
+          else if (v === 2) dim = true
+          else if (v === 22) dim = false
+          else if (v === 7) inverse = true
+          else if (v === 27) inverse = false
+          else if (v === 90) grey = true
+          else if (v === 39 || (v >= 30 && v <= 37) || (v >= 91 && v <= 97)) grey = false
+          else if (v === 38 || v === 48) {
+            // An extended colour: 5;n (the 256 palette) or 2;r;g;b. Only a foreground can be grey.
+            const kind = nums[i + 1]
+            if (kind === 2) {
+              if (v === 38) grey = greyRgb(nums[i + 2], nums[i + 3], nums[i + 4])
+              i += 4
+            } else if (kind === 5) {
+              if (v === 38) grey = nums[i + 2] === 8 || (nums[i + 2] >= 238 && nums[i + 2] <= 250)
+              i += 2
+            }
+          }
+        }
+        break
       default:
-      // Colours (m), modes (h, l), reports (n, c), scroll regions (r): nothing on screen.
+      // Modes (h, l), reports (n, c), scroll regions (r): nothing on screen.
     }
   }
 
@@ -271,7 +312,16 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
       wrapNext = false
     },
     lines() {
-      return cells.map(r => r.join('').replace(/\s+$/, ''))
+      return cells.map(r => unmark(r.join('')).replace(/\s+$/, ''))
+    },
+    typedLines() {
+      return cells.map(r => {
+        const quiet = r.some(c => c.includes(GHOST))
+        return r
+          .map(c => (c.includes(GHOST) || (quiet && c.includes(INVERSE)) ? ' ' : unmark(c)))
+          .join('')
+          .replace(/\s+$/, '')
+      })
     },
   }
 }

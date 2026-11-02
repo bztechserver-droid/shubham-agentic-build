@@ -49,6 +49,13 @@ export interface Spec {
   onExit?(code: number | null): Promise<void> | void
   /** Exit codes that mean "update, then start again". */
   updateCodes?: readonly number[]
+  /**
+   * F-083: the longest the update step is waited for (default 12 minutes; the guard's own limit on Update.cmd is 10).
+   * Nothing is started while it runs: an agent started 1 s into a 2.3 s `git pull` loaded the old files (2 Nov 2026).
+   */
+  updateLimitMs?: number
+  /** The old way, for the record: start again even while the update step runs (the 2 Nov race). Default false. */
+  startDuringUpdate?: boolean
 }
 
 export interface Deps {
@@ -98,6 +105,8 @@ export const BACKOFF_MS = [0, 2000, 5000, 10_000, 20_000, 30_000]
 const STABLE_MS = 60_000
 /** A process that has said it is stopping for an update and then stops answering is ended after this many looks, not `hungAfter`. */
 export const ANNOUNCED_HUNG_AFTER = 5
+/** The most the update step is waited for before the process is started anyway (the guard's Update.cmd limit is 10 minutes). */
+export const UPDATE_LIMIT_MS = 12 * 60_000
 
 export function supervise(spec: Spec, d: Deps): Supervisor {
   let running: Running | null = null
@@ -122,6 +131,8 @@ export function supervise(spec: Spec, d: Deps): Supervisor {
   let nextWhy: string | null = null
   /** When the process being watched started, if this didn't start it (for `intent`). */
   let adoptedSince: number | null = null
+  /** The update step is running (F-083): looks do nothing. */
+  let updating = false
 
   /** 75 etc. when the process said it was stopping for an update (and `updateCodes` says that means one). */
   const announced = (since: number | null): number | null => {
@@ -131,10 +142,26 @@ export function supervise(spec: Spec, d: Deps): Supervisor {
   /** The update step, then a start at once. */
   async function updateStep(code: number) {
     setState('updating')
+    // F-083: while the update step runs, no look starts the process (see look()).
+    updating = !spec.startDuringUpdate
+    const limit = spec.updateLimitMs ?? UPDATE_LIMIT_MS
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      await spec.onExit?.(code)
+      await Promise.race([
+        Promise.resolve(spec.onExit?.(code)),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => {
+            d.log(`${spec.name}: the update step took longer than ${Math.round(limit / 1000)} s; going on without it`)
+            resolve()
+          }, limit)
+          timer.unref?.()
+        }),
+      ])
     } catch (e) {
       d.log(`${spec.name}: the update step failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      clearTimeout(timer)
+      updating = false
     }
     nextTryAt = d.now()
     wake = true
@@ -248,6 +275,8 @@ export function supervise(spec: Spec, d: Deps): Supervisor {
   }
 
   async function look() {
+    // The update step is pulling new files: nothing starts (or adopts) until it is done, or its limit is up.
+    if (updating) return
     if (!running) {
       if (nextTryAt !== null && d.now() < nextTryAt) return
       // Something answers that this didn't start: leave it be, and watch it.

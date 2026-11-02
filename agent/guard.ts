@@ -318,6 +318,8 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
       hungAfter: o.agentHungAfter ?? 8,
       updateCodes: [75],
       onExit: runUpdate,
+      // F-083: the agent is not started while Update.cmd pulls (SAD_GUARD_START_DURING_UPDATE=1 brings the old way back).
+      startDuringUpdate: process.env.SAD_GUARD_START_DURING_UPDATE === '1',
     } satisfies Spec,
     { ...clock, log: m => log.info(m) },
   )

@@ -150,6 +150,8 @@ export interface WsSocket {
 export interface ApiMount {
   prefix: string
   ownAuth?(rest: string): boolean
+  /** F-082: a route whose request body may be larger than the usual 64 KiB (the phone's screen reading): its limit in bytes; undefined for the usual. */
+  maxBody?(rest: string): number | undefined
   /** Resolves to the JSON answer; an apiError for an error status. */
   http(req: MountRequest): Promise<unknown>
   /** Its WebSocket at `rest`, run once accepted; null when it has none there (404). */
@@ -191,7 +193,7 @@ function send(res: ServerResponse, status: number, data: unknown) {
   res.end(body)
 }
 
-async function readJson(req: IncomingMessage): Promise<unknown> {
+async function readJson(req: IncomingMessage, limit = MAX_BODY): Promise<unknown> {
   const type = String(req.headers['content-type'] ?? '')
   // The UI always sends JSON; a form post from another site can't, without a CORS preflight.
   if (!/^application\/json\b/i.test(type)) throw apiError(415, 'Send the request body as application/json')
@@ -199,7 +201,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
   for await (const chunk of req) {
     size += (chunk as Buffer).length
-    if (size > MAX_BODY) throw apiError(413, 'Request too large')
+    if (size > limit) throw apiError(413, 'Request too large')
     chunks.push(chunk as Buffer)
   }
   const text = Buffer.concat(chunks).toString('utf8')
@@ -477,7 +479,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
     }
     const method = req.method ?? 'GET'
-    const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? await readJson(req) : undefined
+    const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? await readJson(req, m.maxBody?.(rest)) : undefined
     return m.http({ method, rest, query: url.searchParams, body, headers: req.headers })
   }
 

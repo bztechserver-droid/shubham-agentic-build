@@ -61,7 +61,7 @@ import { createDeviceStore } from './approval-devices.ts'
 import { createAutoUpdate } from './auto-update.ts'
 import type { DevicesAnswer, PublicJwk, SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
-import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
+import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
@@ -174,6 +174,8 @@ export interface AgenticOptions {
   newerBuild?: () => string | null
   /** F-074: tests: what stands in for the registered device's signature on a pair code. */
   voiceProof?: (body: unknown) => string
+  /** F-080: the speech service's stream (Whisper on the hub), offered to the phone at /voice/speech with its device key. */
+  speech?: (ws: WsSocket) => void
   /** F-078: the build running now (its version), for the morning summary. */
   currentBuild?: () => string | null
   /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
@@ -1227,6 +1229,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return request<string>(link, 'screen', { sessionId: c.sessionId }).catch(() => null)
   }
 
+  // The one key a Cancel button presses (the member PC's 'keys' request takes it, and digits, nothing else).
+  const ESC_KEY = String.fromCharCode(27)
+
   /**
    * What a waiting chat asks, off its live screen only: options come from the menu drawn now, never from older text above a newer
    * footer. Where the screen can't be had, the scroll-back gives the words around it but no buttons (nothing is pressed from stale text).
@@ -1235,7 +1240,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const screen = await screenOf(c)
     if (screen !== null) return promptOf(screen)
     const p = promptOf(await readChat(c, 60).catch(() => ''))
-    return { ...p, menu: null }
+    return { ...p, menu: null, cancellable: false }
   }
 
   /** M1: a chat waiting at a permission prompt or a menu is never typed into (Enter would pick the highlighted option). The words for a person or an agent. */
@@ -1469,6 +1474,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const voice = createVoice({
     now: Date.now,
     file: path.join(o.dir, 'voice-devices.json'),
+    speech: o.speech,
     log,
     assistant: () => {
       const sid = assistantAt()?.a.sessionId ?? null
@@ -1751,6 +1757,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
           args,
         )
         return typeof out === 'string' ? out : json(out)
+      }
+      // F-082: the overlay assistant's hands on the phone. Only that agent; the hub (phone.ts) carries the phone's own answers.
+      case 'phone_screen':
+      case 'phone_control': {
+        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant uses Shubham's phone; ask it (it is the sparkle button in the app).")
+        if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
+        const device = typeof args.device === 'string' ? args.device : undefined
+        const op = name === 'phone_screen' ? 'screen' : typeof args.action === 'string' ? args.action : ''
+        return voice.phone.call(device, op, args)
       }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
@@ -2084,7 +2099,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const items = await Promise.all(
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
         const p = await promptOfChat({ sessionId: sid, id: w.id })
-        return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu) }
+        return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable }
       }),
     )
     return { items, prepared: [...prepared.values()].sort((x, y) => y.at.localeCompare(x.at)) }
@@ -2110,6 +2125,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
     approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
     log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}`)
     return { ok: true, answered: `${option.n}. ${option.label}`, agent: at.agent.name, floor: at.floor.name }
+  }
+
+  /**
+   * His tap on Cancel (Esc) for the prompt he was shown: one Escape key into that chat, only while its screen still shows the same prompt
+   * and its footer says "Esc to cancel". Signed like an answer. On a permission prompt Esc means No.
+   */
+  async function cancelApproval(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
+    const req = raw as unknown as CancelRequest
+    by = `${humanProof('cancel', [req.sessionId, req.id], req.sig)} via ${by}`
+    const at = floors.bySession(req.sessionId)
+    const w = whereAll()[req.sessionId]
+    if (!at || !w) throw apiError(404, "That chat isn't running any more")
+    if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
+    const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+    if (!p.cancellable) throw apiError(409, 'That prompt has no "Esc to cancel"; answer it in the chat itself.')
+    if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
+    if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, ESC_KEY))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be cancelled right now`)
+    const detail = `${p.menu?.question || 'A prompt'} → Esc (cancel)${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
+    approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
+    log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}`)
+    return { ok: true, agent: at.agent.name, floor: at.floor.name }
   }
 
   /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
@@ -2442,6 +2479,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
     ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals())],
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r)))],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r)))],
     ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r)))],
@@ -2910,9 +2948,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'attach-get':
           return answer(raw => attachGetPeer(raw))
         case 'keys':
-          // F-076: the hub answering a prompt in a chat that runs here: one or two digits (a numbered choice), nothing else.
+          // F-076: the hub answering a prompt in a chat that runs here: one or two digits (a numbered choice), or the one Esc key of a Cancel button; nothing else.
           return answer(raw => {
-            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.data !== 'string' || !/^\d{1,2}$/.test(raw.data)) throw apiError(400, 'Expected {sessionId, data: a number}')
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.data !== 'string' || !(/^\d{1,2}$/.test(raw.data) || raw.data === ESC_KEY)) throw apiError(400, 'Expected {sessionId, data: a number or Esc}')
             return chats.input(raw.sessionId, raw.data)
           })
         case 'open':
@@ -3113,6 +3151,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       subs.clear()
       for (const s of events) s.close(1001, 'the agent is stopping')
       ui.close()
+      voice.close()
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
       clearInterval(voiceTimer)

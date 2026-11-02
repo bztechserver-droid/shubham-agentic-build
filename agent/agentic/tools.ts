@@ -274,6 +274,51 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // F-082: the overlay assistant's hands on Shubham's PHONE (the Chris app's accessibility service). Only that agent; the phone must be
+  // unlocked with control switched on at the phone. Chris' own safety rules (secure screens, passwords, banking apps, sending/paying/
+  // deleting needs his fingerprint) are enforced on the phone and come back as a refusal to read, not to fight.
+  {
+    name: 'phone_screen',
+    description:
+      "Look at Shubham's PHONE right now (only the overlay assistant can; needs the Chris app with control switched on, the phone unlocked): the app in front and each thing on screen (an id like n12, its words, whether it can be pressed, typed in or scrolled, where it is). Read it before you act and again after the screen changes; ids are only good for the screen they came from. shot=true also saves a screenshot to a file you can open with Read. Secure screens (banking, passwords) come back empty on purpose.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        shot: { type: 'boolean', description: 'Also save a screenshot and give its file path.' },
+        device: { type: 'string', description: "Which phone, only if several are paired (its name)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'phone_control',
+    description:
+      "Do something on Shubham's PHONE, live, where he can watch (the Chris dot glows and says it is controlling; he can stop it at any time and then you are told). action: tap (id from phone_screen, or x,y), long_press, type (text; id of the field; clear:false to add; submit:true presses the keyboard's action key), scroll (dir up/down/left/right; optional id), swipe (x1,y1,x2,y2,ms), back, home, recents, notifications, open_app (name or package), wait (ms). Most answer with the fresh screen. Chris refuses on its own to type into password fields or act in banking apps, and anything that sends, pays, buys, deletes, installs or changes security settings waits for Shubham's fingerprint or face on the phone (you are told what it waits for; he may say no). Put why: a few words on what you are doing for (logged). If it is refused or stopped, do not try to get around it: tell Shubham.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['tap', 'long_press', 'type', 'scroll', 'swipe', 'back', 'home', 'recents', 'notifications', 'open_app', 'wait'] },
+        id: { type: 'string', description: 'An element from phone_screen, like n12.' },
+        x: { type: 'number' },
+        y: { type: 'number' },
+        text: { type: 'string', description: 'type: what to write.' },
+        clear: { type: 'boolean', description: 'type: replace what is there (default true).' },
+        submit: { type: 'boolean', description: 'type: press the keyboard action key after.' },
+        dir: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+        x1: { type: 'number' },
+        y1: { type: 'number' },
+        x2: { type: 'number' },
+        y2: { type: 'number' },
+        ms: { type: 'number', description: 'swipe: duration (50-3000); wait: milliseconds (100-10000).' },
+        name: { type: 'string', description: "open_app: the app's name, like WhatsApp." },
+        package: { type: 'string', description: 'open_app: the Android package, when the name is ambiguous.' },
+        why: { type: 'string', description: 'A few words: what this is for (shown in the phone\'s action log).' },
+        device: { type: 'string', description: 'Which phone, only if several are paired (its name).' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
   {
     name: 'watchdog_status',
     description:

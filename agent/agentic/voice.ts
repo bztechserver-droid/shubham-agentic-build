@@ -1,8 +1,10 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import type { Scan } from './orders.ts'
+import { MAX_RESULT_BYTES, createPhoneControl, type PhoneControl, type PhoneTiming } from './phone.ts'
 
 // F-074: the hub's side of "Hey Chris", Shubham's phone app. The phone never gets the app's API token.
 // A page button asks for a pair code (token, page); the phone trades it for a device key: 32 random bytes,
@@ -80,6 +82,10 @@ export interface VoiceDeps {
   history?(before: number, limit: number | undefined): unknown
   /** What the Assistant's spinner says, if it says anything. */
   status?(): AskView['status'] | null
+  /** F-080: the WebSocket handler for /voice/speech (the speech service's stream), opened with a paired phone's device key. Without it the route does not exist. */
+  speech?: (ws: WsSocket) => void
+  /** F-082: the timings of phone control (tests shorten them). */
+  phoneTiming?: Partial<PhoneTiming>
   log?: { info(m: string): void; warn(m: string): void }
 }
 
@@ -145,10 +151,14 @@ export interface Voice {
   beat(text: string, items: { floor: string; agent: string; what: string }[]): void
   /** For tests and the page: the devices paired. */
   devices(): { id: string; name: string; model: string; at: string; lastSeen: string | null }[]
+  /** F-082: the Assistant's hands on the phone (phone_screen, phone_control). */
+  phone: PhoneControl
+  close(): void
 }
 
 export function createVoice(deps: VoiceDeps): Voice {
   let devices: Device[] = load(deps.file)
+  const phone = createPhoneControl({ now: deps.now, dir: deps.file ? path.dirname(deps.file) : undefined, timing: deps.phoneTiming, log: deps.log })
   const codes = new Map<string, number>()
   let fails = 0
   const attempts: number[] = []
@@ -396,15 +406,18 @@ export function createVoice(deps: VoiceDeps): Voice {
   }
 
   // --- the mount -------------------------------------------------------------------------------
-  const pageRoute = (rest: string) => rest === '/pair-code' || rest === '/devices' || rest === '/devices/revoke'
+  const pageRoute = (rest: string) => rest === '/pair-code' || rest === '/devices' || rest === '/devices/revoke' || rest === '/control-status' || rest === '/control-stop'
   const mount: ApiMount = {
     prefix: '/voice',
-    // Everything but the page's own three routes carries the phone's key, never the app's token.
+    // Everything but the page's own routes carries the phone's key, never the app's token.
     ownAuth: rest => !pageRoute(rest),
+    // A screen read by the phone (its nodes, a shot) is bigger than the 64 KiB every other body is held to.
+    maxBody: rest => (rest === '/control/result' ? MAX_RESULT_BYTES : undefined),
     // The phone's live screen is a WebSocket on its device key alone (agent/api.ts: wsKey); nothing else here is.
-    ws: rest => (rest === '/live' ? live : null),
+    // F-080: the phone's speech-to-text socket (Whisper on the hub, agent/speech): the same device-key check as /live.
+    ws: rest => (rest === '/live' ? live : rest === '/speech' ? (deps.speech ?? null) : null),
     wsKey: (rest, headers) => {
-      if (rest !== '/live') return null
+      if (rest !== '/live' && !(rest === '/speech' && deps.speech)) return null
       try {
         auth({ headers })
         return true
@@ -429,13 +442,21 @@ export function createVoice(deps: VoiceDeps): Voice {
         devices = devices.filter(x => x.id !== id)
         if (devices.length === before) throw apiError(404, 'No such phone')
         save()
+        phone.forget(id)
         return { devices: voice.devices() }
       }
+      const control = phone.page(method, rest)
+      if (control !== undefined) return control
       if (method === 'POST' && rest === '/pair') return pair(r.body)
       const d = auth(r)
       if (method === 'GET' && rest === '/hello') {
         const as = deps.assistant()
         return { assistant: { sessionId: as?.sessionId ?? null, live: liveOf(as?.state) }, settings: {} }
+      }
+      // F-082: the phone's hands (phone.ts): state, the long poll for the next command, its result, progress, STOP.
+      if (rest.startsWith('/control/')) {
+        const out = phone.http(d, method, rest.slice('/control'.length), r.query, r.body)
+        if (out !== undefined) return out
       }
       if (method === 'POST' && rest === '/ask') return ask(d, r.body)
       const sure = /^\/confirm\/([^/]+)$/.exec(rest)
@@ -462,6 +483,8 @@ export function createVoice(deps: VoiceDeps): Voice {
       push({ t: 'beat', at: deps.now(), text, items })
     },
     devices: () => devices.map(d => ({ id: d.id, name: d.name, model: d.model, at: d.at, lastSeen: d.lastSeen })),
+    phone,
+    close: () => phone.close(),
   }
   return voice
 }

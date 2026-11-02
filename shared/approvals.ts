@@ -29,6 +29,8 @@ export interface ApprovalItem {
   id: string
   /** Buttons can answer it (a numbered choice to pick one of); otherwise it is answered in the chat. */
   answerable: boolean
+  /** Its footer, drawn now, says "Esc to cancel": a Cancel (Esc) button can press Esc for him. On a permission prompt Esc means No. */
+  cancellable?: boolean
 }
 
 /** A card the assistant prepared: a target and the words proposed. Only the person's tap sends it. */
@@ -56,6 +58,13 @@ export interface AnswerRequest {
   id: string
   n: number
   /** The registered approval device's signature (shared/approval-sign.ts). */
+  sig?: Signed
+}
+
+/** POST /agentic/approvals/cancel: Esc into the prompt `id` of that chat (only when its footer says "Esc to cancel"). Signed like an answer. */
+export interface CancelRequest {
+  sessionId: string
+  id: string
   sig?: Signed
 }
 

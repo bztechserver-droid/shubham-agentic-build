@@ -9,6 +9,7 @@ import { findMenu } from './screen.ts'
 
 const BOX = /[│┃╭╮╰╯┌┐└┘├┤┬┴┼]/g
 const RULES = /[─━═]{3,}/g
+const ESC_FOOTER_RE = /\besc to cancel\b/i
 /** How many lines above the options are kept as what the prompt is about. */
 const CONTEXT_LINES = 28
 
@@ -17,8 +18,13 @@ const CONTEXT_LINES = 28
  * tool), and an id made of both. The id is what an answer names: if the prompt has changed by then (the same
  * "Do you want to proceed?" for another command), the id differs and the answer is refused.
  */
-export function promptOf(screen: string): { menu: ChatMenu | null; context: string; id: string } {
+export function promptOf(screen: string): { menu: ChatMenu | null; context: string; id: string; cancellable: boolean } {
   const lines = screen.split(/\r?\n/)
+  // A footer that says "Esc to cancel" among the last lines drawn: Esc closes this prompt (on a permission prompt that means No).
+  const cancellable = lines
+    .filter(l => l.trim() !== '')
+    .slice(-4)
+    .some(l => ESC_FOOTER_RE.test(l))
   const found = findMenu(lines)
   const menu = found?.menu ?? null
   const tidy = (rows: string[]) =>
@@ -29,7 +35,7 @@ export function promptOf(screen: string): { menu: ChatMenu | null; context: stri
   const clean = tidy(found ? lines.slice(0, found.first) : lines)
   const context = clean.slice(Math.max(0, clean.length - CONTEXT_LINES)).join('\n').trim()
   const basis = JSON.stringify({ context, q: menu?.question ?? '', h: menu?.hint ?? '', o: menu?.options.map(o => [o.n, o.label]) ?? [] })
-  return { menu, context, id: createHash('sha1').update(basis).digest('hex').slice(0, 16) }
+  return { menu, context, id: createHash('sha1').update(basis).digest('hex').slice(0, 16), cancellable }
 }
 
 /** An answer's option is one the prompt has, and the prompt is one buttons can answer. */
