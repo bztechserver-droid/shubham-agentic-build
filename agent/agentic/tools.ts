@@ -2,6 +2,8 @@
 // the orchestration part), served to claude by mcp-shim.ts and carried out by tool-calls.ts.
 // Who is calling is never an argument: it is the chat whose key came with the call.
 
+import { WA_TOOLS } from '../whatsapp/tools.ts'
+
 export interface ToolDef {
   name: string
   description: string
@@ -274,13 +276,14 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
-  // F-082: the overlay assistant's hands on Shubham's PHONE (the Chris app's accessibility service). Only that agent; the phone must be
+  // F-082: the overlay assistant's hands on Shubham's PHONE (the Chris app's accessibility service). Only that agent and (F-084) the
+  // Mobile agent's chat, each logged under its own name (`by`) on the phone; the phone must be
   // unlocked with control switched on at the phone. Chris' own safety rules (secure screens, passwords, banking apps, sending/paying/
   // deleting needs his fingerprint) are enforced on the phone and come back as a refusal to read, not to fight.
   {
     name: 'phone_screen',
     description:
-      "Look at Shubham's PHONE right now (only the overlay assistant can; needs the Chris app with control switched on, the phone unlocked): the app in front and each thing on screen (an id like n12, its words, whether it can be pressed, typed in or scrolled, where it is). Read it before you act and again after the screen changes; ids are only good for the screen they came from. shot=true also saves a screenshot to a file you can open with Read. Secure screens (banking, passwords) come back empty on purpose.",
+      "Look at Shubham's PHONE right now (only the overlay Assistant and the Mobile agent can; the phone's log and notification say which; needs the Chris app with control switched on, the phone unlocked): the app in front and each thing on screen (an id like n12, its words, whether it can be pressed, typed in or scrolled, where it is). Read it before you act and again after the screen changes; ids are only good for the screen they came from. shot=true also saves a screenshot to a file you can open with Read. Secure screens (banking, passwords) come back empty on purpose.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -326,6 +329,12 @@ export const TOOLS: ToolDef[] = [
     inputSchema: none,
   },
   {
+    name: 'phone_update',
+    description:
+      "Ask Shubham's PHONE to install the Chris build that is on offer (F-085; only the overlay assistant and the Mobile chat can). It checks that the offer (C:\\sac\\out\\offer.json, written by mobile/scripts/offer.mjs after the PC tests and a phone check) is valid and that the file still matches its sha256, then tells every paired phone to update. A phone acts only when its 'update from the PC' setting is on, the offered build is newer than the one it runs, and it is unlocked with the screen on; Android may still ask Shubham to confirm. Answers what it pushed (version, size, how many phones) or why nothing was offered.",
+    inputSchema: none,
+  },
+  {
     name: 'agent_hire',
     description:
       "Create a NEW AGENT on your floor, reporting to you. BOSS ONLY. Use it when the work in front of you needs an owner that does not exist yet — a reviewer, a migration specialist, somebody to own one subsystem. The `md` you write IS that agent's brief: it is what the agent is told about itself when its chat starts, so write what it owns, what it must not touch, and how it should report back. Hire deliberately, one at a time, for work you are about to give it. Names must be unique on the floor. No chat is started: the human opens it from the floor.",
@@ -343,4 +352,6 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // F-079: Shubham's WhatsApp, for the overlay Assistant only: it reads when asked and drafts; only his tap sends.
+  ...WA_TOOLS,
 ]

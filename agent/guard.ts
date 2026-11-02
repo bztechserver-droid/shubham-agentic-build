@@ -184,16 +184,21 @@ export async function startGuard(o: GuardOptions): Promise<Guard> {
   const keeperCmd = o.keeper === false ? null : (o.keeper ?? (config.role === 'hub' ? { file: process.execPath, args: ['agent/hub/keeper.ts', ...(o.agentArgs ?? [])] } : null))
   const updateCmd = o.update === false ? null : (o.update ?? { file: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/c', 'Update.cmd'] })
 
-  const agentEnv = (): NodeJS.ProcessEnv => ({
-    ...process.env,
-    // Tells the agent: it is kept (so Update now works), the page is the guard's, the RustDesk
-    // servers are the keeper's, and the chats that were open are to come back.
-    SAD_SUPERVISED: '1',
-    SAD_PAGE_SERVER: 'guard',
-    ...(keeperCmd ? { SAD_RUSTDESK_EXTERNAL: '1' } : {}),
-    SAD_RESUME_CHATS: process.env.SAD_RESUME_CHATS ?? '1',
-    ...agentCmd.env,
-  })
+  const agentEnv = (): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      // Tells the agent: it is kept (so Update now works), the page is the guard's, the RustDesk
+      // servers are the keeper's, and the chats that were open are to come back.
+      SAD_SUPERVISED: '1',
+      SAD_PAGE_SERVER: 'guard',
+      SAD_RESUME_CHATS: process.env.SAD_RESUME_CHATS ?? '1',
+    }
+    // Without a keeper there are no servers of its to wait for: a flag inherited from a guard above (a member PC, a test
+    // run inside an agent the guard started) is dropped, not passed on.
+    if (keeperCmd) env.SAD_RUSTDESK_EXTERNAL = '1'
+    else delete env.SAD_RUSTDESK_EXTERNAL
+    return { ...env, ...agentCmd.env }
+  }
 
   function launch(name: string, file: string, args: string[], env: NodeJS.ProcessEnv): Running {
     const fd = openSync(consoleFile, 'a')

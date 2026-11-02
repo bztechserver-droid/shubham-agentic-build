@@ -16,6 +16,18 @@ import { writeAtomic } from '../config.ts'
 /** The Assistant is the agent called Assistant on the floor called Assistant. */
 export const isAssistantAgent = (floorName: string, agentName: string) => floorName.trim().toLowerCase() === 'assistant' && agentName.trim().toLowerCase() === 'assistant'
 
+/**
+ * F-084 H2: who may use Shubham's phone (phone_screen, phone_control, phone_update): the Assistant, and the Mobile agent's chat, the
+ * agent called Mobile on the floor called Final, which builds and tries the phone app. Null for everyone else. The name goes with each
+ * command (`by`) to the phone's action log and its notification.
+ */
+export const phoneUser = (floorName: string, agentName: string): 'assistant' | 'mobile' | null => {
+  const floor = floorName.trim().toLowerCase()
+  const agent = agentName.trim().toLowerCase()
+  if (isAssistantAgent(floorName, agentName)) return 'assistant'
+  return floor === 'final' && agent === 'mobile' ? 'mobile' : null
+}
+
 /** What is only a "thank you / got it": it asks for nothing, so it opens no order. A real instruction ("do it", "ok now fix X") is never all of these words. */
 const ACK_ONLY = /^(?:(?:ok|okay|k|kk|thanks|thank you|thx|ty|got it|noted|understood|roger|great|perfect|cool|nice|good|fine|sure|done|ack|acknowledged|will do|sounds good|👍|🙏|✅)\s*)+$/u
 

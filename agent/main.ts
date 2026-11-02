@@ -34,7 +34,10 @@ import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
 import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, rustdeskHandler } from './rustdesk.ts'
 import { createSavedPasswords } from './saved-passwords.ts'
 import { createAppScreen } from './screen/index.ts'
+import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
+import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
+import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 
 // The device agent (agent/SPEC.md): `npm run agent [-- --role hub|member]`.
 //   hub:    supervises hbbs/hbbr, registers with hbbs, listens for members on its LAN and
@@ -84,6 +87,8 @@ export interface AgentExtras {
   currentBuild?: () => string | null
   /** F-075: set here once the chats run in the chat host, for the update to ask about it (build.ts). */
   chatHostGate?: { current: ChatHostGate | null }
+  /** F-080: Whisper on this PC, for the phone app's /voice/speech too (Chris: one utterance, up to 60 s). */
+  speech?: SpeechEngine | null
 }
 
 /**
@@ -163,6 +168,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     extras.agents !== false && chatHostWanted(paths.agent)
       ? await ensureChatHost({ buildRoot: path.resolve(import.meta.dirname, '..'), stateRoot: paths.root, token, log: log.child('chathost'), port: Number(process.env.SAD_CHAT_HOST_PORT) || undefined })
       : null
+  // F-079: Shubham's WhatsApp (made below, once the Agents section is: its sends are signed by his approval device).
+  let whatsapp: WhatsApp | null = null
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
@@ -174,9 +181,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     chatHost,
     newerBuild: () => extras.newerBuild?.() ?? null,
     currentBuild: () => extras.currentBuild?.() ?? null,
+    // F-080: Chris's speech-to-text (Overlay's /voice/speech, device key) is the hub's Whisper stream.
+    speech: extras.speech ? speechStream(extras.speech, log.child('speech'), { maxMs: 60_000 }) : undefined,
     // F-058: under the guard, the chats that were open when the app last stopped come back.
     // With the chat host, the list is also what brings the chats back when the host itself changes with an update.
     resumeChats: process.env.SAD_RESUME_CHATS === '1' || !!chatHost,
+    whatsapp: () => whatsapp?.tools ?? null,
     token: () => {
       try {
         return userEnv?.get(TOKEN_VAR) || null
@@ -204,6 +214,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   if (agentic && chatHost && extras.chatHostGate) {
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
   }
+  // F-079: on the hub only, and only with the Agents section. It runs only while it is used (agent/whatsapp/).
+  if (role === 'hub' && agentic) whatsapp = createWhatsApp({ dir: path.join(paths.root, 'whatsapp'), log: log.child('whatsapp'), human: (kind, fields, sig) => agentic.humanProof(kind, fields, sig) })
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
   // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this
@@ -722,7 +734,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(agentic ? [agentic.voiceMount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -738,6 +750,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   async function stopAll() {
     for (const t of timers) clearInterval(t)
+    // F-079: WhatsApp closes its Chrome properly alongside the rest (if the agent ends first, the worker still does).
+    const waClosed = whatsapp?.close()
     // Claude subscription failover first: nothing may start restarting a chat while they are being closed.
     failover.stop()
     rowWatch?.stop()
@@ -749,6 +763,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     member?.links.stop('the agent is stopping')
     tunnels.closeAll()
     await hub?.stop()
+    await waClosed
   }
 
   let stopping: Promise<void> | null = null
@@ -771,6 +786,8 @@ if (import.meta.main) {
   const log = rootLog
   let agent: Agent | null = null
   let build: Build | null = null
+  // F-080: Whisper on this PC for the mic (loaded only while someone speaks; agent/speech).
+  let speech: SpeechEngine | null = null
   let ui: UiServer | null = null
   let uiTailnet: UiServer | null = null
   let logsDir: string | null = null
@@ -797,6 +814,7 @@ if (import.meta.main) {
     }
     try {
       build?.close()
+      await within('letting Whisper go', speech?.stop(), 3000)
       await within('closing the page', ui?.close(), 3000)
       await within('closing the tailnet page', uiTailnet?.close(), 3000)
       await within('stopping the agent', agent?.stop(), 10_000)
@@ -846,7 +864,8 @@ if (import.meta.main) {
     // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).
     const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
-    agent = await startAgent(config, log, { mounts: [build.mount], devDir, agents, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
+    speech = createEngine({ log: log.child('speech') })
+    agent = await startAgent(config, log, { mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app's Devices page talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

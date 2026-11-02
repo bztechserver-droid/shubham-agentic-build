@@ -4,12 +4,14 @@ import path from 'node:path'
 import { apiError } from '../api.ts'
 
 // F-082 (hub side): the Assistant's hands on Shubham's phone. The phone app (Chris) holds an accessibility service; this
-// module is the other end of its protocol (mobile/docs/HUB-PROTOCOL.md §11). The Assistant (and only it: index.ts checks)
-// calls phone_screen and phone_control; each becomes one command the phone fetches with a long poll, runs, and answers.
+// module is the other end of its protocol (mobile/docs/HUB-PROTOCOL.md §11). The Assistant and the Mobile agent's chat (F-084 H2;
+// index.ts checks who) call phone_screen and phone_control; each becomes one command the phone fetches with a long poll, runs, and
+// answers. Every command says who asked, `by`, for the phone's action log and its notification. The commands of both callers share one
+// queue, one command in flight and one rate limit per phone.
 //
 //   phone (device key, like every /voice route):
 //     POST /voice/control/state     {armed, reason?, app?, v}   on a change
-//     GET  /voice/control/next?wait=25   the long poll that is also the heartbeat -> {cmd:{id, op, args, why, deadlineMs}|null, stopped?}
+//     GET  /voice/control/next?wait=25   the long poll that is also the heartbeat -> {cmd:{id, op, args, why, by, deadlineMs}|null, stopped?}
 //     POST /voice/control/result    {id, ok, kind?, error?, data?}   up to 2 MiB (a screen with its nodes, a shot)
 //     POST /voice/control/progress  {id, waiting:'biometric', summary}   a sensitive action needs his fingerprint: wait longer
 //     POST /voice/control/stop      {reason}   his STOP: everything pending ends, control stays off until the phone arms again
@@ -19,6 +21,10 @@ import { apiError } from '../api.ts'
 // 90 s; every command's op and arguments are written to phone-control.jsonl with the result's ok/kind/error and its node count, but
 // never a screen's text, a node's text, what was typed (only its length) or a shot. The safety rules about what is on the screen
 // (banking, passwords, sending, paying) are the phone's: it sees the screen. A shot is saved as a file the Assistant can look at.
+
+/** Who asked for a command. The caller (index.ts) names it from the chat's identity; a tool's own arguments can never say. */
+export const CALLERS = ['assistant', 'mobile'] as const
+export type PhoneCaller = (typeof CALLERS)[number]
 
 export const ONLINE_MS = 90_000
 export const PICKUP_MS = 10_000
@@ -101,6 +107,8 @@ export interface LogRow {
   op: string
   args: Record<string, unknown>
   why: string
+  /** Who asked; rows written before F-084 have none (they were the Assistant's). */
+  by?: PhoneCaller
   ok: boolean
   kind: string | null
   error: string
@@ -128,6 +136,7 @@ interface Cmd {
   op: Op
   args: Record<string, unknown>
   why: string
+  by: PhoneCaller
   created: number
   /** Hub clock: when it counts as late. Before pickup it is the pickup limit; after, the phone's time to answer. */
   deadline: number
@@ -163,8 +172,8 @@ export interface PhoneControl {
   http(d: { id: string; name: string }, method: string, rest: string, query: URLSearchParams, body: unknown): Promise<unknown> | undefined
   /** The page's two: GET control-status, POST control-stop. */
   page(method: string, rest: string): unknown
-  /** One command for the Assistant's tools. Throws for what the hub refuses; a phone's refusal is part of the answer. */
-  call(device: string | undefined, op: string, args: Record<string, unknown>): Promise<string>
+  /** One command for the tools of the Assistant or the Mobile chat (`by`, default the Assistant). Throws for what the hub refuses; a phone's refusal is part of the answer. */
+  call(device: string | undefined, op: string, args: Record<string, unknown>, by?: PhoneCaller): Promise<string>
   status(): { devices: PhoneState[]; log: LogRow[] }
   /** A device was removed: forget it. */
   forget(id: string): void
@@ -267,7 +276,7 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     c.timer = null
     if (x.inflight === c) x.inflight = null
     x.queue = x.queue.filter(q => q !== c)
-    writeLog({ at: deps.now(), device: x.name, op: c.op, args: logArgs(c.op, c.args), why: c.why, ok: r.ok, kind: r.kind, error: r.error.slice(0, LOG_TEXT), nodes: r.screen ? r.screen.nodes.length : null })
+    writeLog({ at: deps.now(), device: x.name, op: c.op, args: logArgs(c.op, c.args), why: c.why, by: c.by, ok: r.ok, kind: r.kind, error: r.error.slice(0, LOG_TEXT), nodes: r.screen ? r.screen.nodes.length : null })
     c.resolve(r)
     pump(x)
   }
@@ -344,7 +353,7 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
       x.waiter = null
     }
     return new Promise(resolve => {
-      const give = (c: Cmd | null) => resolve({ cmd: c ? { id: c.id, op: c.op, args: c.args, why: c.why, deadlineMs: Math.max(0, c.deadline - deps.now() - T.grace) } : null, ...(x.stopped ? { stopped: true } : {}) })
+      const give = (c: Cmd | null) => resolve({ cmd: c ? { id: c.id, op: c.op, args: c.args, why: c.why, by: c.by, deadlineMs: Math.max(0, c.deadline - deps.now() - T.grace) } : null, ...(x.stopped ? { stopped: true } : {}) })
       const timer = setTimeout(
         () => {
           if (x.waiter?.timer === timer) x.waiter = null
@@ -466,7 +475,8 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     return lines.join('\n')
   }
 
-  async function call(sel: string | undefined, op: string, rawArgs: Record<string, unknown>): Promise<string> {
+  async function call(sel: string | undefined, op: string, rawArgs: Record<string, unknown>, by: PhoneCaller = 'assistant'): Promise<string> {
+    if (!(CALLERS as readonly string[]).includes(by)) throw apiError(400, `No such caller: ${String(by)}`)
     if (!(OPS as readonly string[]).includes(op)) throw apiError(400, `No such phone action: ${op}; they are ${OPS.join(', ')}`)
     const args = cleanArgs(op, rawArgs)
     const x = target(sel)
@@ -476,7 +486,7 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     x.sent.push(t)
     const why = text(rawArgs.why, 160)
     const r = await new Promise<PhoneResult>(resolve => {
-      const c: Cmd = { id: `p${randomBytes(4).toString('hex')}`, op: op as Op, args, why, created: t, deadline: t + T.pickup, picked: false, waiting: null, timer: null, resolve }
+      const c: Cmd = { id: `p${randomBytes(4).toString('hex')}`, op: op as Op, args, why, by, created: t, deadline: t + T.pickup, picked: false, waiting: null, timer: null, resolve }
       x.queue.push(c)
       arm(x, c)
       pump(x)

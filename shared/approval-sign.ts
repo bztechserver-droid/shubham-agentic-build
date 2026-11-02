@@ -17,7 +17,8 @@ export interface Signed {
 /** A signature is good for this long either side of the hub's clock. */
 export const SIGN_WINDOW_MS = 60_000
 
-export type SignedKind = 'answer' | 'send' | 'code' | 'remove' | 'unsigned' | 'autoupdate' | 'pair' | 'cancel'
+/** F-079 'wa-send': a WhatsApp message he sends, over [chatId, sha256(text), the Assistant's draft or ''] (agent/whatsapp/). */
+export type SignedKind = 'answer' | 'send' | 'code' | 'remove' | 'unsigned' | 'autoupdate' | 'pair' | 'cancel' | 'wa-send'
 
 /**
  * The text that is signed. Fields are joined with line breaks (none of them can contain one: ids, a number, a hash),

@@ -170,7 +170,17 @@ export interface ApiMount {
    * answered as JSON, as for the others.
    */
   raw?(rest: string, url: URL): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | null
+  /**
+   * F-085: a streamed answer that carries the paired phone's DEVICE KEY in place of the app token (the APK the Update
+   * button downloads). Only the paths in KEY_STREAM_PATHS can be one, whatever a mount says; any Origin is refused
+   * here, and the handler itself checks the key (a missing, wrong or revoked key is an apiError, answered as JSON).
+   * GET and HEAD only. Every other `raw` route keeps the app token.
+   */
+  keyStream?(rest: string, url: URL): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | null
 }
+
+/** F-085: the one streamed route that is not guarded by the app token but by a paired phone's device key. An allow-list, not a switch. */
+export const KEY_STREAM_PATHS: readonly string[] = ['/agent-api/voice/app/apk']
 
 export interface Api {
   port: number
@@ -548,6 +558,14 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (!path.startsWith(`${AGENT_API_PREFIX}/`)) return send(res, 404, { error: `No such path: ${path}` })
     const mount = mountOf(path)
     if (mount) {
+      // F-085: the phone's APK download, on its device key; only the listed path, only GET and HEAD, never from a page.
+      if (KEY_STREAM_PATHS.includes(path) && (req.method === 'GET' || req.method === 'HEAD')) {
+        const keyed = mount.keyStream?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url)
+        if (keyed) {
+          if (req.headers.origin !== undefined) throw apiError(403, 'Not for pages')
+          return keyed(req, res)
+        }
+      }
       // F-054: a path that takes over the response (the CRM's proxy), guarded the same way.
       const raw = mount.raw?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url)
       if (raw) {

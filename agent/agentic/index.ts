@@ -50,8 +50,8 @@ import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chat
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
-import { mcpConfigFor, readRegistry } from './mcp-registry.ts'
-import { createOrders, isAssistantAgent, scanMessages } from './orders.ts'
+import { mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
+import { createOrders, isAssistantAgent, phoneUser, scanMessages } from './orders.ts'
 import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
@@ -59,6 +59,8 @@ import { createVoice } from './voice.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
 import { createDeviceStore } from './approval-devices.ts'
 import { createAutoUpdate } from './auto-update.ts'
+import type { WaTools } from '../whatsapp/index.ts'
+import { waTool } from '../whatsapp/tools.ts'
 import type { DevicesAnswer, PublicJwk, SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
@@ -151,6 +153,11 @@ export interface AgenticOptions {
   projectsDir?: string
   /** Tests: a scratch ~/.claude.json (claude-config.ts). */
   claudeJson?: string
+  /**
+   * F-078 scope fix: chats start with --strict-mcp-config and a config of their own, so a server in the user's ~/.claude.json that the
+   * registry keeps back (windows-mcp) reaches only the agents that name it. On; SAD_MCP_STRICT=0 (or false here) is the way it was.
+   */
+  strictMcp?: boolean
   /** Tests: the pause between the commands a tune types into one chat (F-067; 800 ms). */
   tuneGapMs?: number
   /** Tests: how often a running chat's JSONL is looked at for what to send on (1 s). */
@@ -199,6 +206,8 @@ export interface AgenticOptions {
    * node-pty in this process, as before.
    */
   chatHost?: ChatHostLink | null
+  /** F-079: Shubham's WhatsApp on the hub (agent/whatsapp/), for the overlay Assistant's wa_* tools; null where there is none. */
+  whatsapp?: () => WaTools | null
 }
 
 export interface Agentic {
@@ -229,6 +238,11 @@ export interface Agentic {
   busyChats(): number
   /** F-075: the chat host changes with an update: the open chats are written down (so the new agent resumes them), then ended in the host. */
   retireChatHost(): Promise<void>
+  /**
+   * F-079: that a request carries his approval device's signature over `kind` and `fields` (or the old way is switched
+   * on): who it was, for a log line; throws 401/403 otherwise. WhatsApp's sends use it (kind 'wa-send').
+   */
+  humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown): string
   close(): void
 }
 
@@ -656,8 +670,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const effort = agent.effort || dflt.effort
     const ultracode = agent.ultracode ? agent.ultracode === 'on' : dflt.ultracode
     // Per-agent MCP servers (mcp-registry.ts): only what this agent was given, else the shared file as ever.
-    const mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    // F-078 scope fix: with the strict way (the default) the chat's file is its own and lists the servers by name in the log (never their values).
+    let mcp: string
+    let strictMcp = false
+    if (o.strictMcp ?? process.env.SAD_MCP_STRICT !== '0') {
+      try {
+        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
+        mcp = built.file
+        strictMcp = true
+        log?.info(`chat ${sid.slice(0, 8)}: MCP servers ${built.names.join(', ')}`)
+      } catch (e) {
+        log?.warn(`couldn't write chat ${sid.slice(0, 8)}'s MCP file, starting it the old way: ${message(e)}`)
+        mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
+      }
+    } else {
+      mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
+    }
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
     launched.set(sid, { effort, at: new Date().toISOString(), ultracode })
     heartbeat.opened(sid)
     chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
@@ -1655,6 +1684,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json(rosterOf(floor, agent))
       case 'watchdog_status':
         return json(watchdogView())
+      // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
+      case 'phone_update': {
+        if (!phoneUser(floor.name, agent.name)) {
+          throw apiError(403, "Only the overlay assistant and the Mobile chat can ask Shubham's phone to update.")
+        }
+        if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
+        return json(await voice.updatePhones())
+      }
       case 'read_chat': {
         const c = siblingOf(floor, args.sessionId)
         return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
@@ -1758,14 +1795,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
         )
         return typeof out === 'string' ? out : json(out)
       }
-      // F-082: the overlay assistant's hands on the phone. Only that agent; the hub (phone.ts) carries the phone's own answers.
+      // F-082: the overlay assistant's hands on the phone; F-084 H2: the Mobile agent's chat (floor Final) too, nobody else. The hub
+      // (phone.ts) carries the phone's own answers. Who asked is taken from the chat's identity (phoneUser), never from an argument, and goes
+      // with the command to the phone's action log and notification.
       case 'phone_screen':
       case 'phone_control': {
-        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant uses Shubham's phone; ask it (it is the sparkle button in the app).")
+        const by = phoneUser(floor.name, agent.name)
+        if (!by) throw apiError(403, "Only the overlay assistant and the Mobile agent use Shubham's phone; ask the Assistant (it is the sparkle button in the app).")
         if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
         const device = typeof args.device === 'string' ? args.device : undefined
         const op = name === 'phone_screen' ? 'screen' : typeof args.action === 'string' ? args.action : ''
-        return voice.phone.call(device, op, args)
+        return voice.phone.call(device, op, args, by)
       }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
@@ -1784,6 +1824,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         })
         log?.info(`${agent.name} hired ${hired.name} on ${floor.name}`)
         return json({ hired: hired.name, role: hired.role, effort: hired.effort || 'inherit', total: after.agents.length, note: 'No chat is started yet; the human opens it from the floor.' })
+      }
+      // F-079: Shubham's WhatsApp. Only the overlay assistant, and it only reads and drafts (agent/whatsapp/tools.ts).
+      case 'wa_status':
+      case 'wa_chats':
+      case 'wa_read':
+      case 'wa_prepare_send': {
+        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant uses Shubham's WhatsApp; ask it (it is the sparkle button in the app).")
+        const wa = o.whatsapp?.()
+        if (!wa) throw apiError(409, "WhatsApp isn't on in this app: it runs on the hub.")
+        return waTool(wa, name, args)
       }
       default:
         throw apiError(404, `No tool called ${name}`)
@@ -3127,6 +3177,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       recovery?.freeze()
       await o.chatHost?.shutdown(true)
     },
+    humanProof,
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true

@@ -115,6 +115,8 @@ export interface StartChat {
   briefPath: string
   /** This chat's own --mcp-config (the app's tools plus the MCP servers its agent was given); the shared one when none. */
   mcpConfig?: string
+  /** claude --strict-mcp-config: only the servers of mcpConfig, none from the user's own config (the F-078 scope fix). */
+  strictMcp?: boolean
   model: AgentModel
   /** F-049: claude --effort (low ... max); none: the CLI's own. */
   effort?: string
@@ -650,6 +652,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
 
       const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
+      if (s.strictMcp) args.push('--strict-mcp-config')
       // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
       for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
       if (s.model) args.push('--model', s.model)

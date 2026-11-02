@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
+import { DEFAULT_OFFER_FILE, createAppUpdate } from './app-update.ts'
 import type { Scan } from './orders.ts'
 import { MAX_RESULT_BYTES, createPhoneControl, type PhoneControl, type PhoneTiming } from './phone.ts'
 
@@ -57,7 +58,7 @@ export interface AskView {
   error?: string
 }
 
-export type VoiceEvent = { t: 'answer'; askId: string; speak: string } | { t: 'beat'; at: number; text: string; items: { floor: string; agent: string; what: string }[] } | { t: 'ask'; askId: string; state: AskView['state'] }
+export type VoiceEvent = { t: 'update'; versionCode: number } | { t: 'answer'; askId: string; speak: string } | { t: 'beat'; at: number; text: string; items: { floor: string; agent: string; what: string }[] } | { t: 'ask'; askId: string; state: AskView['state'] }
 
 export interface VoiceDeps {
   now(): number
@@ -86,6 +87,8 @@ export interface VoiceDeps {
   speech?: (ws: WsSocket) => void
   /** F-082: the timings of phone control (tests shorten them). */
   phoneTiming?: Partial<PhoneTiming>
+  /** F-085: the offer file the Update button reads (default: SAD_APP_OFFER, else C:\sac\out\offer.json). */
+  appOffer?: string
   log?: { info(m: string): void; warn(m: string): void }
 }
 
@@ -153,12 +156,15 @@ export interface Voice {
   devices(): { id: string; name: string; model: string; at: string; lastSeen: string | null }[]
   /** F-082: the Assistant's hands on the phone (phone_screen, phone_control). */
   phone: PhoneControl
+  /** F-085: asks every paired phone to install the offered build (an `update` event); says what it did. */
+  updatePhones(): Promise<{ pushed: boolean; message: string; versionCode?: number; versionName?: string; bytes?: number; phones?: number }>
   close(): void
 }
 
 export function createVoice(deps: VoiceDeps): Voice {
   let devices: Device[] = load(deps.file)
   const phone = createPhoneControl({ now: deps.now, dir: deps.file ? path.dirname(deps.file) : undefined, timing: deps.phoneTiming, log: deps.log })
+  const app = createAppUpdate({ file: deps.appOffer ?? process.env.SAD_APP_OFFER ?? DEFAULT_OFFER_FILE, log: deps.log })
   const codes = new Map<string, number>()
   let fails = 0
   const attempts: number[] = []
@@ -425,6 +431,14 @@ export function createVoice(deps: VoiceDeps): Voice {
         return false
       }
     },
+    // F-085: the APK for the Update button, streamed (agent/api.ts KEY_STREAM_PATHS lists the one path): the device key is checked here.
+    keyStream: rest =>
+      rest === '/app/apk'
+        ? async (req, res) => {
+            auth(req)
+            await app.serve(req, res)
+          }
+        : null,
     async http(r) {
       const { method, rest } = r
       if (method === 'POST' && rest === '/pair-code') {
@@ -458,6 +472,8 @@ export function createVoice(deps: VoiceDeps): Voice {
         const out = phone.http(d, method, rest.slice('/control'.length), r.query, r.body)
         if (out !== undefined) return out
       }
+      // F-085: what the Update button may install (offer.json, checked against the file): cheap, any time.
+      if (method === 'GET' && rest === '/app') return { offered: await app.offered() }
       if (method === 'POST' && rest === '/ask') return ask(d, r.body)
       const sure = /^\/confirm\/([^/]+)$/.exec(rest)
       if (method === 'POST' && sure) return confirm(d, sure[1], r.body)
@@ -484,6 +500,24 @@ export function createVoice(deps: VoiceDeps): Voice {
     },
     devices: () => devices.map(d => ({ id: d.id, name: d.name, model: d.model, at: d.at, lastSeen: d.lastSeen })),
     phone,
+    async updatePhones() {
+      const offer = await app.offered()
+      if (!offer) return { pushed: false, message: app.reason() ?? 'No build is offered.' }
+      const seen = { versionCode: offer.versionCode, versionName: offer.versionName, bytes: offer.bytes }
+      if (devices.length === 0) return { pushed: false, ...seen, phones: 0, message: 'No phone is paired, so nobody was asked.' }
+      push({ t: 'update', versionCode: offer.versionCode })
+      const lately = devices.filter(d => d.lastSeen && deps.now() - Date.parse(d.lastSeen) < 10 * 60_000).length
+      deps.log?.info(`voice: app: asked ${devices.length} phone(s) to install ${offer.versionName} (${offer.versionCode})`)
+      return {
+        pushed: true,
+        ...seen,
+        phones: devices.length,
+        message:
+          `Asked ${devices.length} paired phone(s) (${lately} in touch in the last 10 minutes) to install ${offer.versionName} (code ${offer.versionCode}). ` +
+          'A phone acts only when its "update from the PC" setting is on, the offered build is newer than the one it runs, and it is unlocked with the screen on (else it waits for his unlock); Android may still ask him to confirm. ' +
+          "The hub does not know which version a phone runs, so it cannot say whether this one is newer for it.",
+      }
+    },
     close: () => phone.close(),
   }
   return voice
