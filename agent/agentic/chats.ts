@@ -24,7 +24,8 @@ export interface PtyLike {
   kill(): void
 }
 
-export type PtySpawn = (file: string, args: string[], opts: { cwd: string; env: Record<string, string>; cols: number; rows: number }) => PtyLike
+/** `id` and `meta` are for a spawn that lives elsewhere (the chat host, F-075), which keeps them with the chat; node-pty ignores them. */
+export type PtySpawn = (file: string, args: string[], opts: { cwd: string; env: Record<string, string>; cols: number; rows: number; id?: string; meta?: Record<string, unknown> }) => PtyLike
 
 /** node-pty, loaded when the first chat starts; null with the reason when it can't be. */
 export function loadNodePty(): { spawn: PtySpawn } | { error: string } {
@@ -69,6 +70,40 @@ const GATE_WINDOW_MS = 15_000
 const MAX_BUFFER_BYTES = 256 * 1024
 /** A chat nobody is looking at and that isn't working is stopped after this long. */
 export const IDLE_REAP_MS = 4 * 60 * 60 * 1000
+/** How often the reaper looks. */
+export const REAP_EVERY_MS = 5 * 60 * 1000
+
+// F-083: work that goes on while the chat sits at its prompt. Claude Code draws it under the input box:
+// "1 shell" / "2 local agents" in the footer, a workflow's bar ("◯ name ▱▱▱▱ 0/5 · 3m45s"), or the line
+// "Waiting for 1 dynamic workflow to finish". Read off the last lines of the screen. A chat with any of
+// these is working, whatever its prompt looks like: it is never taken for idle (the night of 2 Nov: Mobile's chat
+// sat idle at its prompt while its tests ran in a background shell, and the reaper ended both).
+const FOOTER_RES: readonly [RegExp, string][] = [
+  [/\b\d+\s+(?:local\s+|background\s+)?(?:shells?|bash(?:es)?|monitors?)\b/i, 'a background shell'],
+  [/\b\d+\s+(?:local\s+|background\s+|remote\s+)?(?:agents?|tasks?|workflows?|subagents?)\b/i, 'a background task'],
+  [/[▰▱]{6,}/, 'a workflow'],
+]
+const WAITING_RE = /waiting for \d+ (?:dynamic )?workflows? to finish/i
+const BG_RULE_RE = /^\s*[─━]{8,}/
+/**
+ * What background work the screen shows, or null. Pure. The footer is what is drawn under the last rule (the input
+ * box's bottom edge): shells, agents, a workflow's bar. "Waiting for 1 dynamic workflow" is a spinner line above the box.
+ */
+export function backgroundWork(lines: readonly string[]): string | null {
+  let end = lines.length
+  while (end > 0 && !lines[end - 1].trim()) end-- // the screen is as tall as the terminal: the empty rows under the footer are not it
+  const tail = lines.slice(Math.max(0, end - 16), end)
+  let rule = -1
+  for (let i = tail.length - 1; i >= 0; i--) {
+    if (BG_RULE_RE.test(tail[i])) {
+      rule = i
+      break
+    }
+  }
+  for (const l of tail) if (WAITING_RE.test(l)) return 'a workflow'
+  for (const l of tail.slice(rule + 1)) for (const [re, what] of FOOTER_RES) if (re.test(l)) return what
+  return null
+}
 const PASTE_START = '\u001b[200~'
 const PASTE_END = '\u001b[201~'
 
@@ -78,6 +113,8 @@ export interface StartChat {
   agentId: string
   cwd: string
   briefPath: string
+  /** This chat's own --mcp-config (the app's tools plus the MCP servers its agent was given); the shared one when none. */
+  mcpConfig?: string
   model: AgentModel
   /** F-049: claude --effort (low ... max); none: the CLI's own. */
   effort?: string
@@ -85,6 +122,16 @@ export interface StartChat {
   resume: boolean
   cols?: number
   rows?: number
+}
+
+/** F-078: how a chat ended. cause: stopped (by him), idle-reaper, agent-stop (the app stopping: an Update, a restart), exited (it ended itself, code 0), crashed (a non-zero code), ended (no code). */
+export interface ChatEnded {
+  sessionId: string
+  floorId: string
+  agentId: string
+  cause: string
+  code: number | null
+  startedAt: string
 }
 
 export interface Viewer {
@@ -117,12 +164,46 @@ export interface ChatPool {
   read(sessionId: string, lines?: number): string | null
   /** F-050: what its terminal shows now, line by line (a question waiting, the spinner: screen.ts reads them); null when it isn't running. */
   screen(sessionId: string): string[] | null
+  /** M1: is it at a question right now (a menu on its screen)? A guess from words with no menu behind it is put right and counts as no. False when it isn't running here. */
+  asking(sessionId: string): boolean
+  /** Is there unsent text in its idle input box (Shubham is typing there)? Anything pasted would join it. False when it isn't running here. */
+  drafting(sessionId: string): boolean
   /** Pastes `text` and presses Enter (send_to_chat); false when it isn't running. */
   type(sessionId: string, text: string): boolean
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
-  typeWhenReady(sessionId: string, text: string): void
-  kill(sessionId: string): boolean
+  typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
+  kill(sessionId: string, why?: string): boolean
+  /**
+   * F-075: takes hold of a chat that is already running in the chat host (an agent that started after the one that
+   * began it): its terminal, what the host kept of its output (read to find what it is doing), and its key.
+   */
+  adopt(a: AdoptChat, pty: PtyLike, replay: string): ChatInfo
+  /** F-083: what the watchdog reads: when it last printed, when it last did anything, and background work on its status line (a shell, a workflow). null when it isn't running here. */
+  activity(sessionId: string): ChatActivity | null
+  /** F-083: raw keys into the terminal for the app's own use (the watchdog dismissing a harmless menu); unlike input() it is not Shubham looking at the chat. */
+  press(sessionId: string, data: string): boolean
   closeAll(): void
+}
+
+export interface ChatActivity {
+  state: ChatState
+  startedAt: string
+  /** Epoch ms. */
+  lastOutputAt: number
+  lastActiveAt: number
+  background: string | null
+}
+
+/** What the chat host keeps of a chat for the agent that finds it again. */
+export interface AdoptChat {
+  sessionId: string
+  floorId: string
+  agentId: string
+  cwd: string
+  startedAt: string
+  key: string
+  cols: number
+  rows: number
 }
 
 export interface ChatPoolOptions {
@@ -139,6 +220,8 @@ export interface ChatPoolOptions {
   token?: () => string | null
   /** Live set or a chat's state changed. */
   onChange?: () => void
+  /** F-078: a chat ended, and why (chat-log.ts keeps the pattern). */
+  onEnded?: (e: ChatEnded) => void
   env?: NodeJS.ProcessEnv
   /** Ends a process and its children, given when it started. Tests with a fake pty, whose pid is some other process's, pass a no-op. */
   treeKill?: (pid: number, startedAt?: number) => void
@@ -146,6 +229,16 @@ export interface ChatPoolOptions {
   settings?: string
   /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
   addDirs?: string[]
+  /**
+   * F-075: the terminals live in the chat host, which outlives this agent: closeAll() lets go of them instead of
+   * ending them (every other way of stopping a chat still ends it, in the host).
+   */
+  keepOnClose?: boolean
+  /** F-083: true = this chat has work the reaper must not end (an open order, unfinished work). Asked before every reap. */
+  keep?: (sessionId: string) => boolean
+  /** F-083: how long a chat may sit idle and unwatched before it is stopped (IDLE_REAP_MS), and how often that is looked at (REAP_EVERY_MS); tests shorten both. */
+  idleReapMs?: number
+  reapEveryMs?: number
 }
 
 /**
@@ -183,11 +276,19 @@ interface Chat {
   bytes: number
   viewers: Set<Viewer>
   exited: boolean
+  /** F-078: why it is being ended, when the app is the one ending it. */
+  why?: string
   lastSeen: number
+  /** F-083: when it last did anything: a message typed in, a turn starting or ending, output while working, background work on its status line. */
+  lastActive: number
+  /** F-083: when it last printed anything. */
+  lastOutputAt: number
   size: { cols: number; rows: number }
   /** F-050: its terminal as a screen of text, kept as it prints. */
   screen: Screen
   gates: { trust: boolean; trustTries: number; resume: boolean; scan: string; until: number }
+  /** When the state last became 'question' (the grace before a phantom one is corrected). */
+  questionAt?: number
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
@@ -197,7 +298,96 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   let spawnPty = o.spawn ?? null
   const changed = () => o.onChange?.()
 
-  const infoOf = (c: Chat): ChatInfo => ({ ...c.info, state: c.state, viewers: c.viewers.size })
+  const infoOf = (c: Chat): ChatInfo => {
+    settle(c)
+    return { ...c.info, state: c.state, viewers: c.viewers.size }
+  }
+
+  // M1: is a question menu up? Read off the screen as it is drawn now, not off the state, which is guessed from words
+  // ("Do you want me to publish?" in plain prose also looks like a prompt). A real prompt shows a highlighted
+  // numbered option ("❯ 1. Yes", what readMenu reads) and/or its footer ("Enter to confirm · Esc to cancel"); prose has neither.
+  // Those words quoted in a reply (this very sentence) are not a menu: a live menu is the bottom of the screen, where the idle
+  // input box is, so the box drawn BELOW the last such line (rule, "❯" line, rule) means it is only text. Real screens
+  // (screen.test.ts, live chats): idle and working chats always draw that box; a menu replaces it.
+  // Fail-safe: a screen that cannot be read counts as a menu being up.
+  const OPTION_UNDER_CURSOR_RE = /^\s*❯\s*\d{1,2}\.\s+\S/
+  const MENU_FOOTER_RE = /Enter to (?:select|confirm)|Esc to cancel/i
+  const RULE_LINE_RE = /^\s*[─━]{8,}/
+  const INPUT_LINE_RE = /^\s*❯(?!\s*\d{1,2}\.\s)/
+  /** Whether an idle input box is drawn from line `from` on: a rule, the "❯" line (typed text may run on a few lines), a rule. */
+  function inputBoxBelow(lines: string[], from: number): boolean {
+    for (let j = from + 1; j < lines.length; j++) {
+      if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
+      for (let k = j + 1; k < Math.min(lines.length, j + 9); k++) if (RULE_LINE_RE.test(lines[k])) return true
+    }
+    return false
+  }
+  /**
+   * What is typed in the idle input box (the lowest one drawn) and not sent yet: a draft. '' when no box is drawn or it is empty.
+   * claude's own grey suggestion for a fresh chat ('Try "write a test"') is not a draft. Anything pasted now would join it,
+   * and the Enter would send both as one message.
+   */
+  function boxText(lines: string[]): string {
+    for (let j = lines.length - 1; j >= 1; j--) {
+      if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
+      let end = -1
+      for (let k = j + 1; k < Math.min(lines.length, j + 9); k++) {
+        if (RULE_LINE_RE.test(lines[k])) {
+          end = k
+          break
+        }
+      }
+      if (end < 0) continue
+      const text = [lines[j].replace(/^\s*❯/, ''), ...lines.slice(j + 1, end)].join(' ').replace(/\s+/g, ' ').trim()
+      return /^Try "/.test(text) ? '' : text
+    }
+    return ''
+  }
+  function draftOnScreen(c: Chat): boolean {
+    try {
+      return !menuOnScreen(c) && boxText(c.screen.lines()) !== ''
+    } catch {
+      return false
+    }
+  }
+  function menuOnScreen(c: Chat): boolean {
+    try {
+      const lines = c.screen.lines()
+      let last = -1
+      for (let i = lines.length - 1; i >= 0 && last < 0; i--) if (OPTION_UNDER_CURSOR_RE.test(lines[i]) || MENU_FOOTER_RE.test(lines[i])) last = i
+      if (last < 0) return false
+      return !inputBoxBelow(lines, last)
+    } catch {
+      return true
+    }
+  }
+
+  /** A state of 'question' that no menu backs is a phantom: put right (working if it can be interrupted, else idle). */
+  function correct(c: Chat) {
+    const running = (() => {
+      try {
+        return c.screen.lines().some(l => /esc to interrupt/i.test(l))
+      } catch {
+        return false
+      }
+    })()
+    c.state = running ? 'running' : 'idle'
+    log?.info(`chat ${c.info.sessionId.slice(0, 8)}: it was taken for a question but no menu is on its screen (plain words); now ${c.state}`)
+    changed()
+  }
+
+  /** What is shown to others (Approvals, the roster, the phone): a phantom question is corrected once it has stood a few seconds (a prompt still being drawn is not). */
+  function settle(c: Chat) {
+    if (c.state !== 'question' || Date.now() - (c.questionAt ?? 0) < 3_000 || menuOnScreen(c)) return
+    correct(c)
+  }
+
+  /** Whether typing into it is refused right now: a menu is up, whatever the state says. A phantom 'question' with no menu is corrected and allowed. */
+  function blocked(c: Chat): boolean {
+    if (menuOnScreen(c)) return true
+    if (c.state === 'question') correct(c)
+    return false
+  }
 
   function noteState(c: Chat, chunk: string) {
     const clean = strip(chunk).replace(/\s+/g, '')
@@ -212,7 +402,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     if (TURN_QUESTION_RE.test(t)) c.state = 'question'
     else if (TURN_RUNNING_RE.test(t)) c.state = 'running'
     else if (TURN_DONE_RE.test(t) || TURN_IDLE_RE.test(t)) c.state = 'idle'
-    if (c.state !== before) changed()
+    if (c.state === 'question' && before !== 'question') c.questionAt = Date.now()
+    if (c.state !== before) {
+      c.lastActive = Date.now() // a turn started or ended
+      changed()
+    }
   }
 
   function answerGates(c: Chat, chunk: string) {
@@ -277,6 +471,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     c.exited = true
     keys.delete(c.key)
     if (chats.get(c.info.sessionId) === c) chats.delete(c.info.sessionId)
+    try {
+      o.onEnded?.({ sessionId: c.info.sessionId, floorId: c.info.floorId, agentId: c.info.agentId, cause: c.why ?? (code === 0 ? 'exited' : code === null ? 'ended' : 'crashed'), code, startedAt: c.info.startedAt })
+    } catch {
+      // The log is the log's trouble.
+    }
     for (const v of c.viewers) {
       try {
         v.send({ t: 'exit', code })
@@ -289,6 +488,31 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     changed()
   }
 
+  /** The chat's terminal feeds its buffer, its screen, its state and its viewers. */
+  function register(c: Chat) {
+    const pty = c.pty
+    chats.set(c.info.sessionId, c)
+    keys.set(c.key, c)
+    pty.onData(data => {
+      c.buffer.push(data)
+      c.bytes += data.length
+      while (c.bytes > MAX_BUFFER_BYTES && c.buffer.length > 1) c.bytes -= c.buffer.shift()!.length
+      c.screen.write(data)
+      noteState(c, data)
+      c.lastOutputAt = Date.now()
+      if (c.state === 'running') c.lastActive = c.lastOutputAt
+      answerGates(c, data)
+      for (const v of c.viewers) {
+        try {
+          v.send({ t: 'out', d: data })
+        } catch {
+          // That page is gone; its detach follows.
+        }
+      }
+    })
+    pty.onExit(e => finish(c, typeof e?.exitCode === 'number' ? e.exitCode : null))
+  }
+
   function bufferText(c: Chat) {
     return strip(c.buffer.join('')).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   }
@@ -296,22 +520,92 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function paste(c: Chat, text: string) {
     // A paste, not keystrokes: the TUI takes it whole, newlines in it are text, and Enter
     // follows separately (in the same chunk it would be a newline in the paste).
+    // M1: Enter at a permission prompt or a menu picks the highlighted option, an approval nobody tapped.
+    // So nothing is pasted while the chat asks, and the Enter is skipped if it began to ask in the 300 ms between.
+    // This one guard covers every way in (the tools, the chat view, the heartbeat, a member PC's 'type', the chat host).
+    // Approvals answer a question on purpose with input(), not with this.
+    if (blocked(c)) return false
     if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false
-    setTimeout(() => write(c, '\r'), 300).unref()
+    c.lastActive = Date.now()
+    setTimeout(() => {
+      if (blocked(c)) {
+        log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: it began to ask a question just after a message was pasted; Enter was not pressed`)
+        return
+      }
+      write(c, '\r')
+    }, 300).unref()
     return true
   }
 
-  // Stop chats nobody is watching that have sat idle for IDLE_REAP_MS.
-  const reaper = setInterval(() => {
-    const t = Date.now()
-    for (const c of [...chats.values()]) {
-      if (!c.viewers.size && c.state !== 'running' && t - c.lastSeen > IDLE_REAP_MS) {
-        log?.info(`chat ${c.info.sessionId.slice(0, 8)}: stopped after ${IDLE_REAP_MS / 3_600_000} h unwatched and idle`)
-        killTree(c)
-        finish(c, null)
+  /** Types `text` once the chat is at its prompt: waits past start-up questions and past any later question (never drops it for that). */
+  function typeWhenReady(id: string, text: string, opt?: { holdForDraft?: boolean }) {
+    const born = Date.now()
+    let since = born
+    const poll = setInterval(() => {
+      const c = chats.get(id)
+      if (!c || c.exited || Date.now() - since > 90_000 || Date.now() - born > 6 * 3_600_000) {
+        clearInterval(poll)
+        if (c && !c.exited) log?.warn(`chat ${id.slice(0, 8)}: never reached its prompt; a message for it was dropped`)
+        return
       }
+      // At a question the clock stands still: the message waits for the answer.
+      if (blocked(c)) {
+        since = Date.now()
+        return
+      }
+      // For a message from the app (a nudge): never into a draft he is typing; the clock stands still for that too.
+      if (opt?.holdForDraft && draftOnScreen(c)) {
+        since = Date.now()
+        return
+      }
+      // What is on screen now: a gate answered a minute ago is still in the scrollback.
+      const tail = bufferText(c).slice(-4000).replace(/\s+/g, '')
+      if (TRUST_GATE_RE.test(tail) || !PROMPT_READY_RE.test(tail)) return
+      clearInterval(poll)
+      setTimeout(() => {
+        if (c.exited) return
+        if (opt?.holdForDraft && draftOnScreen(c)) return typeWhenReady(id, text, opt)
+        if (!paste(c, text) && menuOnScreen(c)) typeWhenReady(id, text, opt)
+      }, 800).unref()
+    }, 400)
+    poll.unref()
+  }
+
+  function backgroundOf(c: Chat): string | null {
+    try {
+      return backgroundWork(c.screen.lines())
+    } catch {
+      return null
     }
-  }, 5 * 60 * 1000)
+  }
+
+  // Stop chats nobody is watching that have really sat idle for IDLE_REAP_MS. F-083: "idle" is no message typed or
+  // pasted, no turn, no output while working, for that long, and no background work on its status line, no question
+  // up, no open order or unfinished work (o.keep). The night of 2 Nov the old rule (nobody had the chat open and it
+  // was not "running" this second) ended chats that were working through messages, and Mobile's during its tests.
+  const idleMs = o.idleReapMs ?? IDLE_REAP_MS
+  function reapOnce(t = Date.now()) {
+    for (const c of [...chats.values()]) {
+      if (c.exited || c.viewers.size || c.state === 'running' || c.state === 'question') continue
+      if (backgroundOf(c)) {
+        c.lastActive = t
+        continue
+      }
+      if (t - Math.max(c.lastSeen, c.lastActive) <= idleMs) continue
+      let keep = false
+      try {
+        keep = o.keep?.(c.info.sessionId) === true
+      } catch {
+        keep = true // when in doubt, do not end a chat
+      }
+      if (keep) continue
+      log?.info(`chat ${c.info.sessionId.slice(0, 8)}: stopped after ${Math.round(idleMs / 360_000) / 10} h unwatched and idle`)
+      c.why = 'idle-reaper'
+      killTree(c)
+      finish(c, null)
+    }
+  }
+  const reaper = setInterval(reapOnce, o.reapEveryMs ?? REAP_EVERY_MS)
   reaper.unref()
 
   return {
@@ -338,7 +632,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const token = o.token?.()
       if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
 
-      const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', o.mcpConfig]
+      const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
       // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
       for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
       if (s.model) args.push('--model', s.model)
@@ -347,10 +641,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const file = /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }
-      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows })
+      const startedAt = new Date().toISOString()
+      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt } satisfies Record<string, unknown> })
 
       const c: Chat = {
-        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt: new Date().toISOString() },
+        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt },
         pty,
         key,
         state: 'idle',
@@ -360,28 +655,13 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         viewers: new Set(),
         exited: false,
         lastSeen: Date.now(),
+        lastActive: Date.now(),
+        lastOutputAt: Date.now(),
         size,
         screen: createScreen(size.cols, size.rows),
         gates: { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
       }
-      chats.set(s.sessionId, c)
-      keys.set(key, c)
-      pty.onData(data => {
-        c.buffer.push(data)
-        c.bytes += data.length
-        while (c.bytes > MAX_BUFFER_BYTES && c.buffer.length > 1) c.bytes -= c.buffer.shift()!.length
-        c.screen.write(data)
-        noteState(c, data)
-        answerGates(c, data)
-        for (const v of c.viewers) {
-          try {
-            v.send({ t: 'out', d: data })
-          } catch {
-            // That page is gone; its detach follows.
-          }
-        }
-      })
-      pty.onExit(e => finish(c, typeof e?.exitCode === 'number' ? e.exitCode : null))
+      register(c)
       log?.info(`chat ${s.sessionId.slice(0, 8)}: ${s.resume ? 'resumed' : 'started'} in ${s.cwd}`)
       changed()
       return infoOf(c)
@@ -396,7 +676,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
     states() {
       const out: Record<string, ChatState> = {}
-      for (const c of chats.values()) if (!c.exited) out[c.info.sessionId] = c.state
+      for (const c of chats.values()) {
+        if (c.exited) continue
+        settle(c)
+        out[c.info.sessionId] = c.state
+      }
       return out
     },
 
@@ -465,40 +749,88 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       return c && !c.exited ? c.screen.lines() : null
     },
 
+    drafting(id) {
+      const c = chats.get(id)
+      return !!c && !c.exited && draftOnScreen(c)
+    },
+
+    asking(id) {
+      const c = chats.get(id)
+      return !!c && !c.exited && blocked(c)
+    },
+
     type(id, text) {
       const c = chats.get(id)
       return !!c && !c.exited && paste(c, text)
     },
 
-    typeWhenReady(id, text) {
-      const started = Date.now()
-      const poll = setInterval(() => {
-        const c = chats.get(id)
-        if (!c || c.exited || Date.now() - started > 90_000) {
-          clearInterval(poll)
-          if (c && !c.exited) log?.warn(`chat ${id.slice(0, 8)}: never reached its prompt; a message for it was dropped`)
-          return
-        }
-        // What is on screen now: a gate answered a minute ago is still in the scrollback.
-        const tail = bufferText(c).slice(-4000).replace(/\s+/g, '')
-        if (TRUST_GATE_RE.test(tail) || !PROMPT_READY_RE.test(tail)) return
-        clearInterval(poll)
-        setTimeout(() => paste(c, text), 800).unref()
-      }, 400)
-      poll.unref()
-    },
+    typeWhenReady,
 
-    kill(id) {
+    kill(id, why = 'stopped') {
       const c = chats.get(id)
       if (!c || c.exited) return false
+      c.why = why
       killTree(c)
       finish(c, null)
       return true
     },
 
+    adopt(a, pty, replay) {
+      const existing = chats.get(a.sessionId)
+      if (existing && !existing.exited) return infoOf(existing)
+      const size = { cols: a.cols, rows: a.rows }
+      const c: Chat = {
+        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, cwd: a.cwd, startedAt: a.startedAt },
+        pty,
+        key: a.key,
+        state: 'idle',
+        carry: '',
+        buffer: replay ? [replay] : [],
+        bytes: replay.length,
+        viewers: new Set(),
+        exited: false,
+        lastSeen: Date.now(),
+        lastActive: Date.now(),
+        lastOutputAt: Date.now(),
+        size,
+        screen: createScreen(size.cols, size.rows),
+        // Long past its start gates (and nobody but a person answers a question that comes later).
+        gates: { trust: false, trustTries: 0, resume: false, scan: '', until: 0 },
+      }
+      // What it was doing, read off what it printed (a menu waiting, the spinner): in slices, as it came.
+      for (let i = 0; i < replay.length; i += 16 * 1024) {
+        const part = replay.slice(i, i + 16 * 1024)
+        c.screen.write(part)
+        noteState(c, part)
+      }
+      register(c)
+      log?.info(`chat ${a.sessionId.slice(0, 8)}: taken over from the chat host (${c.state})`)
+      changed()
+      return infoOf(c)
+    },
+
+    activity(id) {
+      const c = chats.get(id)
+      if (!c || c.exited) return null
+      settle(c)
+      return { state: c.state, startedAt: c.info.startedAt, lastOutputAt: c.lastOutputAt, lastActiveAt: Math.max(c.lastActive, c.lastSeen), background: backgroundOf(c) }
+    },
+
+    press(id, data) {
+      const c = chats.get(id)
+      return !!c && !c.exited && write(c, data)
+    },
+
     closeAll() {
       clearInterval(reaper)
+      if (o.keepOnClose) {
+        // The terminals are the host's and go on; only this agent's hold on them ends.
+        chats.clear()
+        keys.clear()
+        return
+      }
       for (const c of [...chats.values()]) {
+        c.why = 'agent-stop'
         killTree(c)
         finish(c, null)
       }

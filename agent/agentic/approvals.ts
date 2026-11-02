@@ -3,7 +3,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, s
 import path from 'node:path'
 import type { ApprovalLogEntry } from '../../shared/approvals.ts'
 import type { ChatMenu } from '../../shared/chat.ts'
-import { readMenu } from './screen.ts'
+import { findMenu } from './screen.ts'
 
 // F-076: reading what a waiting chat asks, from its screen text, and the log of what was answered and sent.
 
@@ -19,15 +19,16 @@ const CONTEXT_LINES = 28
  */
 export function promptOf(screen: string): { menu: ChatMenu | null; context: string; id: string } {
   const lines = screen.split(/\r?\n/)
-  const menu = readMenu(lines)
-  const clean = lines
-    .map(l => l.replace(BOX, ' ').replace(RULES, ' ').replace(/\s+$/, '').replace(/^\s{0,2}/, ''))
-    .filter(l => l.trim() !== '')
-  // The context is what comes before the first option (or the end of the screen when there is no menu).
-  const first = menu ? clean.findIndex(l => /^\s*(?:❯\s*)?\d{1,2}\.\s+\S/.test(l)) : -1
-  const upto = first >= 0 ? first : clean.length
-  const context = clean.slice(Math.max(0, upto - CONTEXT_LINES), upto).join('\n').trim()
-  const basis = JSON.stringify({ context, q: menu?.question ?? '', o: menu?.options.map(o => [o.n, o.label]) ?? [] })
+  const found = findMenu(lines)
+  const menu = found?.menu ?? null
+  const tidy = (rows: string[]) =>
+    rows
+      .map(l => l.replace(BOX, ' ').replace(RULES, ' ').replace(/\s+$/, '').replace(/^\s{0,2}/, ''))
+      .filter(l => l.trim() !== '')
+  // The context is what comes before the menu's first option (or the whole screen when there is no menu to press).
+  const clean = tidy(found ? lines.slice(0, found.first) : lines)
+  const context = clean.slice(Math.max(0, clean.length - CONTEXT_LINES)).join('\n').trim()
+  const basis = JSON.stringify({ context, q: menu?.question ?? '', h: menu?.hint ?? '', o: menu?.options.map(o => [o.n, o.label]) ?? [] })
   return { menu, context, id: createHash('sha1').update(basis).digest('hex').slice(0, 16) }
 }
 

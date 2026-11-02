@@ -1,3 +1,4 @@
+import type { Signed } from './approval-sign.ts'
 import type { ChatMenu } from './chat.ts'
 import type { ChatState } from './agentic.ts'
 
@@ -54,6 +55,8 @@ export interface AnswerRequest {
   sessionId: string
   id: string
   n: number
+  /** The registered approval device's signature (shared/approval-sign.ts). */
+  sig?: Signed
 }
 
 /** POST /agentic/send-as-me: his words, typed into the chat as plain input. */
@@ -63,11 +66,25 @@ export interface SendAsMeRequest {
   text: string
   /** The prepared card this came from (it is dropped once sent). */
   card?: string
+  /** The registered approval device's signature over the target and the words. */
+  sig?: Signed
+}
+
+/** F-081: "Apply new builds automatically when quiet" (auto-update.json on the hub; the guard applies, this agent keeps the switch). */
+export interface AutoUpdateStatus {
+  on: boolean
+  changedAt: string | null
+  changedBy: string
+  /** The guard's last automatic update. */
+  lastApplied: { at: string; from: string; to: string; note: string } | null
+  /** The guard's last look that found it not quiet (or otherwise held off), and why. */
+  lastSkipped: { at: string; why: string } | null
 }
 
 export interface ApprovalLogEntry {
   at: string
-  kind: 'answer' | 'send'
+  /** answer: a prompt answered; send: his words sent; device: an approval device registered or removed, or the old way switched. */
+  kind: 'answer' | 'send' | 'device'
   floor: string
   agent: string
   pc: string

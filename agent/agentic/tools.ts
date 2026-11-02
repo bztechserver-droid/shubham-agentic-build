@@ -275,6 +275,12 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: 'watchdog_status',
+    description:
+      "The app's own watchdog (F-083), which checks every chat on every floor every 5 minutes without the Assistant: when it last looked and when it looks next, what it found (chats started again after a crash or an update, a harmless menu dismissed, a restart held back for memory, a chat down or silent), and which chats are down now. Use this to tell Shubham whether any chat is down or stuck.",
+    inputSchema: none,
+  },
+  {
     name: 'agent_hire',
     description:
       "Create a NEW AGENT on your floor, reporting to you. BOSS ONLY. Use it when the work in front of you needs an owner that does not exist yet — a reviewer, a migration specialist, somebody to own one subsystem. The `md` you write IS that agent's brief: it is what the agent is told about itself when its chat starts, so write what it owns, what it must not touch, and how it should report back. Hire deliberately, one at a time, for work you are about to give it. Names must be unique on the floor. No chat is started: the human opens it from the floor.",

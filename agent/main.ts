@@ -7,7 +7,7 @@ import { agenticOff, createAgentic } from './agentic/index.ts'
 import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
-import { createBuild, findDevDir, type Build } from './build.ts'
+import { createBuild, findDevDir, type Build, type ChatHostGate } from './build.ts'
 import { createBridge } from './claude/bridge.ts'
 import { CrmError } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
@@ -15,6 +15,7 @@ import { CHECK_EVERY_MS, createClaudeSubscription, TOKEN_VAR } from './claude/in
 import { startRowWatch } from './claude/rowwatch.ts'
 import { loadUserEnv } from './claude/userenv.ts'
 import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './config.ts'
+import { ensureChatHost } from './chathost/ensure.ts'
 import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
@@ -77,6 +78,21 @@ export interface AgentExtras {
   devDir?: string | null
   /** False: the Agents section is off here (Dev beside the build, which runs the chats). On when left out. */
   agents?: boolean
+  /** F-078: the newer build waiting for Update now, if there is one (the heartbeat tells the Assistant). */
+  newerBuild?: () => string | null
+  /** F-078: the build running now, for the morning summary. */
+  currentBuild?: () => string | null
+  /** F-075: set here once the chats run in the chat host, for the update to ask about it (build.ts). */
+  chatHostGate?: { current: ChatHostGate | null }
+}
+
+/**
+ * F-075: is the chat host on? SAD_CHAT_HOST=on (or off, which wins) in the environment, else the file
+ * <state>/agent/chat-host.on exists (the switch: create it to turn the host on at the next start, delete it to turn it off).
+ */
+export function chatHostWanted(agentDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.SAD_CHAT_HOST === 'off') return false
+  return env.SAD_CHAT_HOST === 'on' || existsSync(path.join(agentDir, 'chat-host.on'))
 }
 
 export async function startAgent(config: Config, log: Logger = rootLog, extras: AgentExtras = {}): Promise<Agent> {
@@ -141,6 +157,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // Tests (e2e step 11): a pretend claude, and a scratch Claude folder for its conversations
   // and ~/.claude.json, so the real ones are never touched.
   const testClaudeHome = process.env.SAD_TEST_CLAUDE_HOME || null
+  // F-075: the chats' terminals in the chat host, which outlives this agent (Update now no longer stops a chat).
+  // Off unless SAD_CHAT_HOST=on; if the host can't be had, the chats run in this process as they always did.
+  const chatHost =
+    extras.agents !== false && chatHostWanted(paths.agent)
+      ? await ensureChatHost({ buildRoot: path.resolve(import.meta.dirname, '..'), stateRoot: paths.root, token, log: log.child('chathost'), port: Number(process.env.SAD_CHAT_HOST_PORT) || undefined })
+      : null
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
@@ -149,8 +171,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     claudeJson: testClaudeHome ? path.join(testClaudeHome, '.claude.json') : undefined,
     apiUrl: () => `http://127.0.0.1:${api?.port ?? ports.api}${AGENT_API_PREFIX}`,
     log: log.child('agentic'),
+    chatHost,
+    newerBuild: () => extras.newerBuild?.() ?? null,
+    currentBuild: () => extras.currentBuild?.() ?? null,
     // F-058: under the guard, the chats that were open when the app last stopped come back.
-    resumeChats: process.env.SAD_RESUME_CHATS === '1',
+    // With the chat host, the list is also what brings the chats back when the host itself changes with an update.
+    resumeChats: process.env.SAD_RESUME_CHATS === '1' || !!chatHost,
     token: () => {
       try {
         return userEnv?.get(TOKEN_VAR) || null
@@ -175,6 +201,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       },
     },
   })
+  if (agentic && chatHost && extras.chatHostGate) {
+    extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
+  }
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
   // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this
@@ -693,7 +722,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(agentic ? [agentic.voiceMount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -804,7 +833,9 @@ if (import.meta.main) {
     // F-020: which build this is, its updates, and Publish on the hub where Dev is beside it.
     const root = path.resolve(import.meta.dirname, '..')
     const devDir = findDevDir(root)
+    const hostGate: { current: ChatHostGate | null } = { current: null }
     build = createBuild({
+      chatHostGate: hostGate,
       root,
       devDir,
       role: () => config.role,
@@ -815,7 +846,7 @@ if (import.meta.main) {
     // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).
     const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
-    agent = await startAgent(config, log, { mounts: [build.mount], devDir, agents })
+    agent = await startAgent(config, log, { mounts: [build.mount], devDir, agents, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app's Devices page talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

@@ -18,6 +18,8 @@ export interface BuildVersion {
   builtAt: string
   /** F-026: a fingerprint of Dev's files it was built from (its commit, its changes, its new files); null for builds from before. */
   devHash: string | null
+  /** F-075: the chat host this build ships (its wire protocol and code version); absent in builds from before it. */
+  chatHost?: { protocol: number; version: number } | null
 }
 
 export type UpdateState = 'unknown' | 'checking' | 'up-to-date' | 'available' | 'failed'
@@ -39,6 +41,11 @@ export interface BuildInfo {
     /** It can update itself: a build, a clone of the build repo, started by Start.cmd. When not, why. */
     can: boolean
     cannot: string | null
+    /**
+     * F-075: Update was pressed and the chat host changes with it, so it waits for the chats to be idle (10 minutes), then
+     * asks (`ask`): the chats are restarted and resumed if it is confirmed (POST /update {force: true}). Null: not waiting.
+     */
+    hostWait?: { since: string; busy: number; ask: boolean } | null
   }
   /** Publishing, on the hub that has Dev; null elsewhere. */
   publish: {

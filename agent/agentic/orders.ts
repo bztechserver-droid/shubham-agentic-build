@@ -62,8 +62,8 @@ export interface Scan {
  * Where an order began in a transcript and what the agent wrote after it: the order's message carries
  * ", order <id>]"; the answer is the last text the agent wrote before anything else was said to it.
  */
-export function scanMessages(msgs: { role: string; text: string }[], id: string): Scan {
-  const mark = `, order ${id}]`
+export function scanMessages(msgs: { role: string; text: string }[], id: string, word = 'order'): Scan {
+  const mark = `, ${word} ${id}]`
   let at = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].role === 'user' && msgs[i].text.includes(mark)) {

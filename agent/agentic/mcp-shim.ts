@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline'
+import { retryWhileRefused } from './mcp-retry.ts'
 import { TOOLS } from './tools.ts'
 
 // F-018: the MCP server each agent's chat runs (claude starts it from the --mcp-config file
@@ -12,6 +13,8 @@ import { TOOLS } from './tools.ts'
 const url = process.env.SAD_AGENTIC_URL ?? ''
 const key = process.env.SAD_AGENTIC_KEY ?? ''
 const CALL_TIMEOUT_MS = 120_000
+/** F-075: how long a call waits for an agent that is restarting (an update) before it says it can't reach it. */
+const AGENT_AWAY_WAIT_MS = 90_000
 
 type Id = string | number | null
 
@@ -26,12 +29,16 @@ function fail(id: Id, code: number, message: string) {
 async function call(name: string, args: unknown): Promise<{ text: string; isError: boolean }> {
   if (!url || !key) return { text: "This chat wasn't started by Shubham Agentic, so its tools can't reach the floor.", isError: true }
   try {
-    const res = await fetch(`${url}/call`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-sad-chat-key': key },
-      body: JSON.stringify({ name, arguments: args ?? {} }),
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-    })
+    const res = await retryWhileRefused(
+      () =>
+        fetch(`${url}/call`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-sad-chat-key': key },
+          body: JSON.stringify({ name, arguments: args ?? {} }),
+          signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+        }),
+      { maxWaitMs: AGENT_AWAY_WAIT_MS },
+    )
     const data = (await res.json().catch(() => ({}))) as { text?: unknown; error?: unknown }
     if (!res.ok) return { text: typeof data.error === 'string' ? data.error : `The agent answered ${res.status}`, isError: true }
     return { text: typeof data.text === 'string' ? data.text : JSON.stringify(data), isError: false }

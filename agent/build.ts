@@ -62,6 +62,16 @@ export function testCountOf(summary: string): string | null {
   return pass ? `${pass} tests` : null
 }
 
+/** F-075: what the update needs to know of the chat host that runs now. */
+export interface ChatHostGate {
+  protocol: number
+  version: number
+  /** Chats that are in the middle of something (running or asking). */
+  busy(): number
+  /** Lets go of the host's chats for good: they are written to the open-chats list, then ended, and come back resumed after the update. */
+  retire(): Promise<void>
+}
+
 export interface BuildOptions {
   /** The folder this agent runs from (the repo or build root). */
   root: string
@@ -76,6 +86,11 @@ export interface BuildOptions {
   /** Tests: a fake git, and the command publish runs. */
   git?: Git
   publishCommand?: (devDir: string, req: PublishRequest) => { file: string; args: string[] }
+  /** F-075: set once the agent runs its chats in the chat host. */
+  chatHostGate?: { current: ChatHostGate | null }
+  /** Tests: how long an update waits for idle chats before it asks (10 min), and how often it looks (5 s). */
+  hostWaitMs?: number
+  hostPollMs?: number
 }
 
 export interface Build {
@@ -102,6 +117,8 @@ export function parseVersion(text: string): BuildVersion | null {
     dirty: v.dirty === true,
     builtAt: v.builtAt,
     devHash: typeof v.devHash === 'string' ? v.devHash : null,
+    // F-075: only when the build says so (builds from before it have no such field).
+    ...(isObject(v.chatHost) && typeof v.chatHost.protocol === 'number' && typeof v.chatHost.version === 'number' ? { chatHost: { protocol: v.chatHost.protocol, version: v.chatHost.version } } : {}),
   }
 }
 
@@ -173,18 +190,21 @@ export function createBuild(o: BuildOptions): Build {
           ? 'This build was not started by its Start.cmd, so it cannot start itself again: run Update.cmd, then Start.cmd.'
           : null
 
-  const update: BuildInfo['update'] = { state: 'unknown', available: null, checkedAt: null, error: null, can: cannot === null, cannot }
+  const update: BuildInfo['update'] = { state: 'unknown', available: null, checkedAt: null, error: null, can: cannot === null, cannot, hostWait: null }
   const publish: NonNullable<BuildInfo['publish']> | null = o.devDir
     ? { devDir: o.devDir, devCommit: null, devChanges: 0, pending: null, newest: null, state: 'idle', startedAt: null, endedAt: null, log: [], published: null, error: null }
     : null
   let running: ChildProcess | null = null
+  /** F-075: Update is waiting for the chats to be idle because the chat host changes with it. */
+  let hostWait: { since: number; ask: boolean } | null = null
+  let hostTimer: NodeJS.Timeout | null = null
   let checking: Promise<BuildInfo> | null = null
 
   const info = (): BuildInfo => ({
     kind,
     root: o.root,
     current,
-    update: { ...update },
+    update: { ...update, hostWait: hostWait ? { since: new Date(hostWait.since).toISOString(), busy: o.chatHostGate?.current?.busy() ?? 0, ask: hostWait.ask } : null },
     publish: publish && o.role() === 'hub' ? { ...publish, ...pendingNow(), log: [...publish.log] } : null,
   })
 
@@ -284,12 +304,68 @@ export function createBuild(o: BuildOptions): Build {
     return info()
   }
 
-  function startUpdate() {
+  /** Does the host that runs differ from the one the newer build ships? (A build without one is a change too: it could not take the chats over.) */
+  const hostChanges = (g: ChatHostGate) => {
+    // Nothing known of a newer build (Update pressed without one): nothing to compare, nothing changes.
+    if (!update.available) return false
+    const next = update.available.chatHost
+    return !next || next.protocol !== g.protocol || next.version !== g.version
+  }
+
+  function go(retire: ChatHostGate | null) {
+    if (hostTimer) clearInterval(hostTimer)
+    hostTimer = null
+    hostWait = null
+    // Answer first; then go, and Start.cmd (or the guard) takes it from here.
+    void (async () => {
+      if (retire) {
+        try {
+          log?.info('updating: the chat host changes with this build; its chats are saved and ended, and come back resumed')
+          await retire.retire()
+        } catch (e) {
+          log?.warn(`updating: could not retire the chat host: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+      setTimeout(() => o.restart(UPDATE_EXIT_CODE), 300).unref()
+    })()
+  }
+
+  function startUpdate(body?: unknown) {
     if (!update.can) throw apiError(409, update.cannot ?? "This PC can't update itself")
+    const g = o.chatHostGate?.current ?? null
+    const force = isObject(body) && body.force === true
+    if (g && hostChanges(g)) {
+      if (!force && g.busy() > 0) {
+        // F-075: not while a chat is mid-answer: wait for them to be idle, then ask.
+        if (!hostWait) {
+          hostWait = { since: Date.now(), ask: false }
+          log?.info(`updating: the chat host changes with this build and ${g.busy()} chat(s) are busy; waiting for them to be idle`)
+          hostTimer = setInterval(() => {
+            const gate = o.chatHostGate?.current
+            if (!hostWait || !gate) return
+            if (gate.busy() === 0) return go(gate)
+            if (!hostWait.ask && Date.now() - hostWait.since >= (o.hostWaitMs ?? 10 * 60_000)) {
+              hostWait.ask = true
+              log?.info('updating: the chats are still busy after the wait; asking on the Build page')
+            }
+          }, o.hostPollMs ?? 5000)
+          hostTimer.unref()
+        }
+        return { ...info(), restarting: false }
+      }
+      go(g)
+      return { ...info(), restarting: true }
+    }
     log?.info('updating: restarting so Start.cmd pulls the new build')
-    // Answer first; then go, and Start.cmd takes it from here.
-    setTimeout(() => o.restart(UPDATE_EXIT_CODE), 300).unref()
+    go(null)
     return { ...info(), restarting: true }
+  }
+
+  function cancelUpdate() {
+    if (hostTimer) clearInterval(hostTimer)
+    hostTimer = null
+    hostWait = null
+    return info()
   }
 
   const first = setTimeout(() => void check(), FIRST_CHECK_MS)
@@ -304,7 +380,8 @@ export function createBuild(o: BuildOptions): Build {
   const routes: Record<string, (r: MountRequest) => unknown> = {
     'GET /info': () => info(),
     'POST /check': () => check(),
-    'POST /update': () => startUpdate(),
+    'POST /update': r => startUpdate(r.body),
+    'POST /update-cancel': () => cancelUpdate(),
     'POST /publish': r => startPublish(isObject(r.body) && r.body.skipChecks === true ? { skipChecks: true } : {}),
   }
 
@@ -322,6 +399,7 @@ export function createBuild(o: BuildOptions): Build {
     close() {
       clearTimeout(first)
       clearInterval(every)
+      if (hostTimer) clearInterval(hostTimer)
       if (devEvery) clearInterval(devEvery)
       running?.kill()
     },

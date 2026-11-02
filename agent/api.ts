@@ -155,6 +155,13 @@ export interface ApiMount {
   /** Its WebSocket at `rest`, run once accepted; null when it has none there (404). */
   ws?(rest: string, query: URLSearchParams): ((socket: WsSocket) => void) | null
   /**
+   * F-074: a WebSocket of this mount that carries its OWN credential (a paired phone's device key) in place of the
+   * app token. For `rest` that is one, says whether the handshake's headers hold a valid key; null for any other
+   * path, which keeps the app token's rules exactly as they were. For such a path the app token alone is refused,
+   * and so is any Origin (a browser page).
+   */
+  wsKey?(rest: string, headers: IncomingMessage['headers']): boolean | null
+  /**
    * F-054: a path that answers by itself, with the raw request and response (a proxy: any method, a
    * body that isn't JSON, an answer that is streamed). Guarded like the JSON routes (a page on this
    * PC, with x-sad-token) before it runs; null when `rest` isn't one. An apiError it throws is
@@ -719,9 +726,16 @@ export function startApi(o: ApiOptions): Promise<Api> {
     const mount = mountOf(path)
     const mountWs = mount?.ws?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url.searchParams) ?? null
     if (path !== `${AGENT_API_PREFIX}/ws` && path !== keysPath && !remote && !mountWs) return refuse(socket, 404, `No WebSocket at ${path}`)
-    // The proxy keeps the browser's own Origin on a WebSocket (changeOrigin rewrites Host only).
-    if (foreignOrigin(req)) return refuse(socket, 403, 'WebSockets from pages on other sites are refused')
-    if (!tokenOk(req.headers['x-sad-token'], o.token)) return refuse(socket, 401, 'Missing or wrong x-sad-token')
+    // F-074: a path that answers to a device key (the phone's /voice/live) and to nothing else: no app token, no browser page.
+    const keyed = mount && mountWs ? (mount.wsKey?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), req.headers) ?? null) : null
+    if (keyed !== null) {
+      if (req.headers.origin !== undefined) return refuse(socket, 403, 'Not for pages')
+      if (!keyed) return refuse(socket, 401, 'Missing or invalid device key')
+    } else {
+      // The proxy keeps the browser's own Origin on a WebSocket (changeOrigin rewrites Host only).
+      if (foreignOrigin(req)) return refuse(socket, 403, 'WebSockets from pages on other sites are refused')
+      if (!tokenOk(req.headers['x-sad-token'], o.token)) return refuse(socket, 401, 'Missing or wrong x-sad-token')
+    }
     const key = req.headers['sec-websocket-key']
     const upgrade = String(req.headers.upgrade ?? '').toLowerCase()
     if (upgrade !== 'websocket' || req.headers['sec-websocket-version'] !== '13' || typeof key !== 'string' || Buffer.from(key, 'base64').length !== 16) {

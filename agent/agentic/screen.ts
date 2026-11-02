@@ -290,6 +290,24 @@ const CHIP_RE = /^\s*[☐☑✔☒]\s*(.+?)\s*$/
  * permission prompt, the trust menu). A number typed answers it. Null when none is up.
  */
 export function readMenu(lines: string[]): ChatMenu | null {
+  return findMenu(lines)?.menu ?? null
+}
+
+/** A menu and where it sits in the lines: the line of its first option and of its footer. */
+export interface MenuAt {
+  menu: ChatMenu
+  first: number
+  footer: number
+}
+
+/**
+ * readMenu, with its place. The options must be the ones that END AT THE FOOTER: walking up from the footer, only blank
+ * lines, rules and indented description lines may come between it and the last option, and the numbers must run down to 1
+ * without a gap. Anything else on the way (a "❯" line that is no option, a line of plain text: the next screen of a
+ * dialog drawn under an older menu) means these options are not what the footer belongs to, so there is no menu to answer.
+ * Options from an older screen, left above a newer footer, are therefore never picked up.
+ */
+export function findMenu(lines: string[]): MenuAt | null {
   let f = -1
   for (let i = lines.length - 1; i >= 0; i--) {
     if (FOOTER_RE.test(lines[i])) {
@@ -298,9 +316,26 @@ export function readMenu(lines: string[]): ChatMenu | null {
     }
   }
   if (f < 0) return null
-  const block = lines.slice(Math.max(0, f - 40), f)
-  const first = block.findIndex(l => OPTION_RE.test(l))
-  if (first < 0) return null
+  let at = -1
+  let next = 0
+  for (let i = f - 1; i >= Math.max(0, f - 40); i--) {
+    const l = lines[i]
+    const m = OPTION_RE.exec(l)
+    if (m) {
+      const n = Number(m[1])
+      if (next && n !== next) return null
+      at = i
+      next = n - 1
+      if (n === 1) break
+      continue
+    }
+    if (!l.trim() || RULE_RE.test(l)) continue
+    if (/^\s{3,}\S/.test(l) && !/^\s*❯/.test(l)) continue
+    return null
+  }
+  if (at < 0 || next !== 0) return null
+  const block = lines.slice(0, f)
+  const first = at
 
   const options: ChatMenu['options'] = []
   for (let i = first; i < block.length; i++) {
@@ -316,7 +351,7 @@ export function readMenu(lines: string[]): ChatMenu | null {
   // What is asked: the nearest line above the options that is neither a rule nor the header chip.
   let header = ''
   let question = ''
-  for (let i = first - 1; i >= 0; i--) {
+  for (let i = first - 1; i >= Math.max(0, f - 40); i--) {
     const l = block[i]
     if (!l.trim() || RULE_RE.test(l)) continue
     const chip = CHIP_RE.exec(l)
@@ -327,7 +362,7 @@ export function readMenu(lines: string[]): ChatMenu | null {
     if (!question) question = l.trim()
   }
   const multi = options.some(o => /^\[[ xX✔]\]/.test(o.label))
-  return { header, question, options, hint: lines[f].trim(), multi }
+  return { menu: { header, question, options, hint: lines[f].trim(), multi }, first, footer: f }
 }
 
 const SPINNER_RE = /^\s*[✻✽✶✢✳·*⏺]\s+(\S.*?…)\s*(?:\(([^)]*)\))?\s*$/

@@ -1,8 +1,12 @@
 {
-  "version": "2026.11.01-2258",
+  "version": "2026.11.02-1313",
   "commit": "9c00d52",
   "dirty": true,
-  "builtAt": "2026-11-01T17:28:44.542Z",
-  "devHash": "f8ee8e2f99a6bad860b6",
+  "builtAt": "2026-11-02T07:43:11.723Z",
+  "devHash": "30a8797ff08be2a21eba",
+  "chatHost": {
+    "protocol": 1,
+    "version": 1
+  },
   "source": "shubham-agentic-dev"
 }

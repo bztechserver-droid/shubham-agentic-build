@@ -47,10 +47,20 @@ import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
+import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
+import { mcpConfigFor, readRegistry } from './mcp-registry.ts'
 import { createOrders, isAssistantAgent, scanMessages } from './orders.ts'
+import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
+import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
+import { createChatLog, describeEvents } from './chat-log.ts'
+import { createVoice } from './voice.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
+import { createDeviceStore } from './approval-devices.ts'
+import { createAutoUpdate } from './auto-update.ts'
+import type { DevicesAnswer, PublicJwk, SignedKind } from '../../shared/approval-sign.ts'
+import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
@@ -151,6 +161,21 @@ export interface AgenticOptions {
    * use. The rest are for tests.
    */
   memory?: { meaning?: boolean; start?: boolean; embedder?: Embedder; timers?: boolean; claudeArgs?: string[] }
+  /** F-078: the heartbeat's timer runs unless this is false (tests) or SAD_HEARTBEAT=0 (the way it was). */
+  heartbeat?: boolean
+  /** F-083: the watchdog's checks run in the heartbeat's beat unless this is false (tests) or SAD_WATCHDOG=0 (the way it was). */
+  watchdog?: boolean
+  /** F-083: free commit in MB for the watchdog's memory rule (Windows' own number); tests give theirs. */
+  freeCommitMB?: () => Promise<number | null>
+  /** F-083: the idle reaper's limits; tests shorten them. */
+  idleReapMs?: number
+  reapEveryMs?: number
+  /** F-078: the newer build waiting for Update now, if there is one (main.ts reads it off the build). */
+  newerBuild?: () => string | null
+  /** F-074: tests: what stands in for the registered device's signature on a pair code. */
+  voiceProof?: (body: unknown) => string
+  /** F-078: the build running now (its version), for the morning summary. */
+  currentBuild?: () => string | null
   /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
   orderReplies?: boolean
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
@@ -165,10 +190,19 @@ export interface AgenticOptions {
   resumeGapMs?: number
   /** F-054: this PC's CRM session (crm-session.json, beside the agentic folder); tests give a scratch one. */
   crmSession?: string
+  /**
+   * F-075: the chats' terminals live in the chat host (agent/chathost/), which outlives this agent: the chats
+   * started here run there, the ones the agent before this one left running are taken over at start, and
+   * stopping the agent lets go of them instead of ending them. Left out (the default: SAD_CHAT_HOST is off):
+   * node-pty in this process, as before.
+   */
+  chatHost?: ChatHostLink | null
 }
 
 export interface Agentic {
   mount: ApiMount
+  /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
+  voiceMount: ApiMount
   floors: FloorStore
   chats: ChatPool
   memory: MemoryStore
@@ -189,6 +223,10 @@ export interface Agentic {
    * Text goes only to a chat started now, never to one that was running already.
    */
   resumeChat(sessionId: string, text?: string): Promise<boolean>
+  /** F-075: chats in the middle of something (running or asking) on this PC. */
+  busyChats(): number
+  /** F-075: the chat host changes with an update: the open chats are written down (so the new agent resumes them), then ended in the host. */
+  retireChatHost(): Promise<void>
   close(): void
 }
 
@@ -274,7 +312,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const replicaFile = path.join(o.dir, 'replica.json')
   const shim = fileURLToPath(new URL('./mcp-shim.ts', import.meta.url))
   // The shim is named here once; the key it needs comes from the chat's own terminal.
-  writeAtomic(mcpConfig, `${json({ mcpServers: { [MCP_SERVER_NAME]: { type: 'stdio', command: process.execPath, args: [shim] } } })}\n`)
+  const appMcpServers = { [MCP_SERVER_NAME]: { type: 'stdio', command: process.execPath, args: [shim] } }
+  writeAtomic(mcpConfig, `${json({ mcpServers: appMcpServers })}\n`)
+  /** Other MCP servers, given to single agents by name (mcp-registry.ts). */
+  const mcpRegistryFile = path.join(o.dir, 'mcp-servers.json')
   // F-051: the memory's hook (memory-hook.ts), for every chat's --settings, which claude adds to
   // the user's own settings. One command line, run by claude's shell: both paths quoted, with
   // forward slashes (a folder like "Shubham's Agent" has a space and an apostrophe).
@@ -488,13 +529,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-069: the files sent to the chats that run on this PC (the page's photos, pictures and files).
   const uploads = createUploadStore(path.join(o.dir, 'uploads'))
   uploads.prune()
+  // F-078: every chat that stops or starts, and why (chat-log.ts): the pattern Shubham is told in the morning.
+  const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
+  /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
+  const startCause = new Map<string, string>()
   const chats = createChatPool({
     addDirs: [uploads.dir],
+    // F-083: a chat with an open order or unfinished work is never ended for being idle.
+    keep: sid => workOf(sid) !== null,
+    idleReapMs: o.idleReapMs,
+    reapEveryMs: o.reapEveryMs,
+    onEnded: e => {
+      const at = bySession(e.sessionId)
+      chatLog.append({ event: 'stop', sessionId: e.sessionId, agent: at?.agent.name ?? '?', floor: at?.floor.name ?? '?', cause: e.cause, code: e.code, ranMin: Math.max(0, Math.round((Date.now() - Date.parse(e.startedAt)) / 60_000)) })
+    },
     toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
     mcpConfig,
     log,
-    spawn: o.spawn,
-    treeKill: o.treeKill,
+    spawn: o.chatHost?.spawn ?? o.spawn,
+    // In the host, the host ends a chat's processes (by exact PID); nothing here is theirs to end.
+    treeKill: o.chatHost ? () => {} : o.treeKill,
+    keepOnClose: !!o.chatHost,
     claude: o.claude,
     token: o.token,
     // F-051: recall in every prompt, once the memory layer is on (main.ts).
@@ -516,6 +571,34 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }, 150)
       liveTimer.unref()
     },
+  })
+
+  // F-075: the chats the agent before this one left running in the chat host are taken over at once.
+  const adopted: Promise<void> = o.chatHost
+    ? o.chatHost
+        .adopt(chats)
+        .then(r => {
+          if (r.adopted.length || r.ended.length) log?.info(`chat host: took over ${r.adopted.length} running chat${r.adopted.length === 1 ? '' : 's'}${r.ended.length ? `; ${r.ended.length} ended while no agent was there` : ''}`)
+        })
+        .catch(e => void log?.warn(`chat host: could not take over its chats: ${message(e)}`))
+    : Promise.resolve()
+  // The host is lost (it died): the chats that ran in it end. Noted first; reopened (resumed) when a host is back.
+  let lostWithHost: Array<{ sid: string; state: ChatState }> = []
+  o.chatHost?.onLost(why => {
+    lostWithHost = Object.entries(chats.states()).map(([sid, state]) => ({ sid, state }))
+    log?.error(`the chat host is gone (${why}): ${lostWithHost.length} chat(s) ended with it; they are reopened when a host is back`)
+  })
+  o.chatHost?.onBack(() => {
+    const list = lostWithHost
+    lostWithHost = []
+    void (async () => {
+      for (const r of list) {
+        if (closing || chats.info(r.sid)) continue
+        const ok = await resumeChat(r.sid, r.state === 'running' || r.state === 'question' ? CONTINUE_TEXT : undefined)
+        log?.info(`chat host: chat ${r.sid.slice(0, 8)} ${ok ? 'reopened after the host was lost' : 'could not be reopened'}`)
+        await new Promise(res => setTimeout(res, o.resumeGapMs ?? 2000))
+      }
+    })()
   })
 
   const tail = createTail({
@@ -570,8 +653,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const dflt = defaultsNow()
     const effort = agent.effort || dflt.effort
     const ultracode = agent.ultracode ? agent.ultracode === 'on' : dflt.ultracode
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    // Per-agent MCP servers (mcp-registry.ts): only what this agent was given, else the shared file as ever.
+    const mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
+    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
     launched.set(sid, { effort, at: new Date().toISOString(), ultracode })
+    heartbeat.opened(sid)
+    chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+    startCause.delete(sid)
     // Ultracode is claude's own mode, on for the session only: asked for once its prompt is up (`/effort ultracode`).
     if (ultracode) chats.typeWhenReady(sid, '/effort ultracode')
     if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -669,6 +757,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Stops a session's chat wherever it runs, not waiting (an agent taken off, a floor deleted). */
   function stopAnywhere(sid: string) {
+    heartbeat.stoppedOnPurpose(sid)
     if (chats.info(sid)) {
       chats.kill(sid)
       return
@@ -1023,12 +1112,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   let resumeTimer: NodeJS.Timeout | null = null
+  /** F-083: false from the start until recovery has reopened its list (or when there is none to wait for: true at once). */
+  let recoveryDone = !o.resumeChats || team?.role() === 'member'
   if (o.resumeChats && team?.role() !== 'member') {
     const mine = createRecovery(path.join(o.dir, 'open-chats.json'), { log })
     recovery = mine
     resumeTimer = setTimeout(() => {
       resumeTimer = null
       void (async () => {
+        // The chats still running in the chat host are the pool's by now; only the others are reopened.
+        await adopted
         const list = mine.pending
         if (list.length) log?.info(`recovery: reopening ${list.length} chat${list.length === 1 ? '' : 's'} that ${list.length === 1 ? 'was' : 'were'} open when the app stopped`)
         let n = 0
@@ -1043,6 +1136,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (closing) return
         // The list is used: from now on it follows the chats.
         mine.arm()
+        recoveryDone = true
         noteOpen()
       })()
     }, o.resumeAfterMs ?? 4000)
@@ -1122,6 +1216,39 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return request<string>(link, 'read', { sessionId: c.sessionId, lines })
   }
 
+  /**
+   * What the chat's screen shows right now, as lines of text (not its scroll-back: that still holds menus long gone). This PC's chat: its
+   * screen model; another PC's: that PC's, over the link. Null when the screen can't be had (an older PC that has no such request).
+   */
+  async function screenOf(c: { sessionId: string; id: string }): Promise<string | null> {
+    if (c.id === self().id) return chats.screen(c.sessionId)?.join('\n') ?? null
+    const link = team?.member(c.id)
+    if (!link) return null
+    return request<string>(link, 'screen', { sessionId: c.sessionId }).catch(() => null)
+  }
+
+  /**
+   * What a waiting chat asks, off its live screen only: options come from the menu drawn now, never from older text above a newer
+   * footer. Where the screen can't be had, the scroll-back gives the words around it but no buttons (nothing is pressed from stale text).
+   */
+  async function promptOfChat(c: { sessionId: string; id: string }) {
+    const screen = await screenOf(c)
+    if (screen !== null) return promptOf(screen)
+    const p = promptOf(await readChat(c, 60).catch(() => ''))
+    return { ...p, menu: null }
+  }
+
+  /** M1: a chat waiting at a permission prompt or a menu is never typed into (Enter would pick the highlighted option). The words for a person or an agent. */
+  // On this PC the screen decides (a phantom guess from plain words is put right); on another PC the state it reports.
+  const atPrompt = (sessionId: string) => (chats.info(sessionId) ? chats.asking(sessionId) : whereAll()[sessionId]?.state === 'question')
+  const promptWords = (sessionId: string) => `${floors.bySession(sessionId)?.agent.name ?? 'That agent'}'s chat is waiting at a prompt (Approvals tab); nothing was typed. Try again once it is answered.`
+
+  // A draft: unsent text in a chat's idle input box (Shubham is typing there). A message pasted now would join it and one Enter would
+  // send both. Messages from agents and the app wait or are refused; his own say() from the chat view is his text joining his draft.
+  // Known only for chats on this PC (their screens); another PC's chats are typed into as before.
+  const hasDraft = (sessionId: string) => (chats.info(sessionId) ? chats.drafting(sessionId) : false)
+  const draftWords = (sessionId: string) => `${floors.bySession(sessionId)?.agent.name ?? 'That agent'}'s chat has unsent text in its box; try again shortly.`
+
   async function typeInto(c: { sessionId: string; id: string }, body: string): Promise<boolean> {
     if (c.id === self().id) return chats.type(c.sessionId, body)
     const link = team?.member(c.id)
@@ -1131,6 +1258,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
   const approvalLog = createApprovalLog(path.join(o.dir, 'approvals.jsonl'))
+  // The phones (browsers) whose signature an approval or a send needs: registered once, here on the hub.
+  const approvalDevices = createDeviceStore(path.join(o.dir, 'approval-devices.json'))
+  // F-081: the switch the guard's night-watch reads (auto-update.json in this folder).
+  const autoUpdate = createAutoUpdate(path.join(o.dir, 'auto-update.json'))
   const prepared = new Map<string, PreparedCard>()
   const PREPARED_MAX = 20
   // F-072: the orders the overlay Assistant gives, and the replies that come back to it (orders.ts).
@@ -1146,6 +1277,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     deliver: async (assistantSid, body) => {
       const w = whereAll()[assistantSid]
+      // M1: typing ends with Enter, which would pick the highlighted option of a prompt nobody answered: kept, and tried again later.
+      if (w && (atPrompt(assistantSid) || hasDraft(assistantSid))) return false
       return w ? typeInto({ sessionId: assistantSid, id: w.id }, body) : false
     },
   })
@@ -1154,6 +1287,234 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   const ordersTimer = setInterval(() => void orders.tick(), 1000)
   ordersTimer.unref?.()
+
+  // F-078: the heartbeat (heartbeat.ts): a plain check of every chat every few minutes; it starts a stopped
+  // chat that has unfinished work, nudges it once, and wakes the Assistant only when there is news.
+  const TRANSCRIPT_MAX_AGE_MS = 6 * 3_600_000
+  const agentRefs = () =>
+    floors.list().flatMap(f => f.agents.map(a => ({ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, assistant: isAssistantAgent(f.name, a.name) })))
+  const tailOf = (sid: string) => {
+    const file = findTranscript(sid, projectsDir)
+    // A conversation not written to for hours is history: not even read.
+    if (!file || Date.now() - statSync(file).mtimeMs > TRANSCRIPT_MAX_AGE_MS) return null
+    return readTranscriptFile(file)
+      .slice(-3)
+      .map(m => ({ id: m.id, role: m.role, text: m.text, tools: m.tools, timestamp: m.timestamp ?? '' }))
+  }
+  /**
+   * F-083: why this chat has work to go on with, or null: an order from the Assistant is open for it, or its own last words
+   * say it is unfinished (heartbeat.ts). The idle reaper keeps such a chat, and the watchdog starts such a chat again.
+   */
+  function workOf(sid: string): string | null {
+    if (orders.list().some(x => x.to.sessionId === sid)) return 'an order from the Assistant is open'
+    try {
+      const rows = tailOf(sid)
+      return rows ? (unfinishedWork(rows, { now: Date.now(), openOrder: false, running: false })?.why ?? null) : null
+    } catch {
+      return null
+    }
+  }
+  const startedAtMs = Date.now()
+  // F-083: the watchdog (watchdog.ts) is called by each beat of the heartbeat, so it needs no chat to be alive.
+  const watchdogOn = o.watchdog ?? process.env.SAD_WATCHDOG !== '0'
+  const watchdog = createWatchdog({
+    now: Date.now,
+    file: path.join(o.dir, 'watchdog.json'),
+    log,
+    agents: agentRefs,
+    stateOf: sid => whereAll()[sid]?.state,
+    events: since => chatLog.since(since),
+    stoppedOnPurpose: sid => heartbeat.isStopped(sid),
+    work: workOf,
+    // F-058 recovery reopens the chats after an update first; the watchdog never races it (and does not wait for ever).
+    recoveryBusy: () => closing || (!recoveryDone && Date.now() - startedAtMs < 10 * 60_000),
+    freeCommitMB: o.freeCommitMB ?? readFreeCommitMB,
+    restart: async (floorId, agentId, text) => {
+      try {
+        const sid = floors.list().find(f => f.id === floorId)?.agents.find(a => a.id === agentId)?.sessionId
+        if (sid) startCause.set(sid, 'watchdog')
+        // On its home PC (F-064); offline: it is not started here, that is reported.
+        const opened = await openChat(floorId, agentId, { say: text })
+        if (!opened.on) chats.typeWhenReady(opened.sessionId, text, { holdForDraft: true })
+        return null
+      } catch (e) {
+        return (e as { status?: unknown }).status === HOME_OFFLINE_STATUS ? `offline: ${message(e)}` : message(e)
+      }
+    },
+    // Nothing is pressed: the chat is ended and opened again from its conversation, which discards the menu on its screen.
+    restartClean: async sid => {
+      if (mode() === 'member' || !floors.bySession(sid)) return false
+      startCause.set(sid, 'watchdog')
+      await stopAt(self().id, sid)
+      return await resumeChat(sid)
+    },
+    local: sid => {
+      const i = chats.info(sid)
+      return i ? { watching: i.viewers > 0 } : null
+    },
+    screen: sid => chats.screen(sid),
+    asking: sid => chats.asking(sid),
+    press: (sid, keys) => chats.press(sid, keys),
+    activity: sid => chats.activity(sid),
+    record: e => chatLog.append({ event: 'watch', sessionId: e.sessionId, agent: e.agent, floor: e.floor, cause: e.cause, what: e.what, did: e.did }),
+  })
+  const heartbeat = createHeartbeat({
+    now: Date.now,
+    file: path.join(o.dir, 'heartbeat.json'),
+    log,
+    agents: agentRefs,
+    stateOf: sid => whereAll()[sid]?.state,
+    tail: tailOf,
+    watch: watchdogOn ? () => watchdog.watch() : undefined,
+    openOrder: sid => orders.list().some(x => x.to.sessionId === sid),
+    restart: async (floorId, agentId) => {
+      try {
+        const sid = floors.list().find(f => f.id === floorId)?.agents.find(a => a.id === agentId)?.sessionId
+        if (sid) startCause.set(sid, 'heartbeat')
+        await openChat(floorId, agentId, {})
+        return null
+      } catch (e) {
+        return message(e)
+      }
+    },
+    nudge: async (sid, body) => {
+      const w = whereAll()[sid]
+      if (w && w.id !== self().id) return typeInto({ sessionId: sid, id: w.id }, body)
+      chats.typeWhenReady(sid, body, { holdForDraft: true })
+      return true
+    },
+    wake: body => tellAssistant(body),
+    news: items => {
+      // F-083: no phone push between 23:00 and 07:00 for what the watchdog found; it is in the morning summary (chat-events.jsonl).
+      const h = new Date().getHours()
+      const quiet = h >= 23 || h < 7
+      const shown = quiet ? items.filter(i => !['menu', 'down', 'silent'].includes(i.kind)) : items
+      if (shown.length) voice.beat(shown.map(i => i.text).join(' '), shown.filter(i => i.agent).map(i => ({ floor: i.floor ?? '', agent: i.agent ?? '', what: i.kind })))
+    },
+    newerBuild: () => o.newerBuild?.() ?? null,
+    currentBuild: () => o.currentBuild?.() ?? null,
+    overnight: since => describeEvents(chatLog.since(since)),
+    waiting: async () => {
+      const lines: string[] = []
+      const where = whereAll()
+      const asking = floors.list().flatMap(f => f.agents.filter(a => a.sessionId && where[a.sessionId]?.state === 'question').map(a => `${a.name} on ${f.name}`))
+      if (asking.length) lines.push(`${asking.length} chat${asking.length === 1 ? '' : 's'} waiting at a question (the Approvals tab): ${asking.join(', ')}.`)
+      if (prepared.size) lines.push(`${prepared.size} card${prepared.size === 1 ? ' is' : 's are'} prepared for you in the Send tab.`)
+      const replies = orders.list().filter(x => x.pending).length
+      if (replies) lines.push(`${replies} agent repl${replies === 1 ? 'y has' : 'ies have'} not reached the Assistant yet.`)
+      const nb = o.newerBuild?.()
+      if (nb) lines.push(`A newer build (${nb}) is waiting; only you press Update now.`)
+      const open = (await tasks.counts()).open
+      if (open) lines.push(`${open} open task${open === 1 ? '' : 's'} on your list.`)
+      return lines
+    },
+    undeliveredReplies: () => orders.list().filter(x => x.pending).length,
+  })
+  /** F-083: what the overlay and the Assistant's watchdog_status tool show: it runs, the beat's times, what the last look found. */
+  function watchdogView() {
+    const hb = heartbeat.state()
+    const w = watchdog.state()
+    return {
+      enabled: watchdogOn && hb.enabled,
+      intervalMin: hb.intervalMin,
+      lastBeatAt: hb.last?.at ?? null,
+      nextBeatAt: hb.nextAt,
+      chatsLooked: hb.last?.chats ?? 0,
+      found: (hb.last?.findings ?? []).map(f => ({ kind: f.kind, text: f.text, did: f.did })),
+      downNow: w.down.map(d => ({ agent: d.agent, floor: d.floor, downMin: Math.round((Date.now() - d.sinceMs) / 60_000), why: d.why })),
+      restartsLastHour: w.restartsLastHour,
+      summary: !watchdogOn ? 'The watchdog is off (SAD_WATCHDOG=0).' : !hb.enabled ? 'The heartbeat is off, so the watchdog does not look.' : w.down.length ? `${w.down.length} chat${w.down.length === 1 ? ' is' : 's are'} down: ${w.down.map(d => d.agent).join(', ')}.` : hb.last ? `All chats looked at ${new Date(hb.last.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}: ${hb.last.findings.length ? `${hb.last.findings.length} thing${hb.last.findings.length === 1 ? '' : 's'} found.` : 'all well.'}` : 'No look yet since the app started.',
+    }
+  }
+
+  const assistantAt = () =>
+    floors
+      .list()
+      .flatMap(f => f.agents.map(a => ({ f, a })))
+      .find(x => isAssistantAgent(x.f.name, x.a.name)) ?? null
+
+  /** Types `body` into the Assistant's chat, starting it first when it is not running (the heartbeat and the phone's asks). */
+  async function tellAssistant(body: string): Promise<boolean> {
+    const at = assistantAt()
+    if (!at) return false
+    const sid = at.a.sessionId
+    const w = sid ? whereAll()[sid] : undefined
+    // M1 (a safety hole Mobile found): a line typed while the Assistant waits at a permission prompt or a menu ends with Enter,
+    // which would pick the highlighted option: an approval nobody tapped. Phone asks get a 409, the heartbeat tries again next beat.
+    if (w && sid && atPrompt(sid)) throw apiError(409, 'The Assistant is waiting for an answer on the PC')
+    // His draft in the Assistant's box: the heartbeat and the morning summary try again later; a phone ask is told to.
+    if (w && sid && hasDraft(sid)) throw apiError(409, "Shubham has unsent text in the Assistant's box on the PC; try again shortly")
+    if (sid && w) return typeInto({ sessionId: sid, id: w.id }, body)
+    try {
+      const opened = await openChat(at.f.id, at.a.id, {})
+      chats.typeWhenReady(opened.sessionId, body)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // F-074: the hub's side of "Hey Chris" (voice.ts): pairing with a device key, asks to the Assistant,
+  // what the phone's background service reads. A conversation file is read again only when it changed.
+  const messageCache = new Map<string, { sig: string; msgs: ReturnType<typeof readTranscriptFile> }>()
+  const messagesOf = (file: string) => {
+    const st = statSync(file)
+    const sig = `${st.mtimeMs}:${st.size}`
+    const hit = messageCache.get(file)
+    if (hit?.sig === sig) return hit.msgs
+    const msgs = readTranscriptFile(file)
+    messageCache.set(file, { sig, msgs })
+    return msgs
+  }
+  const voice = createVoice({
+    now: Date.now,
+    file: path.join(o.dir, 'voice-devices.json'),
+    log,
+    assistant: () => {
+      const sid = assistantAt()?.a.sessionId ?? null
+      // A 'question' guessed from plain words is put right before the phone is told it is waiting.
+      if (sid && whereAll()[sid]) atPrompt(sid)
+      return assistantAt() ? { sessionId: sid, state: sid ? whereAll()[sid]?.state : undefined } : null
+    },
+    say: body => tellAssistant(body),
+    proof:
+      o.voiceProof ??
+      (body => {
+        // Strict, like Automatic updates ON: a registered approval device's signature over kind 'pair', never the unsigned old way.
+        if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
+        const name = approvalDevices.verify('pair', [], isObject(body) ? body.sig : undefined).name
+        deviceLog('A pair code for the phone app was made', `device "${name}"`)
+        return `device "${name}"`
+      }),
+    feed: send => {
+      const sid = assistantAt()?.a.sessionId
+      return sid ? chatFeeds.attach(sid, send) : () => {}
+    },
+    history: (before, limit) => {
+      const sid = assistantAt()?.a.sessionId
+      return sid ? chatFeeds.history(sid, before, limit) : { items: [], before: null }
+    },
+    scan: (sid, id) => {
+      const file = findTranscript(sid, projectsDir)
+      return file ? scanMessages(messagesOf(file), id, 'ask') : { started: false, answer: '' }
+    },
+    interrupt: async () => {
+      const sid = assistantAt()?.a.sessionId
+      if (!sid || !chats.info(sid)) return false
+      chats.input(sid, String.fromCharCode(27))
+      return true
+    },
+  })
+  const voiceTimer = setInterval(() => {
+    if (mode() !== 'member') voice.tick()
+  }, 1000)
+  voiceTimer.unref?.()
+
+  const heartbeatOn = o.heartbeat ?? process.env.SAD_HEARTBEAT !== '0'
+  const heartbeatTimer = setInterval(() => {
+    if (heartbeatOn && mode() !== 'member' && !closing) void heartbeat.tick()
+  }, 15_000)
+  heartbeatTimer.unref?.()
 
   /** The id of the order a message from `agent` to `toSid` is, or null when it is none (not the Assistant's, or an acknowledgement or a reply). */
   function orderFrom(floor: Floor, agent: FloorAgent, sid: string, toSid: string, body: string): string | null {
@@ -1221,10 +1582,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const target = anyChat(args.sessionId)
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
         const body = text(args.text, 'text')
+        // M1: first, so a refusal starts no cooldown and opens no order.
+        if (atPrompt(target.sessionId)) throw apiError(409, promptWords(target.sessionId))
+        if (hasDraft(target.sessionId)) throw apiError(409, draftWords(target.sessionId))
         relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
-        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
@@ -1261,6 +1625,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!level) return `${kept}; its running chat keeps the effort it has until it starts again.`
         if (a.sessionId === sid) return `${kept}. This is your own chat: it keeps its effort until it starts again (type /effort ${level} in it to change it now).`
         if (w.state === 'running') return `${kept}. Its chat is working right now, so it keeps its effort until it starts again; ask again once it is waiting to set it at once.`
+        if (atPrompt(a.sessionId)) return `${kept}. ${promptWords(a.sessionId)}`
         if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, `/effort ${level}`))) return `${kept}; its chat stopped before it could be set now.`
         log?.info(`${agent.name} set ${a.name}'s effort to ${level}`)
         return `${kept}, and its running chat (on ${w.name}) is on ${level} now: /effort ${level} was typed into it.`
@@ -1282,6 +1647,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'floor_roster':
         return json(rosterOf(floor, agent))
+      case 'watchdog_status':
+        return json(watchdogView())
       case 'read_chat': {
         const c = siblingOf(floor, args.sessionId)
         return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
@@ -1290,9 +1657,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const c = siblingOf(floor, args.sessionId)
         if (c.sessionId === sid) throw apiError(400, "That's your own chat")
         const body = text(args.text, 'text')
+        // M1: first, so a refusal starts no cooldown and opens no order.
+        if (atPrompt(c.sessionId)) throw apiError(409, promptWords(c.sessionId))
+        if (hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
-        if (!(await typeInto(c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, 'That chat stopped before the message reached it')
+        if (!(await typeInto(c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
@@ -1302,11 +1672,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const t = Date.now()
         if (t - (broadcastLast.get(floor.id) ?? 0) < BROADCAST_COOLDOWN_MS) throw apiError(429, 'This floor just had a broadcast; wait a few seconds.')
         broadcastLast.set(floor.id, t)
-        const to = Object.entries(whereAll())
+        const all = Object.entries(whereAll())
           .filter(([s]) => s !== sid && floors.bySession(s)?.floor.id === floor.id)
-          .map(([s, w]) => ({ sessionId: s, id: w.id }))
+          .map(([s, w]) => ({ sessionId: s, id: w.id, asking: atPrompt(s), drafting: hasDraft(s) }))
+        // M1: a chat at a prompt is skipped, not pressed Enter on. A chat with his unsent text in its box is skipped too.
+        const to = all.filter(c => !c.asking && !c.drafting)
+        const skipped = all.filter(c => c.asking)
+        const drafts = all.filter(c => !c.asking && c.drafting)
         await Promise.all(to.map(c => typeInto(c, `[broadcast from ${tag}] ${body}`)))
-        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.`
+        const nameOf = (c: { sessionId: string }) => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)
+        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}`
       }
       case 'memory_save': {
         const entry = memory.save(floor.id, {
@@ -1612,6 +1987,70 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   const byOf = (r: MountRequest) => `the app (${String(r.headers['user-agent'] ?? 'a browser').replace(/\s+/g, ' ').slice(0, 90)})`
 
+  /**
+   * The proof an approval or a send carries: the signature of a registered approval device over exactly what was asked.
+   * Without one it is refused, unless the old way is switched on in Settings (off to start with). Says who it was, for the log.
+   */
+  function humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown): string {
+    if (signed !== undefined && signed !== null) return `device "${approvalDevices.verify(kind, fields, signed).name}"`
+    if (approvalDevices.unsignedAllowed()) return 'an unsigned request (the old way, switched on in Settings)'
+    if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Open Settings › Approval device on your phone and register it.')
+    throw apiError(401, 'This needs a signature from a registered approval device (your phone). Open it there.')
+  }
+
+  /**
+   * F-081: Apply new builds automatically when quiet. Turning it ON needs the signature of a registered approval device
+   * (never the old unsigned way: this one is about his machine restarting by itself); turning it off needs nothing.
+   */
+  function setAutoUpdate(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
+    let who = 'a tap (off needs no signature)'
+    if (raw.on) {
+      if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
+      who = `device "${approvalDevices.verify('autoupdate', [true], raw.sig).name}"`
+    }
+    const st = autoUpdate.set(raw.on, `${who} via ${by}`)
+    deviceLog(`Automatic updates when quiet switched ${raw.on ? 'ON' : 'off'}`, `${who} via ${by}`)
+    log?.info(`automatic updates when quiet: ${raw.on ? 'on' : 'off'}`)
+    return st
+  }
+
+  const devicesAnswer = (): DevicesAnswer => ({ devices: approvalDevices.list(), unsignedAllowed: approvalDevices.unsignedAllowed(), bootstrap: approvalDevices.count() === 0 })
+
+  const deviceLog = (detail: string, by: string) => approvalLog.add({ kind: 'device', floor: '', agent: '', pc: self().name, sessionId: '', detail, by })
+
+  /** A one-time code to add a device: the first one needs nothing (there is nobody to sign); after that, a registered device's signature. */
+  function deviceCode(raw: unknown) {
+    const body = isObject(raw) ? raw : {}
+    if (approvalDevices.count() > 0) humanProof('code', [], body.sig)
+    return approvalDevices.newCode()
+  }
+
+  function deviceRegister(raw: unknown, by: string) {
+    if (!isObject(raw)) throw apiError(400, 'Expected {name, jwk, code}')
+    const d = approvalDevices.register(raw.name, raw.jwk as PublicJwk, raw.code)
+    deviceLog(`Approval device registered: ${d.name} (${d.id})`, by)
+    log?.info(`approval device registered: ${d.name}`)
+    return { device: d, ...devicesAnswer() }
+  }
+
+  function deviceRemove(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.device !== 'string') throw apiError(400, 'Expected {device, sig}')
+    const who = humanProof('remove', [raw.device], raw.sig)
+    if (!approvalDevices.remove(raw.device)) throw apiError(404, 'No such approval device')
+    deviceLog(`Approval device removed: ${raw.device}`, `${who} via ${by}`)
+    return devicesAnswer()
+  }
+
+  /** The old way (requests with no signature) on or off. Changing it needs a registered device's signature, once there is one. */
+  function deviceUnsigned(raw: unknown, by: string) {
+    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
+    const who = approvalDevices.count() > 0 ? humanProof('unsigned', [raw.on], raw.sig) : 'nobody (no device is registered)'
+    approvalDevices.setUnsignedAllowed(raw.on)
+    deviceLog(`Unsigned approvals ${raw.on ? 'switched ON (the old way)' : 'switched off'}`, `${who} via ${by}`)
+    return devicesAnswer()
+  }
+
   /** A message typed to the agent the way the terminal does it (a paste, then Enter); a chat that isn't running is started or picked back up first, and the message follows once it is ready. */
   async function sayTo(id: string, agentId: string, body: string): Promise<SayAnswer> {
     const agent = agentOf(floorOf(id), agentId)
@@ -1620,7 +2059,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const fresh = at.id === self().id && Date.now() - Date.parse(chats.info(agent.sessionId)?.startedAt ?? '') < SAY_FRESH_MS
       // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
       if (fresh) chats.typeWhenReady(agent.sessionId, body)
-      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, `${agent.name}'s chat on ${at.name} can't be typed into right now`)
+      else if (atPrompt(agent.sessionId)) throw apiError(409, promptWords(agent.sessionId))
+      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, atPrompt(agent.sessionId) ? promptWords(agent.sessionId) : `${agent.name}'s chat on ${at.name} can't be typed into right now`)
       return { ok: true, started: false }
     }
     // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
@@ -1643,8 +2083,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
     const items = await Promise.all(
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
-        const screen = await readChat({ sessionId: sid, id: w.id }, 60).catch(() => '')
-        const p = promptOf(screen)
+        const p = await promptOfChat({ sessionId: sid, id: w.id })
         return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu) }
       }),
     )
@@ -1655,11 +2094,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function answerApproval(raw: unknown, by: string) {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string' || typeof raw.n !== 'number') throw apiError(400, 'Expected {sessionId, id, n}')
     const req = raw as unknown as AnswerRequest
+    // A registered device signed exactly this prompt and option (or the old way is on): before anything is looked at or typed.
+    by = `${humanProof('answer', [req.sessionId, req.id, req.n], req.sig)} via ${by}`
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
-    const p = promptOf(await readChat({ sessionId: req.sessionId, id: w.id }, 60))
+    const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
     if (!answerable(p.menu)) throw apiError(409, 'That prompt can only be answered in the chat itself.')
     if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
     const option = p.menu!.options.find(x => x.n === req.n)
@@ -1676,6 +2117,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId, text}')
     const req = raw as unknown as SendAsMeRequest
     const body = text(req.text, 'text', MAX_SAY_TEXT)
+    // A registered device signed exactly this target and these words (or the old way is on).
+    by = `${humanProof('send', [req.floorId, req.agentId, createHash('sha256').update(body, 'utf8').digest('hex'), typeof req.card === 'string' ? req.card : ''], req.sig)} via ${by}`
     const at = agentOf(floorOf(req.floorId), req.agentId)
     const floor = floorOf(req.floorId)
     const r = await sayTo(req.floorId, req.agentId, body)
@@ -1945,6 +2388,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
   type Handler = (m: string[], r: MountRequest) => unknown
   /** `local`: a member answers it itself; the rest it passes to its hub, which keeps the floors. */
   const routes: [string, RegExp, Handler, 'local'?][] = [
+    // F-083: the watchdog: whether it runs, the heartbeat's last and next beat, and the chats it holds down now.
+    ['GET', /^\/watchdog$/, () => watchdogView()],
+    // F-078: the heartbeat's setting and its last and next beat (the overlay shows them); a beat now.
+    ['GET', /^\/heartbeat$/, () => heartbeat.state()],
+    // F-078: the overlay was opened: the morning summary goes now when it is the first time after 06:00 today.
+    ['POST', /^\/heartbeat\/morning$/, async () => ({ sent: await heartbeat.morning({ atOpen: true }) })],
+    [
+      'PATCH',
+      /^\/heartbeat$/,
+      (_, r) => {
+        if (!isObject(r.body)) throw apiError(400, 'Expected {enabled?, intervalMin?}')
+        if (r.body.intervalMin !== undefined && !Number.isInteger(r.body.intervalMin)) throw apiError(400, 'intervalMin is a whole number of minutes (1 to 120)')
+        return heartbeat.set({ enabled: typeof r.body.enabled === 'boolean' ? r.body.enabled : undefined, intervalMin: typeof r.body.intervalMin === 'number' ? r.body.intervalMin : undefined })
+      },
+    ],
+    ['POST', /^\/heartbeat\/beat$/, async () => {
+        await heartbeat.beat()
+        return heartbeat.state()
+      }],
     ['GET', /^\/floors$/, () => answerFloors(), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
@@ -1981,6 +2443,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals())],
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r)))],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r)))],
+    ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
+    ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r)))],
+    ['GET', /^\/approvals\/devices$/, (_, r) => (humanOnly(r), devicesAnswer())],
+    ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body))],
+    ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/devices\/remove$/, (_, r) => (humanOnly(r), deviceRemove(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/devices\/unsigned$/, (_, r) => (humanOnly(r), deviceUnsigned(r.body, byOf(r)))],
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],
     [
       'DELETE',
@@ -2047,6 +2516,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id, agentId]) => {
         const a = agentOf(floorOf(id), agentId)
         if (!a.sessionId) return { killed: false }
+        heartbeat.stoppedOnPurpose(a.sessionId) // F-078: his own stop: the heartbeat leaves it alone
         if (chats.info(a.sessionId)) return { killed: chats.kill(a.sessionId) }
         const running = !!whereAll()[a.sessionId]
         stopAnywhere(a.sessionId)
@@ -2413,6 +2883,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (t === null) throw apiError(404, "That chat isn't running here")
             return t
           })
+        case 'screen':
+          // What its screen shows now (Approvals reads a prompt from this, not from the scroll-back).
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')
+            const lines = chats.screen(raw.sessionId)
+            if (lines === null) throw apiError(404, "That chat isn't running here")
+            return lines.join('\n')
+          })
         case 'type':
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
@@ -2597,6 +3075,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   return {
     mount,
+    voiceMount: voice.mount,
     floors,
     chats,
     memory,
@@ -2604,6 +3083,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     serve,
     restartChat,
     resumeChat,
+    busyChats: () => Object.values(chats.states()).filter(st => st === 'running' || st === 'question').length,
+    async retireChatHost() {
+      // Written down first: ending them would otherwise empty the list.
+      recovery?.freeze()
+      await o.chatHost?.shutdown(true)
+    },
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
@@ -2620,6 +3105,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       clearInterval(memberBriefTimer)
       layer.close()
       chats.closeAll()
+      // F-075: let go of the chat host (its chats go on).
+      o.chatHost?.close()
       sub?.stream.destroy()
       sub = null
       for (const s of subs.values()) s.destroy()
@@ -2627,6 +3114,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       for (const s of events) s.close(1001, 'the agent is stopping')
       ui.close()
       clearInterval(ordersTimer)
+      clearInterval(heartbeatTimer)
+      clearInterval(voiceTimer)
       events.clear()
     },
   }

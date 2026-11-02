@@ -1973,6 +1973,85 @@ The old way (`Start.cmd`, its restart loop) is still there and still works; the 
   the one that had been working was told to carry on. The other kills and the live app: see F-058 in
   features.html.
 
+## F-075: the chat host (chathost/, agentic/chats.ts, build.ts)
+
+Built 2026-11-01, **off by default**. Shubham: "when I press the update button there has to be an intermediate
+layer where all the chats shift and continue to work while the application is updating, so my chats never stop
+and I can update any time."
+
+- **Why a process of its own.** A ConPTY child dies with the process that created its pseudo-console
+  (measured on 1 Nov 2026: killed within a second of its creator being killed, detached or not), so while the
+  chats' terminals lived in the agent, every update, crash or kill took every chat with it, and nothing could
+  be done about it from inside the agent. The terminals (node-pty), the claude processes in them and a 256 KB
+  ring of each one's output now live in the **chat host**, which the agent talks to. The agent can stop, update
+  and start again; the chats go on.
+- **The host** (`chathost/host.ts`, run by `main.ts`; the wire protocol is `protocol.ts`): one per PC, started
+  detached (measured: a detached child outlives its Scheduled Task, its parent being killed and
+  `Stop-ScheduledTask`), from a copy of its own files in `<state>/chathost/host-p<protocol>-v<version>-<hash>/`
+  (`install.ts`: the host's five files and the win32-x64 node-pty, ~15 MB), because a process that has loaded
+  node-pty's native files makes `npm ci` after an update fail (EPERM on node_modules, measured) and a
+  `git pull` could swap its files under it. It listens on 127.0.0.1:21229 (`SAD_CHAT_HOST_PORT`), takes the
+  agent's own API token, has ONE controller (a new one takes over; the old one is told and dropped), and writes
+  `<state>/chathost/host.json` (pid, port, version, protocol, folder). It knows nothing of claude, floors or keys: what
+  the agent wants kept with a chat (`meta`: its key, floor, agent, folder, start time) is stored and returned
+  whole. It never parses output. Messages (JSON lines): `hello`, `spawn`, `write`, `resize`, `kill` (the
+  terminal and its processes by exact PID and start time, `proc-tree.ts`), `list`, `attach` (the replay of the ring,
+  then the stream: nothing is missed or doubled), `forget`, `ping`, `shutdown`. An ended chat is remembered
+  10 minutes for an agent that was away. The first answer (`hello-ok`: protocol, version, pid) never changes shape.
+- **The agent's side** (`client.ts`, `link.ts`, `ensure.ts`): at its start the agent (`ensureChatHost`) uses the host that
+  runs, or starts one, and `link.adopt(pool)` lists the chats and takes each over (`ChatPool.adopt`: its terminal,
+  the host's replay to read what it is doing, the key it was started with, its start time). The pool's terminals
+  are the host's (`spawn` of the link); `keepOnClose`: stopping the agent lets go and ends nothing (every other
+  way of stopping a chat still ends it, in the host). The chats that were open are also in the open-chats list
+  (F-058), which brings back any that did not survive. If the host cannot be had (no node-pty, not answering,
+  another protocol, another token) the agent logs it and the chats run in its own process, as before. If the host
+  is lost while the agent runs (it died), the open chats are noted, a host is started again, and they are reopened
+  resumed, the working ones told to carry on.
+- **Update now**: the agent exits (code 75) without ending its chats; the guard (or `Start.cmd`) runs `Update.cmd`; the new
+  agent finds the host and takes the chats over: same claude processes, same keys, their screens, and what they printed
+  meanwhile. The MCP shim waits up to 90 s for an agent that is away (only a refused connection is tried again, never
+  one that may have arrived: `mcp-retry.ts`); the memory hook already gives up quietly.
+- **When the host itself changes** (the newer build's `RELEASE.json` has `chatHost: {protocol, version}`, written
+  by Publish; none at all counts as a change): Update waits for the chats to be idle (running or asking = busy) for 10
+  minutes, looking every 5 s, and goes by itself the moment none is; after 10 minutes the Build info says `ask`
+  and the page offers to restart the chats and update (`POST /build/update {force:true}`; `POST /build/update-cancel`
+  forgets it). Going: the open chats are written down, the host ends them and stops, the update runs, the new agent
+  starts a new host from the new files and reopens the chats resumed (today's restart + resume, which stays as the fallback).
+  The same version of the host in the newer build: the host and its chats are not touched.
+- **The switch**: `SAD_CHAT_HOST=on|off` in the environment (off wins), else the file `<state>/agent/chat-host.on` (create
+  it, restart: on; delete it: off). Off is the default; the first update with it on restarts and resumes the chats once
+  (the ones running today cannot be moved: nothing can take over a pseudo-console).
+- **Not covered**: a crash of the host itself ends every chat (they are reopened resumed); a reboot or logoff ends them;
+  typing during the few seconds the agent is away; a paste in progress when the agent goes is lost, never half sent.
+- **Tests**: `chathost/chathost.test.ts` (host and client over real loopback with a fake terminal), `update.test.ts` (two
+  agents over one host: same process, key, screen, output while away, typing; the list; a lost host replaced),
+  `ensure.test.ts` (the self-copy, finding or starting, the switch), `agentic/chats.test.ts` (adopt, keepOnClose),
+  `agentic/mcp-retry.test.ts`, `build.test.ts` (the host-change rule). **Run for real**, on the spare-port copy (page 5391,
+  host 21584, own state folder, real node-pty, a fake claude printing a tick every 500 ms while it works, started by a
+  Scheduled Task of its own, through the guard): Update now with a chat mid-answer: the API was back in 1.0 to 1.4 s,
+  both chats in the new agent in 1.0 to 1.4 s, the same host and the same claude processes (no new start), the working
+  chat still running, not told anything, the longest hole in its output 509 to 514 ms (one tick); the agent killed: back in
+  1.5 s, same host, same claude, longest hole 524 ms; the host killed: a new host after 4.1 s, both chats reopened resumed
+  after 10.3 s, the working one told to carry on, the idle one not; a newer build with another host: Update waited
+  with the chats busy (agent and host untouched for the 8 s looked at), went when they were idle, host replaced, chats
+  reopened resumed.
+
+## F-083: the hub watchdog and the idle reaper (agentic/watchdog.ts, agentic/chats.ts, agentic/chat-log.ts, agentic/heartbeat.ts)
+
+What went wrong on the night of 2 Nov 2026 (agent-console.log): the idle reaper ended each chat 4 h after anyone last had it open, even chats working through messages (it asked only "is anyone looking, is it 'running' this second"); it ended Mobile's chat in the middle of its tests (the chat sat idle at its prompt while the tests ran in a background shell); the Assistant's in-chat heartbeat died with its chat; three chats reopened at 03:08 sat at "Teach auto mode about your environment?" until 07:06; and nobody knew Mobile was down.
+
+**The reaper (chats.ts).** A chat is idle only when ALL of these hold for `IDLE_REAP_MS` (4 h): nobody has it open, it is not running, no question is up, no message was typed or pasted (`lastActive`), no turn started or ended and nothing was printed while it worked, no background work shows on its status line (`backgroundWork(screen)`: "1 shell", "2 local agents", a workflow bar `▱▱▱▱`, "Waiting for 1 dynamic workflow to finish"; read off the rows under the input box's bottom rule, so the same words in the conversation do not count; the real footer, read 2 Nov: `⏵⏵ auto mode on · 1 shell · esc to interrupt · ↓ to manage`), and `keep(sessionId)` is false: an open order from the Assistant, or unfinished work by heartbeat.ts's rule (`workOf` in index.ts). When `keep` throws, the chat is kept. `idleReapMs` / `reapEveryMs` are options for tests. `activity(sid)` gives `{state, startedAt, lastOutputAt, lastActiveAt, background}`; `press(sid, keys)` writes keys without counting as a person looking.
+
+**The watchdog (watchdog.ts).** Not a timer of its own and not a chat: each beat of the heartbeat (every 5 min, the first 2 min after start) calls `watch()`, so it runs in the agent whether or not the Assistant's chat is alive, and the overlay's heart card (last beat, next beat, what it found) shows it. `GET /agent-api/agentic/watchdog` and the tool `watchdog_status` give the same with `downNow` and a one-line `summary`. When it is on, the heartbeat no longer starts stopped chats itself (it still nudges idle chats with unfinished work and reports questions).
+- *Down and should not be.* Every agent on every floor with a session, not running anywhere, not stopped by Shubham (heartbeat `isStopped`, or a last stop with cause `stopped`), whose last stop cause is one of crashed / exited / ended / agent-stop / idle-reaper or none logged, AND that has an open order or unfinished work. A chat the reaper ended for true idleness stays ended (otherwise reaper and watchdog would take turns for ever); the reaper itself now keeps chats with work. Not while F-058 recovery is still reopening (`recoveryBusy`: until `mine.arm()`, at most 10 min). Not when its home PC is offline (F-064: `openChat` answers 424; reported, never started elsewhere). Restart = `openChat` (its home PC, resumed from the conversation), then the nudge: *"Your chat was stopped at 04:44 (idle-reaper). It had work unfinished (...). The app started it again. Any background job you had running (a shell, a workflow) was lost: check its state, then carry on..."* (starts with `[heartbeat `, so the heartbeat never counts it as an unanswered message). Limits: ≤3 restarts per chat per hour, waits 5 / 15 / 30 min after the 1st / 2nd / 3rd, ≤3 chats per beat, and only while free commit (Win32_OperatingSystem.FreeVirtualMemory, read ≤ once a minute) ≥ 3.5 GB, else "held: memory" (unreadable counts as low). Kept in `watchdog.json`, so they survive an app restart.
+- *Menus.* A chat with a menu on its live screen (`chats.asking`) is never answered, with ONE exception, matched exactly by `classifyMenu`: the title "Teach auto mode about your environment?" AND "1. Yes" / "2. Not now" / "3. Don't show again" AND a footer "Enter to confirm|select … Esc to cancel", from the last such title down, no input box below it. After it has stood 2 min and nobody has the chat open: the single key `3` (confirms at once; never Enter, never Yes), 2 s later `asking` is read again, and if the menu is still up the chat is ended and opened again from its conversation, pressing nothing. The setup screen "Yes" opens (same title, "Enter to continue" / "How you use Claude here") is never sent any key: the chat is restarted the same way. Any other prompt: the heartbeat reports every chat's after 10 min; the watchdog reports the Assistant's own (which the heartbeat skips).
+- *Silent.* "Running" with no output for 30 min and no background work: reported ("printed nothing for N min"), never touched.
+- *Telling Shubham.* A chat down or held more than 10 min is a `down` finding; the heartbeat wakes the Assistant for it, which gives him one line in the overlay. The phone push (`voice.beat`) for menu / down / silent findings is skipped 23:00–07:00; they are in chat-events.jsonl and so in the morning summary.
+- *The log.* chat-events.jsonl: `start` causes now include `watchdog`; a new event `watch` has `cause` (watchdog-restart, memory, limit, home-offline, restart-failed, menu, silent), `what` and `did`; the morning summary prints one line per `watch` event.
+- *Switches.* `SAD_WATCHDOG=0` turns the watchdog off (the heartbeat then starts stopped chats itself, as before); `SAD_HEARTBEAT=0` still turns the whole beat off.
+
+Tests: `agentic/idle-reaper.test.ts`, `agentic/watchdog.test.ts` (every rule, and the night of 2 Nov replayed), `agentic/heartbeat-api.test.ts` (through the API), `agentic/chat-log.test.ts`.
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.
