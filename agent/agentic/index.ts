@@ -10,6 +10,7 @@ import {
   AGENT_EFFORTS,
   AGENT_MODELS,
   HOME_OFFLINE_STATUS,
+  isOrchestratorAgent,
   AGENT_ULTRACODES,
   NO_DEFAULTS,
   type AgentEffort,
@@ -51,11 +52,23 @@ import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
 import { mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
-import { createOrders, isAssistantAgent, phoneUser, scanMessages } from './orders.ts'
+import { createOrders, FAST_FROM, phoneUser, scanMessages, type HandoffApi, type Order, type OrderProgress } from './orders.ts'
+import { readStatus } from './screen.ts'
 import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
-import { createVoice } from './voice.ts'
+import { createVoice, type AskView } from './voice.ts'
+import { spawn } from 'node:child_process'
+import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
+import { namesChoice, namesFor, type NamesChoice } from '../../shared/fast-names.ts'
+import { fastHello } from '../../shared/fast.ts'
+import { buildBrief, buildSnapshot, type SnapshotInput } from './fast-brief.ts'
+import { createFastSession, type FastSession } from './fast.ts'
+import { fastDenied } from './fast-tools.ts'
+import { readMemory } from './fast-gate.ts'
+import { FAST_TOOLS } from './fast-tools-list.ts'
+import { librarianEnv } from './librarian.ts'
+import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
 import { createDeviceStore } from './approval-devices.ts'
 import { createAutoUpdate } from './auto-update.ts'
@@ -144,6 +157,10 @@ export interface AgenticOptions {
   defaultCodeDir?: string
   /** CLAUDE_CODE_OAUTH_TOKEN as this account has it now (F-007). */
   token?: () => string | null
+  /** F-087: the fast Assistant's warm process (fast-host.ts): on or off (default: SAD_FAST_ASSISTANT=1 or <state>/agent/fast-assistant.on; off, nothing exists). */
+  fastAssistant?: boolean
+  /** F-087: tests: the pieces of the fast host that would start a real claude, replaced. */
+  fastHostDeps?: Partial<FastDeps>
   /** F-021: the hub's PCs; left out, this PC is on its own. */
   team?: AgenticTeamLinks
   /** Tests: a fake node-pty (and a no-op tree kill: its pids are other processes'), a fake claude, and a scratch ~/.claude/projects. */
@@ -214,6 +231,10 @@ export interface Agentic {
   mount: ApiMount
   /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
   voiceMount: ApiMount
+  /** F-087: the fast Assistant's warm process; undefined while the feature is off (the default). */
+  fastHost?: FastHost
+  /** F-087: hand-offs from the fast Assistant to the Orchestrator (the session in fast.ts uses it). */
+  handoff: HandoffApi
   floors: FloorStore
   chats: ChatPool
   memory: MemoryStore
@@ -1104,7 +1125,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return false
     const at = floors.bySession(sid)
     if (!at || !chats.info(sid)) return false
-    if (chats.info(sid)?.state === 'idle' && chats.type(sid, '/exit')) {
+    // The same draft rule as every message to a chat: /exit pasted after Shubham's unsent words would be sent WITH them, and a
+    // chat stopped under them would lose them. A real draft: nothing is typed, nothing is stopped, 409. (A grey suggestion is not one.)
+    if (hasDraft(sid)) throw apiError(409, `${at.agent.name}'s chat has unsent text in its box; nothing was typed and it was not restarted.`)
+    if (chats.info(sid)?.state === 'idle' && chats.type(sid, '/exit', { refuseDraft: true })) {
       const until = Date.now() + (o.restartGraceMs ?? 15_000)
       while (chats.info(sid) && Date.now() < until) await new Promise(r => setTimeout(r, 200))
     }
@@ -1181,15 +1205,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const targetHits = new Map<string, number[]>()
   const broadcastLast = new Map<string, number>()
 
-  function relayAllowed(from: string, to: string) {
+  /** Counts a message against the cooldowns; returns what takes it back (a message the chat refused because of a draft starts no cooldown). */
+  function relayAllowed(from: string, to: string): () => void {
     const t = Date.now()
     const pair = `${from}>${to}`
-    if (t - (pairLast.get(pair) ?? 0) < PAIR_COOLDOWN_MS) throw apiError(429, 'You just messaged that chat; give it a few seconds to answer before sending again.')
-    const hits = (targetHits.get(to) ?? []).filter(x => t - x < TARGET_WINDOW_MS)
+    const pairBefore = pairLast.get(pair)
+    if (t - (pairBefore ?? 0) < PAIR_COOLDOWN_MS) throw apiError(429, 'You just messaged that chat; give it a few seconds to answer before sending again.')
+    const before = targetHits.get(to) ?? []
+    const hits = before.filter(x => t - x < TARGET_WINDOW_MS)
     if (hits.length >= TARGET_WINDOW_MAX) throw apiError(429, 'That chat has had too many messages this minute; wait before sending more.')
     pairLast.set(pair, t)
     targetHits.set(to, [...hits, t])
+    return () => {
+      if (pairBefore === undefined) pairLast.delete(pair)
+      else pairLast.set(pair, pairBefore)
+      targetHits.set(to, hits)
+    }
   }
+  /** typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. */
+  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string) =>
+    typeInto(c, body).catch(e => {
+      undo()
+      throw e
+    })
 
   function rosterOf(floor: Floor, me: FloorAgent) {
     const byId = new Map(floor.agents.map(a => [a.id, a]))
@@ -1283,11 +1321,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const hasDraft = (sessionId: string) => (chats.info(sessionId) ? chats.drafting(sessionId) : false)
   const draftWords = (sessionId: string) => `${floors.bySession(sessionId)?.agent.name ?? 'That agent'}'s chat has unsent text in its box; try again shortly.`
 
-  async function typeInto(c: { sessionId: string; id: string }, body: string): Promise<boolean> {
-    if (c.id === self().id) return chats.type(c.sessionId, body)
+  /**
+   * Types `body` into a chat here or on a member PC. `human`: Shubham's own words (the chat view's say, a setting he changed): they may join
+   * his draft. Every other caller (an agent's message, a broadcast, a nudge, an order's reply) never does: on his unsent text nothing is
+   * typed and it throws 409. A chat on a member PC reports its draft back, because only that PC knows its screen.
+   */
+  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean } = {}): Promise<boolean> {
+    const refuseDraft = opt.human !== true
+    if (c.id === self().id) return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
     const link = team?.member(c.id)
     if (!link) return false
-    return request<boolean>(link, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)
+    const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(() => false)
+    if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
+    return r === true
   }
 
   // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
@@ -1300,20 +1346,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const PREPARED_MAX = 20
   // F-072: the orders the overlay Assistant gives, and the replies that come back to it (orders.ts).
   // Only the hub keeps them: a member's tool calls are run by the hub (callTool).
+  // F-087: where a hand-off's answer and progress go (the fast Assistant's session registers them: handoff.listen below).
+  const fastLinks: { onReturn?: (order: Order, text: string) => Promise<boolean>; onProgress?: (p: OrderProgress) => void } = {}
   const orders = createOrders({
     now: Date.now,
     file: path.join(o.dir, 'orders.json'),
     log,
     stateOf: sid => whereAll()[sid]?.state,
+    progress: p => fastLinks.onProgress?.(p),
+    words: sid => readStatus(chats.screen(sid) ?? [])?.text,
+    interrupt: sid => {
+      if (!chats.info(sid)) return false
+      chats.input(sid, String.fromCharCode(27))
+      return true
+    },
     scan: (sid, id) => {
       const file = findTranscript(sid, projectsDir)
       return file ? scanMessages(readTranscriptFile(file), id) : { started: false, answer: '' }
     },
-    deliver: async (assistantSid, body) => {
+    deliver: async (assistantSid, body, order) => {
+      // F-087: the fast Assistant is a process, not a chat: its answer goes to the session (nothing is typed anywhere).
+      if (order.from === FAST_FROM) return fastLinks.onReturn ? fastLinks.onReturn(order, body).catch(() => false) : false
       const w = whereAll()[assistantSid]
       // M1: typing ends with Enter, which would pick the highlighted option of a prompt nobody answered: kept, and tried again later.
       if (w && (atPrompt(assistantSid) || hasDraft(assistantSid))) return false
-      return w ? typeInto({ sessionId: assistantSid, id: w.id }, body) : false
+      return w ? typeInto({ sessionId: assistantSid, id: w.id }, body).catch(() => false) : false
     },
   })
   function orderReplies(): boolean {
@@ -1326,7 +1383,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // chat that has unfinished work, nudges it once, and wakes the Assistant only when there is news.
   const TRANSCRIPT_MAX_AGE_MS = 6 * 3_600_000
   const agentRefs = () =>
-    floors.list().flatMap(f => f.agents.map(a => ({ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, assistant: isAssistantAgent(f.name, a.name) })))
+    floors.list().flatMap(f => f.agents.map(a => ({ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, assistant: isOrchestratorAgent(f.name, a) })))
   const tailOf = (sid: string) => {
     const file = findTranscript(sid, projectsDir)
     // A conversation not written to for hours is history: not even read.
@@ -1413,7 +1470,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     nudge: async (sid, body) => {
       const w = whereAll()[sid]
-      if (w && w.id !== self().id) return typeInto({ sessionId: sid, id: w.id }, body)
+      if (w && w.id !== self().id) return typeInto({ sessionId: sid, id: w.id }, body).catch(() => false)
       chats.typeWhenReady(sid, body, { holdForDraft: true })
       return true
     },
@@ -1457,6 +1514,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       found: (hb.last?.findings ?? []).map(f => ({ kind: f.kind, text: f.text, did: f.did })),
       downNow: w.down.map(d => ({ agent: d.agent, floor: d.floor, downMin: Math.round((Date.now() - d.sinceMs) / 60_000), why: d.why })),
       restartsLastHour: w.restartsLastHour,
+      // F-087: the fast Assistant's process (null while the feature is off): state, why, pid, memory numbers, turns served, cost.
+      fast: fastHost?.status() ?? null,
       summary: !watchdogOn ? 'The watchdog is off (SAD_WATCHDOG=0).' : !hb.enabled ? 'The heartbeat is off, so the watchdog does not look.' : w.down.length ? `${w.down.length} chat${w.down.length === 1 ? ' is' : 's are'} down: ${w.down.map(d => d.agent).join(', ')}.` : hb.last ? `All chats looked at ${new Date(hb.last.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}: ${hb.last.findings.length ? `${hb.last.findings.length} thing${hb.last.findings.length === 1 ? '' : 's'} found.` : 'all well.'}` : 'No look yet since the app started.',
     }
   }
@@ -1465,7 +1524,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     floors
       .list()
       .flatMap(f => f.agents.map(a => ({ f, a })))
-      .find(x => isAssistantAgent(x.f.name, x.a.name)) ?? null
+      .find(x => isOrchestratorAgent(x.f.name, x.a)) ?? null
 
   /** Types `body` into the Assistant's chat, starting it first when it is not running (the heartbeat and the phone's asks). */
   async function tellAssistant(body: string): Promise<boolean> {
@@ -1488,6 +1547,63 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  // F-087: hand-offs from the fast Assistant to the Orchestrator (orders.ts has the order, its progress and its return). The same safe typing as
+  // every message to a chat: a chat at a prompt or with Shubham's unsent text is a 409 at once, nothing is typed, no retry loop.
+  const handoffTimes: number[] = []
+  const HANDOFFS_PER_MIN = 6
+  const HANDOFF_MAX = 4000
+  const handoff: HandoffApi = {
+    async handOff(text, origin, sender = 'the Assistant') {
+      if (mode() === 'member') return { ok: false, status: 409, reason: 'Hand-offs are made on the hub.' }
+      const clean = text.replace(/\s+/g, ' ').trim()
+      if (!clean) return { ok: false, status: 400, reason: 'There is nothing to hand off.' }
+      if (clean.length > HANDOFF_MAX) return { ok: false, status: 413, reason: `That is longer than ${HANDOFF_MAX} characters.` }
+      const now = Date.now()
+      while (handoffTimes.length && now - handoffTimes[0] > 60_000) handoffTimes.shift()
+      if (handoffTimes.length >= HANDOFFS_PER_MIN) return { ok: false, status: 429, reason: 'Too many hand-offs this minute. Wait a little.' }
+      const at = assistantAt()
+      if (!at) return { ok: false, status: 409, reason: 'There is no Orchestrator chat on this PC.' }
+      const who = at.a.name
+      const sid = at.a.sessionId
+      const running = sid ? whereAll()[sid] : undefined
+      const id = orders.plan(FAST_FROM, sid ?? 'orchestrator', clean)
+      if (!id) return { ok: false, status: 400, reason: 'That is not something to hand off.' }
+      const line = `[message from ${sender}, ${orders.marker(id)}] ${clean}`
+      if (sid && running) {
+        if (atPrompt(sid)) return { ok: false, status: 409, reason: `${who} is waiting for an answer on the PC.` }
+        if (hasDraft(sid)) return { ok: false, status: 409, reason: `Shubham has unsent text in ${who}'s box on the PC; try again shortly.` }
+        if (!(await typeInto({ sessionId: sid, id: running.id }, line).catch(() => false))) return { ok: false, status: 409, reason: `${who} could not take it right now.` }
+        orders.open(id, FAST_FROM, { sessionId: sid, agent: who, floor: at.f.name }, clean, { kind: 'handoff', origin })
+        handoffTimes.push(now)
+        return { ok: true, orderId: id, phase: 'typed' }
+      }
+      // Not running: started, and the message is typed when it is ready (held back from a draft, as for every message). The order waits as 'queued'.
+      let opened: ChatOpened
+      try {
+        opened = await openChat(at.f.id, at.a.id, {})
+      } catch (e) {
+        return { ok: false, status: 503, reason: `${who} could not be started: ${message(e)}` }
+      }
+      chats.typeWhenReady(opened.sessionId, line, { holdForDraft: true })
+      orders.open(id, FAST_FROM, { sessionId: opened.sessionId, agent: who, floor: at.f.name }, clean, { kind: 'handoff', origin, queued: true })
+      handoffTimes.push(now)
+      return { ok: true, orderId: id, phase: 'queued' }
+    },
+    status(orderId) {
+      const od = orders.get(orderId)
+      if (!od) return { orderId, open: false }
+      const st = whereAll()[od.to.sessionId]?.state
+      const age = Date.now() - od.at
+      const phase = od.queued ? 'queued' : st === 'question' ? 'waiting-you' : st === 'running' ? (age > 15 * 60_000 ? 'slow' : 'working') : 'typed'
+      return { orderId, open: true, phase, sec: Math.round(age / 1000), gist: od.gist, ...(st === 'running' ? { words: readStatus(chats.screen(od.to.sessionId) ?? [])?.text } : {}) }
+    },
+    cancel: id => orders.cancel(id),
+    listen(l) {
+      fastLinks.onReturn = l.onReturn
+      fastLinks.onProgress = l.onProgress
+    },
+  }
+
   // F-074: the hub's side of "Hey Chris" (voice.ts): pairing with a device key, asks to the Assistant,
   // what the phone's background service reads. A conversation file is read again only when it changed.
   const messageCache = new Map<string, { sig: string; msgs: ReturnType<typeof readTranscriptFile> }>()
@@ -1504,6 +1620,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     now: Date.now,
     file: path.join(o.dir, 'voice-devices.json'),
     speech: o.speech,
+    fast: () => fastSession?.socket('phone') ?? null,
+    fastInfo: () => fastHello(!!fastHost, fastHost?.state(), fastHost?.status().model),
+    names: () => fastNames,
+    orderAsk: id => orderAsk(id),
     log,
     assistant: () => {
       const sid = assistantAt()?.a.sessionId ?? null
@@ -1540,8 +1660,98 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return true
     },
   })
+  // F-087: the fast Assistant's warm process. Dark: nothing exists unless SAD_FAST_ASSISTANT=1 or <state>/agent/fast-assistant.on is there, and
+  // only on the hub. The session around it (sockets, brief, tools) is fast.ts; this is the process, its supervision and its memory rules.
+  // F-086: "What the chats are called" as the hub keeps it (the words the Assistant speaks follow it; default old). Set from the page; Chris reads it in hello.
+  const fastNamesFile = path.join(o.dir, 'fast-names.json')
+  let fastNames: NamesChoice = (() => {
+    try {
+      return namesChoice((JSON.parse(readFileSync(fastNamesFile, 'utf8')) as { choice?: unknown }).choice)
+    } catch {
+      return 'old'
+    }
+  })()
+  const FAST_LABELS: Record<string, string> = { ui_control: 'Opening that', ui_screen: 'Looking at the screen', app_chats: 'Checking the chats', floor_roster: 'Checking the floor', app_read_chat: 'Reading that chat', app_read_conversation: 'Reading that chat', memory_search: 'Searching', memory_read: 'Searching', memory_recent: 'Searching', task_list: 'Checking your tasks', task_add: 'Adding a task', watchdog_status: 'Checking the chats', approvals_waiting: 'Checking Approvals', hand_off: 'Asking', order_status: 'Checking on it' }
+  let fastSession: FastSession | undefined
+  /** Orders the Orchestrator's stop ended: GET /voice/ask/<orderId> says "It was stopped." (the order itself is gone once its reply is delivered). */
+  const cancelledOrders = new Set<string>()
+  /** The answers of handed-off orders, kept an hour for GET /voice/ask/<orderId> (the order itself is gone once its reply is delivered). */
+  const orderAnswers = new Map<string, { text: string; at: number; cancelled: boolean }>()
+  function orderAsk(id: string): AskView | null {
+    for (const [k, v] of orderAnswers) if (Date.now() - v.at > 3_600_000) orderAnswers.delete(k)
+    const a = orderAnswers.get(id)
+    if (a) return a.cancelled ? { askId: id, state: 'error', error: 'It was stopped.' } : { askId: id, state: 'done', speak: a.text }
+    const st = handoff.status(id)
+    if (!st.open) return null
+    if (st.phase === 'queued') return { askId: id, state: 'queued' }
+    return { askId: id, state: 'working', ...(st.words ? { status: { text: st.words, secs: st.sec ?? null, tokens: null } } : {}) }
+  }
+  /** The host's context (its last turns as role/text) into the brief's pairs. */
+  function fastBriefContext(ctx: { history: { role: 'user' | 'assistant'; text: string }[]; openOrders: string[] }) {
+    const history: { user: string; assistant: string }[] = []
+    for (const h of ctx.history) {
+      if (h.role === 'user') history.push({ user: h.text, assistant: '' })
+      else if (history.length && !history[history.length - 1].assistant) history[history.length - 1].assistant = h.text
+    }
+    return { history, openOrders: ctx.openOrders }
+  }
+  /** What the hub knows right now, for the Assistant's next turn (put in front of it only when it changed). */
+  async function fastSnapshot(): Promise<string> {
+    const where = whereAll()
+    const agents = floors.list().flatMap(f => f.agents.map(a => ({ floor: f.name, name: a.name, role: a.role, state: a.sessionId ? (where[a.sessionId]?.state ?? 'not running') : 'never opened' })))
+    const approvals = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ floor: f.name, agent: a.name }] : [])))
+    const open = await tasks.list({ status: 'open', limit: 4 }).catch(() => [])
+    const count = (await tasks.counts().catch(() => ({ open: 0 }))).open
+    const phones = voice.phone.status().devices.map(d => ({ name: d.name, online: d.online, armed: d.armed }))
+    const orders = (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).phase ?? 'open'}`)
+    const input: SnapshotInput = { agents, approvals, tasks: { open: count, first: open.map(t => t.text) }, phones, build: o.currentBuild?.() ?? null, orders }
+    return buildSnapshot(input, namesFor(fastNames))
+  }
+  const fastOn = o.fastAssistant ?? (process.env.SAD_FAST_ASSISTANT === '1' || existsSync(path.join(o.dir, '..', 'fast-assistant.on')))
+  const fastHost: FastHost | undefined =
+    fastOn && mode() !== 'member'
+      ? createFastHost({
+          now: Date.now,
+          spawn: (file, args, so) => spawn(file, args, { cwd: so.cwd, env: so.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }),
+          claude: () => {
+            const c = o.claude ?? findClaude()
+            if (!c) return null
+            return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
+          },
+          env: () => librarianEnv(process.env, o.token?.() ?? null),
+          dir: path.join(o.dir, 'fast'),
+          toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
+          shim,
+          node: process.execPath,
+          tools: () => FAST_TOOLS.map(t => `mcp__${MCP_SERVER_NAME}__${t.name}`),
+          brief: ctx => buildBrief(fastBriefContext(ctx), namesFor(fastNames)),
+          names: () => fastNames,
+          toolLabel: name => FAST_LABELS[name] ?? 'One moment',
+          onState: st => fastSession?.hostState(st),
+          context: () => (fastSession?.openOrderIds() ?? []).map(id => `${id}: ${handoff.status(id).gist ?? 'handed over'}`),
+          memory: readMemory,
+          kill: async (pid, startedAt) => {
+            await killTree(pid, { since: startedAt })
+          },
+          log: o.log?.child('fast'),
+          ...o.fastHostDeps,
+        })
+      : undefined
+  // F-086/F-087: the session around the host (owners, the two sockets, hand-off routing); null host = the Assistant is off and its sockets are refused.
+  fastSession = createFastSession({ host: fastHost ?? null, snapshot: fastSnapshot, names: () => namesFor(fastNames), log: o.log?.child?.('fast') ?? o.log })
+  handoff.listen({
+    onReturn: async (order, reply) => {
+      // The reply arrives as '[reply from <name> on <floor> to order <id>] <answer>': the answer is what is shown and told.
+      const text = reply.replace(/^\[reply from [^\]]*\]\s*/, '')
+      if (order.cancelled) cancelledOrders.add(order.id)
+      orderAnswers.set(order.id, { text, at: Date.now(), cancelled: order.cancelled === true })
+      return fastSession!.answered(order.id, order.gist, text, order.cancelled === true) === 'told'
+    },
+    onProgress: p => fastSession!.progress(p.orderId, p.phase, p.sec, p.words),
+  })
   const voiceTimer = setInterval(() => {
     if (mode() !== 'member') voice.tick()
+    void fastHost?.tick()
   }, 1000)
   voiceTimer.unref?.()
 
@@ -1553,9 +1763,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** The id of the order a message from `agent` to `toSid` is, or null when it is none (not the Assistant's, or an acknowledgement or a reply). */
   function orderFrom(floor: Floor, agent: FloorAgent, sid: string, toSid: string, body: string): string | null {
-    if (!orderReplies() || mode() === 'member' || !isAssistantAgent(floor.name, agent.name)) return null
+    if (!orderReplies() || mode() === 'member' || !isOrchestratorAgent(floor.name, agent)) return null
     const target = bySession(toSid)
-    if (!target || isAssistantAgent(target.floor.name, target.agent.name)) return null
+    if (!target || isOrchestratorAgent(target.floor.name, target.agent)) return null
     return orders.plan(sid, toSid, body)
   }
   function openOrder(id: string, fromSid: string, toSid: string, body: string) {
@@ -1563,7 +1773,43 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (target) orders.open(id, fromSid, { sessionId: toSid, agent: target.agent.name, floor: target.floor.name }, body)
   }
 
+  /** F-086/F-087: a call from the fast Assistant's process. Its list is fast-tools.ts and is checked here, by the key, at every call. */
+  async function fastCall(name: string, rawArgs: unknown): Promise<string> {
+    const names = namesFor(fastNames)
+    const denied = fastDenied(name, rawArgs, names)
+    if (denied) throw apiError(403, denied)
+    const args = isObject(rawArgs) ? rawArgs : {}
+    switch (name) {
+      case 'hand_off': {
+        const text = typeof args.text === 'string' ? args.text : ''
+        const origin = fastSession?.currentOrigin() ?? null
+        const r = await handoff.handOff(text, { kind: origin?.kind ?? 'web', ...(origin ? { client: origin.clientId, askId: origin.askId } : {}) }, names.fast)
+        if (!r.ok) return json({ ok: false, reason: r.reason, note: 'Nothing was handed over. Tell him why in one sentence; do not try again yourself.' })
+        if (origin) fastSession?.handedOff(r.orderId, origin, `Asked ${names.big.replace(/^the /, 'the ')}: ${handoff.status(r.orderId).gist ?? text.slice(0, 80)}`)
+        return json({ ok: true, orderId: r.orderId, phase: r.phase, note: `Handed to ${names.big}. Tell him in one short sentence that you have asked and will come back with the answer; do not say it is done.` })
+      }
+      case 'order_status': {
+        const id = typeof args.orderId === 'string' ? args.orderId : ''
+        const ids = id ? [id] : (fastSession?.openOrderIds() ?? [])
+        return json({ orders: ids.map(i => (cancelledOrders.has(i) ? { orderId: i, open: false, phase: 'cancelled' } : handoff.status(i))) })
+      }
+      case 'approvals_waiting': {
+        const where = whereAll()
+        const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ agent: a.name, floor: f.name }] : [])))
+        return json({ count: waiting.length, waiting, note: 'He answers these himself in Approvals; you cannot.' })
+      }
+      default: {
+        // The reads and task_add: run as an agent that belongs to the Orchestrator's floor (its memory, its floor's roster), under the Assistant's own name.
+        const at = assistantAt()
+        if (!at) throw apiError(409, 'There is no Orchestrator chat on this PC yet.')
+        const agent = { ...at.a, id: 'fast-assistant', name: names.fastName, role: 'Fast assistant', isBoss: false, sessionId: null } as unknown as FloorAgent
+        return toolFor('', name, rawArgs, { floor: at.f, agent })
+      }
+    }
+  }
+
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
+    if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
     if (mode() === 'member') return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs })
@@ -1571,8 +1817,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** A tool call from the chat `sid` (running here, or on a member that passed it on). */
-  async function toolFor(sid: string, name: string, rawArgs: unknown): Promise<string> {
-    const mine = floors.bySession(sid)
+  async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent }): Promise<string> {
+    const mine = as ?? floors.bySession(sid)
     if (!mine) throw apiError(409, "This chat isn't an agent on a floor any more.")
     const { floor, agent } = mine
     const args = isObject(rawArgs) ? rawArgs : {}
@@ -1620,10 +1866,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(target.sessionId)) throw apiError(409, promptWords(target.sessionId))
         if (hasDraft(target.sessionId)) throw apiError(409, draftWords(target.sessionId))
-        relayAllowed(sid, target.sessionId)
+        const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
-        if (!(await typeInto(target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
@@ -1641,7 +1887,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'prepare_send': {
         // F-076: only the overlay Assistant, and only a proposal: nothing is typed anywhere. Shubham sees the card and sends it with his own tap.
-        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, 'Only the overlay assistant prepares cards for Shubham to send.')
+        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, 'Only the overlay assistant prepares cards for Shubham to send.')
         const card = prepareCard(args.floor, args.agent, args.text, args.why)
         log?.info(`${agent.name} prepared a card for ${card.agentName} on ${card.floorName}`)
         return `Prepared for Shubham: "${card.text.slice(0, 120)}" to ${card.agentName} on ${card.floorName}. It is on his Send tab; only his own tap sends it.`
@@ -1661,7 +1907,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (a.sessionId === sid) return `${kept}. This is your own chat: it keeps its effort until it starts again (type /effort ${level} in it to change it now).`
         if (w.state === 'running') return `${kept}. Its chat is working right now, so it keeps its effort until it starts again; ask again once it is waiting to set it at once.`
         if (atPrompt(a.sessionId)) return `${kept}. ${promptWords(a.sessionId)}`
-        if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, `/effort ${level}`))) return `${kept}; its chat stopped before it could be set now.`
+        if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, `/effort ${level}`, { human: true }))) return `${kept}; its chat stopped before it could be set now.`
         log?.info(`${agent.name} set ${a.name}'s effort to ${level}`)
         return `${kept}, and its running chat (on ${w.name}) is on ${level} now: /effort ${level} was typed into it.`
       }
@@ -1686,7 +1932,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json(watchdogView())
       // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
       case 'phone_update': {
-        if (!phoneUser(floor.name, agent.name)) {
+        if (!phoneUser(floor.name, agent)) {
           throw apiError(403, "Only the overlay assistant and the Mobile chat can ask Shubham's phone to update.")
         }
         if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
@@ -1703,9 +1949,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(c.sessionId)) throw apiError(409, promptWords(c.sessionId))
         if (hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
-        relayAllowed(sid, c.sessionId)
+        const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
-        if (!(await typeInto(c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
@@ -1722,7 +1968,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const to = all.filter(c => !c.asking && !c.drafting)
         const skipped = all.filter(c => c.asking)
         const drafts = all.filter(c => !c.asking && c.drafting)
-        await Promise.all(to.map(c => typeInto(c, `[broadcast from ${tag}] ${body}`)))
+        // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
+        const refused = (await Promise.all(to.map(c => typeInto(c, `[broadcast from ${tag}] ${body}`).then(() => null, () => c)))).filter((c): c is NonNullable<typeof c> => c !== null)
+        if (refused.length) {
+          drafts.push(...refused)
+          to.splice(0, to.length, ...to.filter(c => !refused.includes(c)))
+        }
         const nameOf = (c: { sessionId: string }) => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)
         return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}`
       }
@@ -1788,7 +2039,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'ui_control':
       case 'ui_modules':
       case 'ui_invoke': {
-        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
+        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
         const out = await ui.call(
           name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
           args,
@@ -1800,7 +2051,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // with the command to the phone's action log and notification.
       case 'phone_screen':
       case 'phone_control': {
-        const by = phoneUser(floor.name, agent.name)
+        const by = phoneUser(floor.name, agent)
         if (!by) throw apiError(403, "Only the overlay assistant and the Mobile agent use Shubham's phone; ask the Assistant (it is the sparkle button in the app).")
         if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
         const device = typeof args.device === 'string' ? args.device : undefined
@@ -1830,7 +2081,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'wa_chats':
       case 'wa_read':
       case 'wa_prepare_send': {
-        if (!isAssistantAgent(floor.name, agent.name)) throw apiError(403, "Only the overlay assistant uses Shubham's WhatsApp; ask it (it is the sparkle button in the app).")
+        if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant uses Shubham's WhatsApp; ask it (it is the sparkle button in the app).")
         const wa = o.whatsapp?.()
         if (!wa) throw apiError(409, "WhatsApp isn't on in this app: it runs on the hub.")
         return waTool(wa, name, args)
@@ -2125,7 +2376,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
       if (fresh) chats.typeWhenReady(agent.sessionId, body)
       else if (atPrompt(agent.sessionId)) throw apiError(409, promptWords(agent.sessionId))
-      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body))) throw apiError(409, atPrompt(agent.sessionId) ? promptWords(agent.sessionId) : `${agent.name}'s chat on ${at.name} can't be typed into right now`)
+      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body, { human: true }))) throw apiError(409, atPrompt(agent.sessionId) ? promptWords(agent.sessionId) : `${agent.name}'s chat on ${at.name} can't be typed into right now`)
       return { ok: true, started: false }
     }
     // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
@@ -2284,7 +2535,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (w.state === 'question') return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat is at a question, so it applies at its next start. Answer it, then change it again to apply it at once.` }
     for (const [i, c] of commands.entries()) {
       if (i > 0) await new Promise(r => setTimeout(r, TUNE_GAP_MS))
-      if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, c))) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat stopped before it could be set now, so it applies at its next start.` }
+      if (!(await typeInto({ sessionId: a.sessionId, id: w.id }, c, { human: true }))) return { floor, applied: 'next', detail: `${a.name}'s ${what} is kept; its chat stopped before it could be set now, so it applies at its next start.` }
     }
     log?.info(`${a.name}: ${commands.join(', ')}`)
     return { floor, applied: 'now', detail: `${a.name}'s ${what} is set in its running chat (on ${w.name}) now: ${commands.join(', ')} ${commands.length > 1 ? 'were' : 'was'} typed into it.` }
@@ -2477,6 +2728,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const routes: [string, RegExp, Handler, 'local'?][] = [
     // F-083: the watchdog: whether it runs, the heartbeat's last and next beat, and the chats it holds down now.
     ['GET', /^\/watchdog$/, () => watchdogView()],
+    // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
+    ['GET', /^\/fast\/names$/, () => ({ choice: fastNames })],
+    [
+      'POST',
+      /^\/fast\/names$/,
+      (_p, r) => {
+        const choice = isObject(r.body) ? r.body.choice : undefined
+        if (choice !== 'old' && choice !== 'new') throw apiError(400, "choice is 'old' or 'new'")
+        fastNames = choice
+        writeAtomic(fastNamesFile, JSON.stringify({ choice }))
+        return { choice: fastNames }
+      },
+      'local',
+    ],
     // F-078: the heartbeat's setting and its last and next beat (the overlay shows them); a beat now.
     ['GET', /^\/heartbeat$/, () => heartbeat.state()],
     // F-078: the overlay was opened: the morning summary goes now when it is the first time after 06:00 today.
@@ -2982,7 +3247,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'type':
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
-            return chats.type(raw.sessionId, raw.text)
+            // A caller that is not the person typing (an agent's message, a broadcast, a nudge) asks for the draft check: this PC knows its own screens.
+            if (raw.refuseDraft === true && chats.drafting(raw.sessionId)) return 'draft'
+            return chats.type(raw.sessionId, raw.text, raw.refuseDraft === true ? { refuseDraft: true } : undefined)
           })
         case 'sessions':
           return answer(raw => ownSessions(pageOf(isObject(raw) ? raw : {})))
@@ -3149,6 +3416,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (rest === '/terminal') return terminal(query)
       if (rest === '/chat') return chatSocket(query)
       if (rest === '/ui') return ui.socket()
+      // F-086/F-087: the fast Assistant's stream for the web page (shared/fast.ts); no host = off = no such socket.
+      if (rest === '/fast') return fastSession?.socket('web') ?? null
       if (rest === '/events')
         return ws => {
           events.add(ws)
@@ -3164,6 +3433,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   return {
     mount,
     voiceMount: voice.mount,
+    fastHost,
+    handoff,
     floors,
     chats,
     memory,
@@ -3203,6 +3474,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       for (const s of events) s.close(1001, 'the agent is stopping')
       ui.close()
       voice.close()
+      fastSession?.close()
+      void fastHost?.stop('the app is stopping')
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
       clearInterval(voiceTimer)

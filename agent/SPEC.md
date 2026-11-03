@@ -2305,3 +2305,59 @@ Claude loads the servers of the user's own config (`~/.claude.json`, user scope)
 - The old way: `SAD_MCP_STRICT=0` (or `strictMcp: false`): chats start as before (the shared `mcp.json`, or their own file when the agent names a registry server, no `--strict-mcp-config`). If the file cannot be written the chat starts the old way and the log says so.
 - **Open question for Shubham:** the user-scope server `scyramp-ai-ship-c35fae` (the other app's CRM tools, 39 tools) is NOT restricted: every chat still gets it, as before, because the CRM floors may use its tools. If only some agents should have it, add its name to `"restricted"` in `mcp-servers.json` and name it in those agents' `mcpServers` (it also needs an entry in the registry then).
 - Checked with a real claude 2.1.316 on the files this code generates: a normal chat's init shows `shubham-agentic` connected and no windows-mcp; the Assistant's shows `shubham-agentic` and `windows-mcp` both connected.
+
+## F-086/F-087 slice 1: the fast Assistant's host, the Orchestrator duty and hand-offs (hub side)
+
+Dark: nothing changes in the app until the Assistant is switched on (`SAD_FAST_ASSISTANT=1`, or the file `<state>/agent/fast-assistant.on`, or `fastAssistant: true`; the hub only).
+Files: `agent/agentic/fast-host.ts` (+ `fast-gate.ts`, `fast-tools-list.ts`), the duty in `shared/agentic.ts` / `floors.ts`, hand-offs in `orders.ts` / `index.ts`.
+The session around the process (owners, sockets, brief, snapshot, tools and their gating) is `fast.ts` (Overlay).
+
+- **The process** is NOT a chat: no terminal, no floor, no transcript. One hidden `claude -p --input-format stream-json --output-format stream-json
+  --include-partial-messages --verbose --replay-user-messages --no-session-persistence --session-id <uuid> --append-system-prompt-file <brief>
+  --strict-mcp-config --mcp-config <file> --tools "" --permission-mode manual --permission-prompts none --allowedTools <fast tools> --settings <no hooks,
+  no CLAUDE.md> --model haiku|sonnet --effort low`, started in a private empty folder (`<state>/agent/agentic/fast/room`), with the chats' own login
+  (`librarianEnv`), a child of the agent. Its MCP file (mode 0600, deleted when it ends) names the app's shim with a key of its own (`sad_fast_…`) and
+  `SAD_TOOLSET=fast`; the shim then lists only `FAST_TOOLS`; the hub decides each call by the key (`host.keyOwns(key)`), never by what the model says.
+- **Supervision** is the guard's `supervise()` (backoff 0/2/5/10/20/30 s, 30 s init timeout, hung check); more than 6 exits in 5 minutes: `unavailable`
+  with a sentence until somebody opens it again. A turn is sent to a restarted process at most twice. Ended by exact PID and start time (`proc-tree.ts`),
+  never by name, pattern, port or `taskkill /T`; on the app stopping, its own handle first.
+- **Warm only while open + 10 minutes** (`host.open(who)` / `host.close(who)`; the owners are the session's). No keep-alive turns.
+- **Memory** (`fast-gate.ts`, the numbers are in `watchdog_status.fast.gate`): starts at 2.5 GB of available RAM or more; ended first (state `paused`,
+  "Assistant paused: memory is low") when available RAM stays under 1.2 GB for 30 s; free commit under 1.0 GB only as a backstop. An unreadable number never
+  ends it and never allows a start; when memory is back and somebody still has it open it starts again by itself.
+- **Turns**: `ask({id, text, model, snapshot?}, emit)` → frames `delta`, `flush` (end of a text block), `tool {name,label}`, `done {text, ms, costUsd,
+  ttftMs, cancelled?}`, `error {status,message}` (plain words, never the raw error). A new ask cuts the old one off (`done {cancelled}`), the process is
+  interrupted, and the new turn is written when it has stopped (or after 400 ms); what it still says about the old turn is dropped. `interrupt(id)` =
+  Stop (restarted if it does not stop in 2 s). The snapshot goes in front only when it differs from the last this process was given. A model change
+  (Haiku / Sonnet "thorough") or a change of the naming choice restarts it between turns. `deliver(note, turnId, emit)` is the hub speaking (a hand-off's
+  answer): a turn that never cuts another off and is not kept as Shubham's words. The last 6 turns and the open hand-offs go into the brief at every start.
+  The last 30 turns' times (first word, finish) are in `status().timings` and in the log.
+- **Role field**: `FloorAgent.duty: 'orchestrator' | null`, set by the hub only. `ensureDuty` (floors.ts) gives it once, from the old name (the agent
+  Assistant on the floor Assistant), at the first start and whenever none has it; one agent only; a page can neither set nor clear it. Every check that
+  was a name match (`isOrchestratorAgent`, `phoneUser`, the order gate, `prepare_send`, `ui_*`, `wa_*`, `phone_*`) now looks at the duty, so the overlay chat
+  can be renamed; the overlay client (`src/overlay/assistant.ts`) finds it by the duty and never makes a second chat.
+- **Hand-offs** (`orders.ts`, `HandoffApi` on the agent): an order whose giver is the fast Assistant (`from: 'fast'`, `kind: 'handoff'`, with its `origin`:
+  web tab or phone device and ask). Typed into the Orchestrator with the same guards as every message (a prompt or Shubham's unsent text: 409 at once, no
+  retry loop; not running: started and the order is `queued`); at most 6 a minute. Progress at 10 s, 60 s and every 5 minutes (`queued`, `typed`, `working`,
+  `waiting-you`, `slow` after 15 minutes) with the chat's spinner words; `not-taken` after 120 s; give-up at 3 h. The answer is **not** typed anywhere: it goes
+  to the session that registered with `listen({onReturn, onProgress})`; if that returns false the reply waits (kept 1 h) and is tried again. Stop = Esc into the
+  Orchestrator and a reply "(cancelled: Shubham stopped it)". One reply per order; a reply is never an order; an acknowledgement opens none.
+
+## M1 hole closed: nothing the app types goes after Shubham's unsent words
+
+`restartChat` (the app's gentle restart: Claude subscription failover, the restart route) typed `/exit` into any idle chat without the draft check that `send_to_chat` has. With his unsent words in the box, `/exit` would have been pasted after them and sent WITH them, and a chat stopped under a draft loses it.
+
+- `restartChat` now asks `hasDraft(sid)` first (the same check as `send_to_chat`: `draftOnScreen`, which ignores claude's grey/dim suggested next prompt and an empty box). A real draft: **409** "<agent>'s chat has unsent text in its box; nothing was typed and it was not restarted." Nothing is typed, nothing is stopped, nothing is started. The restart route returns that 409; the failover bridge logs "couldn't restart" and the chat is left for the person.
+- `chats.type(sessionId, text, { refuseDraft: true })` types nothing and answers false on a real draft (the final guard, used by `restartChat` for `/exit` and by the failover bridge). Without the option `type()` is as before (his own say from the chat view joins his draft by design).
+- The failover bridge (`claude/bridge.ts`, the "[message from the app]" lines and the note to Lead) now waits while the chat holds a draft (`drafting`), then types with `refuseDraft`; if the draft stays, it gives up with false and types nothing.
+- Audited, nothing to change: the heartbeat nudge (`typeWhenReady … holdForDraft`), the watchdog's keys (`press`, only at a menu), a fresh chat's `/effort ultracode` and carry-on text (a chat that was just started has no draft), `send_to_chat` / `broadcast` (checked already), Esc on cancel (not text).
+- Not covered: text typed into a chat on another PC (`typeInto` to a member) is not draft-checked there, because only the hub's own chats' screens are known to the caller.
+- Tests: `restart.test.ts` (real draft refused with 409 and nothing typed, killed or started; the route's 409 and the retry after he clears it; a grey suggestion and an empty box allowed), `chats.test.ts` (`type` with `refuseDraft`), `bridge.test.ts` (waits for the draft to go; gives up when it stays).
+
+## M1 hole closed, part 2: his unsent words in a chat on a member PC
+
+The draft check (`hasDraft`) ran only for chats on the hub's own PC: the hub knows only its own screens. A message for a chat on a member PC was typed with no check.
+
+- `typeInto` (index.ts) now takes `{ human?: boolean }`. Every caller except Shubham's own words (`sayTo` from the chat view, the `/effort` tune he changes) refuses a draft: locally through `chats.type(…, { refuseDraft: true })`, on a member through the link's `type` message carrying `refuseDraft: true`. The member PC, which knows its own screens, answers `'draft'` when the box holds his unsent text (a grey suggestion and an empty box are not), and types nothing. The hub then throws 409 "<agent>'s chat has unsent text in its box; try again shortly." An older member that does not know the field types as before.
+- `send_to_chat` and `app_send_to_chat`: the 409 goes to the caller. A message refused for a draft starts no cooldown (`relayAllowed` now returns what takes it back) and opens no order. `broadcast_to_chats`: a member chat with a draft is counted with the skipped ones in the answer. The heartbeat nudge and the Assistant's reply delivery treat the refusal as "false, try again later"; a hand-off into a member's Orchestrator says it could not take it right now.
+- Tests: `team.test.ts` (over the in-memory two-PC link of F-021): a draft in the Laptop chat is a 409 at the Server with nothing typed and the next message (box with only a grey suggestion) goes through at once; an empty box; a broadcast skips the Laptop chat with a draft and reaches it when the box is empty. The two draft tests fail without this change.

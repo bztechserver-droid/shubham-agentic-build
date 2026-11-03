@@ -69,6 +69,8 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     sessionId: typeof a.sessionId === 'string' && SESSION_ID_RE.test(a.sessionId) ? a.sessionId : null,
     homePc: typeof a.homePc === 'string' && a.homePc.trim() ? a.homePc.trim().slice(0, 64) : null,
     homePcName: typeof a.homePc === 'string' && a.homePc.trim() && typeof a.homePcName === 'string' && a.homePcName.trim() ? a.homePcName.trim().slice(0, NAME_MAX) : null,
+    // F-086: the hub's own mark (see ensureDuty); a page can neither set nor clear it (patch() puts the old one back).
+    duty: a.duty === 'orchestrator' ? 'orchestrator' : null,
     model: isModel(a.model) ? a.model : '',
     effort: isEffort(a.effort) ? a.effort : '',
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
@@ -152,9 +154,45 @@ export interface FloorStore {
   bySession(sessionId: string): { floor: Floor; agent: FloorAgent } | null
 }
 
+/**
+ * F-086: the one Orchestrator. If some agent already has the duty, it keeps it and no other does. If none has it, the agent that used
+ * to be recognised by its name (the agent "Assistant" on the floor "Assistant", the overlay chat) is given it, once: this is the only
+ * place the old name still counts, and it is what lets that chat be renamed. True when anything changed.
+ */
+export function ensureDuty(floors: Floor[]): boolean {
+  let changed = false
+  let owner: FloorAgent | null = null
+  for (const f of floors)
+    for (const a of f.agents) {
+      if (a.duty !== 'orchestrator') continue
+      if (!owner) owner = a
+      else {
+        a.duty = null
+        changed = true
+      }
+    }
+  if (owner) return changed
+  for (const f of floors) {
+    const hit = f.agents.find(a => f.name.trim().toLowerCase() === 'assistant' && a.name.trim().toLowerCase() === 'assistant')
+    if (hit) {
+      hit.duty = 'orchestrator'
+      return true
+    }
+  }
+  return changed
+}
+
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
 export function createFloorStore(file: string, onChange: () => void = () => {}): FloorStore {
   let floors: Floor[] = load()
+  // F-086: the migration runs at the start; what it changed is written with the next change at the latest (and at once if it can be).
+  if (ensureDuty(floors)) {
+    try {
+      writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`)
+    } catch {
+      // Written with the next save.
+    }
+  }
 
   function load(): Floor[] {
     let text: string
@@ -175,6 +213,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
   }
 
   function save() {
+    ensureDuty(floors)
     writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`)
     onChange()
   }
@@ -256,6 +295,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           // F-064: and so is the PC it lives on.
           a.homePc = before.get(a.id)?.homePc ?? null
           a.homePcName = before.get(a.id)?.homePcName ?? null
+          // F-086: nor the job (Orchestrator) the hub gave it.
+          a.duty = before.get(a.id)?.duty ?? null
           return a
         })
         const names = new Set<string>()

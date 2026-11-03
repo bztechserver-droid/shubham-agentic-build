@@ -23,7 +23,10 @@ export interface AgenticSlice {
   chats: {
     live(): { sessionId: string; state: 'running' | 'question' | 'idle'; startedAt: string }[]
     info(sessionId: string): { sessionId: string; state: 'running' | 'question' | 'idle'; startedAt: string } | null
-    type(sessionId: string, text: string): boolean
+    /** `refuseDraft`: types nothing and answers false when Shubham has unsent text in the box. */
+    type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
+    /** Is there unsent text of Shubham's in its box? (Absent: not known.) */
+    drafting?(sessionId: string): boolean
   }
   floors: {
     list(): { id: string; name: string; agents: { id: string; name: string; sessionId: string | null }[] }[]
@@ -121,6 +124,7 @@ export function createBridge(o: BridgeOptions): ChatBridge {
       const i = a.chats.info(sessionId)
       if (!i) return false
       if (i.state === 'question') return false // a menu: the text would land in it
+      if (a.chats.drafting?.(sessionId)) return false // his unsent words: ours would join them. Wait for him to send or clear them
       if (!opts.needIdle) return true
       return i.state === 'idle' && now() - Date.parse(i.startedAt) >= paintMs
     }, readyMs)
@@ -128,7 +132,7 @@ export function createBridge(o: BridgeOptions): ChatBridge {
     const marker = markerOf(body)
     for (let attempt = 0; attempt < 2; attempt++) {
       const before = sizeOf(sessionId)
-      if (!a.chats.info(sessionId) || !a.chats.type(sessionId, body)) return false
+      if (!a.chats.info(sessionId) || !a.chats.type(sessionId, body, { refuseDraft: true })) return false
       if (await waitUntil(() => inFile(sessionId, marker, before), deliveredMs, 1000)) return true
     }
     return false

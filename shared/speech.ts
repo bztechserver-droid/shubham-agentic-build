@@ -67,6 +67,10 @@ export const joinFinals = (finals: readonly (string | undefined)[]) =>
 /** Messages the hub's stream sends (agent/speech/routes.ts). */
 export type HubMessage =
   | { t: 'ready'; model: string }
+  /** Speech has started (F-087: the page shows "heard you"). */
+  | { t: 'heard' }
+  /** The hub has stopped listening (stop, a limit, or one question over): the microphone can go; 'done' follows. */
+  | { t: 'stopped' }
   | { t: 'partial'; text: string }
   | { t: 'final'; i: number; text: string; audioMs: number; ms: number }
   | { t: 'error'; message: string; status: number }

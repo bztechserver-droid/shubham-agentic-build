@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline'
 import { retryWhileRefused } from './mcp-retry.ts'
+import { FAST_TOOLS } from './fast-tools-list.ts'
 import { TOOLS } from './tools.ts'
 
 // F-018: the MCP server each agent's chat runs (claude starts it from the --mcp-config file
@@ -12,6 +13,9 @@ import { TOOLS } from './tools.ts'
 
 const url = process.env.SAD_AGENTIC_URL ?? ''
 const key = process.env.SAD_AGENTIC_KEY ?? ''
+// F-087: the fast Assistant's process runs this same shim with SAD_TOOLSET=fast: it is told about its own few tools only (the hub still
+// decides every call by its key).
+const LISTED = process.env.SAD_TOOLSET === 'fast' ? FAST_TOOLS : TOOLS
 const CALL_TIMEOUT_MS = 120_000
 /** F-075: how long a call waits for an agent that is restarting (an update) before it says it can't reach it. */
 const AGENT_AWAY_WAIT_MS = 90_000
@@ -58,10 +62,10 @@ async function handle(msg: { id?: Id; method?: unknown; params?: Record<string, 
         serverInfo: { name: 'shubham-agentic', version: '1.0.0' },
       })
     case 'tools/list':
-      return reply(id, { tools: TOOLS })
+      return reply(id, { tools: LISTED })
     case 'tools/call': {
       const name = typeof msg.params?.name === 'string' ? msg.params.name : ''
-      if (!TOOLS.some(t => t.name === name)) return reply(id, { content: [{ type: 'text', text: `No tool called ${name}` }], isError: true })
+      if (!LISTED.some(t => t.name === name)) return reply(id, { content: [{ type: 'text', text: `No tool called ${name}` }], isError: true })
       const r = await call(name, msg.params?.arguments)
       return reply(id, { content: [{ type: 'text', text: r.text }], isError: r.isError })
     }

@@ -75,6 +75,11 @@ export class Segmenter {
     return this.speechFrames > 0 ? Buffer.concat(this.cur) : null
   }
 
+  /** Whether he is speaking right now (a sentence has started and not ended). */
+  get speaking(): boolean {
+    return this.speechFrames > 0
+  }
+
   /** He pressed stop: whatever he was saying is a sentence too. */
   flush(): Segment | null {
     if (this.rest.length) {

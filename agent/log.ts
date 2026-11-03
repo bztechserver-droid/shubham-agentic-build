@@ -36,6 +36,7 @@ export interface DailyFile {
   write(text: string): void
   /** The file written to last, or null before the first write. */
   current(): string | null
+  /** Done once every line written so far is in its file, the day before's too (just after midnight). */
   close(): Promise<void>
 }
 
@@ -45,9 +46,12 @@ export function dailyFile(dir: string, prefix: string, keepDays = 14): DailyFile
   let file: string | null = null
   let stream: WriteStream | null = null
   let failed = false
+  // A day's stream is ended when the next day's opens; its last lines may still be on their way. close() waits for them.
+  let past: Promise<unknown> = Promise.resolve()
+  const finish = (s: WriteStream) => new Promise<void>(resolve => s.end(resolve))
 
   function open(today: string) {
-    stream?.end()
+    if (stream) past = Promise.all([past, finish(stream)])
     day = today
     file = path.join(dir, `${prefix}-${today}.log`)
     try {
@@ -71,11 +75,11 @@ export function dailyFile(dir: string, prefix: string, keepDays = 14): DailyFile
       stream?.write(text)
     },
     current: () => file,
-    close() {
+    async close() {
       const s = stream
       stream = null
       day = ''
-      return new Promise(resolve => (s ? s.end(resolve) : resolve()))
+      await Promise.all([past, s && finish(s)])
     },
   }
 }

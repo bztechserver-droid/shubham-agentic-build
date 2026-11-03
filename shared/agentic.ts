@@ -42,6 +42,16 @@ export const FLOOR_PREAMBLE_MAX = 8000
 /** An agent's brief (its system prompt). */
 export const AGENT_BRIEF_MAX = 20_000
 
+/** F-086: a job the hub gives a chat (see FloorAgent.duty); null: none. */
+export type AgentDuty = 'orchestrator' | null
+
+/**
+ * F-086: is this agent the Orchestrator (the chat the Assistant hands work to; the overlay chat until now)? By its duty. Only an agent
+ * with no duty field at all (made by hand, never by the hub) falls back to the old name: the agent "Assistant" on the floor "Assistant".
+ */
+export const isOrchestratorAgent = (floorName: string, agent: { name: string; duty?: AgentDuty }): boolean =>
+  agent.duty === undefined ? floorName.trim().toLowerCase() === 'assistant' && agent.name.trim().toLowerCase() === 'assistant' : agent.duty === 'orchestrator'
+
 /** One agent on a floor: a desk on the chart, and one Claude Code chat once it is opened. */
 export interface FloorAgent {
   id: string
@@ -64,6 +74,13 @@ export interface FloorAgent {
   homePc: string | null
   /** F-064: that PC's name, for when it is offline and its id says nothing. */
   homePcName: string | null
+  /**
+   * F-086: the job the hub knows this chat by, apart from its name: 'orchestrator' is the one chat Shubham's Assistant hands
+   * work to (it was the "Assistant" chat on the "Assistant" floor). Who it is no longer depends on what anyone calls it, so it
+   * can be renamed. Set by the hub only (first from the old name, once), never taken from a page. The hub always sends null or
+   * 'orchestrator'; undefined is only an object made by hand (a mock, a test), which is then judged by its old name.
+   */
+  duty?: AgentDuty
   model: AgentModel
   /** F-049: its chat starts with claude --effort this. */
   effort: AgentEffort

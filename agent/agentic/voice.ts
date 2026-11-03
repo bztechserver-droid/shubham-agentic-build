@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
+import type { FastHello } from '../../shared/fast.ts'
 import { DEFAULT_OFFER_FILE, createAppUpdate } from './app-update.ts'
 import type { Scan } from './orders.ts'
 import { MAX_RESULT_BYTES, createPhoneControl, type PhoneControl, type PhoneTiming } from './phone.ts'
@@ -47,6 +48,9 @@ export interface Device {
   lastSeen: string | null
 }
 
+/** An order's id (orders.ts): o and four hex digits. */
+const ORDER_ID = /^o[0-9a-f]{4}$/
+
 export interface AskView {
   askId: string
   state: 'queued' | 'working' | 'done' | 'error'
@@ -83,6 +87,14 @@ export interface VoiceDeps {
   history?(before: number, limit: number | undefined): unknown
   /** What the Assistant's spinner says, if it says anything. */
   status?(): AskView['status'] | null
+  /** F-086/F-087: the fast Assistant's stream for Chris (shared/fast.ts) on /voice/fast, opened with a paired phone's device key; null/absent = the Assistant is off and the route does not exist. */
+  fast?: () => ((ws: WsSocket) => void) | null
+  /** hello's `fast`: whether the fast Assistant is ready, and on what model. */
+  fastInfo?: () => FastHello
+  /** "What the chats are called" (hello's `names`): old | new. Default old. */
+  names?: () => 'old' | 'new'
+  /** GET /voice/ask/<orderId>: where a request the fast Assistant handed to the big chat is (or its answer, kept an hour); null = no such order. */
+  orderAsk?: (orderId: string) => AskView | null
   /** F-080: the WebSocket handler for /voice/speech (the speech service's stream), opened with a paired phone's device key. Without it the route does not exist. */
   speech?: (ws: WsSocket) => void
   /** F-082: the timings of phone control (tests shorten them). */
@@ -324,6 +336,17 @@ export function createVoice(deps: VoiceDeps): Voice {
     }
   }
 
+  /** An order's state, waiting up to `wait` seconds for it to change from what the phone last saw. */
+  async function orderState(id: string, waitS: number, seen: string | null): Promise<AskView> {
+    const until = deps.now() + Math.min(MAX_WAIT_S, Math.max(0, waitS)) * 1000
+    for (;;) {
+      const v = deps.orderAsk?.(id)
+      if (!v) throw apiError(404, 'No such ask')
+      if (v.state === 'done' || v.state === 'error' || JSON.stringify(v) !== seen || deps.now() >= until) return v
+      await new Promise(r => setTimeout(r, 400))
+    }
+  }
+
   async function cancel(d: Device, id: string) {
     const a = mine(d, id)
     if (!a.final) {
@@ -421,9 +444,9 @@ export function createVoice(deps: VoiceDeps): Voice {
     maxBody: rest => (rest === '/control/result' ? MAX_RESULT_BYTES : undefined),
     // The phone's live screen is a WebSocket on its device key alone (agent/api.ts: wsKey); nothing else here is.
     // F-080: the phone's speech-to-text socket (Whisper on the hub, agent/speech): the same device-key check as /live.
-    ws: rest => (rest === '/live' ? live : rest === '/speech' ? (deps.speech ?? null) : null),
+    ws: rest => (rest === '/live' ? live : rest === '/speech' ? (deps.speech ?? null) : rest === '/fast' ? (deps.fast?.() ?? null) : null),
     wsKey: (rest, headers) => {
-      if (rest !== '/live' && !(rest === '/speech' && deps.speech)) return null
+      if (rest !== '/live' && !(rest === '/speech' && deps.speech) && !(rest === '/fast' && deps.fast?.())) return null
       try {
         auth({ headers })
         return true
@@ -465,7 +488,7 @@ export function createVoice(deps: VoiceDeps): Voice {
       const d = auth(r)
       if (method === 'GET' && rest === '/hello') {
         const as = deps.assistant()
-        return { assistant: { sessionId: as?.sessionId ?? null, live: liveOf(as?.state) }, settings: {} }
+        return { assistant: { sessionId: as?.sessionId ?? null, live: liveOf(as?.state) }, names: deps.names?.() ?? 'old', fast: deps.fastInfo?.() ?? { ready: false }, settings: {} }
       }
       // F-082: the phone's hands (phone.ts): state, the long poll for the next command, its result, progress, STOP.
       if (rest.startsWith('/control/')) {
@@ -484,6 +507,8 @@ export function createVoice(deps: VoiceDeps): Voice {
         return Number.isFinite(before) && deps.history ? deps.history(before, limit) : { items: [], before: null }
       }
       const one = /^\/ask\/([^/]+)$/.exec(rest)
+      // F-087: an order id (a request the fast Assistant handed to the big chat) is followed like an ask.
+      if (method === 'GET' && one && ORDER_ID.test(one[1]) && deps.orderAsk) return orderState(one[1], num(r.query.get('wait'), 0), r.query.get('seen'))
       if (method === 'GET' && one) return askState(d, one[1], num(r.query.get('wait'), 0), r.query.get('seen'))
       const stop = /^\/ask\/([^/]+)\/cancel$/.exec(rest)
       if (method === 'POST' && stop) return cancel(d, stop[1])

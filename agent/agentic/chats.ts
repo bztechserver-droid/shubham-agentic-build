@@ -170,8 +170,12 @@ export interface ChatPool {
   asking(sessionId: string): boolean
   /** Is there unsent text in its idle input box (Shubham is typing there)? Anything pasted would join it. False when it isn't running here. */
   drafting(sessionId: string): boolean
-  /** Pastes `text` and presses Enter (send_to_chat); false when it isn't running. */
-  type(sessionId: string, text: string): boolean
+  /**
+   * Pastes `text` and presses Enter (send_to_chat); false when it isn't running. `refuseDraft`: types NOTHING and answers false
+   * when the idle input box holds unsent text of Shubham's (the paste would join it and one Enter would send both); a grey
+   * suggestion is not a draft.
+   */
+  type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
   typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
   kill(sessionId: string, why?: string): boolean
@@ -779,9 +783,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       return !!c && !c.exited && blocked(c)
     },
 
-    type(id, text) {
+    type(id, text, opt) {
       const c = chats.get(id)
-      return !!c && !c.exited && paste(c, text)
+      if (!c || c.exited) return false
+      if (opt?.refuseDraft && draftOnScreen(c)) return false
+      return paste(c, text)
     },
 
     typeWhenReady,

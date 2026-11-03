@@ -22,6 +22,11 @@ import { pcmMs, wavToPcm } from './wav.ts'
 // never logged (only lengths and timings).
 // The recording runs until he presses stop; pauses only cut it into sentences, which are transcribed in
 // order while he goes on speaking, each with the one before as context.
+// F-087 (the Assistant, hands-free): {t:'start', once:true, endSilenceMs?, noSpeechMs?} is ONE question that
+// ends by itself: at the first pause of endSilenceMs (default 1.2 s) after speech, or empty when nothing is
+// said within noSpeechMs of audio (default 8 s), or at 60 s. The hub also sends {t:'heard'} the moment speech
+// starts (any mode), so the page can show "heard you", and {t:'stopped'} when it stops listening (stop, a limit,
+// or one question over: the microphone can go; the last words and 'done' follow).
 
 export const MAX_UTTERANCE_MS = 120_000
 export const MAX_RECORDING_MS = 15 * 60_000
@@ -31,6 +36,13 @@ export const MAX_AUDIO_B64 = 512 * 1024
 export const AUDIO_IDLE_MS = 10_000
 /** A live partial of the sentence in progress, at most this often. */
 export const PARTIAL_EVERY_MS = 1500
+/** One question (once): the pause that ends it, the wait for any speech, and its longest. */
+export const ONCE_END_SILENCE_MS = 1200
+export const ONCE_NO_SPEECH_MS = 8000
+export const ONCE_MAX_MS = 60_000
+
+const clampMs = (v: unknown, min: number, max: number, dflt: number) =>
+  typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.round(v))) : dflt
 
 export function decodeAudio(raw: Buffer): Buffer {
   if (!raw.length) throw apiError(400, 'Expected audio: 16 kHz mono 16-bit PCM or WAV')
@@ -106,6 +118,10 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
     let ended = false
     let stopped = false
     let n = 0
+    let once = false
+    let heard = false
+    let noSpeechMs = ONCE_NO_SPEECH_MS
+    let limit = maxMs
     let quiet: ReturnType<typeof setTimeout> | null = null
     const unheard = () => {
       if (quiet) clearTimeout(quiet)
@@ -157,6 +173,24 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         })
     }
 
+    /** The end (stop pressed, the limit, or one question over): the sentences still in Whisper, then 'done'. */
+    const finish = (dropRest = false) => {
+      if (stopped || ended || !seg) return
+      stopped = true
+      if (quiet) clearTimeout(quiet)
+      // The page can let the microphone go now; the words follow.
+      send({ t: 'stopped' })
+      // After one question's pause, whatever came next is not part of it.
+      const last = dropRest ? null : seg.flush()
+      if (last) queueFinal(last.pcm)
+      void chain.then(() => {
+        if (ended) return
+        ended = true
+        send({ t: 'done', text: finals.filter(Boolean).join(' ') })
+        ws.close(1000, 'done')
+      })
+    }
+
     ws.onText(text => {
       let m: Record<string, unknown>
       try {
@@ -166,7 +200,13 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
       }
       if (m.t === 'start' && !seg) {
         o = { ...opts(m), partials: m.partials === true }
-        seg = new Segmenter()
+        once = m.once === true
+        if (once) {
+          noSpeechMs = clampMs(m.noSpeechMs, 2000, 30_000, ONCE_NO_SPEECH_MS)
+          limit = Math.min(maxMs, ONCE_MAX_MS)
+        }
+        // One question is never cut in the middle: its first pause ends it, or its 60 s.
+        seg = once ? new Segmenter({ endSilenceMs: clampMs(m.endSilenceMs, 500, 3000, ONCE_END_SILENCE_MS), maxMs: ONCE_MAX_MS + 1000 }) : new Segmenter()
         unheard()
         const s = engine.status()
         if (!s.available) {
@@ -194,28 +234,22 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         const pcm = Buffer.from(m.b64, 'base64')
         total += pcmMs(pcm)
         unheard()
-        if (total > maxMs) {
-          send({ t: 'error', message: `Recordings stop after ${Math.round(maxMs / 1000)} s`, status: 413 })
-          m = { t: 'stop' }
-        } else {
-          for (const s of seg.push(pcm.length % 2 ? pcm.subarray(0, pcm.length - 1) : pcm)) queueFinal(s.pcm)
-          partial()
-          return
+        if (total > limit) {
+          send({ t: 'error', message: `Recordings stop after ${Math.round(limit / 1000)} s`, status: 413 })
+          return finish()
         }
-      }
-      if (m.t === 'stop') {
-        stopped = true
-        if (quiet) clearTimeout(quiet)
-        const last = seg.flush()
-        if (last) queueFinal(last.pcm)
-        void chain.then(() => {
-          if (ended) return
-          ended = true
-          send({ t: 'done', text: finals.filter(Boolean).join(' ') })
-          ws.close(1000, 'done')
-        })
+        const done = seg.push(pcm.length % 2 ? pcm.subarray(0, pcm.length - 1) : pcm)
+        if (!heard && (seg.speaking || done.length)) {
+          heard = true
+          send({ t: 'heard' })
+        }
+        for (const s of done) queueFinal(s.pcm)
+        // One question: its first sentence is the whole of it; nothing said at all ends it empty.
+        if (once && (done.length || (!heard && total >= noSpeechMs))) return finish(true)
+        partial()
         return
       }
+      if (m.t === 'stop') return finish()
       if (m.t === 'cancel') {
         ended = true
         if (quiet) clearTimeout(quiet)
