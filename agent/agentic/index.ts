@@ -163,6 +163,8 @@ export interface AgenticOptions {
   fastHostDeps?: Partial<FastDeps>
   /** F-021: the hub's PCs; left out, this PC is on its own. */
   team?: AgenticTeamLinks
+  /** F-097: the hub's end of the Common Drive over the member link: one request from a member PC (agent/drive/link.ts). */
+  driveLink?: (from: { id: string; name: string }, body: unknown) => Promise<unknown>
   /** Tests: a fake node-pty (and a no-op tree kill: its pids are other processes'), a fake claude, and a scratch ~/.claude/projects. */
   spawn?: PtySpawn
   treeKill?: (pid: number) => void
@@ -231,6 +233,8 @@ export interface Agentic {
   mount: ApiMount
   /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
   voiceMount: ApiMount
+  /** F-097: the paired phone a request's device key belongs to, or null (the Common Drive's phone uploads use it). */
+  phoneDeviceOf(headers: MountRequest['headers']): { id: string; name: string } | null
   /** F-087: the fast Assistant's warm process; undefined while the feature is off (the default). */
   fastHost?: FastHost
   /** F-087: hand-offs from the fast Assistant to the Orchestrator (the session in fast.ts uses it). */
@@ -240,6 +244,8 @@ export interface Agentic {
   memory: MemoryStore
   /** What a tool call does, for the chat whose key it carries; the answer is the text the chat sees. */
   callTool(key: string, name: string, args: unknown): Promise<string>
+  /** F-097: a member PC's request to the hub's Common Drive over the link (throws when there is no hub or it can't be reached). */
+  driveRequest(body: unknown, timeoutMs?: number): Promise<unknown>
   /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
   serve(meta: Record<string, unknown>): (stream: Duplex) => void
   /**
@@ -3208,6 +3214,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(raw => attachPutPeer(raw))
         case 'attach-get':
           return answer(raw => attachGetPeer(raw))
+        case 'drive':
+          // F-097: a member PC's sync folder asks the Common Drive for a file, a list, a piece (agent/drive/link.ts).
+          return answer(raw => (o.driveLink ? o.driveLink(from, raw) : Promise.reject(apiError(404, 'The Common Drive is not on this PC'))))
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
@@ -3433,12 +3442,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   return {
     mount,
     voiceMount: voice.mount,
+    phoneDeviceOf: headers => voice.deviceOf(headers),
     fastHost,
     handoff,
     floors,
     chats,
     memory,
     callTool,
+    driveRequest: async (body, timeoutMs) => request<unknown>(needHub(), 'drive', body, timeoutMs ?? 30_000),
     serve,
     restartChat,
     resumeChat,

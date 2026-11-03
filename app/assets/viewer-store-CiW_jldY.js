@@ -1,0 +1,1 @@
+import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./react-B8SKf8RM.js";var n=e(t(),1),r=null,i=new Set,a=()=>i.forEach(e=>e()),o=e=>{r=e,a()},s=()=>{r=null,a()},c=()=>(0,n.useSyncExternalStore)(e=>(i.add(e),()=>void i.delete(e)),()=>r),l=(0,n.createContext)(null);export{c as i,s as n,o as r,l as t};

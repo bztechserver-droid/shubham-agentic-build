@@ -165,7 +165,7 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
       engine
         .transcribe(cur, { ...o, partial: true, before: finals.join(' ') })
         .then(r => {
-          if (r && r.text && !ended && seg?.current()) send({ t: 'partial', i: n, text: r.text })
+          if (r && r.text && !stopped && !ended && seg?.current()) send({ t: 'partial', i: n, text: r.text })
         })
         .catch(() => {})
         .finally(() => {

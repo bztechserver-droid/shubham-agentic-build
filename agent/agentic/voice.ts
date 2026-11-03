@@ -168,6 +168,8 @@ export interface Voice {
   devices(): { id: string; name: string; model: string; at: string; lastSeen: string | null }[]
   /** F-082: the Assistant's hands on the phone (phone_screen, phone_control). */
   phone: PhoneControl
+  /** F-097: the paired phone an Authorization: Bearer <key> belongs to, or null (the same check as every phone call; notes that it was seen). */
+  deviceOf(headers: MountRequest['headers']): { id: string; name: string } | null
   /** F-085: asks every paired phone to install the offered build (an `update` event); says what it did. */
   updatePhones(): Promise<{ pushed: boolean; message: string; versionCode?: number; versionName?: string; bytes?: number; phones?: number }>
   close(): void
@@ -525,6 +527,14 @@ export function createVoice(deps: VoiceDeps): Voice {
     },
     devices: () => devices.map(d => ({ id: d.id, name: d.name, model: d.model, at: d.at, lastSeen: d.lastSeen })),
     phone,
+    deviceOf(headers) {
+      try {
+        const d = auth({ headers })
+        return { id: d.id, name: d.name }
+      } catch {
+        return null
+      }
+    },
     async updatePhones() {
       const offer = await app.offered()
       if (!offer) return { pushed: false, message: app.reason() ?? 'No build is offered.' }

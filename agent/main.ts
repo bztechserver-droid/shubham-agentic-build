@@ -38,6 +38,7 @@ import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
 import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
+import { createDrive } from './drive/index.ts'
 
 // The device agent (agent/SPEC.md): `npm run agent [-- --role hub|member]`.
 //   hub:    supervises hbbs/hbbr, registers with hbbs, listens for members on its LAN and
@@ -170,6 +171,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       : null
   // F-079: Shubham's WhatsApp (made below, once the Agents section is: its sends are signed by his approval device).
   let whatsapp: WhatsApp | null = null
+  // F-097: the Common Drive (agent/drive/): the pool of files every device shares. On the hub; opens on first use, so no folder is made until it is asked for.
+  const drive = extras.agents === false ? null : createDrive({ dir: path.join(paths.agent, 'drive'), device: config.name, role, log: log.child('drive') })
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
@@ -195,6 +198,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       }
     },
     // F-021: one session used from the hub's PCs in turn; the hub keeps the floors.
+    // F-097: the Common Drive's end of the member link.
+    driveLink: drive ? (from, body) => drive.linkCall(from, body) : undefined,
     team: {
       self: () => ({ id: identity.id, name: config.name }),
       role: () => role,
@@ -211,6 +216,10 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       },
     },
   })
+  // F-097: a member PC's sync folder reaches the hub's Common Drive through the Agents link.
+  drive?.setHubRequest(agentic ? (body, ms) => agentic.driveRequest(body, ms) : null)
+  // F-097: a paired phone's device key (voice pairing) is what lets it upload into the Common Drive's phone inbox.
+  drive?.setPhoneAuth(agentic ? headers => agentic.phoneDeviceOf(headers) : null)
   if (agentic && chatHost && extras.chatHostGate) {
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
   }
@@ -734,7 +743,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [agentic?.mount ?? agenticOff(), ...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -757,6 +766,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     rowWatch?.stop()
     claude.close()
     agentic?.close()
+    void drive?.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()
     member?.discovery.stop()

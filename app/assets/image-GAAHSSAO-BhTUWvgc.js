@@ -1,0 +1,1 @@
+export{Ms as decodePngMetadata,Ua as encodePngMetadata}from"./chunk-K2UTITRG-BdSMM7Q1.js";import"./chunk-SRAX5OIU-wzfotNc-.js";

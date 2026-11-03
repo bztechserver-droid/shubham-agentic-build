@@ -20,8 +20,23 @@ import { clean, promptFor, whisperLang } from './words.ts'
 // own; a server whose agent has gone (died without stopping it) is ended by the next agent to load Whisper,
 // by its exact PID and start time, never by name, and never one whose agent is still running.
 
-export const DEFAULT_MODEL = 'large-v3-turbo-q5_0'
+// Measured on this PC (i5-12500H, CPU only, 8 threads) on 3 Nov 2026, for a 5 s sentence once loaded:
+// small 1.2 s with the window below (3.4 s without), large-v3-turbo q5 4.8 s (18 s without). Turbo is too slow
+// here, so small is the default; SAD_WHISPER_MODEL can still pick another file from the models folder.
+export const DEFAULT_MODEL = 'small'
 export const IDLE_MS = 5 * 60_000
+/** Whisper's full window: 1500 frames = 30 s of audio, encoded whole even for a short sentence. */
+const FULL_CTX = 1500
+
+/**
+ * The encoder window for this much audio: the audio plus 4 s, at least 512 frames (10 s), in steps of 64; 0 (the
+ * full window) when that reaches 30 s. A short sentence then costs a third of the time. Below 512 the text goes
+ * wrong (odd capitals on every word), so that is the floor.
+ */
+export function audioCtx(ms: number): number {
+  const frames = Math.max(512, Math.ceil(((ms / 1000 + 4) * 50) / 64) * 64)
+  return frames >= FULL_CTX ? 0 : frames
+}
 const READY_TIMEOUT_MS = 60_000
 const INFER_TIMEOUT_MS = 60_000
 /** Room the model needs on top of its file size, in MB (whisper.cpp's buffers and the server). */
@@ -103,10 +118,13 @@ function freePort(): Promise<number> {
   })
 }
 
+/** SAD_WHISPER_MODEL (e.g. large-v3-turbo-q5_0) names a file ggml-<name>.bin in the models folder; anything else is the default. */
+export const modelFromEnv = (v: string | undefined) => (v && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(v) && !v.includes('..') ? v : DEFAULT_MODEL)
+
 export function createEngine(d: EngineDeps = {}): Engine {
   const root = d.root ?? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'shubham-agentic')
   const exe = path.join(root, 'speech-bin', 'whisper', 'Release', 'whisper-server.exe')
-  const model = d.model ?? DEFAULT_MODEL
+  const model = d.model ?? modelFromEnv(process.env.SAD_WHISPER_MODEL)
   const modelFile = path.join(root, 'models', `ggml-${model}.bin`)
   const threads = d.threads ?? Math.max(2, Math.min(8, os.cpus().length - 4))
   const idleMs = d.idleMs ?? IDLE_MS
@@ -293,6 +311,8 @@ export function createEngine(d: EngineDeps = {}): Engine {
     form.append('temperature', '0.0')
     form.append('language', whisperLang(o.lang))
     form.append('prompt', promptFor(o.before, o.words))
+    const ctx = audioCtx(pcmMs(pcm))
+    if (ctx) form.append('audio_ctx', String(ctx))
     let r: Response
     try {
       r = await fetchFn(`${base}/inference`, { method: 'POST', body: form, signal: AbortSignal.timeout(INFER_TIMEOUT_MS) })
