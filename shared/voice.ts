@@ -97,8 +97,9 @@ export const voiceKeepsGoing = (code: string) => code === 'no-speech' || code ==
 export const VOICE_IDLE_MS = 2 * 60 * 1000
 
 /** The sentence the mic button says when the page can't listen. */
-export function voiceWhy(support: VoiceSupport, here: { protocol: string; host: string }, secureAddress = 'https://server.tailc768e5.ts.net:5173'): string | null {
+export function voiceWhy(support: VoiceSupport, here: { protocol: string; host: string }, secureAddress?: string | null): string | null {
   if (support === 'ok') return null
   if (support === 'unsupported') return 'This browser has no speech recognition. Chrome on Android has it.'
-  return `The microphone needs a secure page, and this one is ${here.protocol}//${here.host}. Open the app at ${secureAddress} instead.`
+  // The address is the app's own (its tailnet name, which changes), passed in; without one the page points to where it is written.
+  return `The microphone needs a secure page, and this one is ${here.protocol}//${here.host}. Open the app at ${secureAddress || 'the https address of this app (Home page)'} instead.`
 }

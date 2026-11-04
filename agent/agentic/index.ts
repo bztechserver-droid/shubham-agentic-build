@@ -70,11 +70,12 @@ import { FAST_TOOLS } from './fast-tools-list.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
-import { createDeviceStore } from './approval-devices.ts'
+import { cleanOrigin, createDeviceStore } from './approval-devices.ts'
+import { createRecovery as createDeviceRecovery, windowsElevation, type Elevation } from './approval-recovery.ts'
 import { createAutoUpdate } from './auto-update.ts'
 import type { WaTools } from '../whatsapp/index.ts'
 import { waTool } from '../whatsapp/tools.ts'
-import type { DevicesAnswer, PublicJwk, SignedKind } from '../../shared/approval-sign.ts'
+import type { DevicesAnswer, PublicJwk, RecoveryFinished, RecoveryStarted, SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
@@ -200,6 +201,8 @@ export interface AgenticOptions {
   newerBuild?: () => string | null
   /** F-074: tests: what stands in for the registered device's signature on a pair code. */
   voiceProof?: (body: unknown) => string
+  /** F-076 recovery: the Windows administrator prompt that lets a person add an approval device from this PC when none can sign (tests: a fake). */
+  recoveryElevation?: Elevation
   /** F-080: the speech service's stream (Whisper on the hub), offered to the phone at /voice/speech with its device key. */
   speech?: (ws: WsSocket) => void
   /** F-078: the build running now (its version), for the morning summary. */
@@ -2345,13 +2348,41 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function deviceCode(raw: unknown) {
     const body = isObject(raw) ? raw : {}
     if (approvalDevices.count() > 0) humanProof('code', [], body.sig)
+    recoveryCode = null
     return approvalDevices.newCode()
   }
 
-  function deviceRegister(raw: unknown, by: string) {
+  // Recovery from this PC (order o4a52): when no registered device can sign, a Windows administrator prompt on this PC lets ONE new device register.
+  // agent/agentic/approval-recovery.ts has the why and the checks; these are its routes. Every step goes in the approvals log.
+  const deviceRecovery = createDeviceRecovery({ elevation: o.recoveryElevation ?? windowsElevation(), note: (detail, by) => deviceLog(detail, by) })
+  /** The code the last accepted recovery gave: a registration with it is logged as "after a Windows administrator prompt". */
+  let recoveryCode: string | null = null
+
+  const recoverStart = (by: string): RecoveryStarted => deviceRecovery.start(by)
+
+  async function recoverFinish(by: string, body: unknown): Promise<RecoveryFinished> {
+    await deviceRecovery.finish(by, isObject(body) ? body.ticket : undefined)
+    const c = approvalDevices.newCode()
+    recoveryCode = c.code
+    return { ...c, ...devicesAnswer() }
+  }
+
+  /** The page address from the Origin header, unless it is the remote gate's own loopback value (the gate rewrites the header, so it says nothing about the page). */
+  function headerOrigin(h: string | string[] | undefined): string | undefined {
+    const o1 = cleanOrigin(Array.isArray(h) ? h[0] : h)
+    if (!o1) return undefined
+    const u = new URL(o1)
+    return u.hostname === '127.0.0.1' && u.port === '4740' ? undefined : o1
+  }
+
+  function deviceRegister(raw: unknown, by: string, header?: string | string[]) {
     if (!isObject(raw)) throw apiError(400, 'Expected {name, jwk, code}')
-    const d = approvalDevices.register(raw.name, raw.jwk as PublicJwk, raw.code)
-    deviceLog(`Approval device registered: ${d.name} (${d.id})`, by)
+    // The page says where it is (location.origin): the gate rewrites the Origin header, so the header is only a fallback. Information only.
+    const origin = cleanOrigin(raw.origin) ?? headerOrigin(header)
+    const viaRecovery = recoveryCode !== null && raw.code === recoveryCode
+    const d = approvalDevices.register(raw.name, raw.jwk as PublicJwk, raw.code, origin)
+    if (viaRecovery) recoveryCode = null
+    deviceLog(`Approval device registered: ${d.name} (${d.id})${d.origin ? ` from ${d.origin}` : ''}`, viaRecovery ? `${by} after a Windows administrator prompt` : by)
     log?.info(`approval device registered: ${d.name}`)
     return { device: d, ...devicesAnswer() }
   }
@@ -2806,7 +2837,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r)))],
     ['GET', /^\/approvals\/devices$/, (_, r) => (humanOnly(r), devicesAnswer())],
     ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body))],
-    ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r), r.headers.origin))],
+    ['GET', /^\/approvals\/devices\/recover$/, (_, r) => (humanOnly(r), deviceRecovery.status())],
+    ['POST', /^\/approvals\/devices\/recover\/start$/, (_, r) => (humanOnly(r), recoverStart(byOf(r)))],
+    ['POST', /^\/approvals\/devices\/recover\/finish$/, (_, r) => (humanOnly(r), recoverFinish(byOf(r), r.body))],
     ['POST', /^\/approvals\/devices\/remove$/, (_, r) => (humanOnly(r), deviceRemove(r.body, byOf(r)))],
     ['POST', /^\/approvals\/devices\/unsigned$/, (_, r) => (humanOnly(r), deviceUnsigned(r.body, byOf(r)))],
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],

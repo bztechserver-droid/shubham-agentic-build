@@ -241,7 +241,9 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
     try {
       const fresh = checkBundle(v)
       if (!hub || fresh.id !== hub.id || fresh.spkiSha256 !== hub.spkiSha256) throw new Error('not the pinned hub')
-      o.devices.updateHub({ name: fresh.name, lan: fresh.lan, public: fresh.public, licenceKey: fresh.licenceKey })
+      // The Tailscale address too (F-057 follow-up, 4 Nov 2026: the hub moved to another tailnet, and a member kept dialling the old address for ever).
+      // A hello without one ("Tailscale isn't up on the hub right now") keeps the last known address rather than wiping it.
+      o.devices.updateHub({ name: fresh.name, lan: fresh.lan, public: fresh.public, licenceKey: fresh.licenceKey, ...(fresh.tailnet ? { tailnet: fresh.tailnet } : {}) })
     } catch (e) {
       log?.warn(`ignored the hub's details: ${message(e)}`)
     }

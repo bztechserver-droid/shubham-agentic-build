@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
+import { nameProblem } from '../../shared/drive.ts'
 import type { FastHello } from '../../shared/fast.ts'
 import { DEFAULT_OFFER_FILE, createAppUpdate } from './app-update.ts'
 import type { Scan } from './orders.ts'
@@ -16,6 +17,7 @@ import { MAX_RESULT_BYTES, createPhoneControl, type PhoneControl, type PhoneTimi
 //   phone:  POST /voice/pair        GET /voice/hello
 //           POST /voice/ask         GET /voice/ask/:id?wait=25     POST /voice/ask/:id/cancel
 //           GET /voice/events?since=<cursor>&wait=25
+//           GET /voice/name   POST /voice/name {name}   (F-097: this phone's own name, its Common Drive folder)
 // An ask is Shubham's own words, typed into the Assistant's chat marked as spoken; the Assistant's final
 // answer of that turn comes back as `speak` (found by the ask's id in its conversation, as orders are).
 
@@ -23,6 +25,8 @@ export const CODE_TTL_MS = 10 * 60_000
 export const CODE_TRIES = 5
 export const PAIR_ATTEMPTS_PER_MIN = 10
 export const MAX_DEVICES = 8
+/** A phone's name, as pairing keeps it and as a rename may set it (it is also its folder in the Common Drive). */
+export const MAX_NAME_CHARS = 40
 export const MAX_ASK_CHARS = 4000
 export const MAX_WAIT_S = 25
 /** An ask the Assistant never took up, with its chat resting, is said to have failed after this long. */
@@ -253,6 +257,28 @@ export function createVoice(deps: VoiceDeps): Voice {
     if (!d) throw apiError(401, 'This phone is not paired (or was removed)')
     d.lastSeen = new Date(deps.now()).toISOString()
     return d
+  }
+
+  /**
+   * F-097: "This phone's name" in Chris's Settings. A phone renames only its OWN record: the key says which, and nothing in the
+   * body can name another phone. The name is also the phone's folder in the Common Drive (Phone/<name>/), so it keeps the
+   * store's name rules (shared/drive.ts nameProblem) and the pairing's 40 characters. Uploads after it go to the new folder.
+   */
+  function rename(d: Device, raw: unknown) {
+    const b = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    if (typeof b.name !== 'string') throw apiError(400, 'Expected the new name as "name".')
+    const name = b.name.normalize('NFC').trim()
+    // Counted as the folder's name is cut (UTF-16 units), so the Common Drive never has to shorten it.
+    if (name.length > MAX_NAME_CHARS) throw apiError(400, `A phone's name is at most ${MAX_NAME_CHARS} characters.`)
+    const why = nameProblem(name)
+    if (why) throw apiError(400, why)
+    if (name !== d.name) {
+      const was = d.name
+      d.name = name
+      save()
+      deps.log?.info(`voice: the phone ${was} is now called ${name}`)
+    }
+    return { deviceId: d.id, name: d.name }
   }
 
   // --- asks ------------------------------------------------------------------------------------
@@ -499,6 +525,9 @@ export function createVoice(deps: VoiceDeps): Voice {
       }
       // F-085: what the Update button may install (offer.json, checked against the file): cheap, any time.
       if (method === 'GET' && rest === '/app') return { offered: await app.offered() }
+      // F-097: this phone's own name (the key's record only).
+      if (method === 'GET' && rest === '/name') return { deviceId: d.id, name: d.name }
+      if (method === 'POST' && rest === '/name') return rename(d, r.body)
       if (method === 'POST' && rest === '/ask') return ask(d, r.body)
       const sure = /^\/confirm\/([^/]+)$/.exec(rest)
       if (method === 'POST' && sure) return confirm(d, sure[1], r.body)

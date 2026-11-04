@@ -236,8 +236,10 @@ export function createEngine(d: EngineDeps = {}): Engine {
   }
 
   async function load() {
-    if (child) return
+    // A load in progress first: `child` is set as soon as the server is spawned, long before it listens (F-095:
+    // a sentence sent while the model was still loading went to a closed port and failed with "fetch failed").
     if (starting) return starting
+    if (child) return
     starting = (async () => {
       const m = missing()
       if (m) throw SpeechError(m, 503)

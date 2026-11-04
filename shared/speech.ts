@@ -4,15 +4,23 @@
 
 export const SPEECH_RATE = 16_000
 
-/** Which engine turns speech into words: Whisper on the PC (the hub), or the phone browser's own (Google). */
-export type VoiceEngine = 'hub' | 'phone'
+/**
+ * Which engine turns speech into words: Whisper on the PC (the hub), the phone browser's own (Google), or the phone's
+ * keyboard (F-101: the mic opens the keyboard, and its own voice typing writes in the box).
+ */
+export type VoiceEngine = 'hub' | 'phone' | 'keyboard'
 export const VOICE_ENGINES: readonly { code: VoiceEngine; label: string; note: string }[] = [
   { code: 'hub', label: 'PC (Whisper)', note: 'Your voice goes to this PC only. Better with Indian English, names and punctuation.' },
   { code: 'phone', label: 'Phone (Google)', note: "The phone browser's own recogniser. Sends your voice to Google." },
+  {
+    code: 'keyboard',
+    label: 'Keyboard',
+    note: "The mic opens your keyboard: tap the keyboard's own mic (Samsung keyboard, Gboard). The same voice typing as in any other app, with punctuation and the words it has learnt. In a terminal the mic uses Phone (Google).",
+  },
 ]
 // The old way stays the default until Whisper has been measured on this PC and Shubham has heard it (F-080).
 export const DEFAULT_ENGINE: VoiceEngine = 'phone'
-export const parseEngine = (raw: unknown): VoiceEngine => (raw === 'hub' || raw === 'phone' ? raw : DEFAULT_ENGINE)
+export const parseEngine = (raw: unknown): VoiceEngine => (raw === 'hub' || raw === 'phone' || raw === 'keyboard' ? raw : DEFAULT_ENGINE)
 
 /**
  * Microphone samples at any rate -> 16 kHz PCM16. Each output sample is the average of the input samples it

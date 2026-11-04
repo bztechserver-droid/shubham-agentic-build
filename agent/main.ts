@@ -30,6 +30,7 @@ import { createHubLinks, createMemberLinks, type HubLinks, type MemberLinks } fr
 import { closeLog, initLog, log as rootLog, type Logger } from './log.ts'
 import { inCidr, localSubnets, parseHostPort, tailnetAddress } from './net.ts'
 import { createPairingHub, normalizeCode, startJoin, type Join, type PairingHub } from './pairing.ts'
+import { createTailnetName } from './tailnet-name.ts'
 import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
 import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, rustdeskHandler } from './rustdesk.ts'
 import { createSavedPasswords } from './saved-passwords.ts'
@@ -121,6 +122,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   let api: Api | null = null
   const changed = () => api?.changed()
+  // This PC's name on the tailnet, for the page's "open it on the phone" address (read in the background, at most once a minute; never in test mode).
+  const tailnetName = createTailnetName({ up: () => tailnet() !== null, disabled: testNoRustdesk, onChange: () => changed() })
   const timers: NodeJS.Timeout[] = []
   const every = (ms: number, fn: () => void) => timers.push(setInterval(fn, ms))
 
@@ -527,6 +530,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         lanAddress: lan?.address ?? null,
         lanSubnet: lan?.cidr ?? null,
         tailnetAddress: tailnet(),
+        tailnetName: tailnetName.get(),
         rustdeskId,
         version: VERSION,
         paired: role === 'hub' || devices.hub() !== null,

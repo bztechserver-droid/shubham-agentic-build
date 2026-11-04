@@ -46,6 +46,11 @@ export interface SelfInfo {
   lanSubnet: string | null
   /** This PC's Tailscale IPv4, e.g. "100.65.101.123", or null when Tailscale isn't up here. */
   tailnetAddress: string | null
+  /**
+   * This PC's own name on the tailnet, e.g. "server.tail36192f.ts.net" (no trailing dot): what a page shows as the address to open on a phone, instead of a name typed
+   * in the code (it changes with the tailnet). Null while unknown or when Tailscale isn't up. Optional so older agents and mocks need no change.
+   */
+  tailnetName?: string | null
   /** The installed RustDesk's ID (`RustDesk.exe --get-id`), or null when not installed. */
   rustdeskId: string | null
   version: string

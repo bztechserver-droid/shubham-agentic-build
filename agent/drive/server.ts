@@ -23,6 +23,8 @@ export interface DriveListenerOptions {
   devices: DriveDevices
   /** The tailnet login of this machine's owner, or null when unknown (then nothing proxied from the tailnet gets in). */
   owner(): string | null
+  /** Learns the owner again (it changes when this PC moves to another tailnet account). Called when a proxied request with a login is refused, at most once a minute. */
+  refreshOwner?(): Promise<void>
   log?: Logger
   /** The page API for sync devices under /api (a route's handler, or null): after the sign-in, with the device's name as the label of its changes. */
   api?: (rest: string) => ((req: IncomingMessage, res: ServerResponse, by?: string) => Promise<void>) | null
@@ -52,8 +54,16 @@ export async function startDriveListener(o: DriveListenerOptions): Promise<Drive
   // A device that just signed in is not asked to prove it again for a minute: scrypt is slow on purpose, and a file manager sends many requests.
   const proven = new Map<string, { user: string; until: number; revision: number }>()
 
+  let lastOwnerLook = Number.NEGATIVE_INFINITY
+
   async function handle(req: IncomingMessage, res: ServerResponse) {
-    const where = originOf(req.headers, o.owner())
+    let where = originOf(req.headers, o.owner())
+    // A login that is not the owner we know may be the owner under a new account (the PC moved tailnets while the drive was on): look again, but not more than once a minute.
+    if (where === 'refused' && o.refreshOwner && req.headers['tailscale-user-login'] !== undefined && req.headers['tailscale-funnel-request'] === undefined && now() - lastOwnerLook >= 60_000) {
+      lastOwnerLook = now()
+      await o.refreshOwner().catch(() => undefined)
+      where = originOf(req.headers, o.owner())
+    }
     if (where === 'refused') return plain(res, 403, 'This drive is for its owner, on the tailnet.')
     const fwd = req.headers['x-forwarded-for']
     const who = `${where}:${(Array.isArray(fwd) ? fwd[0] : fwd) ?? req.socket.remoteAddress ?? '?'}`

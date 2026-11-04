@@ -42,6 +42,49 @@ export interface ApprovalDevice {
   name: string
   addedAt: string
   lastUsed: string | null
+  /**
+   * The page address (location.origin, e.g. "https://server.tail36192f.ts.net:5173") the device registered from. A device's key lives in that page's
+   * browser storage, so a device registered from an old address can't sign from the new one. Shown for information only, never used to decide anything;
+   * absent for devices registered before it was kept.
+   */
+  origin?: string
+}
+
+/** Where a recovery stands (agent/agentic/approval-recovery.ts). */
+export type RecoveryState =
+  | 'none' // nothing started (or the last one is over and forgotten)
+  | 'waiting' // the Windows administrator prompt is open on the PC the hub runs on
+  | 'ready' // the prompt was answered Yes: Finish can be pressed
+  | 'declined' // No (or closed)
+  | 'failed' // the prompt could not be shown or the step did not work
+  | 'expired' // more than 5 minutes
+  | 'used' // Finish was pressed; the code was given
+
+/** GET /agentic/approvals/devices/recover, and the answer of .../recover/start */
+export interface RecoveryAnswer {
+  /** False where recovery is not built yet (Linux, macOS): `why` says so in words. */
+  supported: boolean
+  why?: string
+  state: RecoveryState
+  startedAt?: string
+  /** When the started recovery runs out (5 minutes after the start). */
+  expiresAt?: string
+  /** What went wrong, in words, for 'declined' and 'failed'. */
+  detail?: string
+}
+
+/**
+ * The answer of POST /agentic/approvals/devices/recover/start: the state, and a one-time `ticket` that only this answer carries (GET never shows it).
+ * Finish needs it, so a program that merely shares the page's token can't finish a recovery the person started. Keep it in memory only.
+ */
+export interface RecoveryStarted extends RecoveryAnswer {
+  ticket: string
+}
+
+/** The answer of POST /agentic/approvals/devices/recover/finish: a code to register ONE device with, like the first device's. */
+export interface RecoveryFinished extends DevicesAnswer {
+  code: string
+  expiresAt: string
 }
 
 /** GET /agentic/approvals/devices */

@@ -22,6 +22,21 @@ export const deviceIdOf = (jwk: PublicJwk) => createHash('sha256').update(JSON.s
 
 const isJwk = (v: unknown): v is PublicJwk => typeof v === 'object' && v !== null && (v as PublicJwk).kty === 'EC' && (v as PublicJwk).crv === 'P-256' && typeof (v as PublicJwk).x === 'string' && typeof (v as PublicJwk).y === 'string' && (v as PublicJwk).x.length <= 64 && (v as PublicJwk).y.length <= 64
 
+/**
+ * A page address worth keeping: "https://host:port" exactly as a browser's location.origin writes it (no path, no login), at most 200 characters; else
+ * undefined. For showing only: nothing is ever decided by it (the page says it itself, so it proves nothing).
+ */
+export function cleanOrigin(v: unknown): string | undefined {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 200) return undefined
+  try {
+    const u = new URL(v)
+    if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.username || u.password || u.origin !== v) return undefined
+    return u.origin
+  } catch {
+    return undefined
+  }
+}
+
 export interface DeviceStore {
   list(): ApprovalDevice[]
   count(): number
@@ -30,7 +45,7 @@ export interface DeviceStore {
   /** A one-time code that lets one device register (5 minutes). */
   newCode(): { code: string; expiresAt: string }
   /** Registers a device with a code (used once). Throws when the code isn't good. */
-  register(name: unknown, jwk: unknown, code: unknown): ApprovalDevice
+  register(name: unknown, jwk: unknown, code: unknown, origin?: unknown): ApprovalDevice
   remove(id: string): boolean
   /**
    * That `signed` is a signature by a registered device of `payload` made now and never seen: throws 401 otherwise.
@@ -53,7 +68,7 @@ export function createDeviceStore(file: string, now: () => number = Date.now): D
     }
   }
   const save = () => writeAtomic(file, `${JSON.stringify(data, null, 2)}\n`)
-  const pub = ({ id, name, addedAt, lastUsed }: Stored): ApprovalDevice => ({ id, name, addedAt, lastUsed })
+  const pub = ({ id, name, addedAt, lastUsed, origin }: Stored): ApprovalDevice => ({ id, name, addedAt, lastUsed, ...(origin ? { origin } : {}) })
   let code: { value: string; until: number } | null = null
   /** Nonces seen lately: a signature is good once. */
   const seen = new Map<string, number>()
@@ -76,7 +91,7 @@ export function createDeviceStore(file: string, now: () => number = Date.now): D
       code = { value, until: now() + CODE_MS }
       return { code: value, expiresAt: new Date(code.until).toISOString() }
     },
-    register(name, jwk, given) {
+    register(name, jwk, given, originGiven) {
       if (!code || code.until < now() || typeof given !== 'string' || given !== code.value) throw apiError(403, 'That code is not right, or it has run out. Ask for a new one.')
       if (!isJwk(jwk)) throw apiError(400, 'Expected the device\'s public key (ECDSA P-256)')
       const nm = typeof name === 'string' && name.trim() ? name.trim().slice(0, 60) : 'A device'
@@ -86,10 +101,13 @@ export function createDeviceStore(file: string, now: () => number = Date.now): D
       const had = data.devices.find(d => d.id === id)
       if (had) {
         had.name = nm
+        const again = cleanOrigin(originGiven)
+        if (again) had.origin = again
         save()
         return pub(had)
       }
-      const d: Stored = { id, name: nm, addedAt: new Date(now()).toISOString(), lastUsed: null, jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } }
+      const origin = cleanOrigin(originGiven)
+      const d: Stored = { id, name: nm, addedAt: new Date(now()).toISOString(), lastUsed: null, ...(origin ? { origin } : {}), jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } }
       data.devices.push(d)
       save()
       return pub(d)

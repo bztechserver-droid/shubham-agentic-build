@@ -147,6 +147,9 @@ export function createDrive(o: DriveOptions): Drive {
             why,
             devices,
             owner: () => owner,
+            refreshOwner: async () => {
+              owner = (await tailnetInfo(run))?.owner ?? owner
+            },
             log: o.log?.child('webdav'),
             api: rest => api(rest),
             pairing: { redeem: code => pairing.redeem(code), createDevice: name => devices.create(name) },
