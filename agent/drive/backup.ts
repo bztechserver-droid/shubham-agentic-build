@@ -303,14 +303,18 @@ export function createBackup(o: BackupOptions): Backup {
               continue
             }
             // Wait for a change (then a quiet moment so a burst is one pass), or the night, or a minute.
-            await new Promise<void>(r => {
-              if (ac.signal.aborted) return r()
-              wake = r
-              const t = setTimeout(r, Math.max(1000, Math.min(MINUTE, night - now())))
-              t.unref?.()
-              ac.signal.addEventListener('abort', () => r())
-            })
-            wake = null
+            // Not when a change came while the pass was running: its wake-up found nobody waiting (wake was null), so waiting now would sit
+            // out the whole minute with the change still uncopied (4 Nov 2026: the "remembers that it was on after a restart" test, 8 s).
+            if (!dirty) {
+              await new Promise<void>(r => {
+                if (ac.signal.aborted) return r()
+                wake = r
+                const t = setTimeout(r, Math.max(1000, Math.min(MINUTE, night - now())))
+                t.unref?.()
+                ac.signal.addEventListener('abort', () => r())
+              })
+              wake = null
+            }
             if (dirty && !ac.signal.aborted) {
               await new Promise<void>(r => {
                 if (ac.signal.aborted) return r()

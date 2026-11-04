@@ -61,6 +61,14 @@ const shortPath = (p: string) => {
 
 const SIBLING_RE = /^\[(?:message|broadcast) from ([^\]]*)\]\s*/
 
+// F-108 (4 Nov 2026): every message the app types into a chat goes in as a bracketed paste, and claude stores one it counts as a paste
+// as `<pasted_content id="e158"> the words </pasted_content id="e158">`. The page matches what it sent with what claude wrote back by
+// the words (shared/chat-rows.ts reconcile); with the wrapper still on, they never matched, so the message showed twice: once as sent,
+// once as the raw wrapper. Only claude's own pair is taken off (the closing tag must carry the same id); the same characters inside
+// someone's sentence are only words.
+const PASTE_RE = /<pasted_content id="([^"]*)">([\s\S]*?)<\/pasted_content id="\1">/g
+export const unwrapPaste = (s: string) => (s.includes('<pasted_content id=') ? s.replace(PASTE_RE, (_m, _id: string, inner: string) => inner.trim()) : s)
+
 /** "Lead on Final, chat e7d3dd12", "Lead, chat e7d3dd12" or "chat 4e0100d2". */
 export function senderOf(inner: string): ChatSender {
   const chat = /(?:,\s*)?chat ([0-9a-f]{6,12})\s*$/i.exec(inner)
@@ -254,7 +262,7 @@ export class Converter {
 
   /** What was typed to the agent, as it is stored: some of it is claude's wrapping, not the person's words. */
   private userText(raw: string, at: string | null, uuid: string | null): Op[] {
-    const t = raw.trim()
+    const t = unwrapPaste(raw).trim()
     if (!t || !uuid) return []
     if (t.startsWith('<task-notification') || t.startsWith('<local-command-caveat') || t.startsWith('<system-reminder')) return []
     if (t.startsWith('<agent-message')) return [add(notice(uuid, at, 'A sub-agent reported back', 'info'))]
