@@ -61,6 +61,8 @@ export interface MemberLinksOptions {
   tailnetPeers?: () => Promise<TailnetView | null>
   /** F-110: this PC's own tailnet name suffix now, or null; with it the hub's row says whether this PC and the hub are on the same tailnet. */
   tailnetSuffix?: () => string | null
+  /** F-114: the hub says what it shares on Tailscale (in its hello and in later 'ports' messages); an older hub says nothing. Given as it came: the receiver checks it. */
+  onPorts?: (raw: unknown) => void
   version: string
   /** Stream kinds this end serves to the hub. */
   onOpen?: Record<string, OpenHandler>
@@ -260,6 +262,7 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
     log?.info(`linked to the hub: ${link.path} via ${link.address}`)
     // Bookkeeping last; neither of these throws.
     refreshHub(link.hello.hub)
+    if (link.hello.ports !== undefined) o.onPorts?.(link.hello.ports)
     saveLastSeen()
     changed()
   }
@@ -291,6 +294,8 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
     } else if (msg.t === 'hub') {
       refreshHub(msg.hub)
       changed()
+    } else if (msg.t === 'ports') {
+      o.onPorts?.(msg.ports)
     }
   }
 

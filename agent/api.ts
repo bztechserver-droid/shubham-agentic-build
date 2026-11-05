@@ -16,6 +16,9 @@ import {
   type ForgetHubRequest,
   type ForgetHubResult,
   type SetHubAddressRequest,
+  type PortRequest,
+  type PortsSettingsRequest,
+  type PortsState,
   type SetHubAddressResult,
   type JoinRequest,
   type JoinState,
@@ -82,6 +85,11 @@ export interface ApiActions {
   forgetHub(req: ForgetHubRequest): ForgetHubResult
   /** F-113: a member saves an address typed by hand for its hub ("" clears it) and connects at once; throws apiError 400 for something that is not host:port, 409 for another hub. */
   setHubAddress(req: SetHubAddressRequest): SetHubAddressResult
+  /** F-114: Ports. Each answers the new PortsState; apiError 400 for a bad request, 409 for a port that cannot be shared (the sentence says why). */
+  portsSettings(req: PortsSettingsRequest): Promise<PortsState>
+  portShare(req: PortRequest): Promise<PortsState>
+  portUnshare(req: PortRequest): Promise<PortsState>
+  portsRefresh(): Promise<PortsState>
   check(id: string): unknown
   screen(id: string): unknown
   /** A raw stream to that device's screen (its own through the app, or its RustDesk), or to this PC's own (F-014), for the in-app viewer; throws apiError when there is none. */
@@ -242,6 +250,29 @@ function joinRequest(body: unknown): JoinRequest {
   }
   const req: JoinRequest = { hubAddress: body.hubAddress.trim(), code: body.code }
   return body.hubId === undefined ? req : { ...req, hubId: body.hubId }
+}
+
+function portRequest(body: unknown): PortRequest {
+  if (!isObject(body) || typeof body.port !== 'number' || !Number.isInteger(body.port) || body.port < 1 || body.port > 65535) throw apiError(400, 'Expected {port}: a port number from 1 to 65535')
+  return { port: body.port }
+}
+
+function portsSettingsRequest(body: unknown): PortsSettingsRequest {
+  if (!isObject(body)) throw apiError(400, "Expected {mode?: 'off'|'chosen'|'all', chosen?: number[], tlsBy?: 'agent'|'tailscale'}")
+  const out: PortsSettingsRequest = {}
+  if (body.mode !== undefined) {
+    if (body.mode !== 'off' && body.mode !== 'chosen' && body.mode !== 'all') throw apiError(400, "mode must be 'off', 'chosen' or 'all'")
+    out.mode = body.mode
+  }
+  if (body.tlsBy !== undefined) {
+    if (body.tlsBy !== 'agent' && body.tlsBy !== 'tailscale') throw apiError(400, "tlsBy must be 'agent' or 'tailscale'")
+    out.tlsBy = body.tlsBy
+  }
+  if (body.chosen !== undefined) {
+    if (!Array.isArray(body.chosen) || body.chosen.length > 500 || !body.chosen.every(p => typeof p === 'number' && Number.isInteger(p) && p >= 1 && p <= 65535)) throw apiError(400, 'chosen must be a list of port numbers from 1 to 65535')
+    out.chosen = body.chosen as number[]
+  }
+  return out
 }
 
 function forgetRequest(body: unknown): ForgetHubRequest {
@@ -480,6 +511,10 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ['POST', /^\/join\/cancel$/, () => a.cancelJoin()],
     ['POST', /^\/hub\/forget$/, (_, body) => a.forgetHub(forgetRequest(body))],
     ['POST', /^\/hub\/address$/, (_, body) => a.setHubAddress(hubAddressRequest(body))],
+    ['POST', /^\/ports\/settings$/, (_, body) => a.portsSettings(portsSettingsRequest(body))],
+    ['POST', /^\/ports\/share$/, (_, body) => a.portShare(portRequest(body))],
+    ['POST', /^\/ports\/unshare$/, (_, body) => a.portUnshare(portRequest(body))],
+    ['POST', /^\/ports\/refresh$/, () => a.portsRefresh()],
     ['POST', /^\/devices\/([^/]+)\/check$/, ([id]) => a.check(id)],
     ['POST', /^\/devices\/([^/]+)\/screen$/, ([id]) => a.screen(id)],
     ['POST', /^\/devices\/([^/]+)\/remove$/, ([id]) => a.remove(id)],

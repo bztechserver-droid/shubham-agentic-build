@@ -41,6 +41,8 @@ import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { createDrive } from './drive/index.ts'
+import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
+import { createPorts } from './ports/index.ts'
 
 // The device agent (agent/SPEC.md): `npm run agent [-- --role hub|member]`.
 //   hub:    supervises hbbs/hbbr, registers with hbbs, listens for members on its LAN and
@@ -127,6 +129,26 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const tailnetName = createTailnetName({ up: () => tailnet() !== null, disabled: testNoRustdesk, onChange: () => changed() })
   // F-110: this PC's tailnet (its PCs), read only when a member's stored hub address fails; never in test mode.
   const tailnetPeers = createTailnetPeers({ disabled: testNoRustdesk, up: () => tailnet() !== null, onChange: () => changed() })
+  // F-114: Ports - this PC's agent shares some or all of its listening ports on Tailscale, behind its own gate. Off until it is switched on. Never in test mode.
+  let onPortsChanged: () => void = () => {}
+  const portsMod = createPorts({
+    dir: path.join(paths.agent, 'ports'),
+    run: tailscaleRunner,
+    disabled: testNoRustdesk,
+    // The app's own ports: the agent's, RustDesk's (21115-21119), the guard (21228) and chat host (21229) range, the Drive's WebDAV and the others the phone gate was told never to share.
+    appPorts: () => [...Object.values(ports), 21222, 21228, 21229, 21280, ...Array.from({ length: 12 }, (_, i) => 21320 + i), Number(process.env.SAD_CHAT_HOST_PORT) || 21229, Number(process.env.SAD_GUARD_PORT) || 21228],
+    appMarker: path.resolve(import.meta.dirname, '..').toLowerCase().replaceAll('\\', '/') + '/agent/',
+    pagePort: Number(process.env.SAD_UI_PORT) || 5173,
+    hub: () => {
+      const h = devices.hub()
+      return h ? { name: h.name, tailnetName: h.tailnetName ?? null, tailnetAddress: h.tailnet ? h.tailnet.replace(/:\d+$/, '') : null } : null
+    },
+    onChange: () => {
+      changed()
+      onPortsChanged()
+    },
+    log: log.child('ports'),
+  })
   const timers: NodeJS.Timeout[] = []
   const every = (ms: number, fn: () => void) => timers.push(setInterval(fn, ms))
 
@@ -338,7 +360,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     const links = createHubLinks({
       devices,
       pairing,
-      hello: () => ({ ...hello(), hub: bundleOrNull() }),
+      hello: () => ({ ...hello(), hub: bundleOrNull(), ports: portsMod.hello() }),
       subnets,
       onOpen,
       onChange: changed,
@@ -424,6 +446,17 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       })
     }
 
+    // F-114: members learn what the hub shares (their Server button) in its hello, and again whenever it changes.
+    let lastPorts = ''
+    onPortsChanged = () => {
+      const p = portsMod.hello()
+      const now = JSON.stringify(p)
+      if (now === lastPorts) return
+      const first = lastPorts === ''
+      lastPorts = now
+      if (!first && p) links.broadcast({ t: 'ports', ports: p })
+    }
+
     // Members learn the hub's new details (LAN address, hbbs key) over their links.
     let lastBundle = ''
     function shareBundle() {
@@ -496,6 +529,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       tailnetSearch: () => config.tailnetSearch !== false,
       tailnetPeers: () => tailnetPeers.get(),
       tailnetSuffix: () => tailnetPeers.suffix(),
+      onPorts: raw => void portsMod.setServer(raw),
       version: VERSION,
       onOpen,
       // Where the pinned hub's ID answered on the LAN: tried with its stored address.
@@ -553,6 +587,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       discovered: member && !devices.hub() ? member.discovery.list() : [],
       hubRefused: member?.links.refusal() ?? null,
       hubAddress: member?.links.manual() ?? null,
+      ports: portsMod.state(),
       settings: { route, stayReachable },
       appScreen: appScreen.status(),
       claude: claude.status(),
@@ -676,6 +711,10 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       changed()
       return { ok: true, address: normal }
     },
+    portsSettings: req => portsMod.settings(req),
+    portShare: req => portsMod.share(req),
+    portUnshare: req => portsMod.unshare(req),
+    portsRefresh: () => portsMod.refresh(),
     cancelJoin: () => {
       needMember()
       join?.cancel()
@@ -801,6 +840,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
   }
 
+  portsMod.start()
   void checkScreen()
   every(60_000, () => void checkScreen())
   // The CRM decides what Claude here runs on: asked at start and every hour while signed in.
@@ -819,6 +859,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     claude.close()
     agentic?.close()
     void drive?.close()
+    void portsMod.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()
     member?.discovery.stop()

@@ -307,6 +307,8 @@ export interface AgentState {
   hubRefused?: HubRefusal | null
   /** F-113: member only. The address typed by hand for the saved hub and how the last try of it went. Null when this PC has no hub. */
   hubAddress?: HubAddressInfo | null
+  /** F-114: Ports - this PC's shared pages on Tailscale, and (member) the Server's. Absent on an older agent. */
+  ports?: PortsState
   settings: AgentSettings
   /** F-006: this PC's own screen for other PCs. */
   appScreen: AppScreenInfo
@@ -364,6 +366,121 @@ export interface ForgetHubResult {
   ok: true
   forgot: { id: string; name: string } | null
 }
+
+/** F-114 Ports (5 Nov 2026): share some or all of this PC's listening ports on Tailscale, from this PC's own agent. Goes into shared/agent-api.ts at my merge. */
+
+/** off: nothing shared by this PC's agent. chosen: only the `chosen` ports. all: every listening port that is allowed (see PortBlock). Default: off, on every PC. */
+export type PortsMode = 'off' | 'chosen' | 'all'
+
+/** How https is done for the ports this agent shares. 'agent' (default): the agent's own gate answers TLS with this PC's real certificate and plain http on the same port (so http://100.x.y.z:port opens). 'tailscale' (the old way, as the phone gate does it): Tailscale does the TLS, by name only. */
+export type PortsTlsBy = 'agent' | 'tailscale'
+
+/** Why a port can never be shared by Ports, even when chosen one by one. */
+export type PortBlock =
+  | 'app' //         decided by PROCESS first (the agent and its children, the chat host, RustDesk), then by the app's own port numbers and RustDesk's 21115-21119
+  | 'tailscale' //   Tailscale's own
+  | 'low' //         under 1024
+  | 'windows' //     a Windows service's port (svchost, System, lsass, ...) or a known Windows port (3389, 5357, 5985, 7680 ...)
+  | 'reserved' //    80, 443, 4740, 4741, 4742, 8443, 8444: Christopher, the phone gate, the Drive
+  | 'debugger' //    answers like a debugger or remote-control endpoint: never shared, by Share all or one by one
+  | 'other-entry' // Tailscale already serves this port for something else (the phone gate, the Drive, a hand-made entry): Ports never touches it
+  | 'not-reachable' // listens on one address only, not on this PC's loopback or all addresses: the gate could not reach it
+
+export interface ListeningPort {
+  port: number
+  /** Process name without .exe, e.g. "node"; null when it cannot be read. */
+  program: string | null
+  pid: number | null
+  /** Who shares it on Tailscale right now: 'ports' = this PC's agent (Ports); 'gate' = the phone gate (old way, read-only); 'other' = some other Tailscale entry (read-only); null = nobody. */
+  sharedBy: 'ports' | 'gate' | 'other' | null
+  /** In the `chosen` list (whatever the mode is). */
+  chosen: boolean
+  /** True for the app's own page port (SAD_UI_PORT, 5173 by default): the one app port that may be shared. Its page server forwards /agent-api, so sharing it lets EVERY device of the tailnet (any account) use this PC's app; the page should say that plainly next to the switch. */
+  appPage: boolean
+  /** Set when Ports can never share it; `text` is one plain sentence for the page. */
+  blocked: { why: PortBlock; text: string } | null
+}
+
+/**
+ * One shared page and the links to open it. NEVER a link that cannot open (Lead's rule, 5 Nov):
+ *  - httpsUrl: https://<name>.<tailnet>.ts.net:<port> with the real certificate. null when this PC's tailnet name is unknown, or when https is not served on that port (`note` says why).
+ *  - ipUrl: the link by the bare Tailscale IP.
+ *      * A share by Ports with the agent doing the TLS (the default): http://100.x.y.z:port, which opens with no warning. ipUrlWarns false.
+ *      * A share whose TLS Tailscale does (the phone gate's, other entries, Ports' own when `tlsBy` is 'tailscale' or the certificate could not be fetched): plain http can never open,
+ *        so ipUrl is https://100.x.y.z:port and ipUrlWarns is TRUE (the browser shows a certificate warning that can be clicked through).
+ *      * null when nothing opens by IP (`note` says why), e.g. a raw TCP entry that is not a web page.
+ */
+export interface PortShare {
+  port: number
+  program: string | null
+  sharedBy: 'ports' | 'gate' | 'other'
+  httpsUrl: string | null
+  ipUrl: string | null
+  /** True when ipUrl is https by a bare IP: the browser will warn about the certificate. */
+  ipUrlWarns: boolean
+  /** One plain sentence when a link is missing or warns (e.g. "The phone gate shares this port: by its IP the browser warns about the certificate"), else null. */
+  note: string | null
+}
+
+export interface PortsGate {
+  /** The Ports gate listens (127.0.0.1:port) and Tailscale hands it the connections. */
+  listening: boolean
+  port: number | null
+  /** 'ready': https by name is served with the real certificate; 'getting': fetching it; 'no-cert': could not get one (the shares then use Tailscale's TLS, by name only; `detail` says why); 'off': Ports is off or `tlsBy` is 'tailscale'. */
+  https: 'ready' | 'getting' | 'no-cert' | 'off'
+  /** ISO time the certificate runs out, or null. */
+  certExpires: string | null
+  detail: string | null
+}
+
+/** What this PC's agent knows about the Server's shared pages (member only). The hub sends it in its hello; an absent field means an older hub (then only the saved tailnet name is known). */
+export interface ServerPorts {
+  name: string
+  tailnetName: string | null
+  tailnetAddress: string | null
+  /** The Server's main page (Christopher, https://<name>), or null when the hub does not say. Same link rules as PortShare. */
+  main: { httpsUrl: string | null; ipUrl: string | null; ipUrlWarns: boolean } | null
+  shares: PortShare[]
+  /** ISO time of the hub's last message that carried this; null while only the saved tailnet name is known. */
+  at: string | null
+}
+
+export interface PortsState {
+  /** False when Ports cannot work on this PC (Tailscale not installed or not up, not Windows). `unavailable` says why in one sentence. */
+  available: boolean
+  unavailable: string | null
+  mode: PortsMode
+  chosen: number[]
+  tlsBy: PortsTlsBy
+  /** The programs "Share all" covers (the phone gate's list: node, python ...). Ports chosen one by one can be any program. */
+  allPrograms: string[]
+  /** This PC on Tailscale (for its own button): null parts while unknown. */
+  self: { name: string | null; address: string | null; tailnet: string | null }
+  /** Every TCP port that listens on this PC, lowest first. */
+  ports: ListeningPort[]
+  /** Everything shared from this PC on Tailscale now (Ports' own + read-only others), for the page's list and its buttons. */
+  shares: PortShare[]
+  gate: PortsGate
+  /** The last problem, in one plain sentence, or null. */
+  error: string | null
+  /** ISO time of the last scan, or null before the first. */
+  scannedAt: string | null
+  /** Member only: the Server's shared pages (the Server button). Null on the hub. */
+  server: ServerPorts | null
+}
+
+/** POST /ports/settings: any of the three; answers the new PortsState. 400 for a bad port, mode or tlsBy. A blocked port in `chosen` is 409 (the text says why). */
+export interface PortsSettingsRequest {
+  mode?: PortsMode
+  chosen?: number[]
+  tlsBy?: PortsTlsBy
+}
+/** POST /ports/share {port} adds it to `chosen` (mode off becomes chosen); POST /ports/unshare {port} removes it. Both answer the new PortsState. */
+export interface PortRequest {
+  port: number
+}
+// POST /ports/refresh {} : scan now; answers the new PortsState.
+// AgentState gets:  ports?: PortsState   (absent on an older agent: Web treats absent as "this PC's agent does not have Ports yet")
 
 /** Every response that is not 2xx carries this body. */
 export interface ApiError {
