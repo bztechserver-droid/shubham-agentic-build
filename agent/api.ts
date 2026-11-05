@@ -13,6 +13,10 @@ import {
   type ForgetPasswordRequest,
   type GrabbedKey,
   type JoinConfirm,
+  type ForgetHubRequest,
+  type ForgetHubResult,
+  type SetHubAddressRequest,
+  type SetHubAddressResult,
   type JoinRequest,
   type JoinState,
   type KeysMessage,
@@ -74,6 +78,10 @@ export interface ApiActions {
   join(req: JoinRequest): JoinState | Promise<JoinState>
   confirmJoin(req: JoinConfirm): JoinState | Promise<JoinState>
   cancelJoin(): unknown
+  /** F-112: a member forgets its saved hub (the pairing only); throws apiError 409 when `hubId` is not the saved one. */
+  forgetHub(req: ForgetHubRequest): ForgetHubResult
+  /** F-113: a member saves an address typed by hand for its hub ("" clears it) and connects at once; throws apiError 400 for something that is not host:port, 409 for another hub. */
+  setHubAddress(req: SetHubAddressRequest): SetHubAddressResult
   check(id: string): unknown
   screen(id: string): unknown
   /** A raw stream to that device's screen (its own through the app, or its RustDesk), or to this PC's own (F-014), for the in-app viewer; throws apiError when there is none. */
@@ -234,6 +242,18 @@ function joinRequest(body: unknown): JoinRequest {
   }
   const req: JoinRequest = { hubAddress: body.hubAddress.trim(), code: body.code }
   return body.hubId === undefined ? req : { ...req, hubId: body.hubId }
+}
+
+function forgetRequest(body: unknown): ForgetHubRequest {
+  if (!isObject(body) || typeof body.hubId !== 'string' || !/^[a-z2-7]{16}$/.test(body.hubId)) throw apiError(400, 'Expected {hubId}: the 16-character ID of the hub to forget')
+  return { hubId: body.hubId }
+}
+
+function hubAddressRequest(body: unknown): SetHubAddressRequest {
+  if (!isObject(body) || typeof body.hubId !== 'string' || !/^[a-z2-7]{16}$/.test(body.hubId) || typeof body.address !== 'string') {
+    throw apiError(400, 'Expected {hubId, address}: the hub\'s 16-character ID and an address like 100.78.83.92:21220 (empty clears it)')
+  }
+  return { hubId: body.hubId, address: body.address }
 }
 
 function screenPassword(body: unknown): ScreenPasswordRequest {
@@ -458,6 +478,8 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ['POST', /^\/join$/, (_, body) => a.join(joinRequest(body))],
     ['POST', /^\/join\/confirm$/, (_, body) => a.confirmJoin(joinConfirm(body))],
     ['POST', /^\/join\/cancel$/, () => a.cancelJoin()],
+    ['POST', /^\/hub\/forget$/, (_, body) => a.forgetHub(forgetRequest(body))],
+    ['POST', /^\/hub\/address$/, (_, body) => a.setHubAddress(hubAddressRequest(body))],
     ['POST', /^\/devices\/([^/]+)\/check$/, ([id]) => a.check(id)],
     ['POST', /^\/devices\/([^/]+)\/screen$/, ([id]) => a.screen(id)],
     ['POST', /^\/devices\/([^/]+)\/remove$/, ([id]) => a.remove(id)],

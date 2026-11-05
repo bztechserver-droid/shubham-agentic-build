@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { isTailnet, parseHostPort } from './net.ts'
+import { isTailnet, parseHostPort, parseIPv4 } from './net.ts'
 
 // devices.json (agent/SPEC.md › Pairing): on the hub, the allowlist of paired members; on a
 // member, the hub it pinned. Written whole to a temp name and renamed, so a reader never sees
@@ -41,6 +41,11 @@ export interface HubBundle {
 export interface HubRecord extends HubBundle {
   pairedAt: string
   lastSeen: string | null
+  /**
+   * F-113 (5 Nov 2026): an address typed by hand ('host:port'), dialled first on every attempt, next to the F-110 search and not instead of it. The pin still decides who
+   * answers, so a wrong address is refused and never taken for the hub. Kept until cleared or this PC joins a hub again; the hub's own hello never changes it.
+   */
+  manualAddress?: string
 }
 
 export interface DevicesFile {
@@ -55,6 +60,22 @@ const HEX32 = /^[0-9a-f]{64}$/
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const isEndpoint = (v: unknown): v is string => typeof v === 'string' && parseHostPort(v) !== null
 const isTime = (v: unknown): v is string => typeof v === 'string' && !Number.isNaN(Date.parse(v))
+
+/**
+ * F-113: an address typed by hand for the hub, as 'host:port' with the host in lower case, or null when it is not one. The host is an IPv4 address or a host name
+ * (a tailnet name, a machine name); the port may be left out, then `defaultPort` is used.
+ */
+export function normalizeHubAddress(input: string, defaultPort: number): string | null {
+  const s = input.trim()
+  if (!s || s.length > 300) return null
+  const withPort = /^[^:[\]\s]+$/.test(s) ? s + ':' + defaultPort : s
+  const hp = parseHostPort(withPort)
+  if (!hp) return null
+  const host = hp.host.toLowerCase().replace(/\.$/, '')
+  if (parseIPv4(host) === null && !isDnsName(host)) return null
+  if (host === '0.0.0.0' || host === '255.255.255.255') return null
+  return host + ':' + hp.port
+}
 
 /** A peer's name, as it may show on screen: trimmed, no control characters, at most 64. */
 export function cleanName(v: unknown, fallback: string): string {
@@ -126,7 +147,8 @@ function checkHub(v: unknown, at: string): HubRecord {
   }
   if (!isTime(v.pairedAt)) throw new Error(`${at}: "pairedAt" must be a date`)
   if (v.lastSeen !== null && !isTime(v.lastSeen)) throw new Error(`${at}: "lastSeen" must be a date or null`)
-  return { ...bundle, pairedAt: v.pairedAt, lastSeen: v.lastSeen }
+  const manualAddress = typeof v.manualAddress === 'string' && isEndpoint(v.manualAddress) ? v.manualAddress : undefined
+  return { ...bundle, pairedAt: v.pairedAt, lastSeen: v.lastSeen, ...(manualAddress ? { manualAddress } : {}) }
 }
 
 /** devices.json, or an empty one when missing. A malformed file is an error, never silently reset: it is the allowlist. */
@@ -202,8 +224,10 @@ export interface DeviceStore {
   hub(): HubRecord | null
   /** Pins a hub (a member that pairs again replaces its hub). */
   setHub(bundle: HubBundle): HubRecord
+  /** F-112: forgets the pinned hub (the member is unpaired again); returns the record it had, or null. */
+  clearHub(): HubRecord | null
   /** Fresh details from the pinned hub's hello; the pin itself never changes this way. */
-  updateHub(patch: Partial<Pick<HubRecord, 'name' | 'lan' | 'public' | 'tailnet' | 'tailnetName' | 'licenceKey' | 'lastSeen'>>): void
+  updateHub(patch: Partial<Pick<HubRecord, 'name' | 'lan' | 'public' | 'tailnet' | 'tailnetName' | 'licenceKey' | 'lastSeen' | 'manualAddress'>>): void
 }
 
 /** Loads devices.json once and keeps it in memory; every change is written through. */
@@ -244,6 +268,12 @@ export function createDeviceStore(file: string): DeviceStore {
       const record: HubRecord = { ...bundle, pairedAt: new Date().toISOString(), lastSeen: null }
       save({ ...data, hub: record })
       return copy(record)
+    },
+    clearHub() {
+      const had = data.hub
+      if (!had) return null
+      save({ ...data, hub: null })
+      return copy(had)
     },
     updateHub(patch) {
       if (!data.hub) return

@@ -5,7 +5,7 @@ import { isDnsName, type HubRecord } from './devices.ts'
 import { createMux, type Control, type Mux, type OpenHandler } from './link/mux.ts'
 import { tlsClient, tlsServer, type PeerTls, type TlsIdentity, type VerifyPeer } from './link/tls.ts'
 import type { Logger } from './log.ts'
-import { inCidr, parseHostPort, type Subnet } from './net.ts'
+import { inCidr, isTailnet, parseHostPort, parseIPv4, type Subnet } from './net.ts'
 import { mangle, unmangle } from './rendezvous/codec.ts'
 import { hubLabels, rankPeers, suffixOf, type TailnetView } from './tailnet-peers.ts'
 import {
@@ -79,10 +79,16 @@ export interface HubLink {
 }
 
 /** Why no link came up. `refused`: the hub itself turned this PC away. */
-export type ConnectFailure = Error & { location: 'offline' | 'unreachable'; refused: boolean; evidence: string[]; hint?: string }
+export type ConnectFailure = Error & { location: 'offline' | 'unreachable'; refused: boolean; evidence: string[]; hint?: string; /** F-112: on a refusal, 'ip:port' of the hub that answered (not a relay's), ready for Join a hub. */ answeredAt?: string }
 
 function failure(text: string, location: 'offline' | 'unreachable', refused = false): ConnectFailure {
   return Object.assign(new Error(text), { location, refused, evidence: [] as string[] })
+}
+
+/** F-113: how a try of the typed address went. */
+export interface ManualResult {
+  result: 'accepted' | 'refused' | 'wrong-pc' | 'no-answer'
+  detail: string
 }
 
 export const isRefusal = (e: unknown): boolean => (e as Partial<ConnectFailure> | null)?.refused === true
@@ -105,6 +111,8 @@ export interface ConnectOptions {
   tailnetSearch?: boolean
   /** F-110: this PC's tailnet as it is now (its PCs and its name suffix), read when the stored address fails; null when unknown. */
   tailnetPeers?: () => Promise<TailnetView | null>
+  /** F-113: told how the try of the typed address (`hub.manualAddress`) went. */
+  onManual?: (r: ManualResult) => void
   /**
    * More addresses for step 1: where LAN discovery heard the pinned hub's ID answer. Discovery
    * is not authenticated, but the pin is: an impostor there fails TLS like any wrong key.
@@ -180,7 +188,10 @@ function establish(raw: Duplex, way: Way, o: ConnectOptions, timeoutMs: number, 
           // TLS went through with the right hub, so this is its answer: it does not take this PC.
           const why = reason.replace(/^peer: /, '')
           note(`The hub refused this PC: ${why}`)
-          settle(failure(`the hub refused this PC (${why})`, 'unreachable', true))
+          const sock = raw as { remoteAddress?: string; remotePort?: number }
+          const direct = way.path !== 'relay-lan' && way.path !== 'relay-internet'
+          const answeredAt = direct ? (sock.remoteAddress && sock.remotePort ? `${sock.remoteAddress.replace(/^::ffff:/i, '')}:${sock.remotePort}` : way.address) : undefined
+          settle(Object.assign(failure(`the hub refused this PC (${why})`, 'unreachable', true), answeredAt ? { answeredAt, reason: why } : { reason: why }))
         })
         mux.send({ ...o.hello, path: way.path, evidence: evidence.slice(-8) })
       }),
@@ -247,6 +258,61 @@ export async function probeDirect(o: ConnectOptions, note: (line: string) => voi
     void Promise.allSettled(attempts).then(results => {
       for (const r of results) if (r.status === 'fulfilled' && r.value !== winner) r.value.mux.close('another direct link won')
     })
+  }
+}
+
+/**
+ * Step 0 (F-113): the address typed by hand for the hub. Any route but Relay only. TCP, then pinned TLS and the hello, like every other path, so an address that
+ * belongs to another PC fails on the pin and is told so. Null when there is none, or when nothing good came of it (the evidence says why); a refusal by the hub is thrown.
+ */
+export async function probeManual(o: ConnectOptions, note: (line: string) => void, evidence: string[]): Promise<HubLink | null> {
+  const at = o.hub.manualAddress
+  if (!at) return null
+  const t = { ...TIMING, ...o.timing }
+  const host = hostOf(at)
+  // How it counts: a Tailscale address or name (100.64/10, *.ts.net, a bare machine name) is over Tailscale; an address on this PC's LAN is the same network; any other is direct over the internet.
+  const viaTailnet = isTailnet(host) || host.endsWith('.ts.net') || (parseIPv4(host) === null && !host.includes('.'))
+  const sameNet = parseIPv4(host) !== null && o.subnets().some(s => inCidr(host, s.cidr))
+  const started = Date.now()
+  let socket
+  try {
+    socket = await connectTcp(at, Math.min(t.tailnetConnectMs, t.tailnetTotalMs))
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    const why =
+      code === 'ECONNREFUSED'
+        ? `${at} refused the connection (no agent listening there)`
+        : code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+          ? `the name ${host} is not known on this PC`
+          : `${at} didn't answer in ${ms(t.tailnetConnectMs)}${viaTailnet && !o.tailnet?.() ? ' (Tailscale is not running on this PC)' : ''}`
+    note(`Typed address: ${why}`)
+    o.onManual?.({ result: 'no-answer', detail: `Nothing answered at ${at}: ${why}.` })
+    return null
+  }
+  const way: Way = {
+    path: viaTailnet ? 'tailscale' : 'lan-direct',
+    location: sameNet ? 'same-network' : 'internet',
+    address: at,
+    started,
+    tlsLine: elapsed => `Typed address: TLS to ${at} in ${ms(elapsed)}, pinned key matched`,
+  }
+  try {
+    const link = await establish(socket, way, o, Math.max(0, started + t.tailnetTotalMs - Date.now()), note, evidence)
+    o.onManual?.({ result: 'accepted', detail: `${o.hub.name} answered at ${at} and let this PC in.` })
+    return link
+  } catch (e) {
+    if (isRefusal(e)) {
+      o.onManual?.({ result: 'refused', detail: `${o.hub.name} answered at ${at} but does not know this PC (it was removed, or never paired). Pair it again.` })
+      throw e
+    }
+    const wrong = /not the paired hub/.test(message(e))
+    note(`Typed address: ${at}: ${message(e)}`)
+    o.onManual?.(
+      wrong
+        ? { result: 'wrong-pc', detail: `Something answered at ${at}, but it is not ${o.hub.name} (its ID or key is different), so it was not used.` }
+        : { result: 'no-answer', detail: `${at} answered, but not as a hub: ${message(e)}.` },
+    )
+    return null
   }
 }
 
@@ -466,6 +532,16 @@ export async function connectHub(o: ConnectOptions): Promise<HubLink> {
   const route = o.route
   const routeNote = ROUTE_NOTE[route]
   if (routeNote) note(routeNote)
+
+  // 0. An address typed by hand (F-113): first, on any route but Relay only; the steps below still run if it gets nowhere.
+  if (route !== 'relay' && o.hub.manualAddress) {
+    try {
+      const link = await probeManual(o, note, evidence)
+      if (link) return link
+    } catch (e) {
+      throw fail(e as ConnectFailure)
+    }
+  }
 
   // 1. Same network first.
   if (route === 'auto' || route === 'rustdesk') {

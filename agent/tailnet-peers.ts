@@ -1,3 +1,4 @@
+import type { TailnetCompare } from '../shared/agent-api.ts'
 import { defaultRunner, type Runner } from './drive/tailscale.ts'
 import { isDnsName, type HubRecord } from './devices.ts'
 import { isTailnet } from './net.ts'
@@ -56,32 +57,84 @@ export function parseTailnet(stdout: string): TailnetView | null {
 export interface TailnetPeers {
   /** The tailnet as it is now, or null while Tailscale is not up here or does not answer. Cached a few seconds. */
   get(): Promise<TailnetView | null>
+  /**
+   * This PC's own tailnet name suffix, at once: what was last read, or null (Tailscale not up here, not read yet, or no answer). It looks again in the background
+   * when what it knows is older than a minute, and tells `onChange` when the answer changes, so a page that is shown can follow a PC that signs in to another tailnet.
+   */
+  suffix(): string | null
 }
 
-export function createTailnetPeers(o: { run?: Runner; ttlMs?: number; now?: () => number; disabled?: boolean } = {}): TailnetPeers {
+export interface TailnetPeersOptions {
+  run?: Runner
+  ttlMs?: number
+  now?: () => number
+  disabled?: boolean
+  /** Is Tailscale up on this PC (does it have an address)? When not, `suffix()` is null and nothing is asked. Default: assumed up. */
+  up?: () => boolean
+  onChange?: () => void
+}
+
+export function createTailnetPeers(o: TailnetPeersOptions = {}): TailnetPeers {
   const run = o.run ?? defaultRunner
   const now = o.now ?? Date.now
   const ttl = o.ttlMs ?? 15_000
   let cached: { at: number; view: TailnetView } | null = null
   let inflight: Promise<TailnetView | null> | null = null
+  let known: string | null = null
+  let askedAt = Number.NEGATIVE_INFINITY
+  const get = (): Promise<TailnetView | null> => {
+    if (o.disabled) return Promise.resolve(null)
+    if (cached && now() - cached.at < ttl) return Promise.resolve(cached.view)
+    inflight ??= run(['status', '--json'])
+      .then(r => (r.code === 0 ? parseTailnet(r.stdout) : null))
+      .catch(() => null)
+      .then(view => {
+        // A failed look is not remembered: the next failed connection asks again.
+        if (view) cached = { at: now(), view }
+        return view
+      })
+      .finally(() => {
+        inflight = null
+      })
+    return inflight
+  }
   return {
-    get() {
-      if (o.disabled) return Promise.resolve(null)
-      if (cached && now() - cached.at < ttl) return Promise.resolve(cached.view)
-      inflight ??= run(['status', '--json'])
-        .then(r => (r.code === 0 ? parseTailnet(r.stdout) : null))
-        .catch(() => null)
-        .then(view => {
-          // A failed look is not remembered: the next failed connection asks again.
-          if (view) cached = { at: now(), view }
-          return view
+    get,
+    suffix() {
+      if (o.disabled) return null
+      if (o.up && !o.up()) {
+        known = null
+        askedAt = Number.NEGATIVE_INFINITY
+        return null
+      }
+      if (now() - askedAt >= 60_000) {
+        askedAt = now()
+        void get().then(view => {
+          const next = view?.suffix ?? null
+          // A look that fails keeps what was known.
+          if (view && next !== known) {
+            known = next
+            o.onChange?.()
+          }
         })
-        .finally(() => {
-          inflight = null
-        })
-      return inflight
+      }
+      return known
     },
   }
+}
+
+/**
+ * F-110: this PC's tailnet against the hub's (shared/agent-api.ts › TailnetCompare), with the sentence the page shows when they differ.
+ * `fresh`: the hub said its tailnet on the link that is up now.
+ */
+export function compareTailnets(mine: string | null, hub: Pick<HubRecord, 'name' | 'tailnetName'>, fresh: boolean): TailnetCompare {
+  const theirs = suffixOf(hub.tailnetName)
+  const state = mine && theirs ? (mine === theirs ? 'same' : 'different') : 'unknown'
+  const message =
+    state === 'different'
+      ? `This PC is on the tailnet ${mine}, but ${hub.name} ${fresh ? 'is' : 'was last'} on ${theirs}. Sign this PC in to ${theirs}${fresh ? ' to reach it over Tailscale' : ' if it is still there'}.`
+      : null
+  return { mine, theirs, state, fresh, message }
 }
 
 /** The labels this hub is likely to carry on a tailnet: the first label of the name it told us, else its own name as a label ("Server" → "server"). */

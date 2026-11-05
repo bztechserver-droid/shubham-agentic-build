@@ -98,6 +98,22 @@ export interface DeviceInfo {
   canOpenAppScreen: boolean
   /** F-008: the ways in whose password this PC remembers for that PC (Remember me). Absent: none. */
   savedPassword?: ScreenVia[]
+  /** F-110: on a member's row for its hub only; absent on every other row (the hub's rows for its members, a PC without a hub). */
+  tailnet?: TailnetCompare
+}
+
+/** F-110: which tailnet each end of a link is on, so the page can say when this PC and the hub are on different ones. */
+export interface TailnetCompare {
+  /** This PC's tailnet name suffix ("tail36192f.ts.net"), or null when Tailscale is not running here or does not say. */
+  mine: string | null
+  /** The hub's tailnet name suffix as the hub last said it, or null when unknown (the hub is not on Tailscale, or never told its name). */
+  theirs: string | null
+  /** 'different' only when BOTH are known and differ; 'same' when both are known and equal; 'unknown' whenever either is null. */
+  state: 'same' | 'different' | 'unknown'
+  /** True when the hub said it on the link that is up now; false = its last known tailnet (the link is down). */
+  fresh: boolean
+  /** One plain sentence for the badge, set only when state is 'different'; null otherwise. */
+  message: string | null
 }
 
 /**
@@ -287,12 +303,66 @@ export interface AgentState {
   join: JoinState | null
   /** Member only: hubs answering the LAN discovery query. */
   discovered: DiscoveredHub[]
+  /** F-112: member only. The hub answered and turned this PC away ("not paired"): the saved pairing is no use and the page should offer Join a hub. Null/absent otherwise. */
+  hubRefused?: HubRefusal | null
+  /** F-113: member only. The address typed by hand for the saved hub and how the last try of it went. Null when this PC has no hub. */
+  hubAddress?: HubAddressInfo | null
   settings: AgentSettings
   /** F-006: this PC's own screen for other PCs. */
   appScreen: AppScreenInfo
   /** F-007: Claude on this PC, on the CRM's subscription. */
   claude: ClaudeInfo
   updatedAt: string
+}
+
+/** F-112: the hub this PC has saved answered, and it does not know this PC any more (removed there, or never paired there). */
+export interface HubRefusal {
+  hubId: string
+  hubName: string
+  /** 'ip:port' the hub answered from (a relay's address is never put here), ready to be the address in Join a hub. */
+  address: string
+  /** The hub's own words, e.g. "this PC is not paired with the hub". */
+  reason: string
+  /** ISO time of the first refusal in this run of refusals. */
+  since: string
+}
+
+/** F-113: the hub's address typed by hand, and what happened when it was tried (the pin is still checked, so a wrong address is refused, never taken for the hub). */
+export interface HubAddressInfo {
+  /** 'host:port' saved by hand, or null when none is. */
+  address: string | null
+  /**
+   * 'checking': an attempt is running; 'accepted': the hub answered at it and let this PC in; 'refused': the hub answered and does not know this PC (see hubRefused: pair again);
+   * 'wrong-pc': something answered but it is not the saved hub (its ID or key differs); 'no-answer': nothing answered there. Null: none saved, or not tried yet.
+   */
+  result: 'checking' | 'accepted' | 'refused' | 'wrong-pc' | 'no-answer' | null
+  /** One plain sentence about the result, or null. */
+  detail: string | null
+  /** ISO time of the last result, or null. */
+  at: string | null
+}
+
+/** F-113: POST /hub/address on a member. `address` is 'host:port' (IPv4 or a name; the port may be left out, then the hub's port is used); '' clears it. `hubId` must be the saved hub. */
+export interface SetHubAddressRequest {
+  hubId: string
+  address: string
+}
+
+/** F-113: the answer. `address` is what was saved ('host:port'), or null when cleared. It connects at once; the outcome comes in the state's `hubAddress`. */
+export interface SetHubAddressResult {
+  ok: true
+  address: string | null
+}
+
+/** F-112: POST /hub/forget on a member: unpair from the saved hub (`hubId` must be the saved one). */
+export interface ForgetHubRequest {
+  hubId: string
+}
+
+/** F-112: the answer. `forgot` is null when this PC had no hub saved (nothing to do). */
+export interface ForgetHubResult {
+  ok: true
+  forgot: { id: string; name: string } | null
 }
 
 /** Every response that is not 2xx carries this body. */

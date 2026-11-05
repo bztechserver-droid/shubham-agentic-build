@@ -366,6 +366,23 @@ path ("answered as device X, not the paired hub Y").
      "Every path failed".
    - The old way, the stored address only, is `"tailnetSearch": false` in config.json (missing =
      on). Nothing is stored in the build: a publish carries no address.
+   - **Which tailnet each end is on** (shared/agent-api.ts › `TailnetCompare`, on a member's row for its hub as
+     `tailnet`): this PC's tailnet name suffix (`tailscale status --json`, read in the background at most once
+     a minute, `tailnet-peers.ts` `suffix()`) against the suffix of the name the hub last told. `different` only
+     when both are known and differ, with one plain sentence (`message`) to show; `fresh` is whether the hub
+     said it on the link that is up now. Unknown or equal: no message.
+   - **When the hub does not know this PC any more (F-112)**: the hub answered and said "not paired". The state's
+     `hubRefused` {hubId, hubName, address (ip:port it answered from, never a relay's), reason, since} tells the page to
+     offer Join a hub with that address filled in; the saved record stays (the default) until the user forgets it:
+     `POST /hub/forget` {hubId} on a member clears the saved hub only (this PC's identity, settings and saved passwords
+     stay; the old devices.json is kept as devices.json.before-forget), after which `self.paired` is false and Join
+     a hub is offered. A different hubId is 409; no hub saved is a no-op ({forgot: null}).
+   - **An address typed by hand (F-113)**: `POST /hub/address` {hubId, address} on a member saves `manualAddress` in the
+     hub record ('host:port'; an IPv4 address or a name; the port may be left out; "" clears it) and connects at once.
+     It is step 0: tried first on every route but Relay only, then the steps above still run. The pin is checked as on
+     every path, so another PC at that address is refused ("wrong-pc"), never taken for the hub. The state's `hubAddress`
+     {address, result: checking|accepted|refused|wrong-pc|no-answer, detail, at} says how the last try went. The hub's
+     hello never changes it; joining a hub again clears it.
    - Result: path `tailscale`, location `internet` (Tailscale says nothing about where the
      hub is).
    - On `tailscale` a failure here ends the attempt ("No link over Tailscale"); on `auto`

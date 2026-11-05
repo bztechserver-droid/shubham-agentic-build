@@ -1,11 +1,11 @@
-import type { DeviceInfo, LinkPath, Location, Route } from '../shared/agent-api.ts'
-import { connectHub, probeDirect, type ConnectFailure, type ConnectOptions, type HubLink, type RelayVia, type Timing } from './connect.ts'
+import type { DeviceInfo, HubAddressInfo, HubRefusal, LinkPath, Location, Route } from '../shared/agent-api.ts'
+import { connectHub, probeDirect, type ConnectFailure, type ConnectOptions, type HubLink, type ManualResult, type RelayVia, type Timing } from './connect.ts'
 import { checkBundle, cleanName, type DeviceStore, type MemberRecord } from './devices.ts'
 import type { Identity } from './link/identity.ts'
 import { createMux, type Control, type Mux, type OpenHandler } from './link/mux.ts'
 import type { PeerTls } from './link/tls.ts'
 import type { Logger } from './log.ts'
-import type { TailnetView } from './tailnet-peers.ts'
+import { compareTailnets, type TailnetView } from './tailnet-peers.ts'
 import { inCidr, parseHostPort, type Subnet } from './net.ts'
 import type { PairingHub } from './pairing.ts'
 
@@ -59,6 +59,8 @@ export interface MemberLinksOptions {
   tailnetSearch?: () => boolean
   /** F-110: this PC's tailnet now (tailnet-peers.ts), for looking for the hub among its PCs when the stored address fails. */
   tailnetPeers?: () => Promise<TailnetView | null>
+  /** F-110: this PC's own tailnet name suffix now, or null; with it the hub's row says whether this PC and the hub are on the same tailnet. */
+  tailnetSuffix?: () => string | null
   version: string
   /** Stream kinds this end serves to the hub. */
   onOpen?: Record<string, OpenHandler>
@@ -80,6 +82,10 @@ export interface MemberLinks {
   device(): DeviceInfo | null
   /** The live link, or null. */
   mux(): Mux | null
+  /** F-112: the hub answered and turned this PC away (not paired), as of its last attempt; null otherwise. */
+  refusal(): HubRefusal | null
+  /** F-113: the address typed by hand for the hub and how its last try went; null when this PC has no hub. */
+  manual(): HubAddressInfo | null
   /** Runs the whole decision again now ("Check again", How to connect changed). */
   check(): void
   /** A new hub was pinned: drop any old link and connect. */
@@ -107,6 +113,10 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
   let opening = 'Connecting'
   let reprobe: NodeJS.Timeout | null = null
   let reprobing = false
+  let refusal: HubRefusal | null = null
+  // F-113: the last try of the typed address, with the address it was for (a changed address makes it stale).
+  let manualTry: (ManualResult & { address: string; at: string }) | null = null
+  let manualChecking = false
 
   const changed = () => o.onChange()
 
@@ -155,6 +165,11 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       tailnet: o.tailnet,
       tailnetSearch: o.tailnetSearch?.() ?? true,
       tailnetPeers: o.tailnetPeers,
+      onManual: r => {
+        manualTry = { ...r, address: hub.manualAddress ?? '', at: new Date().toISOString() }
+        manualChecking = false
+        changed()
+      },
       version: o.version,
       onControl,
       onOpen: fromHub(o.onOpen, hub),
@@ -169,6 +184,7 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
     if (stopped || running || current || !opts) return
     running = true
     const hubId = opts.hub.id
+    manualChecking = Boolean(opts.hub.manualAddress && opts.route !== 'relay')
     evidence = [opening]
     opening = 'Connecting'
     location = 'connecting'
@@ -198,6 +214,9 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       evidence.push(`${f.refused ? 'The hub turned this PC away' : 'Every path failed'}; trying again in ${seconds(delay)}`)
       // F-110: the last line is what the row shows under the name, so it says in plain words what to do.
       const hubName = opts.hub.name
+      refusal = f.refused
+        ? { hubId: hubId, hubName, address: f.answeredAt ?? opts.hub.tailnet ?? opts.hub.lan.peer, reason: (f as { reason?: string }).reason ?? 'this PC is not paired with the hub', since: refusal?.hubId === hubId ? refusal.since : new Date().toISOString() }
+        : null
       const hint = f.refused ? `${hubName} does not know this PC (it was removed, or never paired). Pair it again: on ${hubName}'s Hub page start a pairing code, then Join with it here.` : f.hint
       if (hint) evidence.push(hint)
       log?.warn(`no link to the hub: ${message(e)}; trying again in ${seconds(delay)}`)
@@ -215,6 +234,7 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
 
   function adopt(link: HubLink, lines: string[]) {
     current = link
+    refusal = null
     since = new Date().toISOString()
     location = link.location
     evidence = [...lines]
@@ -350,11 +370,28 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
         evidence: [...evidence],
         canOpenScreen: Boolean(link && link.hello.screen === true),
         canOpenAppScreen: Boolean(link && link.hello.appScreen === true),
+        ...(o.tailnetSuffix ? { tailnet: compareTailnets(o.tailnetSuffix(), hub, link !== null) } : {}),
       }
     },
     mux: () => current?.mux ?? null,
+    refusal: () => (o.devices.hub()?.id === refusal?.hubId ? refusal : null),
+    manual() {
+      const hub = o.devices.hub()
+      if (!hub) return null
+      const address = hub.manualAddress ?? null
+      const t = address && manualTry?.address === address ? manualTry : null
+      return {
+        address,
+        result: !address ? null : manualChecking && (!t || running) ? 'checking' : (t?.result ?? null),
+        detail: t?.detail ?? null,
+        at: t?.at ?? null,
+      }
+    },
     check,
-    hubChanged: () => restart('Connecting to the new hub'),
+    hubChanged: () => {
+      refusal = null
+      restart('Connecting to the new hub')
+    },
     send(msg) {
       current?.mux.send(msg)
     },

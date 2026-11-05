@@ -1,5 +1,5 @@
 import type net from 'node:net'
-import { existsSync } from 'node:fs'
+import { copyFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
@@ -17,7 +17,7 @@ import { loadUserEnv } from './claude/userenv.ts'
 import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './config.ts'
 import { ensureChatHost } from './chathost/ensure.ts'
 import { answerPush, type HubSideOptions } from './connect.ts'
-import { createDeviceStore, type HubBundle } from './devices.ts'
+import { createDeviceStore, normalizeHubAddress, type HubBundle } from './devices.ts'
 import { createDiscoveryClient, startDiscoveryAnswer, type DiscoveryClient } from './discovery.ts'
 import { armExitWatchdog, processStartedAt } from './exit-watchdog.ts'
 import { hardExit } from './hard-exit.ts'
@@ -126,7 +126,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // This PC's name on the tailnet, for the page's "open it on the phone" address (read in the background, at most once a minute; never in test mode).
   const tailnetName = createTailnetName({ up: () => tailnet() !== null, disabled: testNoRustdesk, onChange: () => changed() })
   // F-110: this PC's tailnet (its PCs), read only when a member's stored hub address fails; never in test mode.
-  const tailnetPeers = createTailnetPeers({ disabled: testNoRustdesk })
+  const tailnetPeers = createTailnetPeers({ disabled: testNoRustdesk, up: () => tailnet() !== null, onChange: () => changed() })
   const timers: NodeJS.Timeout[] = []
   const every = (ms: number, fn: () => void) => timers.push(setInterval(fn, ms))
 
@@ -495,6 +495,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       tailnet,
       tailnetSearch: () => config.tailnetSearch !== false,
       tailnetPeers: () => tailnetPeers.get(),
+      tailnetSuffix: () => tailnetPeers.suffix(),
       version: VERSION,
       onOpen,
       // Where the pinned hub's ID answered on the LAN: tried with its stored address.
@@ -550,6 +551,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       pairing: hub ? hub.pairing.state() : null,
       join: member ? joinState : null,
       discovered: member && !devices.hub() ? member.discovery.list() : [],
+      hubRefused: member?.links.refusal() ?? null,
+      hubAddress: member?.links.manual() ?? null,
       settings: { route, stayReachable },
       appScreen: appScreen.status(),
       claude: claude.status(),
@@ -634,6 +637,44 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       needMember()
       if (!join || joinState.status !== 'confirm') throw apiError(409, 'No join is waiting for you to check its number')
       return join.confirm(match)
+    },
+    // F-112: forget the saved hub. The page then offers Join a hub, and the same hub can be joined again (same ID, new pairing). Only devices.json's hub record goes; this
+    // PC's identity, its settings and its saved passwords stay. The file as it was is kept next to it (devices.json.before-forget) so it can be put back by hand.
+    forgetHub({ hubId }) {
+      const m = needMember()
+      const saved = devices.hub()
+      if (!saved) return { ok: true, forgot: null }
+      if (saved.id !== hubId) throw apiError(409, 'This PC is paired with another hub than that one')
+      try {
+        copyFileSync(paths.devices, paths.devices + '.before-forget')
+      } catch (e) {
+        throw apiError(500, "Could not keep a copy of this PC's pairing first, so nothing was forgotten: " + message(e))
+      }
+      devices.clearHub()
+      log.info('forgot the saved hub ' + saved.name + ' (' + saved.id + '); a copy of devices.json is devices.json.before-forget')
+      m.links.hubChanged()
+      updateDiscovery(m.discovery)
+      changed()
+      return { ok: true, forgot: { id: saved.id, name: saved.name } }
+    },
+    // F-113: the hub's address typed by hand. Saved in devices.json (next to the F-110 search, not instead of it) and tried at once; the pin is checked like on every
+    // path, so an address that is not the hub is refused. "" clears it.
+    setHubAddress({ hubId, address }) {
+      const m = needMember()
+      const saved = devices.hub()
+      if (!saved) throw apiError(409, 'This PC has no hub to give an address to; join one first')
+      if (saved.id !== hubId) throw apiError(409, 'This PC is paired with another hub than that one')
+      const typed = address.trim()
+      let normal: string | null = null
+      if (typed) {
+        normal = normalizeHubAddress(typed, parseHostPort(saved.lan.peer)?.port ?? ports.peer)
+        if (!normal) throw apiError(400, '"' + typed + '" is not an address like 100.78.83.92:21220 (an IPv4 address or a name, then the port)')
+      }
+      devices.updateHub({ manualAddress: normal ?? undefined })
+      log.info(normal ? 'the hub\'s address was typed by hand: ' + normal : 'the hub\'s typed address was cleared')
+      m.links.check()
+      changed()
+      return { ok: true, address: normal }
     },
     cancelJoin: () => {
       needMember()
