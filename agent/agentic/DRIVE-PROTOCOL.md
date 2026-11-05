@@ -229,8 +229,14 @@ a minute of a change settling, plus a full check at 03:00 every night. **Off unt
   is there with one list call and what is out of date. An overwrite in the pool updates the same Google file (Google keeps its own revisions).
 - **Deletes**: a delete in the pool takes the COPY to Google's trash (never for good). More than 20 at once and over 20% of the copy is HELD: nothing is removed until a person says
   `POST /backup/allow-deletes`. Copies in Google that are not in the pool are counted ("extra") and left alone.
-- **The keys**: the file `<agent state>/secrets/gdrive-shubhambhole68.env` (GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN). It is read only when an access token is
-  needed, held in memory for that token's life, and never logged, shown, or put in an answer.
+- **The keys** (F-125): two Google accounts, picked by the setting `googleSource`. `company` (the default) is bztech68, the account the CRM uses: its keys are the file
+  `<agent state>/secrets/gdrive-bztech68.env` (GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN), put there by `POST /backup/import-keys` (the Import button) from
+  the CRM backend's own `.env`: only those three keys are read and kept (GDRIVE_PUBLIC, the folder id and everything else are not), the file is locked to the user before the keys
+  are written, and the answer shows only "set" or "missing". `shubhambhole68` is Shubham's own account, the old way, read (never copied) from his Desktop: `gdrive-shubhambhole68.env`,
+  `auth secret.json` or Google's `client_secret*.json` (a client JSON gives the id and secret, an env file the refresh token; they fill in for each other), then the old
+  `secrets/gdrive-shubhambhole68.env`. A key is read only when an access token is needed, held in memory for that token's life, and never logged, shown, or put in an answer.
+  The backup uses its own private "Common Drive" folder in that account, never the CRM's folders, and sets no sharing. When Google refuses a refresh token the page says to
+  make a new refresh token for that account (one consent run).
 - **No keys**: the same copy goes into a folder instead (`G:My DriveCommon Drive`, Google Drive for desktop's own folder, when it exists). A copy removed from the pool is moved to
   `_removed/<time>/` beside it. With neither, the page is told "nowhere to copy to".
 

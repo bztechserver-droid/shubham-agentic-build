@@ -33,12 +33,26 @@ export interface DriveBackupState {
   error?: string
 }
 
+/**
+ * F-125: whose Google account the backup uses. "company" (the default) is bztech68, the account the CRM uses; "shubhambhole68" is Shubham's own, the old way, read from his Desktop file.
+ * A key is never shown, only whether it is "set" or "missing".
+ */
+export type DriveGoogleSource = 'company' | 'shubhambhole68'
+
+export const GOOGLE_SOURCES: readonly DriveGoogleSource[] = ['company', 'shubhambhole68']
+
 /** The backup as the page shows it (GET /backup). */
 export interface DriveBackupInfo extends DriveBackupState {
-  /** Where copies go right now: "Google Drive", or the folder; null when there is nowhere. */
+  /** Where copies go right now: "Google Drive (bztech68)", or the folder; null when there is nowhere. */
   target: string | null
-  /** The Google keys file is in the agent's secrets folder. */
+  /** The keys of the CHOSEN account are there (the same as keysBySource[source] === 'set'). */
   keys: boolean
+  /** F-125: the chosen account. */
+  source?: DriveGoogleSource
+  /** F-125: each account's keys, "set" or "missing". No value is ever sent. */
+  keysBySource?: Record<DriveGoogleSource, 'set' | 'missing'>
+  /** F-125: the company keys can be imported now (the CRM's file with its three Google keys is on this PC). */
+  canImport?: boolean
   /** The folder used when there are no keys (the Google Drive for desktop folder). */
   fallbackFolder: string | null
   /** Removals of copies held back by the brake: nothing was taken away. */
@@ -72,6 +86,8 @@ export interface DriveSettings {
   webdavEnabled: boolean
   /** Copy the pool into the backup (Google Drive, or a folder when there are no keys). Off by default (absent = off). */
   backupEnabled?: boolean
+  /** F-125: whose Google account the backup uses (absent = "company"). */
+  googleSource?: DriveGoogleSource
 }
 
 export type DriveMode = 'create' | 'overwrite' | 'keepboth' | 'ifmatch'

@@ -54,6 +54,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PATCH', /^\/heartbeat$/, OWNER],
   ['POST', /^\/heartbeat\/beat$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
+  ['GET', /^\/offline-chats$/, SIGNED],
+  ['PUT', /^\/offline-chats$/, OWNER],
   ['GET', /^\/sessions$/, OWNER],
   ['GET', /^\/sessions\/copy-all$/, OWNER],
   ['POST', /^\/sessions\/copy-all$/, OWNER],

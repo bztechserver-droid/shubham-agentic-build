@@ -166,6 +166,12 @@ export interface FloorStore {
   setShare(floorId: string, agentId: string, list: ChatShare[]): Floor
   /** F-118: the one-time move: every floor and agent without an owner becomes `owner`'s. How many. */
   assignUnowned(owner: ChatOwner): number
+  /**
+   * F-127: a floor a member made while the hub was out of reach, taken in WHOLE with its ids, owners, shares and chats. Its chats' home is the member.
+   * A floor that is here already (same id) is left as it is: adopting twice is a no-op. Another floor with the same name: this one is named
+   * "<name> (<member's name>)" (and numbered if that too is taken). `created` is false for the no-op.
+   */
+  adopt(raw: unknown, from: { id: string; name: string }): { floor: Floor; created: boolean; renamedFrom: string | null }
   remove(id: string): Floor | null
   reorder(order: string[]): Floor[]
   /**
@@ -439,6 +445,31 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       floor.updatedAt = now()
       save()
       return clone(floor)
+    },
+
+    adopt(raw, from) {
+      const f = hydrateFloor(raw)
+      if (!f) throw apiError(400, 'Not a floor')
+      const have = floors.find(x => x.id === f.id)
+      if (have) return { floor: clone(have), created: false, renamedFrom: null }
+      for (const a of f.agents) {
+        a.duty = null
+        a.homePc = a.sessionId ? from.id : null
+        a.homePcName = a.sessionId ? from.name.slice(0, NAME_MAX) : null
+      }
+      const clash = (name: string) => floors.some(x => x.name.trim().toLowerCase() === name.trim().toLowerCase())
+      let renamedFrom: string | null = null
+      if (clash(f.name)) {
+        renamedFrom = f.name
+        const base = `${f.name} (${from.name})`.slice(0, NAME_MAX)
+        let name = base
+        for (let i = 2; clash(name); i++) name = `${base.slice(0, NAME_MAX - 4)} ${i}`
+        f.name = name
+      }
+      f.updatedAt = now()
+      floors = [f, ...floors]
+      save()
+      return { floor: clone(f), created: true, renamedFrom }
     },
 
     assignUnowned(owner) {

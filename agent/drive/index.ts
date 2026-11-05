@@ -1,12 +1,13 @@
-import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { existsSync, readdirSync, readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createBackup, type Backup, type BackupOptions } from './backup.ts'
 import { localTarget } from './backup-local.ts'
 import type { BackupTarget } from './backup-target.ts'
-import { googleTarget, parseKeys, type GoogleOptions } from './google.ts'
-import { homedir } from 'node:os'
+import { googleTarget, parsePartialKeys, type GoogleKeys, type GoogleOptions } from './google.ts'
+import { homedir, userInfo } from 'node:os'
 import path from 'node:path'
-import type { DriveBackupInfo, DriveBackupState, DriveSettings, DriveStatus, DriveWebdav } from '../../shared/drive.ts'
+import type { DriveBackupInfo, DriveBackupState, DriveGoogleSource, DriveSettings, DriveStatus, DriveWebdav } from '../../shared/drive.ts'
 import type { ApiMount, MountRequest } from '../api.ts'
 import type { Logger } from '../log.ts'
 import { createDriveDevices } from './devices.ts'
@@ -49,8 +50,17 @@ export interface DriveOptions {
   programFile?: string
   /** F-097: which paired phone a device key belongs to (the voice pairing's), for phone uploads; without it no phone can upload. */
   deviceOf?: (headers: MountRequest['headers']) => { id: string; name: string } | null
-  /** The Google keys file (default: gdrive-shubhambhole68.env in the agent's secrets folder, beside the drive folder). Never read until a token is needed. */
+  /** F-125: the COMPANY's (bztech68) Google keys file (default: gdrive-bztech68.env in the agent's secrets folder, beside the drive folder). Never read until a token is needed. */
   keysFile?: string
+  /**
+   * F-125: Shubham's own (shubhambhole68) key files, the old way: each one fills in what the ones before it lack (Google's client JSON has the id and secret, an env file the refresh token).
+   * Default: gdrive-shubhambhole68.env, auth secret.json and client_secret*.json on this user's Desktop, then the old gdrive-shubhambhole68.env in the secrets folder. Used only when the setting says shubhambhole68.
+   */
+  personalKeys?: string[]
+  /** F-125: the CRM backend's .env: the one place the import button reads the company's three Google keys from (nothing else in it is read). */
+  crmEnvFile?: string
+  /** F-125: makes a file readable by this user only (default: icacls on Windows, chmod 600 elsewhere). */
+  lockFile?: (file: string) => Promise<void>
   /** The folder the backup copies into when there are no Google keys (default: G:\My Drive\Common Drive when that Google Drive for desktop folder exists; null for none). */
   backupFolder?: string | null
   /** Tests: the fake Google's addresses and quick waits; the backup loop's timings. */
@@ -188,14 +198,67 @@ export function createDrive(o: DriveOptions): Drive {
   }
 
   // ---- the backup (Google Drive, or a folder when there are no keys) ----------------------------------------------------
-  // The Google keys are a file in the agent's secrets folder; this code only checks that it exists and hands the googleTarget a function that reads
-  // it when a token is needed. The values are never kept here, logged or shown.
-  const keysFile = o.keysFile ?? path.join(path.dirname(o.dir), 'secrets', 'gdrive-shubhambhole68.env')
+  // F-125: two Google accounts, picked by the setting "googleSource". "company" (the default) is bztech68, the account the CRM uses: its three keys live in
+  // gdrive-bztech68.env in the agent's secrets folder, put there by the import button from the CRM's own .env. "shubhambhole68" is Shubham's own account, the old
+  // way: read from his Desktop files (or the old secrets-folder file), never copied. This code only checks that a file exists and hands the googleTarget a function
+  // that reads it when a token is needed. The values are never kept here, logged or shown; the page learns only "set" or "missing".
+  const secretsDir = path.join(path.dirname(o.dir), 'secrets')
+  const companyFile = o.keysFile ?? path.join(secretsDir, 'gdrive-bztech68.env')
+  const crmEnvFile = o.crmEnvFile ?? path.join(homedir(), 'Desktop', 'Github', 'CRM', 'sam-crm-be', '.env')
+  const desktop = path.join(homedir(), 'Desktop')
+  const ACCOUNT: Record<DriveGoogleSource, string> = { company: 'bztech68', shubhambhole68: 'shubhambhole68' }
+  const sourceNow = (): DriveGoogleSource => (cfg.googleSource === 'shubhambhole68' ? 'shubhambhole68' : 'company')
+  /** The files that can hold an account's keys, in the order they are read. */
+  const keyFiles = (src: DriveGoogleSource): string[] => {
+    if (src === 'company') return [companyFile]
+    if (o.personalKeys) return o.personalKeys
+    let clientJson: string[] = []
+    try {
+      clientJson = readdirSync(desktop)
+        .filter(n => /^client_secret.*\.json$/i.test(n))
+        .sort()
+        .map(n => path.join(desktop, n))
+    } catch {
+      // No Desktop to look in.
+    }
+    return [path.join(desktop, 'gdrive-shubhambhole68.env'), path.join(desktop, 'auth secret.json'), ...clientJson, path.join(secretsDir, 'gdrive-shubhambhole68.env')]
+  }
+  /** A text file as text; Windows editors sometimes save UTF-16. */
+  const readText = async (file: string): Promise<string> => {
+    const buf = await readFile(file)
+    return buf[0] === 0xff && buf[1] === 0xfe ? buf.subarray(2).toString('utf16le') : buf.toString('utf8')
+  }
+  /** All three keys of an account, or null. Held by the caller for as long as it needs them, and nowhere else. */
+  const readKeys = async (src: DriveGoogleSource): Promise<GoogleKeys | null> => {
+    const got: Partial<GoogleKeys> = {}
+    for (const f of keyFiles(src)) {
+      if (!existsSync(f)) continue
+      let part: Partial<GoogleKeys>
+      try {
+        part = parsePartialKeys(await readText(f))
+      } catch {
+        continue
+      }
+      got.clientId ??= part.clientId
+      got.clientSecret ??= part.clientSecret
+      got.refreshToken ??= part.refreshToken
+    }
+    return got.clientId && got.clientSecret && got.refreshToken ? { clientId: got.clientId, clientSecret: got.clientSecret, refreshToken: got.refreshToken } : null
+  }
+  const anyKeyFile = (src: DriveGoogleSource) => keyFiles(src).some(f => existsSync(f))
   const fallbackFolder = o.backupFolder === undefined ? (existsSync('G:\\My Drive') ? 'G:\\My Drive\\Common Drive' : null) : o.backupFolder
   let backup: Backup | null = null
-  let google: BackupTarget | null = null
+  const googles = new Map<DriveGoogleSource, BackupTarget>()
   const backupTarget = async (): Promise<BackupTarget | null> => {
-    if (existsSync(keysFile)) return (google ??= googleTarget({ keys: async () => parseKeys(await readFile(keysFile, 'utf8')), ...o.google }))
+    const src = sourceNow()
+    if (anyKeyFile(src)) {
+      let g = googles.get(src)
+      if (!g) {
+        g = googleTarget({ keys: () => readKeys(src), account: ACCOUNT[src], ...o.google })
+        googles.set(src, g)
+      }
+      return g
+    }
     return fallbackFolder ? localTarget(fallbackFolder) : null
   }
   const makeBackup = () =>
@@ -212,12 +275,54 @@ export function createDrive(o: DriveOptions): Drive {
   const backupInfo = async (): Promise<DriveBackupInfo> => {
     const target = await backupTarget()
     const st: DriveBackupState & { held?: number } = backup && cfg.backupEnabled ? backup.status() : { state: 'off' }
+    const src = sourceNow()
+    const keysBySource: Record<DriveGoogleSource, 'set' | 'missing'> = {
+      company: (await readKeys('company')) ? 'set' : 'missing',
+      shubhambhole68: (await readKeys('shubhambhole68')) ? 'set' : 'missing',
+    }
     return {
       ...st,
       target: target?.label ?? null,
-      keys: existsSync(keysFile),
+      keys: keysBySource[src] === 'set',
+      source: src,
+      keysBySource,
+      canImport: existsSync(crmEnvFile),
       fallbackFolder,
-      ...(!target && cfg.backupEnabled ? { error: 'There is nowhere to copy to: put the Google keys file in the agent’s secrets folder, or have Google Drive for desktop on G:.' } : {}),
+      ...(!target && cfg.backupEnabled
+        ? {
+            error:
+              src === 'company'
+                ? 'There is nowhere to copy to: the company (bztech68) Google keys are missing. Import them, or have Google Drive for desktop on G:.'
+                : 'There is nowhere to copy to: the shubhambhole68 Google keys are missing from the Desktop. Put gdrive-shubhambhole68.env there, or have Google Drive for desktop on G:.',
+          }
+        : {}),
+    }
+  }
+  /** Restricts a file to this user: icacls on Windows (no inherited rights), chmod 600 elsewhere. A failure is not fatal (the folder is the user's own) but is said. */
+  const lockFile =
+    o.lockFile ??
+    (async (file: string): Promise<void> => {
+      if (process.platform === 'win32') {
+        await new Promise<void>((resolve, reject) => {
+          execFile('icacls', [file, '/inheritance:r', '/grant:r', `${userInfo().username}:F`], { windowsHide: true }, err => (err ? reject(err) : resolve()))
+        })
+      } else await chmod(file, 0o600)
+    })
+  /** F-125: writes the company's keys file: only the three keys, to a temporary file that is locked before anything goes in it, then renamed over the real one. */
+  const writeCompanyKeys = async (k: GoogleKeys): Promise<void> => {
+    await mkdir(path.dirname(companyFile), { recursive: true })
+    const tmp = `${companyFile}.${process.pid}.tmp`
+    try {
+      await writeFile(tmp, '', { mode: 0o600 })
+      try {
+        await lockFile(tmp)
+      } catch (e) {
+        o.log?.warn(`drive: could not restrict ${path.basename(companyFile)} to this user (${message(e).slice(0, 80)}); the secrets folder's own rights apply`)
+      }
+      await writeFile(tmp, `# The company's (bztech68) Google keys, copied by the app from the CRM's .env. Keep this file private.\nGDRIVE_CLIENT_ID=${k.clientId}\nGDRIVE_CLIENT_SECRET=${k.clientSecret}\nGDRIVE_REFRESH_TOKEN=${k.refreshToken}\n`)
+      await rename(tmp, companyFile)
+    } finally {
+      await rm(tmp, { force: true }).catch(() => undefined)
     }
   }
 
@@ -247,6 +352,7 @@ export function createDrive(o: DriveOptions): Drive {
     why,
     settings: () => ({ ...cfg }),
     async patch(patch) {
+      const before = sourceNow()
       const s = opened ? await opened.catch(() => null) : null
       if (s) cfg = s.setSettings({ ...patch })
       else cfg = applySettings(cfg, patch, 0)
@@ -255,6 +361,11 @@ export function createDrive(o: DriveOptions): Drive {
       else if (o.role === 'hub') await open().catch(() => undefined)
       await syncListener()
       await syncBackup()
+      if (sourceNow() !== before) {
+        // Another account: its Drive has none of the copies yet, so the next pass is a full check against what is really there.
+        googles.clear()
+        if (backup && cfg.backupEnabled) void backup.verify().catch(() => undefined)
+      }
       return { ...cfg }
     },
     phoneDevice: headers => deviceOf?.(headers) ?? null,
@@ -263,6 +374,25 @@ export function createDrive(o: DriveOptions): Drive {
     localSyncRun: () => localSync.run(),
     localSyncAllowDeletes: () => localSync.allowDeletes(),
     backup: backupInfo,
+    async backupImportKeys() {
+      if (o.role !== 'hub') throw driveError(409, 'disabled', why())
+      let text: string
+      try {
+        text = await readText(crmEnvFile)
+      } catch {
+        throw driveError(404, 'notfound', "The CRM's .env file is not on this PC, so there is nothing to import.")
+      }
+      // Only the three keys are taken. Everything else in that file (GDRIVE_PUBLIC, the folder, any other setting) is neither read nor kept.
+      const p = parsePartialKeys(text)
+      if (!p.clientId || !p.clientSecret || !p.refreshToken) {
+        throw driveError(409, 'notfound', "The CRM's .env file does not hold all three Google keys (GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN).")
+      }
+      await writeCompanyKeys({ clientId: p.clientId, clientSecret: p.clientSecret, refreshToken: p.refreshToken })
+      googles.clear()
+      o.log?.info(`drive: the company's Google keys were imported into ${path.basename(companyFile)}`)
+      if (backup && cfg.backupEnabled) void backup.verify().catch(() => undefined)
+      return backupInfo()
+    },
     backupState: () => (backup && cfg.backupEnabled ? backup.status() : { state: 'off' }),
     async backupRun() {
       if (!cfg.backupEnabled) throw driveError(409, 'disabled', 'The backup is switched off. Switch it on in Settings.')

@@ -19,6 +19,7 @@ import {
   type DriveUploadInfo,
   type DriveUploadStart,
   type DriveVersion,
+  GOOGLE_SOURCES,
   conflictName,
   nameKey,
   numbered,
@@ -56,6 +57,10 @@ export function applySettings(cfg: DriveSettings, patch: Partial<DriveSettings>,
   if (patch.enabled !== undefined) next.enabled = patch.enabled === true
   if (patch.webdavEnabled !== undefined) next.webdavEnabled = patch.webdavEnabled === true
   if (patch.backupEnabled !== undefined) next.backupEnabled = patch.backupEnabled === true
+  if (patch.googleSource !== undefined) {
+    if (!GOOGLE_SOURCES.includes(patch.googleSource)) throw driveError(400, 'range', 'The Google account is "company" or "shubhambhole68".')
+    next.googleSource = patch.googleSource
+  }
   if (patch.limitBytes !== undefined) {
     if (!Number.isFinite(patch.limitBytes) || patch.limitBytes < GIB / 1024) throw driveError(400, 'range', 'The limit is too small.')
     if (patch.limitBytes < used) throw driveError(409, 'quota', 'The limit is lower than what is stored now; delete or purge first.')

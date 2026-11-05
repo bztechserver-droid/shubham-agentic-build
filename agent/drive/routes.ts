@@ -48,6 +48,8 @@ export interface DriveHost {
   backupRun(): Promise<DriveBackupInfo>
   /** A person confirmed the removals the brake held: the next pass takes those copies away (into the target's trash). */
   backupAllowDeletes(): Promise<DriveBackupInfo>
+  /** F-125: copies the company's three Google keys from the CRM's file into this agent's secrets folder (one press). Answers like backup(): no value is ever in it. */
+  backupImportKeys(): Promise<DriveBackupInfo>
   /** F-097: the paired phone a request's device key belongs to, or null (phone uploads; agent/drive/phone.ts). */
   phoneDevice(headers: MountRequest['headers']): { id: string; name: string } | null
   /** The sync folder of THIS PC (the hub's own, or a member PC's over the link). Works on every PC, unlike the rest. */
@@ -95,6 +97,7 @@ const METHODS: Record<string, string[]> = {
   backup: ['GET'],
   'backup/run': ['POST'],
   'backup/allow-deletes': ['POST'],
+  'backup/import-keys': ['POST'],
   'sync/program': ['GET', 'HEAD'],
   'webdav/devices': ['POST'],
   'webdav/devices/revoke': ['POST'],
@@ -279,6 +282,7 @@ const handlers: Record<string, Handler> = {
     const patch: Partial<DriveSettings> = {}
     for (const k of ['enabled', 'webdavEnabled', 'backupEnabled'] as const) if (b[k] !== undefined) patch[k] = b[k] as boolean
     for (const k of ['limitBytes', 'binDays', 'versionsKept'] as const) if (b[k] !== undefined) patch[k] = b[k] as number
+    if (b.googleSource !== undefined) patch.googleSource = b.googleSource as DriveSettings['googleSource']
     json(res, 200, await host.patch(patch))
   },
 
@@ -319,6 +323,10 @@ const handlers: Record<string, Handler> = {
 
   async 'backup/allow-deletes'({ res, host }) {
     json(res, 200, await host.backupAllowDeletes())
+  },
+
+  async 'backup/import-keys'({ res, host }) {
+    json(res, 200, await host.backupImportKeys())
   },
 
   async 'sync/local'({ req, res, host }) {

@@ -80,6 +80,8 @@ import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
+import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
+import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
 import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shared/attachments.ts'
@@ -153,6 +155,27 @@ export interface AgenticTeamLinks {
   member(id: string): LinkPeer | null
 }
 
+/** F-127: tools that live on the Server only: a chat of a floor made on a member PC while the Server was away has no use of them. */
+const NEEDS_SERVER = new Set([
+  'task_add',
+  'task_list',
+  'task_update',
+  'ui_screen',
+  'ui_control',
+  'ui_modules',
+  'ui_invoke',
+  'phone_screen',
+  'phone_control',
+  'phone_update',
+  'wa_status',
+  'wa_chats',
+  'wa_read',
+  'wa_prepare_send',
+  'watchdog_status',
+  'memory_read',
+  'prepare_send',
+])
+
 /** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory): the owner of the app's chats only. */
 const ADMIN_TOOLS = new Set([
   'task_add',
@@ -183,6 +206,10 @@ export interface ProofRequest {
 export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
+  /** F-127, tests: how long the Server must be out of reach before new chats are made here (default 20 s). */
+  offlineAfterMs?: number
+  /** F-127, tests: how long after a failed joining it is tried again (default 30 s). */
+  adoptRetryMs?: number
   /** F-118: who is signed in (agent/auth/). Left out (tests), the app is open: every caller may do everything. */
   auth?: Auth
   /** The local API's base URL, http://127.0.0.1:<port>/agent-api (read when a chat starts). */
@@ -459,15 +486,39 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  const floors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
+  const hubFloors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
     if (mode() === 'member') return
-    emit({ t: 'floors', floors: floors.list() })
+    emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
   })
+  // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
+  // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
+  // the hub's and a PC alone's is the usual one.
+  const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
+    if (mode() === 'member') emitFloors()
+  })
+  const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
+  const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
+  const floors: FloorStore = {
+    list: () => pickFloors().list(),
+    get: id => pickFloors().get(id),
+    create: (name, as) => pickFloors().create(name, as),
+    patch: (id, p, as) => pickFloors().patch(id, p, as),
+    setShare: (f, a, l) => pickFloors().setShare(f, a, l),
+    assignUnowned: owner => pickFloors().assignUnowned(owner),
+    adopt: (raw, from) => hubFloors.adopt(raw, from),
+    remove: id => pickFloors().remove(id),
+    reorder: order => pickFloors().reorder(order),
+    moveAgent: (from, agent, to, before) => pickFloors().moveAgent(from, agent, to, before),
+    addAgent: (f, req, as) => pickFloors().addAgent(f, req, as),
+    bindSession: (f, a, s) => pickFloors().bindSession(f, a, s),
+    setHome: (f, a, h) => pickFloors().setHome(f, a, h),
+    bySession: sid => pickFloors().bySession(sid),
+  }
   // F-118: every floor and chat that has no owner is sbskrrt's (the one-time move; it is idempotent, so a chat some older path
   // made without an owner is covered at the next start too). A member keeps no floors of its own: this changes nothing there.
   if (o.auth) {
-    const moved = floors.assignUnowned(SBSKRRT_OWNER)
+    const moved = hubFloors.assignUnowned(SBSKRRT_OWNER)
     if (moved) log?.info(`F-118: ${moved} floors and chats had no owner; they are sbskrrt's now`)
     if (!o.auth.migrated()) o.auth.markMigrated()
   }
@@ -544,6 +595,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   let replica: Replica = loadReplica()
   let sub: { token: object; stream: Duplex } | null = null
   let subscribing = false
+  // F-127: when this member lost its Server (null while it has it), and the debounce after which new chats are made here.
+  let downSince: number | null = null
+  const offlineAfter = o.offlineAfterMs ?? OFFLINE_AFTER_MS
+  const offlineActive = () => mode() === 'member' && offlineSettings.on() && sub === null && downSince !== null && Date.now() - downSince >= offlineAfter
+  /** F-127: new floors and chats on this PC use this PC's own Claude sign-in (F-007); without one they are refused, plainly, before anything is made. */
+  function needClaudeHere() {
+    if (o.token && !o.token()) throw Object.assign(apiError(409, "Sign in to Claude on this PC first (Devices page): new chats made here while the Server is down use this PC's own Claude sign-in."), { code: 'no-claude' })
+  }
 
   function loadHeld(): [string, Held][] {
     try {
@@ -587,8 +646,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function allFloors(): Floor[] {
     if (mode() !== 'member') return floors.list()
     const me = self().id
-    return replica.floors.map(f => ({ ...f, codeDir: f.folders?.[me] ?? null }))
+    const theirs = replica.floors.map(f => ({ ...f, codeDir: f.folders?.[me] ?? null }))
+    // F-127: this PC's own floors the Server does not have yet (once it has one, it is the Server's: the copy here is dropped from the list).
+    const have = new Set(theirs.map(f => f.id))
+    const mine = localFloors.list().filter(f => !have.has(f.id)).map(f => ({ ...f, local: true }))
+    return [...mine, ...theirs]
   }
+
+  /** F-127: a floor made on this PC that the Server does not have yet (it is run here, whatever the link says). */
+  const isLocalFloor = (id: string) => mode() === 'member' && localFloors.get(id) !== null && !replica.floors.some(f => f.id === id)
+  const isLocalSession = (sid: string) => mode() === 'member' && localFloors.bySession(sid) !== null && !replica.floors.some(f => f.agents.some(a => a.sessionId === sid))
 
   function floorOf(id: string): Floor {
     const f = allFloors().find(x => x.id === id)
@@ -847,7 +914,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'alone') return null
     if (m === 'hub') return { pc: self().name, role: 'hub', hub: null, reachable: true, pcs: pcs() }
-    return { pc: self().name, role: 'member', hub: team!.hub()?.name ?? null, reachable: sub !== null, pcs: pcs() }
+    const offline: OfflineChats = { on: offlineSettings.on(), active: offlineActive(), since: sub === null && downSince !== null ? new Date(downSince).toISOString() : null, hubName: team!.hub()?.name ?? null }
+    return { pc: self().name, role: 'member', hub: team!.hub()?.name ?? null, reachable: sub !== null, offline, pcs: pcs() }
   }
 
   const emitWhere = () => emit({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() })
@@ -1033,34 +1101,50 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function needHub(): LinkPeer {
     const h = team?.hub()
     if (!h) throw apiError(409, 'This PC has no hub')
-    if (!h.link || !sub) throw apiError(503, `${h.name} (the hub) can't be reached right now, so floors are read-only here and no chat can start. Chats running here go on.`)
+    if (!h.link || !sub) {
+      const here = !offlineSettings.on()
+        ? ''
+        : offlineActive()
+          ? ' New floors and chats made on this PC work without it.'
+          : ` If it stays out of reach for ${Math.round(offlineAfter / 1000)} s, new floors and chats can be made on this PC.`
+      throw Object.assign(apiError(503, `${h.name} (the hub) can't be reached right now, so the floors on it are read-only here and no chat of theirs can start. Chats running here go on.${here}`), { code: 'hub-offline' })
+    }
     return h.link
   }
 
   function memberTick() {
     if (mode() !== 'member') {
+      downSince = null
       if (sub) dropSub()
       return
     }
     const link = team!.hub()?.link ?? null
     if (sub && (!link || sub.token !== link.token)) dropSub()
+    if (sub) downSince = null
+    else if (downSince === null) downSince = Date.now()
+    // F-127: floors made here while the Server was away join it as soon as it can be reached (again, after a failure, every 30 s).
+    if (link && sub && !adopting && Date.now() >= adoptRetryAt && localFloors.list().length) void adoptLocal(link)
     if (!link || sub || subscribing) return
     subscribing = true
     link.open({ op: 'subscribe' }).then(
       stream => {
         subscribing = false
         sub = { token: link.token, stream }
+        downSince = null
         writeLine(stream, { t: 'hello', live: chats.states(), marks: marksHere() })
         readLines(stream, raw => onHubEvent(link, raw))
         const gone = () => {
           if (sub?.stream !== stream) return
           sub = null
+          downSince = Date.now()
           emitWhere()
         }
         stream.on('close', gone)
         stream.on('error', gone)
         log?.info(`following ${link.name}'s floors`)
         emitWhere()
+        // F-127: this PC's own floors from the time the Server was away.
+        void adoptLocal(link)
       },
       (e: unknown) => {
         subscribing = false
@@ -1072,6 +1156,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function dropSub() {
     const s = sub
     sub = null
+    downSince = Date.now()
     s?.stream.destroy()
     emitWhere()
   }
@@ -1136,6 +1221,145 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  // ---------------------------------------------------------------------------------------
+  // F-127: the floors made on this PC while the Server was away join the Server's list when it is back
+
+  let adopting = false
+  let adoptRetryAt = 0
+  let adoptStatus: AdoptStatus = { state: 'idle', floors: 0, joined: 0, sessions: 0, why: null }
+  const setAdopt = (s: Partial<AdoptStatus>) => {
+    adoptStatus = { ...adoptStatus, ...s }
+    emit({ t: 'adopt', adopt: adoptStatus })
+  }
+
+  interface AdoptAnswer {
+    floors: { id: string; name: string; created: boolean; renamedFrom: string | null }[]
+    /** The hub's copy of each conversation after it caught up. */
+    marks: Record<string, FileMark>
+  }
+
+  /**
+   * The member's side. The Server is asked to take the floors in whole (same ids, owners, shares, chats), then its list must show them, the conversations must be
+   * equal on both sides (the same size and tail; a chat still running here is only moved on from where the Server's copy is), and only THEN are they dropped from the
+   * local file, which is kept as floors-local.adopted-<time>.json: nothing is deleted. Any failure leaves everything as it was and it is tried again in 30 s;
+   * asking twice is a no-op on the Server (it knows a floor by id).
+   */
+  async function adoptLocal(link: LinkPeer): Promise<void> {
+    if (adopting || mode() !== 'member' || sub === null) return
+    const all = localFloors.list()
+    if (!all.length) return
+    adopting = true
+    try {
+      const pending = all.filter(f => !replica.floors.some(x => x.id === f.id))
+      const sids = all.flatMap(f => f.agents.flatMap(a => (a.sessionId ? [a.sessionId] : [])))
+      setAdopt({ state: 'running', floors: all.length, joined: all.length - pending.length, sessions: 0, why: null })
+      const running = sids.filter(s => !!chats.info(s))
+      const marks: Record<string, FileMark> = {}
+      for (const sid of sids) {
+        const found = findTranscript(sid, projectsDir)
+        if (found) marks[sid] = markOf(found)
+      }
+      let checked = 0
+      {
+        // Always all of them: a floor the Server has already is a no-op there, but its conversations are brought up and checked again before anything is dropped.
+        const notes = Object.fromEntries(all.map(f => [f.id, memory.all(f.id).map(x => ({ text: x.text, tags: x.tags, authorName: x.authorName ?? null }))]))
+        const answer = await request<AdoptAnswer>(link, 'adopt', { floors: all, running, marks, notes }, 120_000)
+        for (const sid of sids) {
+          const mine = marks[sid]
+          if (!mine) continue
+          const theirs = answer.marks?.[sid]
+          if (!isMark(theirs)) throw new Error(`the Server has no copy of chat ${sid.slice(0, 8)} yet`)
+          if (running.includes(sid)) {
+            // Still writing here: its stream goes on from where the Server's copy is (what it lacks is sent again).
+            tail.track(sid, fileOf(sid), theirs.bytes)
+          } else if (theirs.bytes !== mine.bytes || theirs.tail !== mine.tail) {
+            throw new Error(`the Server's copy of chat ${sid.slice(0, 8)} isn't equal to this PC's yet`)
+          }
+          checked++
+        }
+      }
+      // Its own list must show them, each with the same chats and owners, before the local copy goes.
+      const deadline = Date.now() + 20_000
+      while (!all.every(f => replica.floors.some(x => x.id === f.id))) {
+        if (sub === null) throw new Error('the link to the Server dropped')
+        if (Date.now() > deadline) throw new Error("the Server's list doesn't show them yet")
+        await new Promise(r => setTimeout(r, 100))
+      }
+      for (const f of all) {
+        const theirs = replica.floors.find(x => x.id === f.id)!
+        const same = f.agents.length === theirs.agents.length && f.agents.every(a => theirs.agents.some(b => b.id === a.id && b.sessionId === a.sessionId && b.owner?.id === a.owner?.id))
+        if (!same) throw new Error(`the Server lists floor "${f.name}" differently from this PC`)
+      }
+      writeAtomic(path.join(o.dir, `floors-local.adopted-${new Date().toISOString().replace(/[:.]/g, '-')}.json`), `${json({ at: new Date().toISOString(), to: link.name, floors: all })}\n`)
+      for (const f of all) localFloors.remove(f.id)
+      log?.info(`F-127: ${all.length} floors made here while the Server was away joined ${link.name}'s list (${checked} conversations checked)`)
+      setAdopt({ state: 'done', floors: all.length, joined: all.length, sessions: checked, why: null })
+      emitFloors()
+    } catch (e) {
+      adoptRetryAt = Date.now() + (o.adoptRetryMs ?? 30_000)
+      const why = message(e)
+      log?.warn(`F-127: floors made here couldn't join ${link.name}'s list yet: ${why}`)
+      setAdopt({ state: 'failed', why: /doesn't do adopt/.test(why) ? `${link.name} is an older build and can't take them in yet: update it.` : why })
+    } finally {
+      adopting = false
+    }
+  }
+
+  /** The hub's side: floors a member made while it was away, taken in whole. A floor it already has (same id) is left alone. */
+  async function adoptFloors(from: { id: string; name: string }, raw: unknown): Promise<AdoptAnswer> {
+    if (!isObject(raw) || !Array.isArray(raw.floors) || raw.floors.length === 0 || raw.floors.length > 200) throw apiError(400, 'Expected {floors: [...]}')
+    const running = new Set(Array.isArray(raw.running) ? raw.running.filter((x): x is string => typeof x === 'string') : [])
+    const marks = isObject(raw.marks) ? raw.marks : {}
+    const notes = isObject(raw.notes) ? raw.notes : {}
+    const link = team?.member(from.id) ?? null
+    const out: AdoptAnswer['floors'] = []
+    const mine: Record<string, FileMark> = {}
+    for (const f of raw.floors) {
+      const { floor, created, renamedFrom } = hubFloors.adopt(f, from)
+      out.push({ id: floor.id, name: floor.name, created, renamedFrom })
+      const list = notes[floor.id]
+      if (created && Array.isArray(list)) {
+        for (const x of list.slice(0, 500)) {
+          if (isObject(x) && typeof x.text === 'string') memory.save(floor.id, { text: x.text, tags: Array.isArray(x.tags) ? x.tags.filter((t): t is string => typeof t === 'string') : [], authorName: typeof x.authorName === 'string' ? x.authorName : null })
+        }
+        memoryChanged(floor.id)
+      }
+      for (const a of floor.agents) {
+        const sid = a.sessionId
+        if (!sid) continue
+        // It runs there now (held by that PC), or it ran there last.
+        if (running.has(sid)) hold(sid, from)
+        else release(sid, from)
+        const want = marks[sid]
+        if (isMark(want) && link) await catchUpFrom(link, sid, want)
+        const found = findTranscript(sid, projectsDir)
+        if (found) mine[sid] = markOf(found)
+      }
+    }
+    log?.info(`${from.name}: ${out.filter(f => f.created).length} floors it made while the Server was away joined the list`)
+    return { floors: out, marks: mine }
+  }
+
+  /** GET /agentic/offline-chats: the setting, whether it is in use now, and how the joining goes. */
+  function offlineAnswer() {
+    const t = teamInfo()
+    return { ...(t?.offline ?? { on: offlineSettings.on(), active: false, since: null, hubName: null }), adopt: adoptStatus }
+  }
+
+  function setOfflineChats(raw: unknown, r: MountRequest) {
+    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on: true | false}')
+    const c = callerOf(r)
+    // A machine setting: a signed-in sbskrrt's to change (the open app, at any level, and everybody else are not).
+    if (o.auth && c.person?.canSeeAll !== true) {
+      o.auth.deny(c, c.person ? 403 : 401, c.person ? 'admin-only' : 'sign-in', 'PUT /agent-api/agentic/offline-chats')
+      throw c.person ? authError(403, 'Only the owner of this app changes this.', 'admin-only') : authError(401, 'Sign in first.', 'sign-in')
+    }
+    offlineSettings.set(raw.on)
+    log?.warn(`${c.person?.username ?? 'someone'} turned "New chats on this PC while the Server is down" ${raw.on ? 'ON' : 'off'}`)
+    emitWhere()
+    return offlineAnswer()
+  }
+
   const memberTimer = team ? setInterval(memberTick, 1000) : null
   memberTimer?.unref()
   const stateTimer = team
@@ -1184,7 +1408,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
-    if (mode() === 'member') return openOnMember(floorId, agentId, req)
+    // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
+    if (mode() === 'member' && isLocalFloor(floorId)) needClaudeHere()
+    else if (mode() === 'member') return openOnMember(floorId, agentId, req)
     let floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
@@ -1912,12 +2138,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
-    if (mode() === 'member') return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs })
+    if (mode() === 'member' && !isLocalSession(me.sessionId)) return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs })
     return toolFor(me.sessionId, name, rawArgs)
   }
 
   /** A tool call from the chat `sid` (running here, or on a member that passed it on). */
   async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent }): Promise<string> {
+    // F-127: on a member this is a chat of a floor made here: what lives on the Server (the task list, the phone, WhatsApp, the screen, the memory layer) is not here.
+    if (mode() === 'member' && NEEDS_SERVER.has(name)) {
+      throw Object.assign(apiError(503, `That needs the Server (${team?.hub()?.name ?? 'the hub'}), which this chat's floor is not on yet. It joins the Server's list when the Server is back.`), { code: 'hub-offline' })
+    }
     const mine = as ?? floors.bySession(sid)
     if (!mine) throw apiError(409, "This chat isn't an agent on a floor any more.")
     const { floor, agent } = mine
@@ -2119,7 +2349,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const entries = memory.search(floor.id, query, limit)
         // F-051: the floor's notes by keyword as before, and hits from all of the memory beside
         // them once the layer is switched on (until then, the answer is exactly as it was).
-        if (args.mode === 'keyword' || !memoryOn || !access.isAdmin(me)) return json({ entries })
+        if (args.mode === 'keyword' || !memoryOn || mode() === 'member' || !access.isAdmin(me)) return json({ entries })
         const hits = query.trim() ? await (await memoryLayer()).search(query, { limit, excludeSession: sid }) : []
         return json({ entries, hits })
       }
@@ -2962,6 +3192,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return heartbeat.state()
       }],
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
+    // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
+    ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
+    ['PUT', /^\/offline-chats$/, (_, r) => setOfflineChats(r.body, r), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
     [
@@ -3364,6 +3597,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  /**
+   * F-127: a member runs this route itself instead of passing it to a hub that can't answer: any route of a floor made here (it is not on the Server yet),
+   * and a NEW floor while the Server has been out of reach and offline chats are allowed. A new floor while the Server answers goes to the Server as ever.
+   */
+  function runsHere(method: string, pattern: RegExp, params: string[]): boolean {
+    if (mode() !== 'member') return false
+    if (method === 'POST' && pattern.source === '^\\/floors$') {
+      if (!offlineActive()) return false
+      needClaudeHere()
+      return true
+    }
+    return pattern.source.startsWith('^\\/floors\\/([^/]+)') && params.length > 0 && isLocalFloor(params[0])
+  }
+
   /** Runs the route `rest` names; `forward` (a member) passes a non-local one to its hub instead. */
   async function route(r: MountRequest, forward?: (r: MountRequest) => Promise<unknown>): Promise<unknown> {
     let methodMismatch = false
@@ -3381,7 +3628,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         throw apiError(400, 'Malformed path')
       }
       checkRule(ruleOf(method, pattern), params, r)
-      if (forward && where !== 'local') return await forward(r)
+      if (forward && where !== 'local' && !runsHere(method, pattern, params)) return await forward(r)
       return await run(params, r)
     }
     throw apiError(methodMismatch ? 405 : 404, methodMismatch ? `${r.method} is not allowed here` : `No such path: ${AGENTIC_PREFIX}${r.rest}`)
@@ -3434,6 +3681,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       switch (op) {
         case 'subscribe':
           return stream => onSubscribe(from, stream)
+        case 'adopt':
+          // F-127: floors a member made while it could not reach this PC, taken in whole.
+          return answer(raw => adoptFloors(from, raw))
         case 'http':
           return answer(body => fromMember(from, body))
         case 'lease':

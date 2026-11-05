@@ -121,6 +121,11 @@ export interface Floor {
   folders: Record<string, string>
   createdAt: string
   updatedAt: string
+  /**
+   * F-127: kept on THIS PC only, not on the Server yet: made while the Server could not be reached. It joins the Server's list by itself when the Server is
+   * back (then this flag is gone). Set by the agent on a member's list, never stored.
+   */
+  local?: boolean
   /** F-118: who made the floor (a floor with nothing visible to a person is hidden from them, unless they made it). */
   createdBy?: ChatOwner | null
   agents: FloorAgent[]
@@ -152,10 +157,36 @@ export interface AgenticTeam {
   role: 'hub' | 'member'
   /** The hub's name (a member's). */
   hub: string | null
-  /** A member: whether its hub can be reached now. Without it, floors are read-only and no chat can start. */
+  /** A member: whether its hub can be reached now. Without it, the Server's floors are read-only here and no Server chat can start (F-127: new chats on this PC still can, see `offline`). */
   reachable: boolean
+  /** F-127, a member's: new chats on this PC while the Server can't be reached. Null on the hub and on a PC alone. */
+  offline?: OfflineChats | null
   /** F-025: the PCs a chat can be run on from here now (this one first): an agent's Run on. */
   pcs: { id: string; name: string; here: boolean }[]
+}
+
+/**
+ * F-127: a member PC's own floors and chats while the Server can't be reached. `on` is the per-PC setting (default on; only a signed-in sbskrrt changes it,
+ * PUT /agentic/offline-chats {on}); `active` says the Server has been out of reach for 20 s and the setting is on, so new floors and chats are made here;
+ * `since` is when it went (ISO). They run on THIS PC's own Claude sign-in.
+ */
+export interface OfflineChats {
+  on: boolean
+  active: boolean
+  since: string | null
+  hubName: string | null
+}
+
+/** F-127: what a PC's floors made while the Server was out of reach are doing now that it is back (AgenticEvent 'adopt'). */
+export type AdoptState = 'idle' | 'running' | 'done' | 'failed'
+export interface AdoptStatus {
+  state: AdoptState
+  /** Local floors still to join, floors joined, and conversations checked equal on both sides. */
+  floors: number
+  joined: number
+  sessions: number
+  /** Why it failed (the Server is older, the link dropped ...); it is tried again by itself. */
+  why: string | null
 }
 
 /** GET /agentic/floors */
@@ -320,6 +351,8 @@ export type AgenticEvent =
   | { t: 'tasks' }
   /** F-118: this connection's sign-in ended (or the level was raised past it); the socket closes with code 4401 right after. */
   | { t: 'auth'; ended: AuthEnded }
+  /** F-127: this PC's own floors joining the Server's list. */
+  | { t: 'adopt'; adopt: AdoptStatus }
   /** F-021: chats on the other PCs, where idle ones ran last, and this PC among the hub's. */
   | { t: 'where'; elsewhere: Record<string, ChatElsewhere>; last: Record<string, ChatLast>; team: AgenticTeam | null }
 

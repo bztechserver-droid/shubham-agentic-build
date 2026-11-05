@@ -12,10 +12,34 @@ export interface GoogleKeys {
   refreshToken: string
 }
 
-/** Reads GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN from an env file's text (KEY=value, # comments, optional quotes). */
-export function parseKeys(text: string): GoogleKeys | null {
+/**
+ * Reads whatever of the three keys a text holds. Two forms (F-125):
+ *  - an env file: GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN (KEY=value, # comments, optional quotes, a leading BOM);
+ *  - Google's client JSON ({"installed":{"client_id","client_secret"}} or "web"), which has no refresh token unless one was added as "refresh_token".
+ * Values are returned to the caller and nowhere else: this function logs and throws nothing that holds one.
+ */
+export function parsePartialKeys(text: string): Partial<GoogleKeys> {
+  const body = text.replace(/^\uFEFF/, '')
+  const out: Partial<GoogleKeys> = {}
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+  if (body.trimStart().startsWith('{')) {
+    try {
+      const j = JSON.parse(body) as Record<string, unknown>
+      const inner = (typeof j.installed === 'object' && j.installed ? j.installed : typeof j.web === 'object' && j.web ? j.web : j) as Record<string, unknown>
+      const get = (...names: string[]) => names.map(n => str(inner[n]) ?? str(j[n])).find(Boolean)
+      const clientId = get('client_id', 'GDRIVE_CLIENT_ID')
+      const clientSecret = get('client_secret', 'GDRIVE_CLIENT_SECRET')
+      const refreshToken = get('refresh_token', 'GDRIVE_REFRESH_TOKEN')
+      if (clientId) out.clientId = clientId
+      if (clientSecret) out.clientSecret = clientSecret
+      if (refreshToken) out.refreshToken = refreshToken
+    } catch {
+      // Not JSON after all: nothing in it.
+    }
+    return out
+  }
   const env = new Map<string, string>()
-  for (const raw of text.split(/\r?\n/)) {
+  for (const raw of body.split(/\r?\n/)) {
     const line = raw.trim()
     if (!line || line.startsWith('#')) continue
     const eq = line.indexOf('=')
@@ -27,7 +51,16 @@ export function parseKeys(text: string): GoogleKeys | null {
   const clientId = env.get('GDRIVE_CLIENT_ID')
   const clientSecret = env.get('GDRIVE_CLIENT_SECRET')
   const refreshToken = env.get('GDRIVE_REFRESH_TOKEN')
-  return clientId && clientSecret && refreshToken ? { clientId, clientSecret, refreshToken } : null
+  if (clientId) out.clientId = clientId
+  if (clientSecret) out.clientSecret = clientSecret
+  if (refreshToken) out.refreshToken = refreshToken
+  return out
+}
+
+/** All three keys from one text, or null when any is missing. */
+export function parseKeys(text: string): GoogleKeys | null {
+  const k = parsePartialKeys(text)
+  return k.clientId && k.clientSecret && k.refreshToken ? { clientId: k.clientId, clientSecret: k.clientSecret, refreshToken: k.refreshToken } : null
 }
 
 export interface GoogleOptions {
@@ -86,7 +119,7 @@ export function googleTarget(o: GoogleOptions): BackupTarget {
   async function accessToken(): Promise<string> {
     if (token && token.until > Date.now() + 60_000) return token.value
     const keys = await o.keys()
-    if (!keys) throw new GoogleError(0, 'The Google keys are not available. Put the keys file in the agent’s secrets folder.')
+    if (!keys) throw new GoogleError(0, `The Google keys are not available${o.account ? ` (${o.account})` : ''}.`)
     const res = await f(tokenUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -100,7 +133,7 @@ export function googleTarget(o: GoogleOptions): BackupTarget {
       } catch {
         // No body.
       }
-      throw new GoogleError(res.status, `Google would not give an access token (${res.status}${why ? ` ${why}` : ''}). The key may have been revoked: make a new one.`)
+      throw new GoogleError(res.status, `Google would not give an access token (${res.status}${why ? ` ${why}` : ''}). ${o.account ? `The refresh token for ${o.account} may have expired or been revoked: make a new refresh token for ${o.account} (one consent run).` : 'The key may have been revoked: make a new one.'}`)
     }
     const j = (await res.json()) as { access_token?: string; expires_in?: number }
     if (!j.access_token) throw new GoogleError(0, 'Google gave no access token.')

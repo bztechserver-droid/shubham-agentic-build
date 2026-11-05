@@ -738,7 +738,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       const code = typeof status === 'number' && status >= 400 && status < 600 ? status : 500
       if (code === 500) log?.error(`${req.method} ${req.url}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
       const why = (e as { code?: unknown }).code
-      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code < 500 ? { code: why } : {}) })
+      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}) })
       else res.destroy()
     })
   })
