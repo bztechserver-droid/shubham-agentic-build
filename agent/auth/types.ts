@@ -8,10 +8,31 @@ export interface Caller {
   via: 'local' | 'tailnet'
   /** The session's public id (the first 12 characters of its hash), or null. Safe to log. */
   sid: string | null
+  /**
+   * The PC itself, not a browser: a request with the machine token and none of the page markers (isPageRequest), such as the Server's own
+   * build-api.mjs. It is not bound by the sign-in level and acts as the owner of the app ('system'); it never holds a person's session.
+   */
+  machine?: boolean
 }
 
 /** A caller with no cookie from this PC's own browser: what everything is when no auth is wired (tests, the open app). */
 export const OPEN: Caller = { person: null, via: 'local', sid: null }
+
+/**
+ * Whether a request came from a PAGE (a browser, through the page server or a Ports share) as opposed to a program on the PC.
+ * Any one marker is enough, so it is enough to be wrong in only one direction (a program that wears a marker is treated as a page and
+ * is bound by the level; nothing a page can do removes them): the page server's own x-sad-page, an Origin, the fetch metadata a browser
+ * always sends (sec-fetch-site, sec-fetch-dest; NOT sec-fetch-mode, which Node's own fetch sends too: it is what build-api.mjs is), or any x-sad-via at all (the Ports gate and the page server set it; the value is not trusted for this).
+ */
+export function isPageRequest(headers: Record<string, string | string[] | undefined>): boolean {
+  return (
+    headers['x-sad-page'] !== undefined ||
+    headers.origin !== undefined ||
+    headers['sec-fetch-site'] !== undefined ||
+    headers['sec-fetch-dest'] !== undefined ||
+    headers['x-sad-via'] !== undefined
+  )
+}
 
 /**
  * F-119: whether this request may press Publish. A PAGE (a browser: it sends an Origin or fetch metadata, or the page server
@@ -20,8 +41,7 @@ export const OPEN: Caller = { person: null, via: 'local', sid: null }
  * headers (build-api.mjs) is not a page and keeps working.
  */
 export function mayPublish(headers: Record<string, string | string[] | undefined>, caller: Caller | undefined): boolean {
-  const page = headers.origin !== undefined || headers['sec-fetch-site'] !== undefined || headers['x-sad-via'] === 'tailnet'
-  return !page || caller?.person?.canSeeAll === true
+  return !isPageRequest(headers) || caller?.person?.canSeeAll === true
 }
 
 /** An error the API answers with this status, message and the contract's code. */

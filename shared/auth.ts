@@ -47,6 +47,8 @@
 export const AUTH_COOKIE = 'sad_session'
 /** Set by the page servers (never by a client) on a request that came over the tailnet; absent for this PC's own browser. */
 export const AUTH_VIA_HEADER = 'x-sad-via'
+/** Set by the page server on EVERY request it forwards to the API (never by a client: its copy is overwritten): "this came from a page". */
+export const AUTH_PAGE_HEADER = 'x-sad-page'
 /** A sign-in ends this long after it began, whatever happens. */
 export const AUTH_SESSION_DAYS = 7
 /** ... or this long after it was last used. */

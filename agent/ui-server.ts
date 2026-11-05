@@ -4,6 +4,7 @@ import net from 'node:net'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { AGENT_API_PREFIX } from '../shared/agent-api.ts'
+import { AUTH_PAGE_HEADER } from '../shared/auth.ts'
 import { applyVia } from './auth/via.ts'
 import { fromApp, hostAllowed } from './local-host.ts'
 import type { Logger } from './log.ts'
@@ -77,6 +78,8 @@ function forwardHeaders(req: IncomingMessage, apiPort: number, token: string | n
   delete headers['x-sad-token']
   if (token) headers['x-sad-token'] = token
   applyVia(headers, req.headers, req.socket.remoteAddress)
+  // F-118: everything this server forwards came from a page: said here, once, so no browser (old ones send no fetch metadata) can look like the PC itself.
+  headers[AUTH_PAGE_HEADER] = '1'
   return headers
 }
 

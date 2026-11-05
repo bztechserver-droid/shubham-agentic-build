@@ -34,7 +34,7 @@ import {
 import type { SwitchAutoRequest, SwitchPreview, SwitchRefreshRequest, SwitchRequest, SwitchResponse } from '../shared/claude-switch.ts'
 import type { Auth } from './auth/index.ts'
 import { authRoute } from './auth/routes.ts'
-import { authError, OPEN, type Caller } from './auth/types.ts'
+import { authError, isPageRequest, OPEN, type Caller } from './auth/types.ts'
 import { ROUTES } from './config.ts'
 import { loopbackOrigin } from './local-host.ts'
 import type { Logger } from './log.ts'
@@ -549,7 +549,11 @@ export function startApi(o: ApiOptions): Promise<Api> {
   ]
 
   /** F-118: who is asking. With no auth wired, everyone is the open app. Call only after the token was checked: the via header is trusted only then. */
-  const callerOf = (req: IncomingMessage): Caller => o.auth?.caller(req.headers) ?? OPEN
+  const callerOf = (req: IncomingMessage): Caller => {
+    const c = o.auth?.caller(req.headers) ?? OPEN
+    // The PC itself (a program with the machine token and no page marker, e.g. build-api.mjs) is not a browser: the sign-in level does not bind it.
+    return o.auth && !c.person && !isPageRequest(req.headers) ? { ...c, machine: true } : c
+  }
 
   /**
    * F-118: the sign-in gate for what a page asks of the PC. 401 (code sign-in) when this request has to be signed in
@@ -560,7 +564,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
     const auth = o.auth
     if (!auth) return
     const route = `${req.method ?? 'GET'} ${(req.url ?? '').split('?')[0]}`
-    if (!c.person && auth.needsSignIn(c.via)) {
+    if (!c.person && !c.machine && auth.needsSignIn(c.via)) {
       auth.deny(c, 401, 'sign-in', route)
       throw authError(401, 'Sign in first.', 'sign-in')
     }

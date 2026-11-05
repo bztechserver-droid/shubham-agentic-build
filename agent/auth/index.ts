@@ -306,11 +306,11 @@ export function createAuth(o: AuthOptions): Auth {
       session: c.person ? sessionInfo(c.sid) : null,
       canPublish: c.person?.canSeeAll === true,
       mayShowCode: c.person?.canSeeAll === true && f.ownerCodes,
-      needsSignIn: !c.person && needsSignIn(c.via),
+      needsSignIn: !c.person && !c.machine && needsSignIn(c.via),
     }
   }
 
-  const admin = (c: Caller) => (c.person ? isAdminId(c.person.id) : !needsSignIn(c.via))
+  const admin = (c: Caller) => (c.person ? isAdminId(c.person.id) : c.machine === true || !needsSignIn(c.via))
 
   /** Five wrong tries a minute for one username, and thirty for the whole app (a spray over many usernames). */
   function throttled(login: string): boolean {
@@ -394,7 +394,7 @@ export function createAuth(o: AuthOptions): Auth {
   }
 
   function users(c: Caller, q: string): AuthUser[] {
-    if (!c.person && needsSignIn(c.via)) throw authError(401, 'Sign in first.', 'sign-in')
+    if (!c.person && !c.machine && needsSignIn(c.via)) throw authError(401, 'Sign in first.', 'sign-in')
     const needle = q.trim().toLowerCase()
     const list = needle ? f.directory.filter(u => u.username.toLowerCase().includes(needle) || u.name.toLowerCase().includes(needle)) : f.directory
     return list.slice(0, 50).map(u => ({ ...u }))
@@ -461,7 +461,7 @@ export function createAuth(o: AuthOptions): Auth {
 
   /** After the level was raised: the open connections that now have to be signed in are ended. */
   function enforce() {
-    endWatchers(w => !w.c.person && needsSignIn(w.c.via), 'sign-in-required')
+    endWatchers(w => !w.c.person && !w.c.machine && needsSignIn(w.c.via), 'sign-in-required')
   }
 
   function track(c: Caller, end: (why: AuthEnded) => void) {
