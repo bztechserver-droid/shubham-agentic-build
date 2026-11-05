@@ -28,6 +28,12 @@ export interface HubBundle {
   public: { hbbs: string; hbbr: string }
   /** 'ip:port' of the hub's listener on its Tailscale address, or null when Tailscale isn't up there. */
   tailnet: string | null
+  /**
+   * F-110 (5 Nov 2026): the hub's own name on the tailnet ("server.tail36192f.ts.net"), when it knows it. A member that cannot reach the
+   * `tailnet` address (the hub moved to another tailnet and got a new one) tries this name, and its first label, before giving up.
+   * Missing in hubs and files from before F-110.
+   */
+  tailnetName?: string
   /** hbbs/hbbr's key (id_ed25519.pub), null while the hub's hbbs has not started yet. */
   licenceKey: string | null
 }
@@ -72,6 +78,8 @@ export function checkBundle(v: unknown): HubBundle {
     if (!isEndpoint(v.tailnet) || !isTailnet(parseHostPort(v.tailnet)?.host ?? '')) throw bad('tailnet')
     tailnet = v.tailnet
   }
+  // A bad name is dropped, not an error: the address above is what counts, and a hub from the future may say it differently.
+  const tailnetName = typeof v.tailnetName === 'string' && isDnsName(v.tailnetName.replace(/\.$/, '').toLowerCase()) ? v.tailnetName.replace(/\.$/, '').toLowerCase() : null
   if (v.licenceKey !== null && (typeof v.licenceKey !== 'string' || !/^[A-Za-z0-9+/=]{1,200}$/.test(v.licenceKey))) {
     throw bad('licenceKey')
   }
@@ -82,9 +90,13 @@ export function checkBundle(v: unknown): HubBundle {
     lan: { peer: lan.peer, hbbs: lan.hbbs, hbbr: lan.hbbr },
     public: { hbbs: pub.hbbs, hbbr: pub.hbbr },
     tailnet,
+    ...(tailnetName ? { tailnetName } : {}),
     licenceKey: v.licenceKey,
   }
 }
+
+/** A host name as DNS has it: dot-separated labels of letters, digits and hyphens (a tailnet name such as server.tail36192f.ts.net). */
+export const isDnsName = (s: string): boolean => s.length > 0 && s.length <= 253 && /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(s)
 
 function checkMember(v: unknown, at: string): MemberRecord {
   const bad = (what: string) => new Error(`${at}: ${what}`)
@@ -191,7 +203,7 @@ export interface DeviceStore {
   /** Pins a hub (a member that pairs again replaces its hub). */
   setHub(bundle: HubBundle): HubRecord
   /** Fresh details from the pinned hub's hello; the pin itself never changes this way. */
-  updateHub(patch: Partial<Pick<HubRecord, 'name' | 'lan' | 'public' | 'tailnet' | 'licenceKey' | 'lastSeen'>>): void
+  updateHub(patch: Partial<Pick<HubRecord, 'name' | 'lan' | 'public' | 'tailnet' | 'tailnetName' | 'licenceKey' | 'lastSeen'>>): void
 }
 
 /** Loads devices.json once and keeps it in memory; every change is written through. */

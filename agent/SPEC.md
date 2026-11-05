@@ -348,6 +348,24 @@ path ("answered as device X, not the paired hub Y").
    (`tailnetAddress()`: an address in 100.64.0.0/10 on Tailscale's adapter); otherwise it is
    skipped with a line saying which end lacks it. TCP with a 5 s timeout, then pinned TLS and
    hellos, 10 s in all.
+   - **When the hub moved to another tailnet (F-110, 5 Nov 2026)** its stored address is dead, and it
+     cannot be refreshed because the refresh comes in the hello of a link that cannot come up.
+     So, in `probeTailnet`: (1) all at once, the stored address and the hub's name (`tailnetName`
+     in the bundle: its full name on the tailnet, then that name's first label, which a new
+     tailnet keeps; an older record has neither, so the hub's own name as a label, "Server" →
+     "server"); (2) if none answers, `tailscale status --json` (read-only, injected runner,
+     `tailnet-peers.ts`) and the hub's port on every other online PC of THIS PC's tailnet, PCs
+     named like the hub first, at most 12, 3 s TCP each. Who is the hub is decided by the pin
+     (its ID and key hash), never by a name or address: any other PC fails TLS before this PC
+     says anything. The hub's hello then refreshes `tailnet` and `tailnetName` in the record.
+   - When nothing answers, the row's last evidence line says why in plain words: "This PC is on
+     the tailnet X, but the Server was last on Y. Sign this PC in to …" when the names differ,
+     else "None of the N other PCs on this PC's tailnet answered as the Server …". A hub that
+     answers but has removed this PC gets "… does not know this PC … Pair it again …". This is the
+     line the Hub page shows under the name, so it no longer sits at "Connecting…" or a bare
+     "Every path failed".
+   - The old way, the stored address only, is `"tailnetSearch": false` in config.json (missing =
+     on). Nothing is stored in the build: a publish carries no address.
    - Result: path `tailscale`, location `internet` (Tailscale says nothing about where the
      hub is).
    - On `tailscale` a failure here ends the attempt ("No link over Tailscale"); on `auto`

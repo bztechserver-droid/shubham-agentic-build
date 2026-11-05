@@ -11,13 +11,40 @@ export interface RunResult {
 }
 export type Runner = (args: string[]) => Promise<RunResult>
 
-export const defaultRunner: Runner = args =>
+/** One run of one file: `missing` when the file is not there (ENOENT), so the next place can be tried. */
+export type Exec = (file: string, args: string[]) => Promise<RunResult & { missing: boolean }>
+
+const realExec: Exec = (file, args) =>
   new Promise(resolve => {
-    execFile('tailscale', args, { timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(file, args, { timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? ((err as { code: number }).code) : 1) : 0
-      resolve({ code, stdout: String(stdout), stderr: String(stderr || (err ? err.message : '')) })
+      resolve({ code, stdout: String(stdout), stderr: String(stderr || (err ? err.message : '')), missing: (err as NodeJS.ErrnoException | null)?.code === 'ENOENT' })
     })
   })
+
+/**
+ * Where tailscale may be: on PATH first, then (F-110, 5 Nov 2026) where its installer puts it on Windows, which is often NOT on PATH for a service-started agent.
+ */
+export function tailscaleFiles(platform: string = process.platform, env: Record<string, string | undefined> = process.env): string[] {
+  if (platform !== 'win32') return ['tailscale']
+  const roots = [env.ProgramFiles, env['ProgramFiles(x86)'], 'C:\\Program Files'].filter((r): r is string => Boolean(r))
+  return ['tailscale', ...new Set(roots.map(r => `${r}\\Tailscale\\tailscale.exe`))]
+}
+
+/** A runner that tries each file until one exists. When none does the answer is a plain failure (code 1), which every caller already treats as "Tailscale is not here". */
+export function makeRunner(exec: Exec, files: string[]): Runner {
+  return async args => {
+    let last: RunResult = { code: 1, stdout: '', stderr: 'tailscale was not found' }
+    for (const file of files) {
+      const { missing, ...r } = await exec(file, args)
+      if (!missing) return r
+      last = r
+    }
+    return last
+  }
+}
+
+export const defaultRunner: Runner = makeRunner(realExec, tailscaleFiles())
 
 /** Ports the drive must never take: web (80, 443), the manager (4740), the public preview (8443), the chat host (21229). */
 export const RESERVED_PORTS: readonly number[] = [80, 443, 4740, 8443, 21229]

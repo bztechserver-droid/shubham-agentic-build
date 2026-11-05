@@ -5,6 +5,7 @@ import type { Identity } from './link/identity.ts'
 import { createMux, type Control, type Mux, type OpenHandler } from './link/mux.ts'
 import type { PeerTls } from './link/tls.ts'
 import type { Logger } from './log.ts'
+import type { TailnetView } from './tailnet-peers.ts'
 import { inCidr, parseHostPort, type Subnet } from './net.ts'
 import type { PairingHub } from './pairing.ts'
 
@@ -54,6 +55,10 @@ export interface MemberLinksOptions {
   subnets: () => Subnet[]
   /** This PC's Tailscale address now, or null. */
   tailnet?: () => string | null
+  /** F-110: may the Tailscale step try the hub's name when its address does not answer (config.json "tailnetSearch", default true)? Read at each attempt. */
+  tailnetSearch?: () => boolean
+  /** F-110: this PC's tailnet now (tailnet-peers.ts), for looking for the hub among its PCs when the stored address fails. */
+  tailnetPeers?: () => Promise<TailnetView | null>
   version: string
   /** Stream kinds this end serves to the hub. */
   onOpen?: Record<string, OpenHandler>
@@ -148,6 +153,8 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       lanPeers: o.lanPeers?.() ?? [],
       subnets: o.subnets,
       tailnet: o.tailnet,
+      tailnetSearch: o.tailnetSearch?.() ?? true,
+      tailnetPeers: o.tailnetPeers,
       version: o.version,
       onControl,
       onOpen: fromHub(o.onOpen, hub),
@@ -189,6 +196,10 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       const delay = f.refused ? backoff[backoff.length - 1] : backoff[Math.min(attempt, backoff.length - 1)]
       attempt++
       evidence.push(`${f.refused ? 'The hub turned this PC away' : 'Every path failed'}; trying again in ${seconds(delay)}`)
+      // F-110: the last line is what the row shows under the name, so it says in plain words what to do.
+      const hubName = opts.hub.name
+      const hint = f.refused ? `${hubName} does not know this PC (it was removed, or never paired). Pair it again: on ${hubName}'s Hub page start a pairing code, then Join with it here.` : f.hint
+      if (hint) evidence.push(hint)
       log?.warn(`no link to the hub: ${message(e)}; trying again in ${seconds(delay)}`)
       schedule(delay)
       // Its LAN address may have changed (no fixed lease in phase 1): ask the LAN where it is now.
@@ -243,7 +254,7 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       if (!hub || fresh.id !== hub.id || fresh.spkiSha256 !== hub.spkiSha256) throw new Error('not the pinned hub')
       // The Tailscale address too (F-057 follow-up, 4 Nov 2026: the hub moved to another tailnet, and a member kept dialling the old address for ever).
       // A hello without one ("Tailscale isn't up on the hub right now") keeps the last known address rather than wiping it.
-      o.devices.updateHub({ name: fresh.name, lan: fresh.lan, public: fresh.public, licenceKey: fresh.licenceKey, ...(fresh.tailnet ? { tailnet: fresh.tailnet } : {}) })
+      o.devices.updateHub({ name: fresh.name, lan: fresh.lan, public: fresh.public, licenceKey: fresh.licenceKey, ...(fresh.tailnet ? { tailnet: fresh.tailnet } : {}), ...(fresh.tailnetName ? { tailnetName: fresh.tailnetName } : {}) })
     } catch (e) {
       log?.warn(`ignored the hub's details: ${message(e)}`)
     }

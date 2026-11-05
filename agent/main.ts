@@ -31,6 +31,7 @@ import { closeLog, initLog, log as rootLog, type Logger } from './log.ts'
 import { inCidr, localSubnets, parseHostPort, tailnetAddress } from './net.ts'
 import { createPairingHub, normalizeCode, startJoin, type Join, type PairingHub } from './pairing.ts'
 import { createTailnetName } from './tailnet-name.ts'
+import { createTailnetPeers } from './tailnet-peers.ts'
 import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
 import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, rustdeskHandler } from './rustdesk.ts'
 import { createSavedPasswords } from './saved-passwords.ts'
@@ -124,6 +125,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const changed = () => api?.changed()
   // This PC's name on the tailnet, for the page's "open it on the phone" address (read in the background, at most once a minute; never in test mode).
   const tailnetName = createTailnetName({ up: () => tailnet() !== null, disabled: testNoRustdesk, onChange: () => changed() })
+  // F-110: this PC's tailnet (its PCs), read only when a member's stored hub address fails; never in test mode.
+  const tailnetPeers = createTailnetPeers({ disabled: testNoRustdesk })
   const timers: NodeJS.Timeout[] = []
   const every = (ms: number, fn: () => void) => timers.push(setInterval(fn, ms))
 
@@ -309,6 +312,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         lan: { peer: lan.peer, hbbs: lan.hbbs, hbbr: lan.hbbr },
         public: { hbbs: `${config.publicHost}:${ports.hbbs}`, hbbr: `${config.publicHost}:${ports.hbbr}` },
         tailnet: tailnetListener.address(),
+        // F-110: members fall back to this name when the address above is stale (a new tailnet).
+        ...(tailnetName.get() ? { tailnetName: tailnetName.get() as string } : {}),
         licenceKey: servers.licenceKey(),
       }
     }
@@ -488,6 +493,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       skipDirect,
       subnets,
       tailnet,
+      tailnetSearch: () => config.tailnetSearch !== false,
+      tailnetPeers: () => tailnetPeers.get(),
       version: VERSION,
       onOpen,
       // Where the pinned hub's ID answered on the LAN: tried with its stored address.

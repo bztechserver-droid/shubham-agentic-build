@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import type { Duplex } from 'node:stream'
 import type { LinkPath, Location, Route } from '../shared/agent-api.ts'
-import type { HubRecord } from './devices.ts'
+import { isDnsName, type HubRecord } from './devices.ts'
 import { createMux, type Control, type Mux, type OpenHandler } from './link/mux.ts'
 import { tlsClient, tlsServer, type PeerTls, type TlsIdentity, type VerifyPeer } from './link/tls.ts'
 import type { Logger } from './log.ts'
 import { inCidr, parseHostPort, type Subnet } from './net.ts'
 import { mangle, unmangle } from './rendezvous/codec.ts'
+import { hubLabels, rankPeers, suffixOf, type TailnetView } from './tailnet-peers.ts'
 import {
   connectTcp,
   punchFailure,
@@ -78,7 +79,7 @@ export interface HubLink {
 }
 
 /** Why no link came up. `refused`: the hub itself turned this PC away. */
-export type ConnectFailure = Error & { location: 'offline' | 'unreachable'; refused: boolean; evidence: string[] }
+export type ConnectFailure = Error & { location: 'offline' | 'unreachable'; refused: boolean; evidence: string[]; hint?: string }
 
 function failure(text: string, location: 'offline' | 'unreachable', refused = false): ConnectFailure {
   return Object.assign(new Error(text), { location, refused, evidence: [] as string[] })
@@ -97,6 +98,13 @@ export interface ConnectOptions {
   skipDirect?: boolean
   /** This PC's Tailscale address now, or null: step 1b needs Tailscale at both ends. */
   tailnet?: () => string | null
+  /**
+   * F-110: when the stored Tailscale address does not answer, try the hub's name, then look for the hub among the PCs on this PC's own tailnet.
+   * Default true; false is the way before 5 Nov 2026 (the stored address only).
+   */
+  tailnetSearch?: boolean
+  /** F-110: this PC's tailnet as it is now (its PCs and its name suffix), read when the stored address fails; null when unknown. */
+  tailnetPeers?: () => Promise<TailnetView | null>
   /**
    * More addresses for step 1: where LAN discovery heard the pinned hub's ID answer. Discovery
    * is not authenticated, but the pin is: an impostor there fails TLS like any wrong key.
@@ -243,13 +251,23 @@ export async function probeDirect(o: ConnectOptions, note: (line: string) => voi
 }
 
 /**
- * Step 1b alone: the hub at its Tailscale address, or null. Tailscale tells us nothing about
- * where the hub is, so the link counts as over the internet.
+ * Step 1b alone: the hub over Tailscale, or null. Tailscale tells us nothing about where the hub is, so the link counts as over the internet.
+ *
+ * F-110 (5 Nov 2026): the stored address goes stale when the hub moves to another tailnet. So, all at once: the stored address and the hub's name
+ * (`tailnetTargets`); if none answers, every other PC on THIS PC's tailnet (`tailnet-peers.ts`). The pin (the hub's ID and key) decides who is really
+ * there, so a wrong PC costs a line of evidence and nothing else; the hub's hello then refreshes the stored address. With `tailnetSearch` off only the
+ * stored address is dialled, as before. Why it failed is said in plain words (`hint`): another tailnet, or no PC answering.
  */
-export async function probeTailnet(o: ConnectOptions, note: (line: string) => void, evidence: string[]): Promise<HubLink | null> {
+export async function probeTailnet(
+  o: ConnectOptions,
+  note: (line: string) => void,
+  evidence: string[],
+  hint?: (text: string) => void,
+): Promise<HubLink | null> {
   const t = { ...TIMING, ...o.timing }
-  const at = o.hub.tailnet
-  if (!at) {
+  const search = o.tailnetSearch !== false
+  const targets = tailnetTargets(o.hub, search)
+  if (!targets.length) {
     note("Tailscale: skipped, the hub hasn't said it is on Tailscale")
     return null
   }
@@ -257,18 +275,107 @@ export async function probeTailnet(o: ConnectOptions, note: (line: string) => vo
     note('Tailscale: skipped, Tailscale is not running on this PC')
     return null
   }
+  const first = await raceTailnet(o, targets, targets.length > 1 ? Math.min(t.tailnetConnectMs, 5000) : t.tailnetConnectMs, note, evidence, t)
+  if (first) {
+    if (first.address !== targets[0]) note(`Tailscale: the hub answered at ${first.address} (not its stored address); its details are refreshed from its hello`)
+    return first
+  }
+  if (!search || !o.tailnetPeers) return null
+
+  const view = await o.tailnetPeers().catch(() => null)
+  if (!view) {
+    note("Tailscale: could not read this PC's tailnet to look for the hub there")
+    return null
+  }
+  const port = parseHostPort(o.hub.lan.peer)?.port ?? parseHostPort(o.hub.tailnet ?? '')?.port ?? 21220
+  const { named, others } = rankPeers(view, o.hub, port, targets)
+  const total = named.length + others.length
+  note(`Tailscale: the stored address did not work; looking for the hub among the ${total} other PC${total === 1 ? '' : 's'} on this PC's tailnet${view.suffix ? ` (${view.suffix})` : ''}`)
+  const connectMs = Math.min(t.tailnetConnectMs, 3000)
+  // PCs named like the hub first; the rest only when none of those is it.
+  let found = named.length ? await raceTailnet(o, named, connectMs, note, evidence, t) : null
+  if (!found && others.length) found = await raceTailnet(o, others, connectMs, note, evidence, t)
+  if (found) {
+    note(`Tailscale: found the hub on this tailnet at ${found.address}; its stored address is refreshed from its hello`)
+    return found
+  }
+  hint?.(tailnetHint(view, o.hub, total))
+  note(`Tailscale: no PC on this tailnet answered as ${o.hub.name}`)
+  return null
+}
+
+/** Why no PC on this tailnet answered, in plain words: another tailnet when the names say so, else "none of them". */
+export function tailnetHint(view: Pick<TailnetView, 'suffix'>, hub: Pick<HubRecord, 'name' | 'tailnetName'>, total: number): string {
+  const mine = view.suffix
+  const last = suffixOf(hub.tailnetName)
+  const who = hub.name
+  if (mine && last && mine !== last) return `This PC is on the tailnet ${mine}, but ${who} was last on ${last}. Sign this PC in to the tailnet ${who} is on now.`
+  return `None of the ${total} other PC${total === 1 ? '' : 's'} on this PC's tailnet${mine ? ` (${mine})` : ''} answered as ${who}. Is ${who} on, and signed in to this tailnet? If it moved to another tailnet, sign this PC in to that one.`
+}
+
+/**
+ * The places to dial the hub over Tailscale: the stored address, then (when `search` is on) the name it told us and that name's first label, then - for a
+ * hub paired before it told its name - its own name as a label ("Server" → "server"). The same port throughout. Empty when the hub never said it is on Tailscale.
+ */
+export function tailnetTargets(hub: HubRecord, search = true): string[] {
+  const out: string[] = []
+  if (hub.tailnet) out.push(hub.tailnet)
+  if (!search || !(hub.tailnet || hub.tailnetName)) return out
+  const port = parseHostPort(hub.lan.peer)?.port ?? parseHostPort(hub.tailnet ?? '')?.port
+  if (!port) return out
+  const hosts = hub.tailnetName ? [hub.tailnetName, hub.tailnetName.split('.')[0]] : hubLabels(hub)
+  for (const h of hosts) if (isDnsName(h)) out.push(`${h}:${port}`)
+  return [...new Set(out)]
+}
+
+/**
+ * Dials all of `targets` at once. The first link wins (a later one is closed); a refusal by the hub itself is conclusive and is thrown at once, without
+ * waiting for a slow name lookup; otherwise null once every dial has failed.
+ */
+function raceTailnet(o: ConnectOptions, targets: string[], connectMs: number, note: (line: string) => void, evidence: string[], t: Timing): Promise<HubLink | null> {
+  const attempts = targets.map(at => tailnetOnce(o, at, connectMs, note, evidence, t))
+  return new Promise<HubLink | null>((resolve, reject) => {
+    let left = attempts.length
+    let done = false
+    for (const attempt of attempts) {
+      attempt.then(
+        link => {
+          if (done) return link.mux.close('another Tailscale link won')
+          done = true
+          resolve(link)
+        },
+        (e: unknown) => {
+          if (done) return
+          if (isRefusal(e)) {
+            done = true
+            return reject(e)
+          }
+          if (--left === 0) {
+            done = true
+            resolve(null)
+          }
+        },
+      )
+    }
+  })
+}
+
+/** One dial: TCP, then pinned TLS and the hello. Rejects when it does not work (the evidence line says why). */
+async function tailnetOnce(o: ConnectOptions, at: string, connectMs: number, note: (line: string) => void, evidence: string[], t: Timing): Promise<HubLink> {
   const started = Date.now()
   let socket
   try {
-    socket = await connectTcp(at, Math.min(t.tailnetConnectMs, t.tailnetTotalMs))
+    socket = await connectTcp(at, Math.min(connectMs, t.tailnetTotalMs))
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code
     note(
       code === 'ECONNREFUSED'
         ? `Tailscale: ${at} refused the connection (no agent listening there)`
-        : `Tailscale: ${at} didn't answer in ${ms(t.tailnetConnectMs)} (is Tailscale running on the hub?)`,
+        : code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+          ? `Tailscale: the name ${hostOf(at)} is not known on this PC's tailnet`
+          : `Tailscale: ${at} didn't answer in ${ms(connectMs)} (is Tailscale running on the hub?)`,
     )
-    return null
+    throw e
   }
   const way: Way = {
     path: 'tailscale',
@@ -280,9 +387,8 @@ export async function probeTailnet(o: ConnectOptions, note: (line: string) => vo
   try {
     return await establish(socket, way, o, Math.max(0, started + t.tailnetTotalMs - Date.now()), note, evidence)
   } catch (e) {
-    if (isRefusal(e)) throw e
-    note(`Tailscale: ${at}: ${message(e)}`)
-    return null
+    if (!isRefusal(e)) note(`Tailscale: ${at}: ${message(e)}`)
+    throw e
   }
 }
 
@@ -303,7 +409,9 @@ export async function connectHub(o: ConnectOptions): Promise<HubLink> {
     o.onEvidence?.(line)
     o.log?.info(`connect ${o.hub.name}: ${line}`)
   }
-  const fail = (e: ConnectFailure) => Object.assign(e, { evidence })
+  // F-110: why the Tailscale step failed, in plain words, for the row's second line (links.ts puts it last).
+  let tailHint: string | undefined
+  const fail = (e: ConnectFailure) => Object.assign(e, { evidence }, tailHint && !e.refused ? { hint: tailHint } : {})
   const local = (addr: string) => o.subnets().some(s => inCidr(hostOf(addr), s.cidr))
   const licenceKey = o.hub.licenceKey ?? ''
 
@@ -376,7 +484,7 @@ export async function connectHub(o: ConnectOptions): Promise<HubLink> {
   // not answer at all until the firewall in front of it lets it.
   if (route === 'auto' || route === 'tailscale') {
     try {
-      const link = await probeTailnet(o, note, evidence)
+      const link = await probeTailnet(o, note, evidence, text => (tailHint = text))
       if (link) return link
     } catch (e) {
       throw fail(e as ConnectFailure)

@@ -32,6 +32,8 @@ export interface ConfigFile {
   lanAddress?: string
   /** How a member reaches its hub (shared/agent-api.ts › Route). */
   route: Route
+  /** F-110: false = the Tailscale step dials only the hub's stored address, never its name (the way before 5 Nov 2026). Missing = true. */
+  tailnetSearch?: boolean
   /** On mains power, stay out of a sleep that cuts the network, for Control (agent/screen/power.ts). Default true. */
   stayReachable: boolean
 }
@@ -189,6 +191,10 @@ function validate(raw: unknown, file: string): ConfigFile {
   } else if (raw.forceRelay === true) {
     // Before "route" there was only a Force relay switch.
     out.route = 'relay'
+  }
+  if (raw.tailnetSearch !== undefined) {
+    if (typeof raw.tailnetSearch !== 'boolean') throw bad('tailnetSearch', 'true or false')
+    out.tailnetSearch = raw.tailnetSearch
   }
   if (raw.stayReachable !== undefined) {
     if (typeof raw.stayReachable !== 'boolean') throw bad('stayReachable', 'true or false')
