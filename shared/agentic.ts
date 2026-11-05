@@ -4,6 +4,8 @@
 // agent's local API: the app's routes with x-sad-token like the rest of the API, and the
 // tools Claude chats call (`/agentic/mcp/...`) with the chat's own key instead.
 
+import type { AuthEnded, ChatAccess, ChatCan, ChatOwner, ChatShare } from './auth.ts'
+
 export const AGENTIC_PREFIX = '/agentic'
 
 /**
@@ -92,6 +94,16 @@ export interface FloorAgent {
   /** Where its desk sits on the Design chart. */
   x: number
   y: number
+  /**
+   * F-118: whose chat this is (a CRM user), set by the hub only, never taken from a page. Absent on a copy that
+   * predates F-118 (the hub's one-time move gives those to sbskrrt).
+   */
+  owner?: ChatOwner | null
+  /** F-118: who it is shared with, and how. Sent to its owner and sbskrrt only; empty for everyone else. */
+  sharedWith?: ChatShare[]
+  /** F-118: computed per connection (shared/auth.ts chatRights): why this viewer sees it, and what they may do. Absent when stored. */
+  access?: ChatAccess
+  can?: ChatCan
 }
 
 /** A floor: a team of agents, each with its own chat, working in one folder. */
@@ -109,6 +121,8 @@ export interface Floor {
   folders: Record<string, string>
   createdAt: string
   updatedAt: string
+  /** F-118: who made the floor (a floor with nothing visible to a person is hidden from them, unless they made it). */
+  createdBy?: ChatOwner | null
   agents: FloorAgent[]
 }
 
@@ -304,6 +318,8 @@ export type AgenticEvent =
   | { t: 'memory'; floorId: string }
   /** F-056: the task list changed (something was added, ticked, edited or deleted, by anyone): ask for it again. */
   | { t: 'tasks' }
+  /** F-118: this connection's sign-in ended (or the level was raised past it); the socket closes with code 4401 right after. */
+  | { t: 'auth'; ended: AuthEnded }
   /** F-021: chats on the other PCs, where idle ones ran last, and this PC among the hub's. */
   | { t: 'where'; elsewhere: Record<string, ChatElsewhere>; last: Record<string, ChatLast>; team: AgenticTeam | null }
 

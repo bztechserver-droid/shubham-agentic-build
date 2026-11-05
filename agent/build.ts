@@ -5,6 +5,7 @@ import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
 import { UPDATE_EXIT_CODE, type BuildInfo, type BuildVersion, type PublishRequest } from '../shared/build.ts'
 import { apiError, type ApiMount, type MountRequest } from './api.ts'
+import { authError, mayPublish } from './auth/types.ts'
 import type { Logger } from './log.ts'
 
 // F-020: what this PC runs, and getting a newer one (shared/build.ts).
@@ -378,11 +379,16 @@ export function createBuild(o: BuildOptions): Build {
   devEvery?.unref()
 
   const routes: Record<string, (r: MountRequest) => unknown> = {
-    'GET /info': () => info(),
+    // F-119: whether this browser may press Publish rides with the info, for the page that shows the button.
+    'GET /info': r => ({ ...info(), mayPublish: mayPublish(r.headers, r.caller) }),
     'POST /check': () => check(),
     'POST /update': r => startUpdate(r.body),
     'POST /update-cancel': () => cancelUpdate(),
-    'POST /publish': r => startPublish(isObject(r.body) && r.body.skipChecks === true ? { skipChecks: true } : {}),
+    'POST /publish': r => {
+      // F-119: from a page, only a browser signed in as sbskrrt; a local tool with the machine token and no page headers is as before.
+      if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only sbskrrt, signed in, publishes from a page.', 'admin-only')
+      return startPublish(isObject(r.body) && r.body.skipChecks === true ? { skipChecks: true } : {})
+    },
   }
 
   return {

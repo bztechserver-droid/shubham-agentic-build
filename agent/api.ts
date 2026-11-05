@@ -32,6 +32,9 @@ import {
   type SettingsPatch,
 } from '../shared/agent-api.ts'
 import type { SwitchAutoRequest, SwitchPreview, SwitchRefreshRequest, SwitchRequest, SwitchResponse } from '../shared/claude-switch.ts'
+import type { Auth } from './auth/index.ts'
+import { authRoute } from './auth/routes.ts'
+import { authError, OPEN, type Caller } from './auth/types.ts'
 import { ROUTES } from './config.ts'
 import { loopbackOrigin } from './local-host.ts'
 import type { Logger } from './log.ts'
@@ -135,6 +138,8 @@ export interface ApiOptions {
   log?: Logger
   /** F-018: parts of the API that live in modules of their own (agent/agentic/). */
   mounts?: ApiMount[]
+  /** F-118: who is asking (agent/auth/). Left out (tests, an app with nobody to sign in), every request is the open app's, as before. */
+  auth?: Auth
   /** F-057, tests: how often a text WebSocket client is pinged, and how long one may stay silent before it is dropped. */
   wsPingMs?: number
   wsDeadMs?: number
@@ -147,6 +152,8 @@ export interface MountRequest {
   query: URLSearchParams
   body: unknown
   headers: IncomingMessage['headers']
+  /** F-118: who is asking (the open app's caller when nobody has to sign in). */
+  caller?: Caller
 }
 
 /** A WebSocket a mount took: text frames both ways. */
@@ -165,13 +172,17 @@ export interface WsSocket {
  */
 export interface ApiMount {
   prefix: string
+  /** F-118: the mount decides by person itself (its routes and sockets get `caller`); every other mount, and the core routes, are for the owner (sbskrrt) only. */
+  scoped?: boolean
   ownAuth?(rest: string): boolean
   /** F-082: a route whose request body may be larger than the usual 64 KiB (the phone's screen reading): its limit in bytes; undefined for the usual. */
   maxBody?(rest: string): number | undefined
   /** Resolves to the JSON answer; an apiError for an error status. */
   http(req: MountRequest): Promise<unknown>
   /** Its WebSocket at `rest`, run once accepted; null when it has none there (404). */
-  ws?(rest: string, query: URLSearchParams): ((socket: WsSocket) => void) | null
+  ws?(rest: string, query: URLSearchParams): ((socket: WsSocket, caller?: Caller) => void) | null
+  /** F-118: refuses a WebSocket of this mount to this caller before it is accepted: throws an apiError (403 for a chat they may not see). */
+  wsAllow?(rest: string, query: URLSearchParams, caller: Caller): void
   /**
    * F-074: a WebSocket of this mount that carries its OWN credential (a paired phone's device key) in place of the
    * app token. For `rest` that is one, says whether the handshake's headers hold a valid key; null for any other
@@ -185,7 +196,7 @@ export interface ApiMount {
    * PC, with x-sad-token) before it runs; null when `rest` isn't one. An apiError it throws is
    * answered as JSON, as for the others.
    */
-  raw?(rest: string, url: URL): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | null
+  raw?(rest: string, url: URL): ((req: IncomingMessage, res: ServerResponse, caller?: Caller) => Promise<void>) | null
   /**
    * F-085: a streamed answer that carries the paired phone's DEVICE KEY in place of the app token (the APK the Update
    * button downloads). Only the paths in KEY_STREAM_PATHS can be one, whatever a mount says; any Origin is refused
@@ -537,21 +548,52 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ['POST', /^\/devices\/([^/]+)\/password\/forget$/, ([id], body) => a.forgetPassword(id, forgetPassword(body))],
   ]
 
+  /** F-118: who is asking. With no auth wired, everyone is the open app. Call only after the token was checked: the via header is trusted only then. */
+  const callerOf = (req: IncomingMessage): Caller => o.auth?.caller(req.headers) ?? OPEN
+
+  /**
+   * F-118: the sign-in gate for what a page asks of the PC. 401 (code sign-in) when this request has to be signed in
+   * and is not; 403 (admin-only) for the PC's own routes when the person is not the owner. Every refusal is logged
+   * (who, the route; never a cookie or a token).
+   */
+  function gate(c: Caller, req: IncomingMessage, ownerOnly: boolean) {
+    const auth = o.auth
+    if (!auth) return
+    const route = `${req.method ?? 'GET'} ${(req.url ?? '').split('?')[0]}`
+    if (!c.person && auth.needsSignIn(c.via)) {
+      auth.deny(c, 401, 'sign-in', route)
+      throw authError(401, 'Sign in first.', 'sign-in')
+    }
+    if (ownerOnly && c.person && !auth.isAdmin(c)) {
+      auth.deny(c, 403, 'admin-only', route)
+      throw authError(403, 'This is for the owner of this app.', 'admin-only')
+    }
+  }
+
+  /** F-118: a core socket (the state, the keys, a remote screen) ends when its session does. */
+  function follow(c: Caller, socket: Duplex) {
+    const untrack = o.auth?.track(c, () => socket.destroy())
+    if (untrack) socket.once('close', untrack)
+  }
+
   /** F-018: the mount whose prefix this path is under. */
   const mountOf = (path: string) => o.mounts?.find(m => path.startsWith(`${AGENT_API_PREFIX}${m.prefix}/`))
 
   async function answerMount(m: ApiMount, req: IncomingMessage, url: URL): Promise<unknown> {
     const rest = url.pathname.slice(`${AGENT_API_PREFIX}${m.prefix}`.length)
+    let caller: Caller = OPEN
     if (m.ownAuth?.(rest)) {
       // Its own credential, for programs: a browser page always sends an Origin on a POST.
       if (req.headers.origin !== undefined) throw apiError(403, 'Not for pages')
     } else {
       if (foreignOrigin(req)) throw apiError(403, 'Requests from pages on other sites are refused')
       if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
+      caller = callerOf(req)
+      gate(caller, req, !m.scoped)
     }
     const method = req.method ?? 'GET'
     const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? await readJson(req, m.maxBody?.(rest)) : undefined
-    return m.http({ method, rest, query: url.searchParams, body, headers: req.headers })
+    return m.http({ method, rest, query: url.searchParams, body, headers: req.headers, caller })
   }
 
   /** F-018: a mount's WebSocket, text frames both ways; closed with the others when the API stops. */
@@ -632,7 +674,9 @@ export function startApi(o: ApiOptions): Promise<Api> {
       if (raw) {
         if (foreignOrigin(req)) throw apiError(403, 'Requests from pages on other sites are refused')
         if (!tokenOk(req.headers['x-sad-token'], o.token)) throw apiError(401, 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)')
-        return raw(req, res)
+        const caller = callerOf(req)
+        gate(caller, req, !mount.scoped)
+        return raw(req, res, caller)
       }
       const result = await answerMount(mount, req, url)
       return send(res, 200, typeof result === 'object' && result !== null ? result : { ok: true })
@@ -642,6 +686,25 @@ export function startApi(o: ApiOptions): Promise<Api> {
       return send(res, 401, { error: 'Missing or wrong x-sad-token: open the app through its dev server (npm run dev)' })
     }
     const rest = path.slice(AGENT_API_PREFIX.length)
+    // F-118: signing in and out, who am I, the sign-in level: their own routes, before the sign-in gate.
+    if (o.auth && rest.startsWith('/auth/')) {
+      const caller = callerOf(req)
+      const method = req.method ?? 'GET'
+      // Only these two carry a body; sign-out and confirm take none (a bare POST is fine).
+      const body = (method === 'POST' && rest === '/auth/sign-in') || method === 'PUT' ? await readJson(req) : undefined
+      const secure = typeof req.headers.origin === 'string' && req.headers.origin.startsWith('https:')
+      const answer = await authRoute(o.auth, { method, rest: rest.slice('/auth'.length), query: url.searchParams, body, caller, secure })
+      if (answer) {
+        const headers: http.OutgoingHttpHeaders = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+        if (answer.setCookie) headers['Set-Cookie'] = answer.setCookie
+        const text = JSON.stringify(answer.data ?? { ok: true })
+        headers['Content-Length'] = Buffer.byteLength(text)
+        res.writeHead(answer.status, headers)
+        return void res.end(text)
+      }
+      return send(res, 404, { error: `No such path: ${path}` })
+    }
+    gate(callerOf(req), req, true)
     let methodMismatch = false
     for (const [method, pattern, run] of routes) {
       const m = pattern.exec(rest)
@@ -670,7 +733,8 @@ export function startApi(o: ApiOptions): Promise<Api> {
       const status = (e as { status?: unknown }).status
       const code = typeof status === 'number' && status >= 400 && status < 600 ? status : 500
       if (code === 500) log?.error(`${req.method} ${req.url}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
-      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e) })
+      const why = (e as { code?: unknown }).code
+      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code < 500 ? { code: why } : {}) })
       else res.destroy()
     })
   })
@@ -710,8 +774,8 @@ export function startApi(o: ApiOptions): Promise<Api> {
     )
   }
 
-  function refuse(socket: Duplex, status: number, text: string) {
-    const body = JSON.stringify({ error: text })
+  function refuse(socket: Duplex, status: number, text: string, code?: string) {
+    const body = JSON.stringify({ error: text, ...(code ? { code } : {}) })
     socket.end(
       `HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
     )
@@ -809,13 +873,26 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (path !== `${AGENT_API_PREFIX}/ws` && path !== keysPath && !remote && !mountWs) return refuse(socket, 404, `No WebSocket at ${path}`)
     // F-074: a path that answers to a device key (the phone's /voice/live) and to nothing else: no app token, no browser page.
     const keyed = mount && mountWs ? (mount.wsKey?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), req.headers) ?? null) : null
+    let caller: Caller = OPEN
     if (keyed !== null) {
       if (req.headers.origin !== undefined) return refuse(socket, 403, 'Not for pages')
       if (!keyed) return refuse(socket, 401, 'Missing or invalid device key')
+      // F-118: the paired phone keeps its device key until it can sign in; unless that was turned off.
+      if (o.auth && !o.auth.phoneExempt() && o.auth.require() !== 'off') return refuse(socket, 401, 'Sign in first.', 'sign-in')
     } else {
       // The proxy keeps the browser's own Origin on a WebSocket (changeOrigin rewrites Host only).
       if (foreignOrigin(req)) return refuse(socket, 403, 'WebSockets from pages on other sites are refused')
       if (!tokenOk(req.headers['x-sad-token'], o.token)) return refuse(socket, 401, 'Missing or wrong x-sad-token')
+      // F-118: who is asking, and may they have this socket (the mount decides which chat).
+      caller = callerOf(req)
+      try {
+        gate(caller, req, !mount?.scoped)
+        if (mount && mountWs) mount.wsAllow?.(path.slice(`${AGENT_API_PREFIX}${mount.prefix}`.length), url.searchParams, caller)
+      } catch (e) {
+        const status = (e as { status?: unknown }).status
+        const why = (e as { code?: unknown }).code
+        return refuse(socket, typeof status === 'number' ? status : 403, e instanceof Error ? e.message : String(e), typeof why === 'string' ? why : undefined)
+      }
     }
     const key = req.headers['sec-websocket-key']
     const upgrade = String(req.headers.upgrade ?? '').toLowerCase()
@@ -827,11 +904,21 @@ export function startApi(o: ApiOptions): Promise<Api> {
 
     if (mountWs) {
       socket.write(switching)
-      return mountWs(wsSocket(socket, head))
+      const ws = wsSocket(socket, head)
+      // F-118: a signed-in socket is told, then closed, when its session ends (or the level is raised past an anonymous one).
+      if (keyed === null) {
+        const untrack = o.auth?.track(caller, why => {
+          ws.sendText(JSON.stringify({ t: 'auth', ended: why }))
+          ws.close(4401, why)
+        })
+        if (untrack) ws.onClose(untrack)
+      }
+      return mountWs(ws, caller)
     }
 
     if (path === keysPath) {
       if (!a.grabKeys) return refuse(socket, 404, "This PC can't take its keys for Control")
+      follow(caller, socket)
       socket.write(switching)
       return keys(socket, head)
     }
@@ -847,6 +934,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       const via = url.searchParams.get('via') ?? 'rustdesk'
       if (via !== 'app' && via !== 'rustdesk') return refuse(socket, 400, 'via must be app or rustdesk')
       // The stream first, so a missing device or link is an HTTP answer with the reason.
+      follow(caller, socket)
       socket.pause()
       Promise.resolve()
         .then(() => a.remote(id, via))
@@ -867,6 +955,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
     socket.write(switching)
     ;(socket as net.Socket).setNoDelay?.(true)
     const client: WsClient = { socket, closing: false }
+    follow(caller, socket)
     let gone = false
     const stopSweep = sweep(client)
     const drop = () => {

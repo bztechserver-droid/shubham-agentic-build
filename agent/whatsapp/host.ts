@@ -171,7 +171,12 @@ export function createHost(o: HostOptions): Host {
       }
       if (buf.length > 4000) buf = ''
     })
-    c.on('message', onMessage)
+    // What it says counts only while it is the running worker. On a busy PC its last words (its "off" as it leaves, even
+    // its answer to quit) can still be in the pipe when its end is seen; heard after that, they would undo what the hub
+    // has said since (why it closed) or speak for the next worker.
+    c.on('message', m => {
+      if (child === c) onMessage(m)
+    })
     exited = new Promise<void>(resolve => {
       c.once('exit', code => {
         child = null
@@ -240,7 +245,10 @@ export function createHost(o: HostOptions): Host {
     if (!c) return
     const done = exited
     const quitMs = o.quitMs ?? 25_000
-    await call('quit', undefined, quitMs).catch(e => o.log.warn(`closing WhatsApp: ${message(e)}`))
+    // Its end can be seen before its answer: that is it quitting, not a failure.
+    await call('quit', undefined, quitMs).catch(e => {
+      if (child === c) o.log.warn(`closing WhatsApp: ${message(e)}`)
+    })
     const ended = await Promise.race([done?.then(() => true), new Promise<boolean>(r => setTimeout(() => r(false), 5000).unref())])
     if (ended) return
     // It didn't end by itself: its exact PID, and what descends from it (its Chrome).

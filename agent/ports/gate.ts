@@ -16,6 +16,9 @@ import type { Identity } from './identity.ts'
 //  3. The Host header's port must be one this agent shares right now, else 404.
 //  4. A request with an Origin whose host is not one of this PC's own names or addresses is refused (403): another website cannot use a visitor's browser to drive a shared page.
 //  5. Headers that Tailscale adds for its own web serve (Tailscale-User-*) are removed from the request, so a visitor cannot forge them to a program that trusts them.
+//  6. F-118: every request that gets through (http, https, WebSocket) carries `x-sad-via: tailnet` and, when Tailscale names the person, `x-sad-via-login: <login>`.
+//     Any `x-sad-via*` header the visitor sent is removed first (and so is its name in a Connection header), so nobody can forge it or make it vanish.
+//     The agent's Accounts (sign-in level "remote") reads it. Only this gate sets it: a visit that never came through here has none.
 
 export interface Shared {
   /** 'agent': this gate does the TLS; 'tailscale': Tailscale already did (the old way / the fallback). */
@@ -53,6 +56,19 @@ export interface Gate {
 interface Conn {
   scheme: 'http' | 'https'
   ip: string
+  /** F-118: the Tailscale login behind the device, when Tailscale names one. */
+  login?: string
+}
+
+/** F-118: the header every request gets that came through this gate. */
+export const VIA_HEADER = 'x-sad-via'
+export const VIA_LOGIN_HEADER = 'x-sad-via-login'
+
+/** A header value must be printable ASCII: anything else (a space, a control character, a letter outside ASCII) is percent-encoded, and the length is capped. */
+export function headerSafe(v: string): string {
+  let out = ''
+  for (const ch of v) out += /^[\x21-\x7e]$/.test(ch) ? ch : encodeURIComponent(ch)
+  return out.slice(0, 200)
 }
 
 const LOOPBACK = '127.0.0.1'
@@ -123,12 +139,18 @@ export async function startGate(o: GateOptions): Promise<Gate> {
     return o.originHosts().has(url.hostname.toLowerCase().replace(/^\[|\]$/g, '')) ? null : `origin ${url.hostname.slice(0, 80)} is not one of this PC's names`
   }
 
-  function rewriteRequestHeaders(raw: string[], port: number): string[] {
+  function rewriteRequestHeaders(raw: string[], port: number, conn: Conn | undefined): string[] {
     const authority = `${upstreamHost}:${port}`
     const out: string[] = []
     for (let i = 0; i < raw.length; i += 2) {
       const lower = raw[i].toLowerCase()
-      if (lower.startsWith('tailscale-')) continue
+      if (lower.startsWith('tailscale-') || lower.startsWith(VIA_HEADER)) continue
+      if (lower === 'connection') {
+        // A visitor must not be able to make the header disappear further along by naming it here (hop-by-hop).
+        const kept = raw[i + 1].split(',').map(s => s.trim()).filter(s => s && !s.toLowerCase().startsWith(VIA_HEADER))
+        if (kept.length) out.push(raw[i], kept.join(', '))
+        continue
+      }
       if (lower === 'host') out.push(raw[i], authority)
       else if (lower === 'origin') {
         // Same-origin (the page's own port) looks like the program's own address to it; a call from another shared port keeps its real Origin so the program's CORS rules still decide.
@@ -141,6 +163,9 @@ export async function startGate(o: GateOptions): Promise<Gate> {
         out.push(raw[i], same ? `http://${authority}` : raw[i + 1])
       } else out.push(raw[i], raw[i + 1])
     }
+    // F-118: set by this gate alone, after everything the visitor sent was dropped above.
+    out.push(VIA_HEADER, 'tailnet')
+    if (conn?.login) out.push(VIA_LOGIN_HEADER, headerSafe(conn.login))
     return out
   }
 
@@ -192,7 +217,7 @@ export async function startGate(o: GateOptions): Promise<Gate> {
       return
     }
     // The rewritten headers go as a flat list, so the program sees them in the order and case the visitor sent them.
-    const options = { host: upstreamHost, port, autoSelectFamily: true, method: req.method, path: req.url, headers: rewriteRequestHeaders(req.rawHeaders, port), setHost: false } as http.RequestOptions
+    const options = { host: upstreamHost, port, autoSelectFamily: true, method: req.method, path: req.url, headers: rewriteRequestHeaders(req.rawHeaders, port, conns.get(req.socket)), setHost: false } as http.RequestOptions
     const upstream = http.request(options, up => {
       res.writeHead(up.statusCode ?? 502, up.statusMessage, rewriteResponseHeaders(up.rawHeaders, req, port))
       up.pipe(res)
@@ -220,7 +245,7 @@ export async function startGate(o: GateOptions): Promise<Gate> {
       return
     }
     const upstream = net.connect({ host: upstreamHost, port, autoSelectFamily: true }, () => {
-      const h = rewriteRequestHeaders(req.rawHeaders, port)
+      const h = rewriteRequestHeaders(req.rawHeaders, port, conns.get(req.socket))
       let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`
       for (let i = 0; i < h.length; i += 2) raw += `${h[i]}: ${h[i + 1]}\r\n`
       upstream.write(raw + '\r\n')
@@ -249,6 +274,7 @@ export async function startGate(o: GateOptions): Promise<Gate> {
     socket.setTimeout(10_000, () => socket.destroy())
     let buf = Buffer.alloc(0)
     let ip = ''
+    let login: string | undefined
 
     const onData = async (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk])
@@ -272,6 +298,7 @@ export async function startGate(o: GateOptions): Promise<Gate> {
           return void socket.destroy()
         }
         if (socket.destroyed) return
+        login = who.login
         socket.resume()
       }
       if (buf.length === 0) return
@@ -293,11 +320,11 @@ export async function startGate(o: GateOptions): Promise<Gate> {
           drop(ip, `the TLS handshake with ${ip} failed: ${(e as NodeJS.ErrnoException).code ?? ''} ${e.message}`.replace(/\s+/g, ' ').slice(0, 200))
           t.destroy()
         })
-        conns.set(t, { scheme: 'https', ip })
+        conns.set(t, { scheme: 'https', ip, login })
         web.emit('connection', t)
       } else {
         counts.plain++
-        conns.set(socket, { scheme: 'http', ip })
+        conns.set(socket, { scheme: 'http', ip, login })
         socket.unshift(buf)
         web.emit('connection', socket)
         socket.resume()

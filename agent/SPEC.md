@@ -2413,4 +2413,48 @@ Every PC's own agent can share some or all of the ports its programs listen on, 
 - **Linux's own ports (F-116)**: a socket of a system account (uid < 1000, or 65534 nobody; never the agent's own non-root uid) or of a known system service (systemd, sshd, cupsd, avahi-daemon, snapd, containerd ...) gets the `windows` reason, worded for both systems. A socket whose PID can't be read (another account's) has `pid: null` and `program: null` in `ListeningPort`, so Share all never takes it.
 - **Tailscale rights on Linux (F-116)**: `tailscale serve` and `tailscale cert` work only for root or Tailscale's operator. Ports reads `tailscale debug prefs` (OperatorUser) with the node's facts, once a minute; when this user is neither, `PortsState.tailscaleRights` = {text, command: `sudo tailscale set --operator=$USER`} and the page shows that one line to run once (the app never runs sudo). status and whois work without it. The field is absent on Windows.
 - **Plain http by name goes to https (F-117, 5 Nov 2026)**: a browser does not upgrade `http://<name>:5173` by itself, and a Tailscale-terminated port cannot answer plain http at all (curl 52 "Empty reply"). On a share where the agent does the TLS (`tlsBy: agent`, certificate loaded) the gate answers plain http whose Host is this PC's NAME (full or short, any case, trailing dot) with **308** to `https://<full name>:<port><same path and query>` (`Cache-Control: no-store`; a POST keeps its method and body); a WebSocket upgrade over http-by-name gets **426** with the wss address that works. A Host that is a bare IP (v4 or [v6]) stays plain http, and a name that is not this PC's is served as before. **No HSTS**: it is per host, not per port, so it would break http on every other port of the name (80, the old way's ports) and stick in browsers after the setting is switched off. `PortsState.httpRedirect {on, active}` (setting `redirectHttp`, default on; `active` = on + tlsBy agent + gate up + certificate loaded). `tlsBy: tailscale` is unchanged and has no redirect (and no plain http). Every Ports settings change is written to the agent log as `setting changed: <key> <old> -> <new>`.
+- **The gate marks every visit that came over the tailnet (F-118, 5 Nov 2026)**: every request the Ports gate passes to a shared page (http, https, and the WebSocket upgrade) gets `x-sad-via: tailnet` and, when Tailscale names the person behind the device (whois `UserProfile.LoginName`; a tagged device has none), `x-sad-via-login: <login>` (printable ASCII; anything else percent-encoded, at most 200 characters). The login is for audit only. Before the header is set, the gate removes every header the visitor sent whose name starts with `x-sad-via` and also drops such a name from a `Connection` header, so nobody can forge the mark or make it disappear further along; the other `Connection` tokens (`Upgrade`) stay. The plain-http-by-name 308 is answered by the gate itself and reaches no page; the request the browser sends on to https gets the mark like any other. A visit that did not come through this gate has no such header. The agent's Accounts reads it for the sign-in level "remote". The phone gate (christopher-remote) is not changed. Tests: `agent/ports/gate.test.ts` 19-22.
 - Tests: `ports/parts.test.ts`, `gate.test.ts` (real sockets), `index.test.ts` (fake tailscale `fake-tailscale.ts`, throwaway certificate `test-cert.ts`), `links.test.ts`, `api.test.ts`.
+
+## F-118: who is using the app (auth/, agentic/access.ts, shared/auth.ts)
+
+Each person signs in IN THE PAGE (per browser) with their own CRM account; every chat belongs to one person; the owner can
+share a chat as "can view" or "can type"; sbskrrt (the CRM id in `auth.json` `admins`, default Shubham's) sees all and alone uses
+the PC's own pages. The contract (routes, errors, types, `chatRights`, `scopeFloors`) is `shared/auth.ts`; it is enforced in the
+agent, on HTTP, on every WebSocket and in the chats' tools, never only hidden in the page.
+
+- **Sign-in** (`auth/index.ts`): `POST /auth/sign-in {username, password}` goes to the CRM once (`claude/crm.ts` signIn, the F-007
+  pattern); the CRM's cookie is used for who-am-I and the member list (a CRM `client` account may not sign in) and dropped. The agent
+  issues its own cookie `sad_session` (httpOnly, SameSite=Strict, Secure over https): 256 random bits; only their sha-256 is kept in
+  `<state>/agent/auth.json` (mode 0600). A session ends 7 days after it began or 12 h after it was last used (sign-out and
+  "sign out everywhere" end it at once; open sockets get `{t:'auth', ended}` and close with 4401). Five wrong tries a minute per
+  username, thirty for the whole app (429 `slow-down`). Nothing secret is logged: deny lines carry the username, the id's first 8
+  characters, the route and the chat id's first 8.
+- **Where it sits**: the token (`x-sad-token`, added by the page server) stays the machine boundary; the cookie is the person boundary
+  on top. `api.ts` resolves the cookie after the token check (`callerOf`), gates every route and WebSocket (`gate`: 401 `sign-in` when
+  this request has to be signed in, 403 `admin-only` for the core routes and every mount that is not `scoped`), and gives the caller to
+  the agentic mount, which decides by person (`MountRequest.caller`, `wsAllow`, `raw(req, res, caller)`). `ownAuth` paths (a chat's own
+  key) and the phone's device-key paths are not gated by sign-in; the phone is exempt while `phoneExempt` (default true).
+- **How strict** (`auth.require`, saved in `auth.json`): `off` (as before: an unsigned browser is the open app, trusted; a signed-in one
+  is scoped), `remote` (a request that came over the tailnet must sign in; this PC's own browser stays open), `all` (everyone).
+  "Came over the tailnet" = the header `x-sad-via: tailnet`, which only the Ports gate (it strips any client copy first) and the page
+  server (`auth/via.ts`: a connection from a non-loopback address, such as the F-028 listener's) may set; the page server keeps the
+  gate's exact value from loopback and drops every other claim. Raising the level is a TRIAL: only a signed-in sbskrrt can, it
+  applies at once and reverts after 120 s unless that SAME session calls `POST /auth/settings/confirm`; lowering is immediate.
+  Break-glass: the file `<state>/agent/auth-off`, or `SAD_AUTH=off`, forces `off` (read each second; the saved level is untouched).
+  Ships as `off`: nothing changes for anyone until sbskrrt raises it.
+- **Ownership** (`agentic/floors.ts`): `FloorAgent.owner`, `sharedWith`, `Floor.createdBy`, kept by the hub, never taken from a page
+  (`patch` puts the old ones back; an agent the chart adds is the editor's). At start every floor and chat without an owner becomes
+  sbskrrt's (idempotent, logged by count). What the open app makes is sbskrrt's; a chat's tools act as its owner; a member passes its
+  page's person to the hub (`by`) and the hub decides as for a page of its own.
+- **Rights** (`agentic/access.ts`): owner = everything; shared `type` = read and type into a RUNNING chat; `view` = read; sbskrrt =
+  everything. Start, stop, restart, move, rename, tune and share are the owner's or sbskrrt's; a floor is changed by its maker (or
+  sbskrrt), deleted only by someone who owns every chat on it. `POLICY` lists every route of the agentic table with its rule; a route
+  not listed is for sbskrrt only, and `access.test.ts` holds POLICY and the table equal. Lists, `/events`, previews, runs, transcripts
+  and the live states are filtered per connection; floors with nothing visible are hidden; a share taken back closes the sharee's open
+  terminal and chat sockets (4403) and a downgrade to view stops their typing at once.
+- **Tools**: `app_chats`, `list_chats` and `floor_roster` list only what the chat's owner may see; reading, typing, stopping, opening and
+  setting effort on another chat need the matching right; `agent_hire` makes the hire the owner's; the task list, the phone, the screen,
+  WhatsApp, the watchdog and the app's memory are for sbskrrt's chats only.
+- **Tests**: `shared/auth.test.ts`, `auth/index.test.ts` (sessions, throttle, trial, break-glass, who may change the level),
+  `auth/via.test.ts`, `api-auth.test.ts` (the gate over HTTP and WebSockets), `agentic/access.test.ts` and `access-hub.test.ts`.

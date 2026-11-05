@@ -346,3 +346,25 @@ export async function moveMeTo(s: Pick<CrmSession, 'url' | 'cookie' | 'user'>, s
   if (r.status === 400) return { kind: 'refused', status: 400, message: sentence ?? 'The CRM turned that Claude subscription down' }
   throw refusal(r, "The CRM wouldn't move you to that Claude subscription")
 }
+
+/** One of the CRM organisation's members, as the Share picker needs them (the CRM's email is left out on purpose). */
+export interface CrmMember {
+  id: string
+  username: string
+  name: string
+  /** The CRM's role: 'admin', 'staff' or 'client'. */
+  role: string
+}
+
+/** The organisation's members (GET /v1/org/members: any member may read it). */
+export async function listMembers(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<CrmMember[]> {
+  const r = await call(`${s.url}/v1/org/members`, { headers: { cookie: s.cookie, accept: 'application/json' } })
+  if (r.status !== 200) throw refusal(r, "The CRM wouldn't list its members")
+  const out: CrmMember[] = []
+  for (const m of Array.isArray(r.body.members) ? r.body.members : []) {
+    if (!isObject(m) || text(m.userId) === null) continue
+    const username = text(m.username)
+    out.push({ id: String(m.userId), username: username ?? '', name: text(m.fullName) ?? username ?? 'Member', role: (text(m.role) ?? 'staff').toLowerCase() })
+  }
+  return out
+}

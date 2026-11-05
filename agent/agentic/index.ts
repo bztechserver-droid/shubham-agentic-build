@@ -85,6 +85,11 @@ import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
 import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shared/attachments.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
+import { AGENT_API_PREFIX } from '../../shared/agent-api.ts'
+import type { ChatOwner, ChatShare } from '../../shared/auth.ts'
+import type { Auth } from '../auth/index.ts'
+import { authError, OPEN, type Caller } from '../auth/types.ts'
+import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmProxy } from './crmproxy.ts'
@@ -148,9 +153,32 @@ export interface AgenticTeamLinks {
   member(id: string): LinkPeer | null
 }
 
+/** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory): the owner of the app's chats only. */
+const ADMIN_TOOLS = new Set([
+  'task_add',
+  'task_list',
+  'task_update',
+  'ui_screen',
+  'ui_control',
+  'ui_modules',
+  'ui_invoke',
+  'phone_screen',
+  'phone_control',
+  'phone_update',
+  'wa_status',
+  'wa_chats',
+  'wa_read',
+  'wa_prepare_send',
+  'watchdog_status',
+  'memory_read',
+  'prepare_send',
+])
+
 export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
+  /** F-118: who is signed in (agent/auth/). Left out (tests), the app is open: every caller may do everything. */
+  auth?: Auth
   /** The local API's base URL, http://127.0.0.1:<port>/agent-api (read when a chat starts). */
   apiUrl: () => string
   log?: Logger
@@ -247,6 +275,8 @@ export interface Agentic {
   memory: MemoryStore
   /** What a tool call does, for the chat whose key it carries; the answer is the text the chat sees. */
   callTool(key: string, name: string, args: unknown): Promise<string>
+  /** F-118, for the test that holds the access policy and the route table equal: each route as 'METHOD <regex source>'. */
+  routeKeys(): string[]
   /** F-097: a member PC's request to the hub's Common Drive over the link (throws when there is no hub or it can't be reached). */
   driveRequest(body: unknown, timeoutMs?: number): Promise<unknown>
   /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
@@ -374,12 +404,53 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const mode = (): 'alone' | 'hub' | 'member' => (!team ? 'alone' : team.role() === 'hub' ? 'hub' : team.hub() ? 'member' : 'alone')
   const self = () => team?.self() ?? { id: 'this-pc', name: os.hostname() }
 
-  const events = new Set<WsSocket>()
+  // F-118: every events socket with its caller: what it is sent is what that person may see.
+  const events = new Map<WsSocket, Caller>()
+  const access = createAccess(o.auth)
   // F-070: the screens the overlay assistant can drive (ui-bridge.ts).
   const ui = createUiBridge()
+  /** One event as this caller may see it, as text; null when it is not theirs at all. */
+  function eventFor(e: AgenticEvent, c: Caller): string | null {
+    if (e.t === 'tasks') return access.isAdmin(c) ? JSON.stringify(e) : null
+    if (e.t === 'auth') return JSON.stringify(e)
+    if (e.t === 'memory') {
+      const f = allFloors().find(x => x.id === e.floorId)
+      return f && access.floorSeen(c, f) ? JSON.stringify(e) : null
+    }
+    if (e.t === 'floors') return JSON.stringify({ t: 'floors', floors: access.scope(c, e.floors) } satisfies AgenticEvent)
+    const seen = access.visible(c, allFloors())
+    if (seen === null) return JSON.stringify(e)
+    const mine = <T>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid)))
+    if (e.t === 'live') return JSON.stringify({ t: 'live', live: mine(e.live) } satisfies AgenticEvent)
+    if (e.t === 'where') return JSON.stringify({ ...e, elsewhere: mine(e.elsewhere), last: mine(e.last) } satisfies AgenticEvent)
+    return JSON.stringify(e)
+  }
+  // F-118: the terminal and chat sockets that are open, with who holds each: closed when their person loses sight of the chat.
+  const viewers = new Set<{ ws: WsSocket; caller: Caller; sid: string }>()
+  function watch(sid: string, caller: Caller, ws: WsSocket) {
+    const entry = { ws, caller, sid }
+    viewers.add(entry)
+    ws.onClose(() => viewers.delete(entry))
+  }
+  function recheckSockets() {
+    for (const e of [...viewers]) {
+      const at = bySession(e.sid)
+      if (at && access.rights(e.caller, at.agent) === null) {
+        viewers.delete(e)
+        e.ws.close(4403, "That chat isn't yours any more")
+      }
+    }
+  }
   const emit = (e: AgenticEvent) => {
-    const t = JSON.stringify(e)
-    for (const s of events) s.sendText(t)
+    if (e.t === 'floors') recheckSockets()
+    // Callers with the same rights get the same text: made once.
+    const made = new Map<string, string | null>()
+    for (const [s, c] of events) {
+      const key = c.person ? c.person.id : '*'
+      if (!made.has(key)) made.set(key, eventFor(e, c))
+      const t = made.get(key)
+      if (t) s.sendText(t)
+    }
   }
 
   const floors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
@@ -387,6 +458,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     emit({ t: 'floors', floors: floors.list() })
     pushState()
   })
+  // F-118: every floor and chat that has no owner is sbskrrt's (the one-time move; it is idempotent, so a chat some older path
+  // made without an owner is covered at the next start too). A member keeps no floors of its own: this changes nothing there.
+  if (o.auth) {
+    const moved = floors.assignUnowned(SBSKRRT_OWNER)
+    if (moved) log?.info(`F-118: ${moved} floors and chats had no owner; they are sbskrrt's now`)
+    if (!o.auth.migrated()) o.auth.markMigrated()
+  }
   // F-067: what "Default" means for a chat's model, effort and ultracode, kept on the hub (a member gets a copy with the state).
   const chatDefaults = createDefaultsStore(path.join(o.dir, 'chat-defaults.json'), () => {
     if (mode() !== 'member') pushState()
@@ -1832,6 +1910,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const { floor, agent } = mine
     const args = isObject(rawArgs) ? rawArgs : {}
     const tag = `${agent.name}, chat ${sid.slice(0, 8)}`
+    // F-118: a chat does what its OWNER may. The owner of the app (every chat there was before) is unchanged.
+    const me = access.asChat(agent)
+    const toolWhere = `tool ${name}`
+    if (ADMIN_TOOLS.has(name) && !access.isAdmin(me)) {
+      o.auth?.deny(me, 403, 'admin-only', toolWhere, sid)
+      throw authError(403, 'That tool is for the owner of this app.', 'admin-only')
+    }
+    /** The agent that holds chat `sessionId`, and whether `me` has this much on it (a chat on no floor is the owner of the app's). */
+    const mayOn = (sessionId: unknown, need: Need) => {
+      const at = typeof sessionId === 'string' ? bySession(sessionId) : null
+      if (at) return access.needChat(me, at.agent, need, toolWhere)
+      if (!access.isAdmin(me)) throw authError(403, "That chat isn't yours.", 'not-yours')
+    }
 
     switch (name) {
       // F-029: the whole app.
@@ -1839,7 +1930,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const where = whereAll()
         const last = lastAll()
         const rows = floors.list().flatMap(f =>
-          f.agents.map(a => {
+          f.agents.filter(a => access.rights(me, a) !== null).map(a => {
             const w = a.sessionId ? where[a.sessionId] : undefined
             return {
               floor: f.name,
@@ -1859,10 +1950,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'app_read_chat': {
         const target = anyChat(args.sessionId)
+        mayOn(target.sessionId, 'view')
         return readChat(target, typeof args.lines === 'number' ? Math.min(500, args.lines) : 100)
       }
       case 'app_read_conversation': {
         if (typeof args.sessionId !== 'string' || !args.sessionId) throw apiError(400, 'sessionId is missing')
+        mayOn(args.sessionId, 'view')
         const file = findTranscript(args.sessionId, projectsDir)
         if (!file) throw apiError(404, `There is no conversation ${args.sessionId} on the hub`)
         const n = typeof args.last === 'number' ? Math.max(1, Math.min(200, args.last)) : 20
@@ -1871,6 +1964,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'app_send_to_chat': {
         const target = anyChat(args.sessionId)
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
+        mayOn(target.sessionId, 'type')
         const body = text(args.text, 'text')
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(target.sessionId)) throw apiError(409, promptWords(target.sessionId))
@@ -1885,6 +1979,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'app_open_chat': {
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
+        access.needChat(me, a, 'owner', toolWhere)
         const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null
         const pc = pcName ? pcs().find(p => p.name.toLowerCase() === pcName || p.id === args.pc) : null
         if (pcName && !pc) throw apiError(404, `No PC called ${String(args.pc)} within reach; app_chats lists them`)
@@ -1905,6 +2000,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-049: kept on the agent (its chat starts with --effort every time) and, when its chat
         // is running and waiting, typed into it as /effort, which sets this session's at once.
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
+        access.needChat(me, a, 'owner', toolWhere)
         const raw = typeof args.level === 'string' ? args.level.trim().toLowerCase() : ''
         const level = (raw === 'default' ? '' : raw) as AgentEffort
         if (!(AGENT_EFFORTS as readonly string[]).includes(level)) throw apiError(400, 'level is low, medium, high, xhigh, max, or default')
@@ -1923,6 +2019,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'app_stop_chat': {
         const target = anyChat(args.sessionId)
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
+        mayOn(target.sessionId, 'owner')
         stopAnywhere(target.sessionId)
         return `Stopping chat ${target.sessionId}.`
       }
@@ -1931,12 +2028,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const others = Object.entries(whereAll())
           .filter(([s]) => s !== sid)
           .map(([s, w]) => ({ s, w, at: floors.bySession(s) }))
-          .filter(x => x.at?.floor.id === floor.id)
+          .filter(x => x.at?.floor.id === floor.id && access.rights(me, x.at.agent) !== null)
           .map(({ s, w, at }) => ({ sessionId: s, agent: at!.agent.name, role: byId.get(at!.agent.id)?.role ?? '', doing: w.state, pc: w.name }))
         return json({ floor: floor.name, you: agent.name, chats: others })
       }
       case 'floor_roster':
-        return json(rosterOf(floor, agent))
+        return json(rosterOf({ ...floor, agents: floor.agents.filter(a => a.id === agent.id || access.rights(me, a) !== null) }, agent))
       case 'watchdog_status':
         return json(watchdogView())
       // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
@@ -1949,11 +2046,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       case 'read_chat': {
         const c = siblingOf(floor, args.sessionId)
+        mayOn(c.sessionId, 'view')
         return readChat(c, typeof args.lines === 'number' ? args.lines : 100)
       }
       case 'send_to_chat': {
         const c = siblingOf(floor, args.sessionId)
         if (c.sessionId === sid) throw apiError(400, "That's your own chat")
+        mayOn(c.sessionId, 'type')
         const body = text(args.text, 'text')
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(c.sessionId)) throw apiError(409, promptWords(c.sessionId))
@@ -1972,6 +2071,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         broadcastLast.set(floor.id, t)
         const all = Object.entries(whereAll())
           .filter(([s]) => s !== sid && floors.bySession(s)?.floor.id === floor.id)
+          .filter(([s]) => {
+            const at = floors.bySession(s)
+            const r = at ? access.rights(me, at.agent) : null
+            return !at || (r !== null && r.can !== 'view')
+          })
           .map(([s, w]) => ({ sessionId: s, id: w.id, asking: atPrompt(s), drafting: hasDraft(s) }))
         // M1: a chat at a prompt is skipped, not pressed Enter on. A chat with his unsent text in its box is skipped too.
         const to = all.filter(c => !c.asking && !c.drafting)
@@ -2002,7 +2106,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const entries = memory.search(floor.id, query, limit)
         // F-051: the floor's notes by keyword as before, and hits from all of the memory beside
         // them once the layer is switched on (until then, the answer is exactly as it was).
-        if (args.mode === 'keyword' || !memoryOn) return json({ entries })
+        if (args.mode === 'keyword' || !memoryOn || !access.isAdmin(me)) return json({ entries })
         const hits = query.trim() ? await (await memoryLayer()).search(query, { limit, excludeSession: sid }) : []
         return json({ entries, hits })
       }
@@ -2013,7 +2117,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return (await memoryLayer()).read(typeof args.ref === 'string' ? args.ref : '')
       // F-051: not a tool the chats see: a member's /mcp/recall, passed to the hub (or this PC's own).
       case 'memory_recall':
-        return memoryOn ? (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
+        return memoryOn && access.isAdmin(me) ? (await memoryLayer()).recall({ sessionId: sid, prompt: typeof args.prompt === 'string' ? args.prompt : '' }) : ''
       // F-056: the app's one task list (the Tasks tab), for every chat.
       case 'task_add': {
         const body = taskText(args.text)
@@ -2081,7 +2185,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           reportsTo: typeof args.reportsTo === 'string' && args.reportsTo.trim() ? args.reportsTo : agent.id,
           model: model as AgentModel | undefined,
           effort: effort as AgentEffort | undefined,
-        })
+        }, access.ownerOf(me))
         log?.info(`${agent.name} hired ${hired.name} on ${floor.name}`)
         return json({ hired: hired.name, role: hired.role, effort: hired.effort || 'inherit', total: after.agents.length, note: 'No chat is started yet; the human opens it from the floor.' })
       }
@@ -2146,15 +2250,38 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // The page's routes
 
-  function answerFloors(): FloorsAnswer {
-    return { floors: allFloors(), live: chats.states(), elsewhere: elsewhere(), last: lastAll(), team: teamInfo(), defaultCodeDir }
+  /** The floors, live states and the rest as one caller may see them (F-118): their own and the shared ones, or all for sbskrrt. */
+  function answerFloors(c: Caller = OPEN, scope?: string | null): FloorsAnswer {
+    const want = scope === 'mine' || scope === 'shared' || scope === 'all' ? scope : undefined
+    const all = allFloors()
+    const seen = access.visible(c, all)
+    const mine = <T>(m: Record<string, T>) => (seen ? Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid))) : m)
+    return { floors: access.scope(c, all, want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir }
   }
 
-  function patchFloor(id: string, body: unknown) {
+  /** F-118: replaces who a chat is shared with. People are named by CRM id; their names are the CRM's, from the sign-in directory. */
+  function shareChat(floorId: string, agentId: string, body: unknown) {
+    if (!isObject(body) || !Array.isArray(body.users)) throw apiError(400, "Expected {users: [{id, can: 'view' | 'type'}]}")
+    if (body.users.length > 64) throw apiError(400, 'At most 64 people')
+    const known = new Map((o.auth?.directory() ?? []).map(u => [u.id, u]))
+    const list: ChatShare[] = []
+    for (const u of body.users) {
+      if (!isObject(u) || typeof u.id !== 'string' || !u.id) throw apiError(400, 'Each person is {id, can}')
+      if (u.can !== 'view' && u.can !== 'type') throw apiError(400, "can is 'view' or 'type'")
+      const who = known.get(u.id.toLowerCase())
+      if (!who && o.auth) throw apiError(404, `Nobody with id ${u.id.slice(0, 40)} in the CRM's member list`)
+      list.push({ id: u.id.toLowerCase(), username: who?.username ?? '', name: who?.name ?? '', can: u.can })
+    }
+    const floor = floors.setShare(floorId, agentId, list)
+    log?.info(`chat ${(agentOf(floor, agentId).sessionId ?? '-').slice(0, 8)} is shared with ${list.map(x => `${x.username || x.id.slice(0, 8)} (${x.can})`).join(', ') || 'nobody'}`)
+    return { agent: agentOf(floor, agentId) }
+  }
+
+  function patchFloor(id: string, body: unknown, as?: ChatOwner) {
     if (!isObject(body)) throw apiError(400, 'Expected {name?, globalPrompt?, codeDir?, agents?}')
     const before = floorOf(id)
     if (typeof body.codeDir === 'string' && body.codeDir.trim()) checkFolder(body.codeDir)
-    const floor = floors.patch(id, body as FloorPatch)
+    const floor = floors.patch(id, body as FloorPatch, as)
     // An agent taken off the floor takes its running chat with it, wherever it runs.
     const kept = new Set(floor.agents.map(a => a.id))
     for (const a of before.agents) if (!kept.has(a.id) && a.sessionId) stopAnywhere(a.sessionId)
@@ -2700,7 +2827,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** A copy of a conversation becomes an agent's chat (transcripts.ts says why a copy): a new agent's, or the one named's. */
-  async function importChat(floorId: string, body: unknown): Promise<ChatImported> {
+  async function importChat(floorId: string, body: unknown, as?: ChatOwner): Promise<ChatImported> {
     if (!isObject(body) || typeof body.sessionId !== 'string' || !UUID_RE.test(body.sessionId)) throw apiError(400, 'Expected {sessionId, agentId?, name?, role?}')
     const from = body.sessionId
     const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
@@ -2743,7 +2870,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (agentId) {
           const before = agentOf(floorOf(floorId), agentId).sessionId
           if (before) stopAnywhere(before)
-        } else agentId = floors.addAgent(floorId, { name, role }).agent.id
+        } else agentId = floors.addAgent(floorId, { name, role }, as).agent.id
         after = floors.bindSession(floorId, agentId, sid)
       }
       const agent = agentOf(after, agentId)
@@ -2796,7 +2923,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         await heartbeat.beat()
         return heartbeat.state()
       }],
-    ['GET', /^\/floors$/, () => answerFloors(), 'local'],
+    ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
     [
@@ -2808,7 +2935,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
-    ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined) })],
+    ['POST', /^\/floors$/, (_, r) => ({ floor: floors.create(isObject(r.body) && typeof r.body.name === 'string' ? r.body.name : undefined, access.ownerOf(callerOf(r))) })],
     [
       'POST',
       /^\/floors\/reorder$/,
@@ -2817,7 +2944,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { floors: floors.reorder(r.body.order as string[]) }
       },
     ],
-    ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body)],
+    ['PATCH', /^\/floors\/([^/]+)$/, ([id], r) => patchFloor(id, r.body, access.ownerOf(callerOf(r)))],
     [
       // F-067: Settings › Chats: what an agent set to Default gets. Read from this PC's copy; changed on the hub.
       'GET',
@@ -2861,7 +2988,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id], r) => {
         const b = isObject(r.body) ? r.body : {}
         if (b.model !== undefined && !(AGENT_MODELS as readonly unknown[]).includes(b.model)) throw apiError(400, 'model is opus, sonnet or haiku')
-        return floors.addAgent(id, b as NewAgent)
+        return floors.addAgent(id, b as NewAgent, access.ownerOf(callerOf(r)))
       },
     ],
     [
@@ -2874,7 +3001,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return floors.moveAgent(id, agentId, to, typeof b.before === 'string' ? b.before : null)
       },
     ],
-    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body), 'local'],
+    [
+      // F-118: who a chat is shared with: the whole list, each person 'view' or 'type'. The owner's or sbskrrt's (the rule says so).
+      'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/share$/,
+      ([id, agentId], r) => shareChat(id, agentId, r.body),
+    ],
+    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body, access.ownerOf(callerOf(r))), 'local'],
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => openChat(id, agentId, openRequest(r.body)), 'local'],
     [
       'POST',
@@ -2954,10 +3087,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     [
       'GET',
       /^\/floors\/([^/]+)\/transcripts$/,
-      ([id]) => {
+      ([id], r) => {
         const out: Record<string, { exists: boolean; bytes: number }> = {}
+        const seen = access.visible(callerOf(r), allFloors())
         for (const a of floorOf(id).agents) {
-          if (!a.sessionId) continue
+          if (!a.sessionId || (seen && !seen.has(a.sessionId))) continue
           const file = findTranscript(a.sessionId, projectsDir)
           out[a.id] = file ? { exists: true, bytes: statSync(file).size } : { exists: false, bytes: 0 }
         }
@@ -3009,10 +3143,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     [
       'GET',
       /^\/previews$/,
-      (): PreviewsAnswer => {
+      (_, r): PreviewsAnswer => {
         const previews: PreviewsAnswer['previews'] = {}
+        const seen = access.visible(callerOf(r), allFloors())
         for (const f of allFloors()) {
           for (const a of f.agents) {
+            if (seen && (!a.sessionId || !seen.has(a.sessionId))) continue
             const p = a.sessionId ? chatFeeds.preview(a.sessionId) : null
             if (p) previews[a.id] = p
           }
@@ -3025,12 +3161,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // F-062: what each chat really runs on (its conversation file says), for the chips on every chat.
       'GET',
       /^\/runs$/,
-      (): RunsAnswer => {
+      (_, r): RunsAnswer => {
         const live = chats.states()
         const runs: Record<string, ChatRun> = {}
         let inherited: { model: string; mtimeMs: number } | null = null
+        const seen = access.visible(callerOf(r), allFloors())
         for (const f of allFloors()) {
           for (const a of f.agents) {
+            if (seen && (!a.sessionId || !seen.has(a.sessionId))) continue
             const file = a.sessionId ? findTranscript(a.sessionId, projectsDir) : null
             const r = file ? readFileRun(file) : null
             const l = a.sessionId && live[a.sessionId] !== undefined ? launched.get(a.sessionId) : undefined
@@ -3057,7 +3195,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/say$/,
-      ([id, agentId], r): Promise<SayAnswer> => sayTo(id, agentId, text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)),
+      ([id, agentId], r): Promise<SayAnswer> => {
+        const body = text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)
+        // F-118: typing into a chat that is running is for whoever may type; starting a stopped one is the owner's.
+        const a = agentOf(floorOf(id), agentId)
+        if (!(a.sessionId && whereAll()[a.sessionId]) && access.rights(callerOf(r), a)?.can !== 'owner') {
+          access.deny(callerOf(r), `POST say`, a.sessionId)
+          throw authError(403, 'That chat is not running, and only its owner can start it.', 'not-yours')
+        }
+        return sayTo(id, agentId, body)
+      },
       'local',
     ],
     ['GET', /^\/floors\/([^/]+)\/memory$/, ([id], r) => ({ entries: memory.search(floorOf(id).id, r.query.get('q') ?? '', 100) })],
@@ -3147,6 +3294,38 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['PATCH', /^\/memory\/settings$/, async (_, r) => ({ settings: (await memoryLayer()).setSettings(r.body) })],
   ]
 
+  const callerOf = (r: MountRequest): Caller => r.caller ?? OPEN
+
+  /** F-118: what a route's rule needs of its caller, checked before anything runs. A route with no rule is for the owner of the app. */
+  function checkRule(rule: Rule | undefined, params: string[], r: MountRequest) {
+    const c = callerOf(r)
+    const where = `${r.method} ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${r.rest}`
+    if (rule === undefined || rule.kind === 'owner') {
+      if (access.isAdmin(c)) return
+      o.auth?.deny(c, 403, 'admin-only', where)
+      throw authError(403, 'This is for the owner of this app.', 'admin-only')
+    }
+    switch (rule.kind) {
+      case 'signed':
+      case 'create':
+      case 'self':
+        return
+      case 'floor':
+        return access.needFloor(c, floorOf(params[rule.floor]), rule.need, where)
+      case 'chat': {
+        const f = floorOf(params[rule.floor])
+        return access.needChat(c, agentOf(f, params[rule.agent]), rule.need, where)
+      }
+      case 'move': {
+        const f = floorOf(params[rule.floor])
+        access.needChat(c, agentOf(f, params[rule.agent]), 'owner', where)
+        access.needFloor(c, f, 'manage', where)
+        const to = isObject(r.body) && typeof r.body.floorId === 'string' && r.body.floorId ? r.body.floorId : f.id
+        if (to !== f.id) access.needFloor(c, floorOf(to), 'manage', where)
+      }
+    }
+  }
+
   /** Runs the route `rest` names; `forward` (a member) passes a non-local one to its hub instead. */
   async function route(r: MountRequest, forward?: (r: MountRequest) => Promise<unknown>): Promise<unknown> {
     let methodMismatch = false
@@ -3163,6 +3342,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       } catch {
         throw apiError(400, 'Malformed path')
       }
+      checkRule(ruleOf(method, pattern), params, r)
       if (forward && where !== 'local') return await forward(r)
       return await run(params, r)
     }
@@ -3178,7 +3358,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (typeof codeDir === 'string' && codeDir.trim()) checkFolder(codeDir)
       body = { ...rest, folderFor: { id: self().id, dir: typeof codeDir === 'string' && codeDir.trim() ? codeDir.trim() : null } }
     }
-    const value = await request<unknown>(link, 'http', { method: r.method, rest: r.rest, query: r.query.toString(), body })
+    const value = await request<unknown>(link, 'http', { method: r.method, rest: r.rest, query: r.query.toString(), body, by: callerOf(r).person })
     // What the hub answers about a floor is in the next state push too; it is on screen now.
     const floor = isObject(value) && isObject(value.floor) ? (value.floor as unknown as Floor) : null
     if (!floor) return value
@@ -3195,7 +3375,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const body = raw.body
     if (isObject(body) && isObject(body.folderFor) && body.folderFor.id !== from.id) throw apiError(403, "A PC sets only its own folder for a floor")
     if (isObject(body) && body.codeDir !== undefined) throw apiError(403, "The hub's own folder is set on the hub")
-    return route({ method: raw.method, rest: raw.rest, query: new URLSearchParams(typeof raw.query === 'string' ? raw.query : ''), body, headers: {} })
+    // F-118: the person the member's page signed in (a member speaks for its own pages, as for its own chats); nobody: the open app.
+    const by = isObject(raw.by) && typeof raw.by.id === 'string' && raw.by.id ? raw.by : null
+    const id = by ? String(by.id).toLowerCase().slice(0, 64) : ''
+    const caller: Caller = by
+      ? { person: { id, username: String(by.username ?? '').slice(0, 80), name: String(by.name ?? '').slice(0, 120), canSeeAll: (o.auth?.admins() ?? []).includes(id) }, via: 'local', sid: null }
+      : OPEN
+    return route({ method: raw.method, rest: raw.rest, query: new URLSearchParams(typeof raw.query === 'string' ? raw.query : ''), body, headers: {}, caller })
   }
 
   // ---------------------------------------------------------------------------------------
@@ -3243,7 +3429,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
           })
         case 'terminal':
-          return serveTerminal
+          return stream => serveTerminal(stream, from)
         case 'attach-put':
           return answer(raw => attachPutPeer(raw))
         case 'attach-get':
@@ -3332,17 +3518,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // WebSockets
 
-  function terminal(query: URLSearchParams) {
+  function terminal(query: URLSearchParams, caller: Caller) {
     const sid = query.get('session') ?? ''
+    // F-118: a person who may only view gets the screen and nothing they send reaches the chat (not keys, not a resize).
+    // It is asked again at every key: a share changed to 'view' while the socket is open takes typing away at once.
+    const typing = () => {
+      const at = bySession(sid)
+      return !at || access.rights(caller, at.agent)?.can !== 'view'
+    }
     return (ws: WsSocket) => {
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
       // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
-      if (!detach && remoteTerminal(sid, ws)) return
+      if (!detach && remoteTerminal(sid, ws, typing)) return
       if (!detach) {
         ws.sendText(JSON.stringify({ t: 'exit', code: null }))
         return ws.close(1000, "That chat isn't running")
       }
       ws.onText(raw => {
+        if (!typing()) return
         let m: TerminalClientMessage
         try {
           m = JSON.parse(raw) as TerminalClientMessage
@@ -3372,12 +3565,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * carries the same messages the page's socket does, one JSON line each; it keeps running
    * there, and what is typed here goes to it. False when it isn't running on a PC within reach.
    */
-  function remoteTerminal(sid: string, ws: WsSocket): boolean {
+  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true): boolean {
     const w = whereAll()[sid]
     if (!w || w.id === self().id) return false
     let link: LinkPeer
     try {
-      link = peerOf(w.id)
+      // F-116 (5 Nov): a member reaches only its hub, so a chat on ANOTHER member is asked of the hub, which relays it (serveTerminal).
+      // Before, peerOf threw here and the page got "exit": the "running on <PC> … Use here" panel, again and again.
+      link = mode() === 'member' && team?.hub()?.id !== w.id ? hubLink() : peerOf(w.id)
     } catch {
       return false
     }
@@ -3385,6 +3580,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     let closed = false
     const early: string[] = []
     ws.onText(raw => {
+      if (!typing()) return
       if (stream) relayLine(stream, raw)
       else early.push(raw)
     })
@@ -3406,8 +3602,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
         ws.close(1000, `${link.name} didn't open it: ${message(e)}`)
       },
     )
-    log?.info(`chat ${sid.slice(0, 8)}: used here, running on ${link.name}`)
+    log?.info(`chat ${sid.slice(0, 8)}: used here, running on ${w.name}${link.name !== w.name ? ` (through ${link.name})` : ''}`)
     return true
+  }
+
+  /** The link to the hub (a member's only way to the other PCs); throws when there is none. */
+  function hubLink(): LinkPeer {
+    const link = team?.hub()?.link ?? null
+    if (!link) throw apiError(503, "The hub can't be reached right now")
+    return link
   }
 
   /** A page's terminal message on to the link; one that isn't JSON is dropped, as the local socket drops it. */
@@ -3419,55 +3622,139 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  /** F-023: the far end of Use here: this PC's chat, viewed and typed into from another PC's page. */
-  function serveTerminal(stream: Duplex) {
+  /**
+   * F-023: the far end of Use here: this PC's chat, viewed and typed into from another PC's page.
+   * F-116: on the hub, `from` (the member asking) may want a chat that runs on another member: the hub opens that one's terminal
+   * and relays it, line for line, both ways (a member reaches only its hub). Never back to the PC that asked.
+   */
+  function serveTerminal(stream: Duplex, from?: { id: string; name: string }) {
     let sid: string | null = null
     let detach: (() => void) | null = null
+    let relay: Duplex | null = null
+    let early: Record<string, unknown>[] | null = null
+    const ended = () => {
+      writeLine(stream, { t: 'exit', code: null })
+      stream.end()
+    }
     readLines(stream, raw => {
       if (!isObject(raw)) return
       if (sid === null) {
         sid = typeof raw.sessionId === 'string' ? raw.sessionId : ''
         detach = chats.attach(sid, { send: m => void writeLine(stream, m) })
-        if (!detach) {
-          writeLine(stream, { t: 'exit', code: null })
-          stream.end()
-        }
+        if (detach) return
+        const w = from && mode() === 'hub' ? whereAll()[sid] : undefined
+        const link = w && w.id !== self().id && w.id !== from!.id ? (team?.member(w.id) ?? null) : null
+        if (!link) return ended()
+        early = []
+        const asked = sid
+        link.open({ op: 'terminal' }).then(
+          s => {
+            if (stream.destroyed) return void s.destroy()
+            relay = s
+            writeLine(s, { sessionId: asked })
+            for (const m of early!.splice(0)) writeLine(s, m)
+            readLines(s, m => void writeLine(stream, m))
+            s.on('close', () => stream.end())
+            s.on('error', () => stream.destroy())
+          },
+          () => ended(),
+        )
+        log?.info(`chat ${asked.slice(0, 8)}: ${from!.name} uses it through this hub, running on ${w!.name}`)
+        return
+      }
+      if (early !== null) {
+        if (relay) writeLine(relay, raw)
+        else early.push(raw)
         return
       }
       if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d)
       else if (raw.t === 'size' && typeof raw.cols === 'number' && typeof raw.rows === 'number') chats.resize(sid, raw.cols, raw.rows)
     })
-    stream.on('close', () => detach?.())
+    stream.on('close', () => {
+      detach?.()
+      relay?.destroy()
+    })
   }
 
   const mount: ApiMount = {
     prefix: AGENTIC_PREFIX,
+    // F-118: this mount decides by person (policy in access.ts); every other mount is for the owner of the app.
+    scoped: true,
     // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
     raw: (rest, url) => {
-      if (rest.startsWith('/crm-proxy/')) return (req, res) => crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search)
+      if (rest.startsWith('/crm-proxy/')) {
+        return (req, res, caller) => {
+          // The built-in CRM runs on this PC's own CRM session: the owner's.
+          if (!access.isAdmin(caller ?? OPEN)) throw authError(403, 'The CRM page is for the owner of this app.', 'admin-only')
+          return crmProxy.handle(req, res, rest.slice('/crm-proxy/'.length), url.search)
+        }
+      }
       // F-069: a file sent to a chat (the body is the file), and one already sent, for its thumbnail.
       const up = /^\/floors\/([^/]+)\/agents\/([^/]+)\/attach$/.exec(rest)
-      if (up) return (req, res) => attachUpload(req, res, decodeURIComponent(up[1]), decodeURIComponent(up[2]), url)
+      if (up)
+        return (req, res, caller) => {
+          // F-118: a file into a chat is typing into it.
+          access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])), 'type', 'POST attach')
+          return attachUpload(req, res, decodeURIComponent(up[1]), decodeURIComponent(up[2]), url)
+        }
       const down = /^\/floors\/([^/]+)\/agents\/([^/]+)\/attachment\/([^/]+)$/.exec(rest)
-      if (down) return (req, res) => attachDownload(req, res, decodeURIComponent(down[1]), decodeURIComponent(down[2]), decodeURIComponent(down[3]))
+      if (down)
+        return (req, res, caller) => {
+          access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(down[1])), decodeURIComponent(down[2])), 'view', 'GET attachment')
+          return attachDownload(req, res, decodeURIComponent(down[1]), decodeURIComponent(down[2]), decodeURIComponent(down[3]))
+        }
       return null
     },
     http: r => route(r, mode() === 'member' ? toHub : undefined),
+    // F-118: who may have this socket, decided before it is accepted (a chat they may not see is a 403).
+    wsAllow(rest, query, caller) {
+      const where = `WS ${AGENT_API_PREFIX}${AGENTIC_PREFIX}${rest}`
+      if (rest === '/terminal' || rest === '/chat') {
+        const at = bySession(query.get('session') ?? '')
+        if (at) access.needChat(caller, at.agent, 'view', where)
+        else if (!access.isAdmin(caller)) {
+          access.deny(caller, where)
+          throw authError(403, "That chat isn't yours.", 'not-yours')
+        }
+        return
+      }
+      if (rest === '/ui' || rest === '/fast') {
+        if (!access.isAdmin(caller)) {
+          o.auth?.deny(caller, 403, 'admin-only', where)
+          throw authError(403, 'This is for the owner of this app.', 'admin-only')
+        }
+      }
+    },
     ws(rest, query) {
-      if (rest === '/terminal') return terminal(query)
-      if (rest === '/chat') return chatSocket(query)
+      if (rest === '/terminal')
+        return (ws, caller) => {
+          watch(query.get('session') ?? '', caller ?? OPEN, ws)
+          terminal(query, caller ?? OPEN)(ws)
+        }
+      if (rest === '/chat')
+        return (ws, caller) => {
+          watch(query.get('session') ?? '', caller ?? OPEN, ws)
+          chatSocket(query)(ws)
+        }
       if (rest === '/ui') return ui.socket()
       // F-086/F-087: the fast Assistant's stream for the web page (shared/fast.ts); no host = off = no such socket.
       if (rest === '/fast') return fastSession?.socket('web') ?? null
       if (rest === '/events')
-        return ws => {
-          events.add(ws)
+        return (ws, caller) => {
+          const c = caller ?? OPEN
+          events.set(ws, c)
           ws.onClose(() => events.delete(ws))
-          ws.sendText(JSON.stringify({ t: 'floors', floors: allFloors() } satisfies AgenticEvent))
-          ws.sendText(JSON.stringify({ t: 'live', live: chats.states() } satisfies AgenticEvent))
-          ws.sendText(JSON.stringify({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() } satisfies AgenticEvent))
+          // F-118: what this person may see, from the first message on.
+          for (const e of [
+            { t: 'floors', floors: allFloors() },
+            { t: 'live', live: chats.states() },
+            { t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() },
+          ] satisfies AgenticEvent[]) {
+            const text = eventFor(e, c)
+            if (text) ws.sendText(text)
+          }
         }
       return null
     },
@@ -3483,6 +3770,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     chats,
     memory,
     callTool,
+    routeKeys: () => routes.map(([m, p]) => policyKey(m, p)),
     driveRequest: async (body, timeoutMs) => request<unknown>(needHub(), 'drive', body, timeoutMs ?? 30_000),
     serve,
     restartChat,
@@ -3516,7 +3804,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       sub = null
       for (const s of subs.values()) s.destroy()
       subs.clear()
-      for (const s of events) s.close(1001, 'the agent is stopping')
+      for (const s of events.keys()) s.close(1001, 'the agent is stopping')
       ui.close()
       voice.close()
       fastSession?.close()

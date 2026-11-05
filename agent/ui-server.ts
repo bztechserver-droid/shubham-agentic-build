@@ -4,6 +4,7 @@ import net from 'node:net'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import { AGENT_API_PREFIX } from '../shared/agent-api.ts'
+import { applyVia } from './auth/via.ts'
 import { fromApp, hostAllowed } from './local-host.ts'
 import type { Logger } from './log.ts'
 
@@ -70,11 +71,12 @@ function plain(res: ServerResponse, status: number, text: string) {
   res.end(text)
 }
 
-/** The headers to forward: Host is the agent's (as Vite's changeOrigin), and the token is ours to add or not. */
+/** The headers to forward: Host is the agent's (as Vite's changeOrigin), the token is ours to add or not, and F-118's x-sad-via is only ever set here (auth/via.ts). */
 function forwardHeaders(req: IncomingMessage, apiPort: number, token: string | null) {
   const headers: http.OutgoingHttpHeaders = { ...req.headers, host: `127.0.0.1:${apiPort}` }
   delete headers['x-sad-token']
   if (token) headers['x-sad-token'] = token
+  applyVia(headers, req.headers, req.socket.remoteAddress)
   return headers
 }
 

@@ -47,6 +47,8 @@ export interface BuildInfo {
      */
     hostWait?: { since: string; busy: number; ask: boolean } | null
   }
+  /** F-119: whether THIS browser may press Publish (signed in as sbskrrt). Only GET /build/info sets it; the pushed state does not carry it. */
+  mayPublish?: boolean
   /** Publishing, on the hub that has Dev; null elsewhere. */
   publish: {
     devDir: string

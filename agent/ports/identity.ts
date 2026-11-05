@@ -22,6 +22,8 @@ export interface PeerCheck {
   ok: boolean
   /** Why not, in a few plain words (logged by the gate, never with secrets). */
   why: string
+  /** F-118: the Tailscale login of the person behind the device (whois UserProfile.LoginName), when ok and Tailscale names one. Not present for a tagged device. */
+  login?: string
 }
 
 export interface Identity {
@@ -74,8 +76,11 @@ export function createIdentity(o: { run: Runner; self: () => SelfNode | null; no
     const r = await o.run(['whois', '--json', ip]).catch(() => null)
     if (!r || r.code !== 0) return { ok: false, why: `${ip} is unknown to Tailscale` }
     let node: { Name?: unknown; StableTailnetID?: unknown; Sharer?: unknown; IsWireGuardOnly?: unknown } | undefined
+    let login: unknown
     try {
-      node = (JSON.parse(r.stdout) as { Node?: typeof node }).Node
+      const j = JSON.parse(r.stdout) as { Node?: typeof node; UserProfile?: { LoginName?: unknown } }
+      node = j.Node
+      login = j.UserProfile?.LoginName
     } catch {
       return { ok: false, why: `Tailscale's answer for ${ip} could not be read` }
     }
@@ -85,7 +90,7 @@ export function createIdentity(o: { run: Runner; self: () => SelfNode | null; no
     if (node?.IsWireGuardOnly === true) return { ok: false, why: `${name} is not a Tailscale device` }
     if (!name.endsWith('.' + self.suffix)) return { ok: false, why: `${name} is not on this tailnet (${self.suffix})` }
     if (self.tailnetId && typeof node?.StableTailnetID === 'string' && node.StableTailnetID !== self.tailnetId) return { ok: false, why: `${name} is on another tailnet` }
-    return { ok: true, why: name }
+    return { ok: true, why: name, ...(typeof login === 'string' && login && login !== 'tagged-devices' ? { login } : {}) }
   }
 
   return {

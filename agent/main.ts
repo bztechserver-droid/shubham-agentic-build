@@ -9,7 +9,8 @@ import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
 import { createBuild, findDevDir, type Build, type ChatHostGate } from './build.ts'
 import { createBridge } from './claude/bridge.ts'
-import { CrmError } from './claude/crm.ts'
+import { createAuth } from './auth/index.ts'
+import { CRM_URL, CrmError, trimUrl } from './claude/crm.ts'
 import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, TOKEN_VAR } from './claude/index.ts'
 import { startRowWatch } from './claude/rowwatch.ts'
@@ -33,7 +34,7 @@ import { createPairingHub, normalizeCode, startJoin, type Join, type PairingHub 
 import { createTailnetName } from './tailnet-name.ts'
 import { createTailnetPeers } from './tailnet-peers.ts'
 import { startRegistration, type Registration } from './rendezvous/hbbs.ts'
-import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, rustdeskHandler } from './rustdesk.ts'
+import { createTunnels, directAnswers, findRustdesk, getRustdeskId, launchRustdesk, readRustdeskWhitelist, rustdeskHandler } from './rustdesk.ts'
 import { createSavedPasswords } from './saved-passwords.ts'
 import { createAppScreen } from './screen/index.ts'
 import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
@@ -175,7 +176,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     },
   })
   const onOpen = {
-    rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, log: log.child('rustdesk') }),
+    // F-116: dialled at an address RustDesk's IP whitelist lets in (read from its own settings at each stream; never changed).
+    rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, tailnet, whitelist: () => readRustdeskWhitelist(), log: log.child('rustdesk') }),
     screen: appScreen.handler,
     // F-021: the Agents section's streams between the hub's PCs (agentic/roam.ts).
     agentic: (meta: OpenMeta) => {
@@ -188,6 +190,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let screen = false
   const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready })
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
+  // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
+  // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
+  const auth = createAuth({ file: path.join(paths.agent, 'auth.json'), breakGlassFile: path.join(paths.agent, 'auth-off'), crmUrl: trimUrl(process.env.SAD_CRM_URL || CRM_URL), log: log.child('auth') })
   // F-008: other PCs' passwords remembered for Control (only as H1, never handed out).
   const saved = createSavedPasswords(paths.savedPasswords, log.child('saved'))
   // F-018: the Agentic Workflow section (floors, agents and their Claude chats), at /agentic.
@@ -208,6 +213,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const drive = extras.agents === false ? null : createDrive({ dir: path.join(paths.agent, 'drive'), device: config.name, role, log: log.child('drive') })
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
+    auth,
     defaultCodeDir: role === 'hub' && extras.devDir ? extras.devDir : undefined,
     claude: process.env.SAD_TEST_CLAUDE || undefined,
     projectsDir: testClaudeHome ? path.join(testClaudeHome, 'projects') : undefined,
@@ -736,7 +742,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     async screen(id) {
       if (!known(id)) throw apiError(404, 'No such device')
       if (!muxOf(id)) throw apiError(409, 'No link to that PC right now')
-      if (!exe && !testNoRustdesk) throw apiError(409, 'RustDesk is not installed on this PC (looked in Program Files)')
+      if (!exe && !testNoRustdesk) throw apiError(409, process.platform === 'win32' ? 'RustDesk is not installed on this PC (looked in Program Files)' : 'RustDesk is not installed on this PC')
       const port = await tunnels.open(id, async () => {
         const mux = muxOf(id)
         if (!mux) throw new Error('no link to that PC right now')
@@ -840,7 +846,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -864,6 +870,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     rowWatch?.stop()
     claude.close()
     agentic?.close()
+    auth.close()
     void drive?.close()
     void portsMod.close()
     appScreen.close(`The app on ${config.name} stopped`)

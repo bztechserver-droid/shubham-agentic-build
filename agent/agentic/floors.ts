@@ -15,6 +15,7 @@ import {
   type FloorPatch,
   type NewAgent,
 } from '../../shared/agentic.ts'
+import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 
@@ -78,6 +79,9 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     mcpServers: strList(a.mcpServers),
     x: num(a.x, 80 + (index % 4) * 250),
     y: num(a.y, 240 + Math.floor(index / 4) * 190),
+    // F-118: the hub's own, like sessionId and homePc: a page's copy of the chart never sets them (patch() puts the old ones back).
+    owner: ownerOf(a.owner),
+    sharedWith: shareList(a.sharedWith),
   }
 }
 
@@ -126,17 +130,42 @@ function hydrateFloor(raw: unknown): Floor | null {
     folders: folderMap(raw.folders),
     createdAt: created,
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : created,
+    createdBy: ownerOf(raw.createdBy),
     agents: repairAgents((Array.isArray(raw.agents) ? raw.agents : []).slice(0, MAX_AGENTS_PER_FLOOR).map(hydrateAgent)),
   }
 }
 
 const clone = <T>(v: T): T => structuredClone(v)
 
+/** F-118: a person as a chat or floor keeps them: the CRM id, username and name. */
+function ownerOf(v: unknown): ChatOwner | null {
+  if (!isObject(v) || typeof v.id !== 'string' || !v.id) return null
+  return { id: v.id.slice(0, 64), username: str(v.username, NAME_MAX), name: str(v.name, NAME_MAX).trim() || str(v.username, NAME_MAX) }
+}
+
+/** F-118: who a chat is shared with: one row per person, each 'view' or 'type'. */
+function shareList(v: unknown): ChatShare[] {
+  if (!Array.isArray(v)) return []
+  const out = new Map<string, ChatShare>()
+  for (const x of v) {
+    const o = ownerOf(x)
+    const can = isObject(x) && (SHARE_LEVELS as readonly unknown[]).includes(x.can) ? (x.can as ShareLevel) : null
+    if (o && can) out.set(o.id, { ...o, can })
+  }
+  return [...out.values()].slice(0, LIST_MAX)
+}
+
 export interface FloorStore {
   list(): Floor[]
   get(id: string): Floor | null
-  create(name?: string): Floor
-  patch(id: string, patch: FloorPatch): Floor
+  /** `as` (F-118): who makes it; the floor and its Lead are theirs. */
+  create(name?: string, as?: ChatOwner | null): Floor
+  /** `as` (F-118): who edits the chart; agents they add are theirs. */
+  patch(id: string, patch: FloorPatch, as?: ChatOwner | null): Floor
+  /** F-118: replaces who a chat is shared with (the owner's or an admin's call; the caller checks). */
+  setShare(floorId: string, agentId: string, list: ChatShare[]): Floor
+  /** F-118: the one-time move: every floor and agent without an owner becomes `owner`'s. How many. */
+  assignUnowned(owner: ChatOwner): number
   remove(id: string): Floor | null
   reorder(order: string[]): Floor[]
   /**
@@ -145,7 +174,7 @@ export interface FloorStore {
    * chart repaired, a new boss when it was the boss).
    */
   moveAgent(fromFloorId: string, agentId: string, toFloorId: string, before?: string | null): { from: Floor; to: Floor }
-  addAgent(floorId: string, req: NewAgent): { floor: Floor; agent: FloorAgent }
+  addAgent(floorId: string, req: NewAgent, as?: ChatOwner | null): { floor: Floor; agent: FloorAgent }
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
   /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
@@ -242,7 +271,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       return f ? clone(f) : null
     },
 
-    create(name) {
+    create(name, as) {
       const t = now()
       const floor: Floor = {
         id: randomUUID(),
@@ -252,14 +281,15 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
         folders: {},
         createdAt: t,
         updatedAt: t,
-        agents: [hydrateAgent({ name: 'Lead', role: 'Orchestrator', isBoss: true, md: LEAD_MD, x: 320, y: 40 }, 0)],
+        createdBy: as ?? null,
+        agents: [hydrateAgent({ name: 'Lead', role: 'Orchestrator', isBoss: true, md: LEAD_MD, x: 320, y: 40, owner: as }, 0)],
       }
       floors = [floor, ...floors]
       save()
       return clone(floor)
     },
 
-    patch(id, p) {
+    patch(id, p, as) {
       const floor = find(id)
       if (p.name !== undefined) {
         if (typeof p.name !== 'string' || !p.name.trim()) throw apiError(400, 'A floor needs a name')
@@ -297,6 +327,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           a.homePcName = before.get(a.id)?.homePcName ?? null
           // F-086: nor the job (Orchestrator) the hub gave it.
           a.duty = before.get(a.id)?.duty ?? null
+          // F-118: nor whose it is or who it is shared with; an agent the chart adds is the editor's.
+          const was = before.get(a.id)
+          a.owner = was ? (was.owner ?? null) : (as ?? null)
+          a.sharedWith = was?.sharedWith ?? []
           return a
         })
         const names = new Set<string>()
@@ -357,7 +391,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       return { from: clone(from), to: clone(to) }
     },
 
-    addAgent(floorId, req) {
+    addAgent(floorId, req, as) {
       const floor = find(floorId)
       if (floor.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `This floor already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
       let name = typeof req.name === 'string' ? req.name.trim().slice(0, NAME_MAX) : ''
@@ -387,6 +421,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           reportsTo,
           model: req.model ?? '',
           effort: req.effort ?? '',
+          owner: as,
           ...desk,
         },
         index,
@@ -395,6 +430,33 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       floor.updatedAt = now()
       save()
       return { floor: clone(floor), agent: clone(agent) }
+    },
+
+    setShare(floorId, agentId, list) {
+      const floor = find(floorId)
+      const agent = agentOf(floor, agentId)
+      agent.sharedWith = shareList(list).filter(x => x.id !== agent.owner?.id)
+      floor.updatedAt = now()
+      save()
+      return clone(floor)
+    },
+
+    assignUnowned(owner) {
+      let n = 0
+      for (const f of floors) {
+        if (!f.createdBy) {
+          f.createdBy = { ...owner }
+          n++
+        }
+        for (const a of f.agents) {
+          if (!a.owner) {
+            a.owner = { ...owner }
+            n++
+          }
+        }
+      }
+      if (n) save()
+      return n
     },
 
     bindSession(floorId, agentId, sessionId) {

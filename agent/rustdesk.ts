@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -86,9 +86,9 @@ function dial(host: string, port: number, timeoutMs: number): Promise<net.Socket
  * This PC's RustDesk direct-access port: 127.0.0.1 first, then the LAN address (RustDesk
  * listens on [::]:21118, but a copy bound to one address only answers there).
  */
-export async function dialDirect(port: number, lan: string | null, timeoutMs = 3000): Promise<net.Socket> {
+export async function dialDirect(port: number, lan: string | null, timeoutMs = 3000, hosts?: string[]): Promise<net.Socket> {
   let last: unknown
-  for (const host of ['127.0.0.1', ...(lan ? [lan] : [])]) {
+  for (const host of hosts ?? ['127.0.0.1', ...(lan ? [lan] : [])]) {
     try {
       return await dial(host, port, timeoutMs)
     } catch (e) {
@@ -136,12 +136,99 @@ export function splice(a: Duplex, b: Duplex, onDone?: () => void): void {
 }
 
 /** The 'rustdesk' stream handler: dial this PC's direct-access port first, so a dead port refuses the stream with the reason. */
-export function rustdeskHandler(o: { port: number; lan: () => string | null; log?: Logger }): OpenHandler {
+export function rustdeskHandler(o: {
+  port: number
+  lan: () => string | null
+  /** F-116: this PC's Tailscale address, for a RustDesk whose IP whitelist leaves out 127.0.0.1. */
+  tailnet?: () => string | null
+  /** F-116: this PC's RustDesk's IP whitelist (readRustdeskWhitelist); default: not known, today's order. */
+  whitelist?: () => string[] | null | undefined
+  log?: Logger
+}): OpenHandler {
   return async () => {
-    const socket = await dialDirect(o.port, o.lan())
-    o.log?.info(`a screen stream to ${socket.remoteAddress}:${o.port}`)
+    const lan = o.lan()
+    const list = o.whitelist?.()
+    const plan = directHosts(lan, o.tailnet?.() ?? null, list)
+    const socket = await dialDirect(o.port, lan, undefined, plan.hosts)
+    o.log?.info(`a screen stream to ${socket.remoteAddress}:${o.port}${plan.why ? ` (${plan.why})` : ''}`)
     return stream => splice(stream, socket, () => o.log?.debug('screen stream closed'))
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-116: RustDesk's IP whitelist (Settings › Security › Use IP Whitelisting). A connection the app pipes in comes from the
+// address it dials, and RustDesk turns away one from outside its whitelist ("Your ip is blocked by the peer"); the TCP connect
+// itself succeeds, so the dial can't tell. So the whitelist is read from RustDesk's own settings file (never changed), and
+// the app dials an address on it: this PC's Tailscale address (a local connection to it comes from it), then the LAN
+// address, then 127.0.0.1. With no whitelist, or none that can be read, the order stays as it always was.
+
+/** Where RustDesk keeps its settings for this user: Linux ~/.config/rustdesk; Windows %APPDATA%\RustDesk\config, then the service's copy. */
+export function rustdeskConfigFiles(platform: string = process.platform, env: Record<string, string | undefined> = process.env): string[] {
+  if (platform === 'linux') return [path.posix.join(env.HOME || os.homedir(), '.config/rustdesk/RustDesk2.toml')]
+  if (platform !== 'win32') return []
+  const appData = env.APPDATA || path.win32.join(env.USERPROFILE || os.homedir(), 'AppData', 'Roaming')
+  const sys = env.SystemRoot || 'C:\\Windows'
+  return [
+    path.win32.join(appData, 'RustDesk', 'config', 'RustDesk2.toml'),
+    path.win32.join(sys, 'ServiceProfiles', 'LocalService', 'AppData', 'Roaming', 'RustDesk', 'config', 'RustDesk2.toml'),
+  ]
+}
+
+/** The `whitelist` option of a RustDesk2.toml: its addresses and ranges; null when it is not set or empty (RustDesk then lets every address in). */
+export function parseWhitelist(toml: string): string[] | null {
+  const m = /^\s*whitelist\s*=\s*(?:'([^']*)'|"([^"]*)")\s*$/m.exec(toml)
+  if (!m) return null
+  const list = (m[1] ?? m[2] ?? '').split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
+  return list.length ? list : null
+}
+
+/**
+ * This PC's RustDesk whitelist: the first settings file that can be read says. null: there is none (every address may come in).
+ * undefined: no settings file could be read (another account's, or none), so nothing is known.
+ */
+export function readRustdeskWhitelist(platform: string = process.platform, env: Record<string, string | undefined> = process.env, read: (file: string) => string = f => readFileSync(f, 'utf8')): string[] | null | undefined {
+  for (const file of rustdeskConfigFiles(platform, env)) {
+    let text: string
+    try {
+      text = read(file)
+    } catch {
+      continue
+    }
+    return parseWhitelist(text)
+  }
+  return undefined
+}
+
+/** Whether a whitelist (addresses and CIDR ranges, IPv4 or IPv6) lets `ip` in. */
+export function whitelistCovers(list: readonly string[], ip: string): boolean {
+  const kind = net.isIPv4(ip) ? 'ipv4' : net.isIPv6(ip) ? 'ipv6' : null
+  if (!kind) return false
+  const allow = new net.BlockList()
+  for (const entry of list) {
+    const [addr, bits] = entry.split('/')
+    const k = net.isIPv4(addr) ? 'ipv4' : net.isIPv6(addr) ? 'ipv6' : null
+    if (!k) continue
+    try {
+      if (bits === undefined) allow.addAddress(addr, k)
+      else allow.addSubnet(addr, Number(bits), k)
+    } catch {
+      // A range RustDesk would not take either.
+    }
+  }
+  return allow.check(ip, kind)
+}
+
+/** The addresses to dial this PC's RustDesk at, in order, and why when the whitelist changed the order. */
+export function directHosts(lan: string | null, tailnet: string | null, whitelist: readonly string[] | null | undefined): { hosts: string[]; why: string | null } {
+  const today = ['127.0.0.1', ...(lan ? [lan] : [])]
+  if (!whitelist || whitelistCovers(whitelist, '127.0.0.1')) return { hosts: today, why: null }
+  const all = [...new Set([tailnet, lan, '127.0.0.1'].filter((h): h is string => Boolean(h)))]
+  const allowed = all.filter(h => whitelistCovers(whitelist, h))
+  const hosts = [...allowed, ...all.filter(h => !allowed.includes(h))]
+  const why = allowed.length
+    ? `RustDesk's IP whitelist leaves out 127.0.0.1, so dialled at ${allowed[0]}`
+    : "RustDesk's IP whitelist covers none of this PC's own addresses: it will turn this connection away"
+  return { hosts, why }
 }
 
 export interface Tunnels {
