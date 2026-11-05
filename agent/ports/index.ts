@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import type { ListeningPort, PortRequest, PortShare, PortsGate, PortsMode, PortsSettingsRequest, PortsState, PortsTlsBy, ServerPorts } from '../../shared/agent-api.ts'
 import { apiError } from '../api.ts'
@@ -11,6 +12,7 @@ import { realProbe, type Probe } from './probe.ts'
 import { scannersFor, type NetScan, type ProcScan } from './scan.ts'
 import { createServe, type ServeEntry, type ServeVia } from './serve.ts'
 import { foreignLinks, oursLinks, type Where } from './urls.ts'
+import { readTailscaleRights, type TailscaleRights } from './rights.ts'
 
 // F-114 Ports: this PC's agent shares some or all of the ports its programs listen on, on Tailscale, behind its own gate (gate.ts).
 //  - Default OFF on every PC. Nothing is shared until the user switches it on.
@@ -50,6 +52,8 @@ export interface PortsOptions {
   pagePort: number
   gatePort?: number
   platform?: string
+  /** F-116: this PC's user name, for Tailscale's operator check on Linux (default: the account the agent runs as). */
+  user?: string
   /** Never scans or shares (test mode). */
   disabled?: boolean
   intervalMs?: number
@@ -111,6 +115,15 @@ function loadSaved(file: string): Saved {
   }
 }
 
+/** This account's name; os.userInfo() throws for an account with no passwd entry (a container, an odd uid). */
+function userName(): string {
+  try {
+    return os.userInfo().username
+  } catch {
+    return process.env.USER ?? ''
+  }
+}
+
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms).unref())
 
 export function createPorts(o: PortsOptions): Ports {
@@ -132,6 +145,7 @@ export function createPorts(o: PortsOptions): Ports {
   const identity = createIdentity({ run: o.run, self: () => self, now })
 
   let self: SelfNode | null = null
+  let rights: TailscaleRights | null = null
   let selfAt = Number.NEGATIVE_INFINITY
   let unavailable: string | null = disabled ? (o.disabled === true ? 'Ports is off in test mode' : `Ports does not have its port scanner for ${platform} yet`) : null
   let listening: Listen[] = []
@@ -166,6 +180,8 @@ export function createPorts(o: PortsOptions): Ports {
     appPorts: new Set([...o.appPorts(), wantedGatePort, ...(gate ? [gate.port] : [])]),
     appMarker: o.appMarker ?? null,
     pagePort: o.pagePort,
+    linux: platform === 'linux',
+    selfUid: process.getuid?.(),
   })
 
   const where = (): Where => ({ name: self?.dnsName ?? null, ip: self?.ips.find(i => /^\d+\./.test(i)) ?? null })
@@ -208,7 +224,8 @@ export function createPorts(o: PortsOptions): Ports {
       return {
         port: l.port,
         program: procs.get(l.pid)?.name ?? null,
-        pid: l.pid,
+        // F-116: -1 is Linux's "another account's process" (its PID can't be read).
+        pid: l.pid < 0 ? null : l.pid,
         sharedBy: owner === 'ours' ? 'ports' : owner,
         chosen: chosen.has(l.port),
         appPage: l.port === o.pagePort,
@@ -276,6 +293,8 @@ export function createPorts(o: PortsOptions): Ports {
       error,
       scannedAt,
       server: serverView(),
+      // F-116: Linux only (absent on Windows): what Tailscale still needs before Ports can share.
+      ...(platform === 'linux' ? { tailscaleRights: rights } : {}),
     }
   }
 
@@ -287,6 +306,8 @@ export function createPorts(o: PortsOptions): Ports {
     self = await readSelf(o.run)
     selfAt = now()
     if (self?.dnsName !== before) identity.reset()
+    // F-116: on Linux, sharing needs Tailscale's operator rights; read with the rest, at the same pace.
+    if (platform === 'linux') rights = await readTailscaleRights(o.run, { platform, user: o.user ?? userName(), uid: process.getuid?.() ?? -1 })
   }
 
   async function probeNew(): Promise<void> {

@@ -394,7 +394,7 @@ export type PortBlock =
   | 'app' //         decided by PROCESS first (the agent and its children, the chat host, RustDesk), then by the app's own port numbers and RustDesk's 21115-21119
   | 'tailscale' //   Tailscale's own
   | 'low' //         under 1024
-  | 'windows' //     a Windows service's port (svchost, System, lsass, ...) or a known Windows port (3389, 5357, 5985, 7680 ...)
+  | 'windows' //     the PC's own system: a Windows service/port (svchost, System, lsass, ...; 3389, 5357, 5985, 7680 ...), or on Linux a system account (uid < 1000, nobody) or a known system service
   | 'reserved' //    80, 443, 4740, 4741, 4742, 8443, 8444: Christopher, the phone gate, the Drive
   | 'debugger' //    answers like a debugger or remote-control endpoint: never shared, by Share all or one by one
   | 'other-entry' // Tailscale already serves this port for something else (the phone gate, the Drive, a hand-made entry): Ports never touches it
@@ -486,6 +486,11 @@ export interface PortsState {
   scannedAt: string | null
   /** Member only: the Server's shared pages (the Server button). Null on the hub. */
   server: ServerPorts | null
+  /**
+   * F-116, Linux only (absent on Windows and from older agents): null when Tailscale lets this PC's user share; otherwise one sentence and the one command to run
+   * once (`sudo tailscale set --operator=$USER`), since only Tailscale's operator (or root) may use `tailscale serve` and `tailscale cert` on Linux.
+   */
+  tailscaleRights?: { text: string; command: string } | null
 }
 
 /** POST /ports/settings: any of the three; answers the new PortsState. 400 for a bad port, mode or tlsBy. A blocked port in `chosen` is 409 (the text says why). */

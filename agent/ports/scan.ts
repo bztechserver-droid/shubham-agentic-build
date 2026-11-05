@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import type { Listen, Proc } from './block.ts'
+import { linuxScanners } from './scan-linux.ts'
 
 // F-114: what listens on this PC and which program owns it. Two commands, both read-only: netstat (cheap, every scan) and the process table (only when the
 // set of listening ports changed). Injected, so tests run neither.
@@ -65,8 +66,9 @@ function run(file: string, args: string[], timeout = 15_000): Promise<string> {
 
 export const realNetstat: NetScan = async () => parseNetstat(await run('netstat.exe', ['-ano']))
 
-/** The scanners for a system, or null when there are none yet (Linux: the Linux agent adds its own and passes them in; this file stays Windows). */
+/** The scanners for a system, or null when there are none yet. Windows: netstat and the process table (this file). Linux (F-116): /proc (scan-linux.ts). */
 export function scannersFor(platform: string): { net: NetScan; procs: ProcScan } | null {
+  if (platform === 'linux') return linuxScanners()
   return platform === 'win32' ? { net: realNetstat, procs: realProcs } : null
 }
 

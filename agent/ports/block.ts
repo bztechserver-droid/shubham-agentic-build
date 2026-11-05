@@ -8,6 +8,8 @@ export interface Listen {
   pid: number
   /** Listens on loopback or on all addresses (the Ports gate reaches it as localhost). */
   reachable: boolean
+  /** F-116, Linux only: the socket's owner. Its PID can't be read when it is another account's (pid -1 then). */
+  uid?: number
 }
 
 export interface Proc {
@@ -34,12 +36,22 @@ export interface BlockContext {
   appMarker: string | null
   /** The app's own page port (SAD_UI_PORT, 5173): the one app port that may be shared like any page (Lead, 5 Nov). Its page server forwards /agent-api, so sharing it lets every device of the tailnet use this PC's app. */
   pagePort: number
+  /** F-116: the agent runs on Linux, where the system's own ports are told by their account (uid) and their service names. */
+  linux?: boolean
+  /** F-116: the agent's own account (Linux). When it is not root, its own sockets never count as the system's, whatever its number. */
+  selfUid?: number
 }
 
 export const RESERVED: readonly number[] = [80, 443, 4740, 4741, 4742, 8443, 8444]
 export const RUSTDESK_PORTS: readonly number[] = [21115, 21116, 21117, 21118, 21119]
 const WINDOWS_PORTS = new Set([1900, 2869, 3389, 5040, 5353, 5355, 5357, 5985, 5986, 7680, 47001])
 const WINDOWS_NAMES = new Set(['system', 'svchost', 'lsass', 'services', 'wininit', 'spoolsv', 'wuauserv', 'searchindexer', 'fdhost', 'msdtc', 'mqsvc', 'dashost', 'winlogon', 'csrss', 'smss', 'lsm', 'sihost', 'dllhost', 'rundll32', 'wudfhost', 'dps', 'dnscache', 'nvcontainer', 'sqlwriter'])
+/** F-116: Linux's own services (their program names; a socket of a system account is told by its uid). */
+export const LINUX_SYSTEM_NAMES: ReadonlySet<string> = new Set([
+  'systemd', 'systemd-resolved', 'systemd-resolve', 'systemd-networkd', 'systemd-timesyncd', 'init', 'sshd', 'cupsd', 'cups-browsed', 'avahi-daemon', 'snapd', 'containerd',
+  'dnsmasq', 'rpcbind', 'rpc.statd', 'chronyd', 'ntpd', 'networkmanager', 'modemmanager', 'smbd', 'nmbd', 'winbindd', 'exim4', 'master', 'postfix', 'xrdp', 'xrdp-sesman',
+  'gnome-remote-desktop-daemon', 'gnome-remote-de', 'vino-server', 'gdm', 'gdm3', 'sddm', 'lightdm', 'colord', 'polkitd', 'dbus-daemon', 'kdeconnectd', 'gsd-sharing',
+])
 const TAILSCALE_NAMES = new Set(['tailscaled', 'tailscale', 'tailscale-ipn'])
 const APP_NAMES = new Set(['rustdesk', 'hbbs', 'hbbr', 'rustdesk-server'])
 
@@ -116,7 +128,7 @@ export const TEXT: Record<PortBlock, string> = {
   app: 'This is part of the app itself (the agent, the chat host or RustDesk), so it is never shared.',
   tailscale: 'This is Tailscale itself, so it is never shared.',
   low: 'Ports under 1024 are never shared.',
-  windows: 'This is a Windows port, so it is never shared.',
+  windows: "This belongs to the PC's own system (a service of Windows or Linux), so it is never shared.",
   reserved: "This port is Christopher's, the phone gate's or the Drive's, so Ports leaves it alone.",
   debugger: 'This answers like a debugger or remote-control port: anyone who could open it could drive the program, so it is never shared.',
   'other-entry': 'Tailscale already shares this port for something else (the phone gate or another entry), so Ports leaves it alone.',
@@ -137,6 +149,9 @@ export function blockOf(l: Listen, procs: ReadonlyMap<number, Proc>, ctx: BlockC
   if (l.port !== ctx.pagePort && (isAppProcess(l.pid, procs, ctx) || (unidentified(proc) && (ctx.appPorts.has(l.port) || RUSTDESK_PORTS.includes(l.port))))) return block('app')
   if (proc && TAILSCALE_NAMES.has(proc.name)) return block('tailscale')
   if (WINDOWS_PORTS.has(l.port) || l.pid === 4 || l.pid === 0 || (proc && WINDOWS_NAMES.has(proc.name))) return block('windows')
+  // F-116: on Linux, a socket of a system account (root, a service's own account, nobody) or a known system service.
+  const systemAccount = l.uid !== undefined && (l.uid < 1000 || l.uid === 65534) && !(ctx.selfUid !== undefined && ctx.selfUid !== 0 && l.uid === ctx.selfUid)
+  if (ctx.linux && (systemAccount || (proc && LINUX_SYSTEM_NAMES.has(proc.name)))) return block('windows')
   if (probed || debuggerByProcess(l.port, proc)) return block('debugger')
   if (!l.reachable) return block('not-reachable')
   return null
