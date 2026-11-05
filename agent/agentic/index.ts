@@ -228,7 +228,7 @@ export interface AgenticOptions {
   /** F-078: the newer build waiting for Update now, if there is one (main.ts reads it off the build). */
   newerBuild?: () => string | null
   /** F-074: tests: what stands in for the registered device's signature on a pair code. */
-  voiceProof?: (body: unknown) => string
+  voiceProof?: (body: unknown, r?: { caller?: Caller; headers: IncomingMessage['headers'] }) => string
   /** F-076 recovery: the Windows administrator prompt that lets a person add an approval device from this PC when none can sign (tests: a fake). */
   recoveryElevation?: Elevation
   /** F-080: the speech service's stream (Whisper on the hub), offered to the phone at /voice/speech with its device key. */
@@ -1721,7 +1721,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     say: body => tellAssistant(body),
     proof:
       o.voiceProof ??
-      (body => {
+      ((body, r) => {
+        // F-122: no signature, but a browser signed in as sbskrrt (unless Settings says approval devices only): given the code too.
+        const signed = isObject(body) && body.sig !== undefined && body.sig !== null
+        const by = signed ? null : ownerCodeBy(r)
+        if (by) {
+          deviceLog('A pair code for the phone app was made', by)
+          return by
+        }
         // Strict, like Automatic updates ON: a registered approval device's signature over kind 'pair', never the unsigned old way.
         if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
         const name = approvalDevices.verify('pair', [], isObject(body) ? body.sig : undefined).name
@@ -2471,10 +2478,30 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   const deviceLog = (detail: string, by: string) => approvalLog.add({ kind: 'device', floor: '', agent: '', pc: self().name, sessionId: '', detail, by })
 
-  /** A one-time code to add a device: the first one needs nothing (there is nobody to sign); after that, a registered device's signature. */
-  function deviceCode(raw: unknown) {
+  /**
+   * F-122: the other way to be given a code (to add an approval device, or to pair Chris): a browser SIGNED IN as the owner of the app
+   * (sbskrrt, F-118's session), on any device, unless Settings turned it off ("approval devices only"). A registered device's signature
+   * is tried first and works exactly as before. "Unsigned, acting as sbskrrt" at sign-in level off does NOT count (as with Publish): it must
+   * be a real session, since every tailnet device can open the Server's page. Says who and from where, for the log; null when it does not apply.
+   */
+  function ownerCodeBy(r: { caller?: Caller; headers: IncomingMessage['headers'] } | undefined): string | null {
+    const c = r?.caller
+    if (!r || !o.auth || !o.auth.ownerCodes() || c?.person?.canSeeAll !== true) return null
+    const login = r.headers['x-sad-via-login']
+    const where = c.via === 'tailnet' ? `over the tailnet${typeof login === 'string' && login ? ` as ${login.slice(0, 80)}` : ''}` : 'on this PC'
+    return `${c.person.username} (${c.person.id.slice(0, 8)}) signed in, ${where}, ${byOf(r as MountRequest)}`
+  }
+
+  /** A one-time code to add a device: the first one needs nothing (there is nobody to sign); after that, a registered device's signature, or (F-122) sbskrrt signed in. */
+  function deviceCode(raw: unknown, r?: MountRequest) {
     const body = isObject(raw) ? raw : {}
-    if (approvalDevices.count() > 0) humanProof('code', [], body.sig)
+    let who = 'the first device (nobody to sign yet)'
+    if (approvalDevices.count() > 0) {
+      const signed = body.sig !== undefined && body.sig !== null
+      who = (signed ? null : ownerCodeBy(r)) ?? humanProof('code', [], body.sig)
+    }
+    // The person and the device are logged, never the code.
+    deviceLog('A code to add an approval device was made', who)
     recoveryCode = null
     return approvalDevices.newCode()
   }
@@ -2963,7 +2990,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r)))],
     ['GET', /^\/approvals\/devices$/, (_, r) => (humanOnly(r), devicesAnswer())],
-    ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body))],
+    ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body, r))],
     ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r), r.headers.origin))],
     ['GET', /^\/approvals\/devices\/recover$/, (_, r) => (humanOnly(r), deviceRecovery.status())],
     ['POST', /^\/approvals\/devices\/recover\/start$/, (_, r) => (humanOnly(r), recoverStart(byOf(r)))],

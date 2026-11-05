@@ -2458,3 +2458,12 @@ agent, on HTTP, on every WebSocket and in the chats' tools, never only hidden in
   WhatsApp, the watchdog and the app's memory are for sbskrrt's chats only.
 - **Tests**: `shared/auth.test.ts`, `auth/index.test.ts` (sessions, throttle, trial, break-glass, who may change the level),
   `auth/via.test.ts`, `api-auth.test.ts` (the gate over HTTP and WebSockets), `agentic/access.test.ts` and `access-hub.test.ts`.
+
+## F-122: codes to add a device for a signed-in sbskrrt (agentic/index.ts ownerCodeBy, agentic/voice.ts, auth/index.ts)
+
+Three agent routes hand out a one-time code. Two follow the approval-device rule and now ALSO the owner's session:
+- `POST /agentic/approvals/devices/code` ("Show a code to add a device", Settings › Security › Approval device): the first device needs nothing; after that a registered approval device's signature, or (F-122) a browser signed in as sbskrrt.
+- `POST /voice/pair-code` ("Show a pairing code", Settings › Devices › Pair Chris): a registered device's signature, or (F-122) a browser signed in as sbskrrt, even when no approval device is registered yet.
+- `POST /pairing/start` (Add a PC on the hub, core route) has NO device rule: it is the page token only (and, since F-118, the owner's pages), and the new PC still has to be approved on the hub. Unchanged. `approvals/devices/recover/finish` gives a code after a Windows administrator prompt on the PC itself: its own rule, unchanged. WhatsApp's `pairCode` is a code WhatsApp makes for its own linking, not a device code.
+
+The rule: a request that carries a signature is checked as a signature, exactly as before. Without one, a caller whose session is sbskrrt's (`caller.person.canSeeAll`) is given the code, unless Settings turned it off (`auth.json` `ownerCodes`, default true; `PUT /auth/settings {ownerCodes}`, signed-in sbskrrt only, logged). "Unsigned, acting as sbskrrt" at sign-in level off does NOT count: only a real session does, since every tailnet device can open the Server's page. Anyone else is refused as before (non-owner people: 403 admin-only). Every code given is logged in the approvals log with who and where ("sbskrrt (019d2ff6) signed in, over the tailnet as <login>, the app (<browser>)" or `device "<name>"`), never the code. `AuthStatus.mayShowCode` tells the page, per browser, whether to show the buttons for the new way. Tests: `agentic/owner-codes.test.ts`, `auth/index.test.ts`, `shared/auth.test.ts`.

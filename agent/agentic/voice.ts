@@ -1,7 +1,9 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
+import type { IncomingHttpHeaders } from 'node:http'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
+import type { Caller } from '../auth/types.ts'
 import { writeAtomic } from '../config.ts'
 import { nameProblem } from '../../shared/drive.ts'
 import type { FastHello } from '../../shared/fast.ts'
@@ -84,7 +86,7 @@ export interface VoiceDeps {
    * The signed tap that allows a pair code: throws unless the request carries a registered approval
    * device's signature (strict: no unsigned old way). Says who signed, for the log. Without it, no pair code is made.
    */
-  proof?(body: unknown): string
+  proof?(body: unknown, r?: { caller?: Caller; headers: IncomingHttpHeaders }): string
   /** The Assistant's chat feed, as /agentic/chat sends it (hello, add, patch, menu, status); returns the way to stop. */
   feed?(send: (m: unknown) => void): () => void
   /** Older items of the Assistant's conversation. */
@@ -495,7 +497,7 @@ export function createVoice(deps: VoiceDeps): Voice {
       if (method === 'POST' && rest === '/pair-code') {
         // Making a code takes his signed tap from a registered approval device: a paired phone can talk to the Assistant, and through it to everything.
         if (!deps.proof) throw apiError(503, 'Pairing needs a registered approval device (Settings › Approval device)')
-        const who = deps.proof(r.body)
+        const who = deps.proof(r.body, r)
         deps.log?.info(`voice: a pair code was made (${who})`)
         return pairCode()
       }

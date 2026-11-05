@@ -92,6 +92,11 @@ export interface AuthStatus {
   session: AuthSession | null
   /** F-119: this browser is signed in as sbskrrt, so it may press Publish on the Build page (the agent refuses it to every other page). */
   canPublish: boolean
+  /**
+   * F-122: this browser may be GIVEN a code to add a device ("Show a code to add a device", "Show a pairing code") without a registered approval
+   * device's signature: it is signed in as sbskrrt and Settings has not turned that off (AuthSettings.ownerCodes). An unsigned page never may.
+   */
+  mayShowCode?: boolean
   /** True when this browser must sign in before the app answers anything else (require says so for `via`). With person null and needsSignIn false the app is open as before: no tabs, no scoping. */
   needsSignIn: boolean
 }
@@ -100,6 +105,8 @@ export interface AuthSettings {
   require: AuthRequire
   /** The paired phone app keeps the old way (its device key) until it can sign in. Default true. */
   phoneExempt: boolean
+  /** F-122: a browser signed in as sbskrrt is given the codes to add a device / pair Chris, whether or not it is a registered approval device. Default true; false = "approval devices only". */
+  ownerCodes: boolean
   /** A raised level waiting to be confirmed: it reverts to `previous` at `until` (ISO). */
   trial: { previous: AuthRequire; until: string } | null
 }
