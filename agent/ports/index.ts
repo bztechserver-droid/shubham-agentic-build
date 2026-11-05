@@ -88,19 +88,22 @@ interface Saved {
   mode: PortsMode
   chosen: number[]
   tlsBy: PortsTlsBy
+  /** F-117: plain http by name goes to https by name where the agent does the TLS. On by default. */
+  redirectHttp: boolean
   entries: { port: number; via: ServeVia; since: string }[]
 }
 
 const isPort = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 65535
 
 function loadSaved(file: string): Saved {
-  const empty: Saved = { mode: 'off', chosen: [], tlsBy: 'agent', entries: [] }
+  const empty: Saved = { mode: 'off', chosen: [], tlsBy: 'agent', redirectHttp: true, entries: [] }
   try {
     const j = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<Saved>
     return {
       mode: j.mode === 'chosen' || j.mode === 'all' ? j.mode : 'off',
       chosen: Array.isArray(j.chosen) ? [...new Set(j.chosen.filter(isPort))].sort((a, b) => a - b) : [],
       tlsBy: j.tlsBy === 'tailscale' ? 'tailscale' : 'agent',
+      redirectHttp: j.redirectHttp !== false,
       entries: Array.isArray(j.entries) ? j.entries.filter(e => e && isPort(e.port) && (e.via === 'raw' || e.via === 'tls')).map(e => ({ port: e.port, via: e.via, since: String(e.since ?? '') })) : [],
     }
   } catch {
@@ -264,6 +267,7 @@ export function createPorts(o: PortsOptions): Ports {
       mode: saved.mode,
       chosen: [...saved.chosen],
       tlsBy: saved.tlsBy,
+      httpRedirect: { on: saved.redirectHttp, active: gate !== null && redirect() !== null },
       allPrograms: [...ALL_PROGRAMS],
       self: { name: self?.dnsName ?? null, address: ipv4(), tailnet: self?.suffix ?? null },
       ports: unavailable === null ? portsView() : [],
@@ -309,6 +313,10 @@ export function createPorts(o: PortsOptions): Ports {
     if (probes.size > 4000) probes.clear()
   }
 
+  /** F-117: on only when the setting is on, this gate does the TLS (tlsBy agent) and a certificate is loaded, so the https it points to really opens. */
+  const redirect = () =>
+    saved.redirectHttp && saved.tlsBy === 'agent' && cert.context() !== null && self ? { name: self.dnsName, hosts: new Set([self.dnsName, self.dnsName.split('.')[0]]) } : null
+
   async function startTheGate() {
     if (gate || closed) return
     const make = o.startGate ?? startGate
@@ -317,6 +325,7 @@ export function createPorts(o: PortsOptions): Ports {
       cert: () => cert.context(),
       shared: () => new Map<number, Shared>([...oursNow()].map(([p, v]) => [p, { tlsBy: v === 'tls' ? 'tailscale' : 'agent' }])),
       originHosts: () => new Set<string>(self ? [self.dnsName, self.dnsName.split('.')[0], ...self.ips].map(s => s.toLowerCase()) : []),
+      redirect,
       log,
       upstreamHost: o.upstreamHost,
     } as const
@@ -484,6 +493,7 @@ export function createPorts(o: PortsOptions): Ports {
     if (disabled) throw apiError(409, unavailable ?? 'Ports is not available here')
     if (req.mode !== undefined && req.mode !== 'off' && req.mode !== 'chosen' && req.mode !== 'all') throw apiError(400, "mode must be 'off', 'chosen' or 'all'")
     if (req.tlsBy !== undefined && req.tlsBy !== 'agent' && req.tlsBy !== 'tailscale') throw apiError(400, "tlsBy must be 'agent' or 'tailscale'")
+    if (req.redirectHttp !== undefined && typeof req.redirectHttp !== 'boolean') throw apiError(400, 'redirectHttp must be true or false')
     if (req.chosen !== undefined) {
       if (!Array.isArray(req.chosen) || req.chosen.length > 500 || !req.chosen.every(isPort)) throw apiError(400, 'chosen must be a list of port numbers (1-65535)')
       for (const port of req.chosen) {
@@ -491,9 +501,19 @@ export function createPorts(o: PortsOptions): Ports {
         if (b && !saved.chosen.includes(port)) throw apiError(409, `Port ${port} cannot be shared: ${b.text}`)
       }
     }
+    // Every change is written in the agent log with the old and the new value, so a surprise has a time and a name.
+    const was = { mode: saved.mode, tlsBy: saved.tlsBy, redirectHttp: saved.redirectHttp, chosen: saved.chosen.join(',') }
     if (req.mode !== undefined) saved.mode = req.mode
     if (req.tlsBy !== undefined) saved.tlsBy = req.tlsBy
+    if (req.redirectHttp !== undefined) saved.redirectHttp = req.redirectHttp
     if (req.chosen !== undefined) saved.chosen = [...new Set(req.chosen)].sort((a, b) => a - b)
+    for (const [key, before, after] of [
+      ['mode', was.mode, saved.mode],
+      ['tlsBy', was.tlsBy, saved.tlsBy],
+      ['redirectHttp', String(was.redirectHttp), String(saved.redirectHttp)],
+      ['chosen', was.chosen || 'none', saved.chosen.join(',') || 'none'],
+    ] as const)
+      if (before !== after) log?.info(`setting changed: ${key} ${before} -> ${after}`)
     save()
     schedule()
     await run(true)

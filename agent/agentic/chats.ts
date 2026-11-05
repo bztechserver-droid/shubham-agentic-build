@@ -253,7 +253,7 @@ export interface ChatPoolOptions {
  * numbers Windows reuses: on 31 Oct 2026 that took down the whole app (features.html F-058).
  */
 function stopTree(pid: number, startedAt?: number) {
-  if (process.platform !== 'win32') return
+  if (process.platform !== 'win32' && process.platform !== 'linux') return
   void killProcessTree(pid, { since: startedAt }).catch(() => {
     // Nothing left to end.
   })

@@ -268,6 +268,10 @@ function portsSettingsRequest(body: unknown): PortsSettingsRequest {
     if (body.tlsBy !== 'agent' && body.tlsBy !== 'tailscale') throw apiError(400, "tlsBy must be 'agent' or 'tailscale'")
     out.tlsBy = body.tlsBy
   }
+  if (body.redirectHttp !== undefined) {
+    if (typeof body.redirectHttp !== 'boolean') throw apiError(400, 'redirectHttp must be true or false')
+    out.redirectHttp = body.redirectHttp
+  }
   if (body.chosen !== undefined) {
     if (!Array.isArray(body.chosen) || body.chosen.length > 500 || !body.chosen.every(p => typeof p === 'number' && Number.isInteger(p) && p >= 1 && p <= 65535)) throw apiError(400, 'chosen must be a list of port numbers from 1 to 65535')
     out.chosen = body.chosen as number[]

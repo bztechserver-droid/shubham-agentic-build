@@ -79,17 +79,29 @@ export function linkNotes(s: Pick<PortShare, 'httpsUrl' | 'ipUrl' | 'ipUrlWarns'
   if (s.note?.trim()) return [s.note.trim()]
   if (!s.ipUrl) return ['There is no link by address.']
   if (s.ipUrlWarns) return ['The browser warns about the certificate on the link by address; click through.']
+  // Plain http by the address: it opens, but without the padlock.
+  if (s.ipUrl.startsWith('http://')) return [NO_PADLOCK]
   return []
 }
+
+/** Said under the link by address when it is plain http (F-117): the link by name is the main one. */
+export const NO_PADLOCK = 'Opens without the padlock, because no certificate can name an address. Use the link by name when you can.'
 
 /** Next to the switch of the app's own page: what sharing it means. */
 export const APP_PAGE_WARNING =
   'This is this PC’s own app page. Shared, it lets every device on your tailnet, whatever account it is signed in with, use this PC’s app.'
 
 export const TLS_WORDS: Record<PortsTlsBy, { label: string; hint: string }> = {
-  agent: { label: 'This app', hint: 'The link by address is plain http and opens with no warning.' },
-  tailscale: { label: 'Tailscale', hint: 'The link by address is https, and the browser warns about its certificate.' },
+  agent: { label: 'This app', hint: 'The link by address is plain http: it opens with no warning, and without the padlock.' },
+  tailscale: { label: 'Tailscale', hint: 'The link by address is https, and the browser warns about its certificate. Tailscale does the https, so there is no plain http and no redirect.' },
 }
 
-/** Whether any share's address link is plain http (no warning): then the page says "use http for the address". */
-export const anyPlainHttp = (shares: Pick<PortShare, 'ipUrl' | 'ipUrlWarns'>[]) => shares.some(s => s.ipUrl?.startsWith('http://') && !s.ipUrlWarns)
+/** The http-to-https redirect line under its switch: what it does now, and why not when it can't. Null when the agent has no such setting (an agent before F-117). */
+export function redirectWords(s: Pick<PortsState, 'tlsBy' | 'httpRedirect'>): { text: string; tone: 'good' | 'wait' } | null {
+  const r = s.httpRedirect
+  if (!r) return null
+  if (s.tlsBy === 'tailscale') return { text: 'With Tailscale doing the https there is no redirect, and no plain http either.', tone: 'wait' }
+  if (!r.on) return { text: 'Off: http by name opens as it is, without the padlock.', tone: 'wait' }
+  if (!r.active) return { text: 'On, but not working yet: it needs this app’s own certificate (see the line above).', tone: 'wait' }
+  return { text: 'On: http by name goes to https by name, whatever was typed. http by address stays http.', tone: 'good' }
+}

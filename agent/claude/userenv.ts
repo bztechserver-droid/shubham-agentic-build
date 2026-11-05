@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module'
 import type * as Koffi from 'koffi'
+import { linuxUserEnv, type LinuxStore } from './userenv-linux.ts'
 
 // This Windows account's own environment variables (F-007): HKCU\Environment, read and written
 // as System Properties › Environment Variables does it, then announced to every window with
@@ -38,6 +39,13 @@ let loadError: string | null = null
  * own). Null off Windows or when koffi can't load, with userEnvFailure() saying why.
  */
 export function loadUserEnv(key = 'Environment'): UserEnv | null {
+  if (process.platform === 'linux') {
+    // F-116: the kernel keyring, else memory only (userenv-linux.ts); never a file.
+    const l = linuxUserEnv(key)
+    linuxStore = l.store
+    if (l.note) loadError = l.note
+    return l.env
+  }
   if (process.platform !== 'win32') {
     loadError = "only Windows keeps a user environment the app can set"
     return null
@@ -52,6 +60,13 @@ export function loadUserEnv(key = 'Environment'): UserEnv | null {
 
 export function userEnvFailure(): string | null {
   return loadError
+}
+
+let linuxStore: LinuxStore | null = null
+
+/** F-116: on Linux, where the sign-in is kept ('keyring' or 'memory'); null on Windows (its user environment). */
+export function userEnvStore(): LinuxStore | null {
+  return linuxStore
 }
 
 function bind(k: typeof Koffi, key: string): UserEnv {

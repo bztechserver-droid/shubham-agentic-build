@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import net from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { OpenHandler } from './link/mux.ts'
@@ -14,8 +15,36 @@ import type { Logger } from './log.ts'
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
-/** C:\Program Files\RustDesk\RustDesk.exe, or the same under Program Files (x86); null when neither is there. */
-export function findRustdesk(env: Record<string, string | undefined> = process.env): string | null {
+/**
+ * F-116: where RustDesk may be on Linux, in this order: the .deb's /usr/bin (a link to /usr/share/rustdesk), a hand
+ * install, /opt, the snap, the user's own bin; then PATH; then a Flatpak's launcher (system-wide, then the user's),
+ * which passes --get-id and --connect on to RustDesk as they are.
+ */
+export function linuxRustdeskFiles(env: Record<string, string | undefined> = process.env): string[] {
+  const home = env.HOME || os.homedir()
+  const onPath = (env.PATH || '').split(':').filter(d => d.startsWith('/')).map(d => path.posix.join(d, 'rustdesk'))
+  const flatpak = 'exports/bin/com.rustdesk.RustDesk'
+  return [
+    ...new Set([
+      '/usr/bin/rustdesk',
+      '/usr/local/bin/rustdesk',
+      '/opt/rustdesk/rustdesk',
+      '/snap/bin/rustdesk',
+      path.posix.join(home, '.local/bin/rustdesk'),
+      ...onPath,
+      path.posix.join('/var/lib/flatpak', flatpak),
+      path.posix.join(home, '.local/share/flatpak', flatpak),
+    ]),
+  ]
+}
+
+/**
+ * C:\Program Files\RustDesk\RustDesk.exe, or the same under Program Files (x86); null when neither is there.
+ * On Linux (F-116), the first of linuxRustdeskFiles() that is there (`exists`: tests). Elsewhere, null.
+ */
+export function findRustdesk(env: Record<string, string | undefined> = process.env, platform: string = process.platform, exists: (file: string) => boolean = existsSync): string | null {
+  if (platform === 'linux') return linuxRustdeskFiles(env).find(f => exists(f)) ?? null
+  if (platform !== 'win32') return null
   const roots = [env.ProgramFiles || 'C:\\Program Files', env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)']
   for (const root of roots) {
     const exe = path.join(root, 'RustDesk', 'RustDesk.exe')

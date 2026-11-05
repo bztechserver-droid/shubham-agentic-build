@@ -19,7 +19,10 @@ export interface HostCopy {
   entry: string
 }
 
-const other = (p: string) => /[\\/]prebuilds[\\/](?!win32-x64)[^\\/]+$/.test(p) || /[\\/]node-pty[\\/](src|typings|scripts|third_party[\\/]conpty[\\/][^\\/]+[\\/]win10-arm64)/.test(p)
+// Only this system's prebuild goes in the copy: win32-x64 on Windows, as it always was; linux-x64 on Ubuntu (F-116).
+const own = `${process.platform}-${process.arch}`
+const other = (p: string) =>
+  (/[\\/]prebuilds[\\/][^\\/]+$/.test(p) && path.basename(p) !== own) || /[\\/]node-pty[\\/](src|typings|scripts|third_party[\\/]conpty[\\/][^\\/]+[\\/]win10-arm64)/.test(p)
 
 /** A fingerprint of what the host runs: its files and the node-pty it uses. */
 export function hostFingerprint(buildRoot: string): string {

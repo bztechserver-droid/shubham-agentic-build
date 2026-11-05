@@ -21,7 +21,7 @@ import {
   type Read,
 } from './crm.ts'
 import { AUTO_COOLDOWN_MS, openSwitchStore, type SwitchStore } from './state.ts'
-import { loadUserEnv, type UserEnv } from './userenv.ts'
+import { loadUserEnv, userEnvStore, type UserEnv } from './userenv.ts'
 
 // Claude on this PC runs on the Claude subscription the CRM gives the person signed in here
 // (F-007). The CRM's super admin keeps the office's subscriptions in the CRM, each as the token
@@ -313,6 +313,8 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     const token: ClaudeInfo['token'] = !userEnv ? 'unsupported' : value === null ? 'empty' : ours(value) ? 'set' : 'taken'
     return {
       token,
+      // F-116: on Linux, where the token is kept (the kernel keyring or memory only); absent on Windows.
+      ...(o.userEnv === undefined && userEnvStore() !== null ? { store: userEnvStore() as 'keyring' | 'memory' } : {}),
       subscription: token === 'set' && placed ? { ...placed.subscription, hint: placed.hint, setAt: placed.setAt } : null,
       url,
       crm: session

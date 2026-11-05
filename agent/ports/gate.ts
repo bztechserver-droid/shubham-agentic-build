@@ -32,6 +32,12 @@ export interface GateOptions {
   shared: () => ReadonlyMap<number, Shared>
   /** Host names (lower case) that may appear as the host of an Origin: this PC's tailnet name, its short name, its Tailscale addresses. */
   originHosts: () => ReadonlySet<string>
+  /**
+   * F-117: plain http by this PC's NAME, on a share where this gate does the TLS, is sent on to https by name (308) so the browser lands on the padlock page, whatever was typed.
+   * null = off (the setting is off, tlsBy is 'tailscale', or there is no certificate yet, so https would not open). `name` is the full tailnet name the redirect points to;
+   * `hosts` are the names (the full one and the short one, lower case) that count as "by name". A bare IP (v4 or [v6]) is never redirected: no certificate can name an IP.
+   */
+  redirect?: () => { name: string; hosts: ReadonlySet<string> } | null
   log?: { info(m: string): void; warn(m: string): void }
   /** Test hook: the host the programs are reached on (default 'localhost'). */
   upstreamHost?: string
@@ -41,7 +47,7 @@ export interface Gate {
   /** The port it listens on (127.0.0.1). */
   port: number
   close(): Promise<void>
-  stats(): { open: number; tls: number; plain: number; dropped: number }
+  stats(): { open: number; tls: number; plain: number; dropped: number; tlsFailed: number }
 }
 
 interface Conn {
@@ -81,7 +87,7 @@ function asDuplex(socket: net.Socket, first: Buffer): Duplex {
 export async function startGate(o: GateOptions): Promise<Gate> {
   const conns = new WeakMap<object, Conn>()
   const all = new Set<net.Socket>()
-  const counts = { tls: 0, plain: 0, dropped: 0 }
+  const counts = { tls: 0, plain: 0, dropped: 0, tlsFailed: 0 }
   const lastDrop = new Map<string, number>()
   const upstreamHost = o.upstreamHost ?? 'localhost'
 
@@ -151,10 +157,32 @@ export async function startGate(o: GateOptions): Promise<Gate> {
     return out
   }
 
+  /** Where plain http by name goes: https://<full name>:<port><same path and query>, or null when this request is not one to send on. */
+  function redirectTo(req: http.IncomingMessage, port: number): string | null {
+    const r = o.redirect?.()
+    if (!r) return null
+    if (conns.get(req.socket)?.scheme !== 'http') return null
+    if (o.shared().get(port)?.tlsBy !== 'agent') return null
+    let hostname: string
+    try {
+      hostname = new URL(`http://${req.headers.host}`).hostname.replace(/\.$/, '')
+    } catch {
+      return null
+    }
+    if (hostname.startsWith('[') || net.isIP(hostname) !== 0 || !r.hosts.has(hostname)) return null
+    return `https://${r.name}:${port}${req.url?.startsWith('/') ? req.url : '/'}`
+  }
+
   const web = http.createServer((req, res) => {
     const port = portOf(req)
     if (!port || !o.shared().has(port)) {
       res.writeHead(404, { 'content-type': 'text/plain' }).end('No page is shared on this port.\n')
+      return
+    }
+    const to = redirectTo(req, port)
+    if (to) {
+      // 308 keeps the method and the body (an API call survives it). Not cached: it must not stick in a browser the way HSTS would, and it follows the setting.
+      res.writeHead(308, { location: to, 'cache-control': 'no-store', 'content-type': 'text/plain' }).end(`This page is on https: ${to}\n`)
       return
     }
     const why = badOrigin(req)
@@ -179,6 +207,13 @@ export async function startGate(o: GateOptions): Promise<Gate> {
 
   web.on('upgrade', (req, socket, head) => {
     const port = portOf(req)
+    const to = port && o.shared().has(port) ? redirectTo(req, port) : null
+    if (to) {
+      // A WebSocket cannot follow a redirect: say so, with the address that works.
+      const body = `Plain http by name is not used here: connect to ${to.replace('https://', 'wss://')} (the page itself is on ${to}).\n`
+      socket.end(`HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nUpgrade: TLS/1.2\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`)
+      return
+    }
     const why = !port || !o.shared().has(port) ? 'port not shared' : badOrigin(req)
     if (why) {
       socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
@@ -252,7 +287,12 @@ export async function startGate(o: GateOptions): Promise<Gate> {
         }
         counts.tls++
         const t = new tls.TLSSocket(asDuplex(socket, buf) as unknown as net.Socket, { isServer: true, secureContext: ctx })
-        t.on('error', () => t.destroy())
+        // A handshake that fails is written down (what it was, from which device, at most once a minute each): without this a browser that "cannot connect" leaves no trace here.
+        t.on('error', e => {
+          counts.tlsFailed++
+          drop(ip, `the TLS handshake with ${ip} failed: ${(e as NodeJS.ErrnoException).code ?? ''} ${e.message}`.replace(/\s+/g, ' ').slice(0, 200))
+          t.destroy()
+        })
         conns.set(t, { scheme: 'https', ip })
         web.emit('connection', t)
       } else {

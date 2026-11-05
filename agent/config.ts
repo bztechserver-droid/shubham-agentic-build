@@ -104,14 +104,16 @@ const PORT_ENV: Record<keyof Ports, string> = {
 
 const TOKEN = /^[0-9a-f]{64}$/
 
-// %LOCALAPPDATA%\shubham-agentic, whatever SAD_HOME says.
-function defaultRoot(env: Env) {
+// %LOCALAPPDATA%\shubham-agentic, whatever SAD_HOME says. Off Windows (F-116, Ubuntu): $XDG_DATA_HOME/shubham-agentic,
+// else ~/.local/share/shubham-agentic (start.sh works the folder out the same way).
+export function defaultRoot(env: Env, platform: string = process.platform) {
+  if (platform !== 'win32') return path.join(env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'shubham-agentic')
   return path.join(env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'shubham-agentic')
 }
 
-/** SAD_HOME, else %LOCALAPPDATA%\shubham-agentic. */
-export function stateRoot(env: Env = process.env): string {
-  return env.SAD_HOME ? path.resolve(env.SAD_HOME) : defaultRoot(env)
+/** SAD_HOME, else %LOCALAPPDATA%\shubham-agentic (on Linux $XDG_DATA_HOME or ~/.local/share, then shubham-agentic). */
+export function stateRoot(env: Env = process.env, platform: string = process.platform): string {
+  return env.SAD_HOME ? path.resolve(env.SAD_HOME) : defaultRoot(env, platform)
 }
 
 export function statePaths(root: string = stateRoot(), env: Env = process.env): StatePaths {

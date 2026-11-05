@@ -35,6 +35,12 @@ export type LinkPath =
  */
 export type Route = 'auto' | 'tailscale' | 'rustdesk' | 'relay'
 
+/** F-116: the system an agent runs on. Absent (an older agent) means Windows, the only one there was. */
+export type HostOs = 'windows' | 'linux' | 'mac' | 'other'
+
+/** F-116: what the page reads: an absent os is Windows. */
+export const osOf = (o: { os?: HostOs } | null | undefined): HostOs => o?.os ?? 'windows'
+
 export interface SelfInfo {
   /** base32(sha256(SPKI)), 16 characters, lowercase. Also the device's hbbs ID. */
   id: string
@@ -66,6 +72,8 @@ export interface SelfInfo {
   canOpenAppScreen?: boolean
   /** F-014: the ways in whose password this PC's agent remembers for itself (Remember me on its own page). */
   savedPassword?: ScreenVia[]
+  /** F-116: the system this PC runs; absent from an older agent, which is Windows (osOf). */
+  os?: HostOs
 }
 
 export interface ServerStatus {
@@ -212,6 +220,12 @@ export interface ClaudeInfo {
    *   unsupported: this PC can't set it (only Windows can)
    */
   token: 'set' | 'taken' | 'empty' | 'unsupported'
+  /**
+   * F-116, Linux only: where the token is kept instead of a user variable. keyring: the kernel's session keyring of the
+   * app's service (it survives the app's restarts); memory: this agent's memory only (the CRM is asked again at each
+   * start). Either way only the chats this app starts get it. Absent on Windows.
+   */
+  store?: 'keyring' | 'memory'
   /** What the app put there, while `token` is 'set': never the token, only its last four characters. */
   subscription: { id: string; name: string; hint: string; setAt: string } | null
   /** The CRM this PC signs in to: https://crmbe.bhole.co, or SAD_CRM_URL. */
@@ -452,6 +466,11 @@ export interface PortsState {
   mode: PortsMode
   chosen: number[]
   tlsBy: PortsTlsBy
+  /**
+   * F-117: plain http by NAME on a share where the agent does the TLS goes to https by name (308), so the browser lands on the padlock page whatever was typed. `on` is the setting (default true);
+   * `active` is whether it works right now: on, tlsBy agent, the gate is up and a certificate is loaded. Absent on an agent before F-117. By a bare IP (v4 or [v6]) plain http stays plain (no certificate can name an IP). No HSTS is ever sent.
+   */
+  httpRedirect?: { on: boolean; active: boolean }
   /** The programs "Share all" covers (the phone gate's list: node, python ...). Ports chosen one by one can be any program. */
   allPrograms: string[]
   /** This PC on Tailscale (for its own button): null parts while unknown. */
@@ -474,6 +493,8 @@ export interface PortsSettingsRequest {
   mode?: PortsMode
   chosen?: number[]
   tlsBy?: PortsTlsBy
+  /** F-117: plain http by name goes to https by name (default true). */
+  redirectHttp?: boolean
 }
 /** POST /ports/share {port} adds it to `chosen` (mode off becomes chosen); POST /ports/unshare {port} removes it. Both answer the new PortsState. */
 export interface PortRequest {

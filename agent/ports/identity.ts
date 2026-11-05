@@ -65,6 +65,8 @@ export async function readSelf(run: Runner): Promise<SelfNode | null> {
 export function createIdentity(o: { run: Runner; self: () => SelfNode | null; now?: () => number }): Identity {
   const now = o.now ?? Date.now
   const cache = new Map<string, { result: PeerCheck; until: number }>()
+  // A browser opens several connections at once from an address nobody has asked about: they share one question (and one answer).
+  const asking = new Map<string, Promise<PeerCheck>>()
 
   async function ask(ip: string): Promise<PeerCheck> {
     const self = o.self()
@@ -91,10 +93,18 @@ export function createIdentity(o: { run: Runner; self: () => SelfNode | null; no
       if (!isTailscaleIp(ip)) return { ok: false, why: `${ip.slice(0, 64)} is not a Tailscale address` }
       const hit = cache.get(ip)
       if (hit && hit.until > now()) return hit.result
-      const result = await ask(ip)
-      cache.set(ip, { result, until: now() + (result.ok ? 300_000 : 10_000) })
-      if (cache.size > 2000) cache.clear()
-      return result
+      let pending = asking.get(ip)
+      if (!pending) {
+        pending = ask(ip)
+          .then(result => {
+            cache.set(ip, { result, until: now() + (result.ok ? 300_000 : 10_000) })
+            if (cache.size > 2000) cache.clear()
+            return result
+          })
+          .finally(() => asking.delete(ip))
+        asking.set(ip, pending)
+      }
+      return pending
     },
     reset: () => cache.clear(),
   }

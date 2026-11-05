@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process'
+import { readdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
 
 // F-058: ending a process and what it started, by exact PID, without `taskkill /t`.
 //
@@ -136,10 +138,11 @@ export function parseTable(text: string): Proc[] {
 const SCRIPT =
   "Get-CimInstance Win32_Process | ForEach-Object { '{0},{1},{2},{3}' -f $_.ProcessId, $_.ParentProcessId, $(if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }), $_.Name }"
 
-/** Every process with when it started (Windows). */
+/** Every process with when it started (Windows; on Linux from /proc, below). */
 export function listProcesses(): Promise<Proc[]> {
+  if (process.platform === 'linux') return listProcessesLinux()
   return new Promise((resolve, reject) => {
-    if (process.platform !== 'win32') return reject(new Error('the process table is read on Windows only'))
+    if (process.platform !== 'win32') return reject(new Error('the process table is read on Windows and Linux only'))
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', SCRIPT], { windowsHide: true, timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(err)
       const table = parseTable(String(stdout))
@@ -147,4 +150,52 @@ export function listProcesses(): Promise<Proc[]> {
       resolve(table)
     })
   })
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-116: the process table on Linux, read straight from /proc (no command is run):
+//   /proc/stat          btime: when the machine booted, in seconds since the epoch
+//   /proc/<pid>/stat    "pid (comm) state ppid ...": starttime (field 22) in clock ticks after boot
+// The ticks are USER_HZ, 100 on every architecture Linux runs on today (the kernel converts to it whatever its own HZ
+// is). btime has whole seconds only, but it is the same for every process, so two processes still compare to the
+// hundredth of a second, and a caller's remembered start (Date.now() at its spawn) stays well inside IDENTITY_MS.
+
+export const USER_HZ = 100
+
+/** btime from /proc/stat, in ms; null when it isn't there. */
+export function parseBootTime(text: string): number | null {
+  const m = /^btime\s+(\d+)\s*$/m.exec(text)
+  return m ? Number(m[1]) * 1000 : null
+}
+
+/** One /proc/<pid>/stat as a Proc; null when it can't be read. The name (comm) may hold spaces and parentheses: it ends at the LAST ')'. */
+export function parseProcStat(text: string, bootMs: number, hz: number = USER_HZ): Proc | null {
+  const open = text.indexOf('(')
+  const close = text.lastIndexOf(')')
+  if (open < 0 || close < open) return null
+  const pid = Number(text.slice(0, open).trim())
+  // rest[0] is field 3 (state), so field n is rest[n - 3]: ppid is field 4, starttime field 22.
+  const rest = text.slice(close + 1).trim().split(/\s+/)
+  const ppid = Number(rest[1])
+  const ticks = Number(rest[19])
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0 || !Number.isInteger(ticks) || ticks < 0) return null
+  return { pid, ppid, created: Math.round(bootMs + (ticks * 1000) / hz), name: text.slice(open + 1, close) }
+}
+
+/** Every process with when it started (Linux). `root` is /proc; tests give a folder of their own. */
+export async function listProcessesLinux(root = '/proc'): Promise<Proc[]> {
+  const boot = parseBootTime(await readFile(path.join(root, 'stat'), 'utf8'))
+  if (boot === null) throw new Error(`${root}/stat has no btime`)
+  const out: Proc[] = []
+  for (const name of await readdir(root)) {
+    if (!/^\d+$/.test(name)) continue
+    try {
+      const p = parseProcStat(await readFile(path.join(root, name, 'stat'), 'utf8'), boot)
+      if (p) out.push(p)
+    } catch {
+      // It ended while the table was read.
+    }
+  }
+  if (!out.length) throw new Error('the process table came back empty')
+  return out
 }

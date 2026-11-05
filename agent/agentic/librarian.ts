@@ -205,7 +205,7 @@ export function readResult(stdout: string): LibrarianResult {
 /** F-058: by exact PID and start time (agent/proc-tree.ts), not `taskkill /t`, which follows parent numbers Windows reuses. */
 function killTree(pid: number | undefined, startedAt?: number) {
   if (!pid) return
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' || process.platform === 'linux') {
     void killProcessTree(pid, { since: startedAt }).catch(() => {
       // Nothing left to end.
     })

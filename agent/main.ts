@@ -2,7 +2,7 @@ import type net from 'node:net'
 import { copyFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
-import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
+import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type HostOs, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
 import { agenticOff, createAgentic } from './agentic/index.ts'
 import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
@@ -62,6 +62,11 @@ import { createPorts } from './ports/index.ts'
 export const VERSION = '0.1.0'
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+/** F-116: the system this agent runs on, for the page (shared/agent-api.ts HostOs). */
+export function hostOs(platform: string = process.platform): HostOs {
+  return platform === 'win32' ? 'windows' : platform === 'linux' ? 'linux' : platform === 'darwin' ? 'mac' : 'other'
+}
 const IDLE_JOIN: JoinState = { status: 'idle', hubAddress: null, sas: null, error: null }
 /** F-014: who is controlling, in the notice and on This PC, when it is this PC's own page from another device. */
 const OWN_PAGE = "Another device on this PC's page"
@@ -579,6 +584,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         canOpenScreen: screen,
         canOpenAppScreen: appScreen.status().ready,
         savedPassword: saved.ways(identity.id),
+        os: hostOs(),
       },
       servers: hub ? hub.servers.status() : null,
       devices: (hub ? hub.links.devices() : own ? [own] : []).map(d => ({ ...d, savedPassword: saved.ways(d.id) })),
