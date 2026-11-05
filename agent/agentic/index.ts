@@ -174,6 +174,12 @@ const ADMIN_TOOLS = new Set([
   'prepare_send',
 ])
 
+/** F-124: what a proof needs of the request: who is asking and the browser's headers. */
+export interface ProofRequest {
+  caller?: Caller
+  headers: IncomingMessage['headers']
+}
+
 export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
@@ -302,7 +308,7 @@ export interface Agentic {
    * F-079: that a request carries his approval device's signature over `kind` and `fields` (or the old way is switched
    * on): who it was, for a log line; throws 401/403 otherwise. WhatsApp's sends use it (kind 'wa-send').
    */
-  humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown): string
+  humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown, r?: ProofRequest): string
   close(): void
 }
 
@@ -2450,8 +2456,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * The proof an approval or a send carries: the signature of a registered approval device over exactly what was asked.
    * Without one it is refused, unless the old way is switched on in Settings (off to start with). Says who it was, for the log.
    */
-  function humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown): string {
+  function humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown, r?: ProofRequest): string {
     if (signed !== undefined && signed !== null) return `device "${approvalDevices.verify(kind, fields, signed).name}"`
+    // F-124: "Sign-in is enough": a browser signed in as sbskrrt (a real F-118 session; the unsigned open app never counts) stands in for the device.
+    const signedIn = ownerCodeBy(r, false)
+    if (signedIn) return signedIn
     if (approvalDevices.unsignedAllowed()) return 'an unsigned request (the old way, switched on in Settings)'
     if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Open Settings › Approval device on your phone and register it.')
     throw apiError(401, 'This needs a signature from a registered approval device (your phone). Open it there.')
@@ -2461,12 +2470,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * F-081: Apply new builds automatically when quiet. Turning it ON needs the signature of a registered approval device
    * (never the old unsigned way: this one is about his machine restarting by itself); turning it off needs nothing.
    */
-  function setAutoUpdate(raw: unknown, by: string) {
+  function setAutoUpdate(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
     let who = 'a tap (off needs no signature)'
     if (raw.on) {
-      if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
-      who = `device "${approvalDevices.verify('autoupdate', [true], raw.sig).name}"`
+      // F-124: a signed-in sbskrrt may switch it on without a device when Sign-in is enough; never the unsigned old way.
+      const signedIn = raw.sig !== undefined && raw.sig !== null ? null : ownerCodeBy(r, false)
+      if (signedIn) who = signedIn
+      else {
+        if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
+        who = `device "${approvalDevices.verify('autoupdate', [true], raw.sig).name}"`
+      }
     }
     const st = autoUpdate.set(raw.on, `${who} via ${by}`)
     deviceLog(`Automatic updates when quiet switched ${raw.on ? 'ON' : 'off'}`, `${who} via ${by}`)
@@ -2484,22 +2498,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * is tried first and works exactly as before. "Unsigned, acting as sbskrrt" at sign-in level off does NOT count (as with Publish): it must
    * be a real session, since every tailnet device can open the Server's page. Says who and from where, for the log; null when it does not apply.
    */
-  function ownerCodeBy(r: { caller?: Caller; headers: IncomingMessage['headers'] } | undefined): string | null {
+  function ownerCodeBy(r: ProofRequest | undefined, browser = true): string | null {
     const c = r?.caller
-    if (!r || !o.auth || !o.auth.ownerCodes() || c?.person?.canSeeAll !== true) return null
+    if (!r || !o.auth || !o.auth.signInEnough() || c?.person?.canSeeAll !== true) return null
     const login = r.headers['x-sad-via-login']
     const where = c.via === 'tailnet' ? `over the tailnet${typeof login === 'string' && login ? ` as ${login.slice(0, 80)}` : ''}` : 'on this PC'
-    return `${c.person.username} (${c.person.id.slice(0, 8)}) signed in, ${where}, ${byOf(r as MountRequest)}`
+    return `${c.person.username} (${c.person.id.slice(0, 8)}) signed in, ${where}${browser ? `, ${byOf(r as MountRequest)}` : ''}`
   }
 
   /** A one-time code to add a device: the first one needs nothing (there is nobody to sign); after that, a registered device's signature, or (F-122) sbskrrt signed in. */
   function deviceCode(raw: unknown, r?: MountRequest) {
     const body = isObject(raw) ? raw : {}
     let who = 'the first device (nobody to sign yet)'
-    if (approvalDevices.count() > 0) {
-      const signed = body.sig !== undefined && body.sig !== null
-      who = (signed ? null : ownerCodeBy(r)) ?? humanProof('code', [], body.sig)
-    }
+    if (approvalDevices.count() > 0) who = `${humanProof('code', [], body.sig, r)}${r ? ` via ${byOf(r)}` : ''}`
     // The person and the device are logged, never the code.
     deviceLog('A code to add an approval device was made', who)
     recoveryCode = null
@@ -2541,18 +2552,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { device: d, ...devicesAnswer() }
   }
 
-  function deviceRemove(raw: unknown, by: string) {
+  function deviceRemove(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.device !== 'string') throw apiError(400, 'Expected {device, sig}')
-    const who = humanProof('remove', [raw.device], raw.sig)
+    const who = humanProof('remove', [raw.device], raw.sig, r)
     if (!approvalDevices.remove(raw.device)) throw apiError(404, 'No such approval device')
     deviceLog(`Approval device removed: ${raw.device}`, `${who} via ${by}`)
     return devicesAnswer()
   }
 
   /** The old way (requests with no signature) on or off. Changing it needs a registered device's signature, once there is one. */
-  function deviceUnsigned(raw: unknown, by: string) {
+  function deviceUnsigned(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
-    const who = approvalDevices.count() > 0 ? humanProof('unsigned', [raw.on], raw.sig) : 'nobody (no device is registered)'
+    const who = approvalDevices.count() > 0 ? humanProof('unsigned', [raw.on], raw.sig, r) : 'nobody (no device is registered)'
     approvalDevices.setUnsignedAllowed(raw.on)
     deviceLog(`Unsigned approvals ${raw.on ? 'switched ON (the old way)' : 'switched off'}`, `${who} via ${by}`)
     return devicesAnswer()
@@ -2598,11 +2609,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** His tap on option n of the prompt he was shown: typed into that chat exactly as pressing it there. Refused when the prompt has changed since. */
-  async function answerApproval(raw: unknown, by: string) {
+  async function answerApproval(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string' || typeof raw.n !== 'number') throw apiError(400, 'Expected {sessionId, id, n}')
     const req = raw as unknown as AnswerRequest
     // A registered device signed exactly this prompt and option (or the old way is on): before anything is looked at or typed.
-    by = `${humanProof('answer', [req.sessionId, req.id, req.n], req.sig)} via ${by}`
+    by = `${humanProof('answer', [req.sessionId, req.id, req.n], req.sig, r)} via ${by}`
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
@@ -2623,10 +2634,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * His tap on Cancel (Esc) for the prompt he was shown: one Escape key into that chat, only while its screen still shows the same prompt
    * and its footer says "Esc to cancel". Signed like an answer. On a permission prompt Esc means No.
    */
-  async function cancelApproval(raw: unknown, by: string) {
+  async function cancelApproval(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
     const req = raw as unknown as CancelRequest
-    by = `${humanProof('cancel', [req.sessionId, req.id], req.sig)} via ${by}`
+    by = `${humanProof('cancel', [req.sessionId, req.id], req.sig, r)} via ${by}`
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
@@ -2642,12 +2653,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
-  async function sendAsMe(raw: unknown, by: string) {
+  async function sendAsMe(raw: unknown, by: string, rq?: ProofRequest) {
     if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId, text}')
     const req = raw as unknown as SendAsMeRequest
     const body = text(req.text, 'text', MAX_SAY_TEXT)
     // A registered device signed exactly this target and these words (or the old way is on).
-    by = `${humanProof('send', [req.floorId, req.agentId, createHash('sha256').update(body, 'utf8').digest('hex'), typeof req.card === 'string' ? req.card : ''], req.sig)} via ${by}`
+    by = `${humanProof('send', [req.floorId, req.agentId, createHash('sha256').update(body, 'utf8').digest('hex'), typeof req.card === 'string' ? req.card : ''], req.sig, rq)} via ${by}`
     const at = agentOf(floorOf(req.floorId), req.agentId)
     const floor = floorOf(req.floorId)
     const r = await sayTo(req.floorId, req.agentId, body)
@@ -2984,19 +2995,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
     ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals())],
-    ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r)))],
-    ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r)))],
-    ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r))],
+    ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r))],
+    ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r))],
     ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
-    ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r)))],
+    ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r), r))],
     ['GET', /^\/approvals\/devices$/, (_, r) => (humanOnly(r), devicesAnswer())],
     ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body, r))],
     ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r), r.headers.origin))],
     ['GET', /^\/approvals\/devices\/recover$/, (_, r) => (humanOnly(r), deviceRecovery.status())],
     ['POST', /^\/approvals\/devices\/recover\/start$/, (_, r) => (humanOnly(r), recoverStart(byOf(r)))],
     ['POST', /^\/approvals\/devices\/recover\/finish$/, (_, r) => (humanOnly(r), recoverFinish(byOf(r), r.body))],
-    ['POST', /^\/approvals\/devices\/remove$/, (_, r) => (humanOnly(r), deviceRemove(r.body, byOf(r)))],
-    ['POST', /^\/approvals\/devices\/unsigned$/, (_, r) => (humanOnly(r), deviceUnsigned(r.body, byOf(r)))],
+    ['POST', /^\/approvals\/devices\/remove$/, (_, r) => (humanOnly(r), deviceRemove(r.body, byOf(r), r))],
+    ['POST', /^\/approvals\/devices\/unsigned$/, (_, r) => (humanOnly(r), deviceUnsigned(r.body, byOf(r), r))],
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],
     [
       'DELETE',

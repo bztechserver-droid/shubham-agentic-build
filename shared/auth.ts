@@ -99,6 +99,13 @@ export interface AuthStatus {
    * device's signature: it is signed in as sbskrrt and Settings has not turned that off (AuthSettings.ownerCodes). An unsigned page never may.
    */
   mayShowCode?: boolean
+  /**
+   * F-124: this browser's sign-in is enough where the app asks for a registered approval device's signature: it is signed in as sbskrrt and Settings
+   * has "Sign-in is enough (no approval device)" on (AuthSettings.signInEnough). Then it may approve a prompt, send as him, cancel, remove or switch
+   * the old way, switch Automatic updates on, send on WhatsApp and be given the codes (F-122) WITHOUT a signature; a registered device's signature is
+   * still taken whenever it is sent. An unsigned page, at any level, and everybody else never may. Same value as mayShowCode (kept for F-122).
+   */
+  mayApprove?: boolean
   /** True when this browser must sign in before the app answers anything else (require says so for `via`). With person null and needsSignIn false the app is open as before: no tabs, no scoping. */
   needsSignIn: boolean
 }
@@ -107,7 +114,12 @@ export interface AuthSettings {
   require: AuthRequire
   /** The paired phone app keeps the old way (its device key) until it can sign in. Default true. */
   phoneExempt: boolean
-  /** F-122: a browser signed in as sbskrrt is given the codes to add a device / pair Chris, whether or not it is a registered approval device. Default true; false = "approval devices only". */
+  /**
+   * F-124: "Sign-in is enough (no approval device)". On (default), a browser signed in as sbskrrt is accepted wherever a registered approval device's
+   * signature is asked for (AuthStatus.mayApprove). Off = exactly the approval-device rule. Only a signed-in sbskrrt changes it (PUT {signInEnough}).
+   */
+  signInEnough: boolean
+  /** F-122's name for the same switch: always equal to signInEnough; PUT accepts either (both, if they agree). */
   ownerCodes: boolean
   /** A raised level waiting to be confirmed: it reverts to `previous` at `until` (ISO). */
   trial: { previous: AuthRequire; until: string } | null

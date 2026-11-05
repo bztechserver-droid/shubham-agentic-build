@@ -1808,6 +1808,33 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-123",
+    "title": "Approval device, its code and the pairing code all in one place, under Devices (not Security), and open pages that reload after an update",
+    "said": "I hate this feature cuase ive been at it for more than a decade nowkeep the approval device also in the device not in security everyhting in one place",
+    "added": "2026-11-05",
+    "notes": [
+      "2026-11-05 (Lead): Typed in Lead's chat at 21:54, after the pairing code still showed the old refusal on build 2147.\n- The cause, found by Lead: the Server had updated to 2147 at 21:48:44, but his open window still ran the page from before the update. The words he saw are the old page's, without \", or sign in as sbskrrt\". The live 2147 page says \"You are signed in as sbskrrt, so this works on any device\".\n- Lead told him to close the app completely and open it again.",
+      "2026-11-05 (Lead): Lead's reading.\n- Approval device moves from Settings › Security to Settings › Devices, beside Pair Chris. That is registering this device, \"Show a code to add a device\", and the list of approval devices.\n- So all of it is in one place under Devices, and Security keeps only who has to sign in.\n- Also, an open page notices when the PC it talks to has updated, and reloads itself or offers a reload. Then an old window can never show old behaviour again.\n- Owner: Web. Nothing built yet.",
+      "Web, 5 Nov: Approval device block moved from Settings > Security to Settings > Devices beside Pair Chris (pointer left in Security; old #settings-approval links open Devices). Open page: newer-build watch also compares the agent's build version; when text or a dialog is open it shows 'New version: reload' (Reload now) instead of waiting silently. (Lead: the silent wait while a half-typed draft was open is the likely reason his window stayed on the old page after the 21:48 update. Lead asked for the duplicate \"Show a code to add a device\" in Pair Chris to be removed, since the Approval block beside it has one.)"
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-124",
+    "title": "A switch to turn approval devices off: signing in as sbskrrt is enough",
+    "said": "Or keep button disbale approval the login will handle the part the login is enough",
+    "added": "2026-11-05",
+    "notes": [
+      "2026-11-05 (Lead): Typed in Lead's chat at 21:57, right after F-123. A moment later he added: \"Anyways this was a feature prior to crm login\".\n- So: approval devices were built before the CRM sign-in existed (F-118). Now that he can sign in, the sign-in is enough.",
+      "2026-11-05 (Lead): Lead's reading.\n- One switch under Devices: \"Sign-in is enough (no approval device)\", on by default as he asks.\n- While it is on, everything that needed a registered approval device's signature also accepts a browser SIGNED IN as sbskrrt: the codes (F-122), approving \"Send as me\", and any other approval.\n- A page that is not signed in still never counts, even while sign-in is \"Nobody\", because every tailnet device can open the Server's page. Other people never count.\n- Switch it off and it is the old way: approval devices only. The approval devices stay, and keep working.\n- Owners: Accounts (the agent's rules, and a list of every place that asks for a device signature) and Web (the switch and the approval flows). It goes together with F-123 (everything under Devices). Nothing built yet.",
+      "2026-11-05 Accounts: 'Sign-in is enough (no approval device)' (auth.json signInEnough, default on; F-122's ownerCodes is the same switch): wherever a registered approval device's signature is asked for (Approvals answer/cancel, Send as me, the codes to add a device and pair Chris, remove a device, the old-way switch, Automatic updates ON, WhatsApp send) a browser signed in as sbskrrt is accepted too; an unsigned page and other people never; a sent signature is always checked; off = the old rule. Only a signed-in sbskrrt changes it; each approval is logged with person and browser. AuthStatus.mayApprove tells the page. Agent side in scratch C:\\saw\\auth5 (patch C:\\saw\\merge\\f124-sign-in-enough.patch), gate green; Web adds the switch.",
+      "2026-11-05 (Lead): The agent side was MERGED into Dev by Accounts, with one full gate: tsc -b and oxlint clean; check:themes 6/6; vite build OK; test:agent 2,312 tests, 2,309 pass, 0 fail, 3 skipped; test:e2e 12/12. Lowest free memory 1.6 GB.\n- Lead's call: Automatic updates ON follows his rule too (\"the login is enough\"), so a signed-in sbskrrt may switch it on with no device.\n- Web's page (F-123 and F-124) merges next. Not published."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

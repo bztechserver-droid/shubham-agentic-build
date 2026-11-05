@@ -263,7 +263,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
   }
   // F-079: on the hub only, and only with the Agents section. It runs only while it is used (agent/whatsapp/).
-  if (role === 'hub' && agentic) whatsapp = createWhatsApp({ dir: path.join(paths.root, 'whatsapp'), log: log.child('whatsapp'), human: (kind, fields, sig) => agentic.humanProof(kind, fields, sig) })
+  if (role === 'hub' && agentic) whatsapp = createWhatsApp({ dir: path.join(paths.root, 'whatsapp'), log: log.child('whatsapp'), human: (kind, fields, sig, r) => agentic.humanProof(kind, fields, sig, r) })
 
   // Claude subscription failover (agent/claude/failover.ts): when the weekly limit of the Claude subscription is used up, the
   // person is moved to the office's other one in the CRM and the chats that hit the limit carry on there. Only chats on this

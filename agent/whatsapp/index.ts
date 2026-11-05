@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { WA_IDLE_MS, WA_PREFIX, WA_READ_MAX, WA_TEXT_MAX, type WaChat, type WaDraft, type WaLive, type WaMessage, type WaSendRequest, type WaSetup, type WaStatus } from '../../shared/whatsapp.ts'
+import type { ProofRequest } from '../agentic/index.ts'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
@@ -28,7 +29,7 @@ export interface WhatsAppOptions {
   dir: string
   log: Logger
   /** His approval device's signature over a WhatsApp send (agentic's humanProof): who it was, or it throws 401/403. */
-  human(kind: 'wa-send', fields: (string | number | boolean)[], sig: unknown): string
+  human(kind: 'wa-send', fields: (string | number | boolean)[], sig: unknown, r?: ProofRequest): string
   // Tests:
   script?: string
   env?: Record<string, string>
@@ -328,7 +329,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     return { told }
   }
 
-  async function send(body: unknown): Promise<WaMessage> {
+  async function send(body: unknown, r?: ProofRequest): Promise<WaMessage> {
     const req = (isObject(body) ? body : {}) as Partial<WaSendRequest>
     const chatId = typeof req.chatId === 'string' ? req.chatId : ''
     const text = typeof req.text === 'string' ? req.text : ''
@@ -337,7 +338,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
     if (!text.trim()) throw apiError(400, 'The message is empty.')
     if (text.length > WA_TEXT_MAX) throw apiError(400, `A message is at most ${WA_TEXT_MAX} characters.`)
     // His tap, signed on his approval device over exactly this chat, these words and this draft: before anything else.
-    const who = o.human('wa-send', [chatId, sha256(text), draft], req.sig)
+    const who = o.human('wa-send', [chatId, sha256(text), draft], req.sig, r)
     if (draft) {
       drafts.get(draft, chatId)
       drafts.allowSend()
@@ -415,7 +416,7 @@ export function createWhatsApp(o: WhatsAppOptions): WhatsApp {
         return host.call<WaMessage[]>('messages', { chatId, count, ...(query.get('before') ? { before: query.get('before') } : {}) })
       }
       case 'POST /send':
-        return send(body)
+        return send(body, req)
       case 'PATCH /settings': {
         if (!isObject(body) || typeof body.alwaysOn !== 'boolean') throw apiError(400, 'Expected {alwaysOn}')
         saveSettings({ alwaysOn: body.alwaysOn })
