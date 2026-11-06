@@ -6,6 +6,8 @@
 export interface FloorRef {
   id: string
   name: string
+  /** F-127: made on this PC while the Server was out of reach, not on the Server yet (the floor's own flag, passed along for its badge). */
+  local?: boolean
 }
 
 /** What the grouping needs to know of one chat in the list. */

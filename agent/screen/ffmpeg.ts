@@ -96,7 +96,7 @@ async function download(release: FfmpegRelease, log: Logger, progress?: (done: n
 }
 
 /**
- * Makes sure the pinned ffmpeg.exe is in `dir` (npm run setup:screen, or the Devices page's
+ * Makes sure the pinned ffmpeg.exe is in `dir` (npm run setup:screen, or Settings › Devices'
  * Set up). Skips when it is there with the right size; otherwise downloads the zip, refuses it
  * on any size or sha256 mismatch, extracts ffmpeg.exe and its LICENSE with Windows' tar.exe in
  * a temp folder, and moves them in.

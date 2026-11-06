@@ -20,6 +20,8 @@ export interface BuildVersion {
   devHash: string | null
   /** F-075: the chat host this build ships (its wire protocol and code version); absent in builds from before it. */
   chatHost?: { protocol: number; version: number } | null
+  /** F-126: SHA-256 of the CRM drive host (crm-fs/crm-fs.exe) this build ships; absent when the publishing PC could not build it. The agent checks the exe against it before starting it. */
+  crmFsSha256?: string
 }
 
 export type UpdateState = 'unknown' | 'checking' | 'up-to-date' | 'available' | 'failed'

@@ -44,13 +44,15 @@ import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { createDrive } from './drive/index.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts } from './ports/index.ts'
+import { createLinuxMount } from './crm-files/mount-linux.ts'
+import type { CrmFilesService } from './crm-files/service.ts'
 
 // The device agent (agent/SPEC.md): `npm run agent [-- --role hub|member]`.
 //   hub:    supervises hbbs/hbbr, registers with hbbs, listens for members on its LAN and
 //           Tailscale addresses, answers hbbs's pushes, pairs new PCs, answers LAN discovery.
 //   member: keeps one link to its hub (direct, over Tailscale, through hbbs, or through hbbr,
 //           as its How to connect setting allows), joins a hub,
-//           looks for hubs on the LAN while the Devices page is open (not paired yet), or for
+//           looks for hubs on the LAN while Settings › Devices is open (not paired yet), or for
 //           its own hub when every path to it failed (its LAN address may have changed).
 // Both: the local API for the app, RustDesk screens tunnelled over the link (Mode 1), the
 // app's own screen for the other PC's viewer (F-006, agent/screen/: no RustDesk needed), and
@@ -211,6 +213,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let whatsapp: WhatsApp | null = null
   // F-097: the Common Drive (agent/drive/): the pool of files every device shares. On the hub; opens on first use, so no folder is made until it is asked for.
   const drive = extras.agents === false ? null : createDrive({ dir: path.join(paths.agent, 'drive'), device: config.name, role, log: log.child('drive') })
+  // F-126 (Linux): the CRM files in GNOME Files, through a WebDAV listener of this agent's own user that gvfs mounts. Windows keeps its WinFsp drive (left out here).
+  let crmFilesService: CrmFilesService | null = null
+  const crmFilesLinux = process.platform === 'linux' && extras.agents !== false ? createLinuxMount({ dir: path.join(paths.agent, 'agentic'), service: () => crmFilesService, log: log.child('crm-drive') }) : undefined
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     auth,
@@ -254,7 +259,9 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         return mux && m ? linkPeer(mux, id, m.name) : null
       },
     },
+    crmFilesMountDriver: crmFilesLinux,
   })
+  crmFilesService = agentic?.crmFiles.service ?? null
   // F-097: a member PC's sync folder reaches the hub's Common Drive through the Agents link.
   drive?.setHubRequest(agentic ? (body, ms) => agentic.driveRequest(body, ms) : null)
   // F-097: a paired phone's device key (voice pairing) is what lets it upload into the Common Drive's phone inbox.
@@ -286,7 +293,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let join: Join | null = null
   let joinSeq = 0
   let joinState: JoinState = IDLE_JOIN
-  // A member's LAN discovery runs while the Devices page is open and it has no hub (the Join
+  // A member's LAN discovery runs while Settings › Devices is open and it has no hub (the Join
   // dialog's list), or while it has lost its hub (where is it now?).
   let pageOpen = false
   let seekingHub = false
@@ -564,7 +571,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     else discovery.stop()
   }
 
-  // The Devices page is open while a WebSocket client is connected.
+  // Settings › Devices is open while a WebSocket client is connected.
   function onClients(count: number) {
     pageOpen = count > 0
     updateDiscovery()
@@ -846,7 +853,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -982,7 +989,7 @@ if (import.meta.main) {
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
     speech = createEngine({ log: log.child('speech') })
     agent = await startAgent(config, log, { mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
-    log.info(`ready: the app's Devices page talks to 127.0.0.1:${agent.apiPort}`)
+    log.info(`ready: the app talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')
     if (appIndex !== -1 && process.argv[appIndex + 1]) {

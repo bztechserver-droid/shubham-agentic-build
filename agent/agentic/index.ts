@@ -96,6 +96,7 @@ import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmProxy } from './crmproxy.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
+import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
@@ -291,9 +292,13 @@ export interface AgenticOptions {
   chatHost?: ChatHostLink | null
   /** F-079: Shubham's WhatsApp on the hub (agent/whatsapp/), for the overlay Assistant's wa_* tools; null where there is none. */
   whatsapp?: () => WaTools | null
+  /** F-126: this PC's way to mount the CRM files (Linux brings its own: loopback WebDAV + gvfs). Left out on Windows, where crm-fs.exe through WinFsp is used. */
+  crmFilesMountDriver?: CrmFilesModuleOptions['mountDriver']
 }
 
 export interface Agentic {
+  /** F-126: the CRM files (agent/crm-files/): the tree and its changes, the page's routes, this PC's mount. */
+  crmFiles: CrmFilesModule
   mount: ApiMount
   /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
   voiceMount: ApiMount
@@ -539,6 +544,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json') })
+  // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
+  const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
+  void crmFiles.resume().catch(() => undefined)
 
   // F-051: the memory layer, kept on the hub (or a PC on its own); a member's chats reach it
   // through the hub, as their tool calls do. Started with the agent when main.ts says so, else
@@ -601,7 +609,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const offlineActive = () => mode() === 'member' && offlineSettings.on() && sub === null && downSince !== null && Date.now() - downSince >= offlineAfter
   /** F-127: new floors and chats on this PC use this PC's own Claude sign-in (F-007); without one they are refused, plainly, before anything is made. */
   function needClaudeHere() {
-    if (o.token && !o.token()) throw Object.assign(apiError(409, "Sign in to Claude on this PC first (Devices page): new chats made here while the Server is down use this PC's own Claude sign-in."), { code: 'no-claude' })
+    if (o.token && !o.token()) throw Object.assign(apiError(409, "Sign in to Claude on this PC first (Settings › Devices): new chats made here while the Server is down use this PC's own Claude sign-in."), { code: 'no-claude' })
   }
 
   function loadHeld(): [string, Held][] {
@@ -4049,6 +4057,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   return {
+    crmFiles,
     mount,
     voiceMount: voice.mount,
     phoneDeviceOf: headers => voice.deviceOf(headers),
@@ -4073,6 +4082,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
+      void crmFiles.close()
       recovery?.freeze()
       if (resumeTimer) clearTimeout(resumeTimer)
       if (liveTimer) clearTimeout(liveTimer)

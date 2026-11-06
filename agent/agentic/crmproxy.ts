@@ -8,7 +8,7 @@ import { SESSION_MS, trimUrl } from '../claude/crm.ts'
 // F-054: the CRM built into the page talks to the CRM's backend through this. The backend allows
 // only the CRM's own sites as origins, so a call from this app's address would be refused by CORS;
 // forwarded from here, where CORS doesn't apply, it is not. It is also what makes one sign-in
-// serve both: the CRM session this PC already holds (crm-session.json, from the Devices page's
+// serve both: the CRM session this PC already holds (crm-session.json, from Settings › Devices'
 // sign-in) is attached here, so the page never has the CRM's cookie, and the CRM's own login
 // form isn't needed (agentic-claude-manager's /api/crm-proxy, ported). The session, its cookie and
 // the CSRF token are never logged, never put in an answer, and never written anywhere else.
@@ -41,7 +41,7 @@ interface Login {
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 
-/** This PC's CRM session, read as it is now (the Devices page signs in and out under it), or null. */
+/** This PC's CRM session, read as it is now (Settings › Devices signs in and out under it), or null. */
 export function readLogin(file: string, now = Date.now()): Login | null {
   try {
     const raw: unknown = JSON.parse(readFileSync(file, 'utf8'))
@@ -71,6 +71,19 @@ export interface CrmProxy {
   session(): CrmSessionInfo
   /** Forwards one request of the page to the CRM, with the session; `sub` is the path after /crm-proxy/. */
   handle(req: IncomingMessage, res: ServerResponse, sub: string, search: string): Promise<void>
+  /**
+   * F-126: one call from this agent itself (the CRM files), with the session and, for a change, the CSRF pair (mended once, as in `handle`). `sub` is the path on the CRM, e.g. "org/files?all=true".
+   * Throws a CrmNotSignedIn when nobody is signed in. The answer is the CRM's, untouched; the caller reads it.
+   */
+  request(method: string, sub: string, init?: { json?: unknown; body?: string | Buffer; headers?: Record<string, string>; signal?: AbortSignal }): Promise<Response>
+}
+
+/** F-126: no CRM session on this PC (or it ran out). */
+export class CrmNotSignedIn extends Error {
+  constructor() {
+    super('The CRM is not signed in on this PC: sign in from the CRM page, or Devices')
+    this.name = 'CrmNotSignedIn'
+  }
 }
 
 const MUTATES = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -107,6 +120,33 @@ export function createCrmProxy(o: CrmProxyOptions): CrmProxy {
   }
 
   return {
+    async request(method, sub, init = {}) {
+      const login = readLogin(o.file, now())
+      if (!login) throw new CrmNotSignedIn()
+      const m = method.toUpperCase()
+      const base = new URL(login.url)
+      const target = new URL(`/${sub.replace(/^\/+/, '')}`, base)
+      if (target.origin !== base.origin) throw apiError(400, 'That is not a path on the CRM')
+      const body = init.json !== undefined ? JSON.stringify(init.json) : init.body
+      const send = async (force: boolean) => {
+        const h: Record<string, string> = { accept: 'application/json', ...(init.json !== undefined ? { 'content-type': 'application/json' } : {}), ...init.headers, cookie: login.cookie }
+        if (MUTATES.has(m)) {
+          const token = await csrfFor(login, force)
+          if (token) {
+            h.cookie = `${login.cookie}; crm_csrf=${token}`
+            h['x-csrf-token'] = token
+          }
+        }
+        return fetchFn(target, { method: m, headers: h, body, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(TIMEOUT_MS) })
+      }
+      let r = await send(false)
+      if (MUTATES.has(m) && r.status === 403) {
+        const peek = await r.clone().text().catch(() => '')
+        if (/csrf/i.test(peek)) r = await send(true)
+      }
+      return r
+    },
+
     session() {
       const login = readLogin(o.file, now())
       return login

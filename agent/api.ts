@@ -133,7 +133,7 @@ export interface ApiOptions {
   host?: string
   token: string
   actions: ApiActions
-  /** WebSocket clients connected now: the Devices page is open while there are any. */
+  /** WebSocket clients connected now: Settings › Devices is open while there are any. */
   onClients?: (count: number) => void
   log?: Logger
   /** F-018: parts of the API that live in modules of their own (agent/agentic/). */

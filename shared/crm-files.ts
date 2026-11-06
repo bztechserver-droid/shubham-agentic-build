@@ -33,7 +33,7 @@ export type CrmNodeKind =
   | 'root' //      id 'root': the list of categories
   | 'category' //  a `folder` tag of the CRM ("general", "projects", ...): id 'cat:<tag>'
   | 'project' //   one linked project under the "projects" tag (or "Uncategorised"): id 'proj:<projectId>'; 'proj:none' is "Uncategorised"
-  | 'group' //     a file group of a project (nested through parent): id 'grp:<groupId>'
+  | 'group' //     a file group of a project (nested through parent): id 'grp:<projectId>:<groupId>'
   | 'file' //      a CRM file: id 'file:<fileId>'
 
 /** What this person may do with a node. The page shows a button only when it is true; the agent refuses the rest (403 'forbidden'). */
@@ -153,8 +153,8 @@ export const CRM_FILES_FIXTURE: CrmNode[] = [
   { id: 'file:11111111-1111-4111-8111-111111111111', kind: 'file', name: 'Company profile.pdf', parentId: 'cat:general', isFolder: false, size: 2_480_113, type: 'application/pdf', createdAt: '2026-10-02T09:14:00.000Z', modifiedAt: '2026-10-02T09:14:00.000Z', versions: 1, rights: { ...READ, version: true, rename: true, move: false } },
   { id: 'proj:22222222-2222-4222-8222-222222222222', kind: 'project', name: 'Website redesign', parentId: 'cat:projects', isFolder: true, createdAt: '2026-09-20T07:00:00.000Z', childCount: 2, rights: { ...READ, upload: true, mkdir: true } },
   { id: 'proj:none', kind: 'project', name: 'Uncategorised', parentId: 'cat:projects', isFolder: true, childCount: 0, rights: READ },
-  { id: 'grp:33333333-3333-4333-8333-333333333333', kind: 'group', name: 'Designs', parentId: 'proj:22222222-2222-4222-8222-222222222222', isFolder: true, createdAt: '2026-09-21T10:30:00.000Z', childCount: 1, rights: ALL },
-  { id: 'file:44444444-4444-4444-8444-444444444444', kind: 'file', name: 'Homepage v3.fig', parentId: 'grp:33333333-3333-4333-8333-333333333333', isFolder: false, size: 14_200_000, type: 'application/octet-stream', createdAt: '2026-10-11T15:02:00.000Z', modifiedAt: '2026-10-29T12:40:00.000Z', versions: 4, rights: ALL },
+  { id: 'grp:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333', kind: 'group', name: 'Designs', parentId: 'proj:22222222-2222-4222-8222-222222222222', isFolder: true, createdAt: '2026-09-21T10:30:00.000Z', childCount: 1, rights: ALL },
+  { id: 'file:44444444-4444-4444-8444-444444444444', kind: 'file', name: 'Homepage v3.fig', parentId: 'grp:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333', isFolder: false, size: 14_200_000, type: 'application/octet-stream', createdAt: '2026-10-11T15:02:00.000Z', modifiedAt: '2026-10-29T12:40:00.000Z', versions: 4, rights: ALL },
   { id: 'file:55555555-5555-4555-8555-555555555555', kind: 'file', name: 'Brief.docx', parentId: 'proj:22222222-2222-4222-8222-222222222222', isFolder: false, size: 48_211, type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', createdAt: '2026-09-22T08:00:00.000Z', modifiedAt: '2026-09-22T08:00:00.000Z', versions: 1, rights: ALL },
   { id: 'file:66666666-6666-4666-8666-666666666666', kind: 'file', name: 'INV-2026-114.pdf', parentId: 'cat:invoices', isFolder: false, size: 91_377, type: 'application/pdf', createdAt: '2026-10-30T11:11:00.000Z', modifiedAt: '2026-10-30T11:11:00.000Z', versions: 1, rights: READ },
 ]

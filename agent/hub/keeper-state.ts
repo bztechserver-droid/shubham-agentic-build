@@ -6,7 +6,7 @@ import { writeAtomic } from '../config.ts'
 // F-058: the RustDesk servers (hbbs, hbbr) run in a process of their own, the keeper (keeper.ts), so
 // that they go on when the agent dies, and Control by RustDesk works while the app restarts. The
 // keeper writes what it sees to this file every few seconds and at every change; the agent
-// (external-servers.ts) reads it, so its Devices page and its pairing still know the servers'
+// (external-servers.ts) reads it, so its Settings › Devices and its pairing still know the servers'
 // state and key. A file older than STALE_MS, or one whose process is gone, is a keeper that is not there.
 
 export const KEEPER_STALE_MS = 8000

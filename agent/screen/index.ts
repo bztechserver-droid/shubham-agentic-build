@@ -38,7 +38,7 @@ export interface AppScreen {
   handler: OpenHandler
   /** Sets this PC's control password; null removes it. Throws with the reason for a bad one. */
   setPassword(password: string | null): void
-  /** Fetches FFmpeg in the background (the Devices page's Set up). */
+  /** Fetches FFmpeg in the background (Settings › Devices' Set up). */
   setup(): void
   /** Looks for FFmpeg again (after npm run setup:screen); true when readiness changed. */
   recheck(): boolean
@@ -55,7 +55,7 @@ export interface AppScreen {
 
 export interface AppScreenOptions {
   paths: StatePaths
-  /** This PC's name in the app (the Devices page's). */
+  /** This PC's name in the app (Settings › Devices'). */
   hostname: string
   /** "Stay reachable for Control" as config.json has it (on unless turned off). */
   reachable: boolean

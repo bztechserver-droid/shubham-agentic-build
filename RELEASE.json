@@ -1,12 +1,13 @@
 {
-  "version": "2026.11.05-2333",
+  "version": "2026.11.06-1009",
   "commit": "9c00d52",
   "dirty": true,
-  "builtAt": "2026-11-05T18:03:15.050Z",
-  "devHash": "a2dca3773f9f987e749f",
+  "builtAt": "2026-11-06T04:39:58.612Z",
+  "devHash": "4727a07c43faa7e57142",
   "chatHost": {
     "protocol": 1,
     "version": 1
   },
+  "crmFsSha256": "b8e79a2866d3a12358cc82119a97599480aad9104f6ccf33cdf791d55600dc3e",
   "source": "shubham-agentic-dev"
 }

@@ -4,7 +4,7 @@
 //   sweeps    a WebSocket ping frame every WS_PING_MS; a client that has sent nothing at all (no
 //             frame, no pong) for WS_DEAD_MS is gone: the phone locked, its VPN dropped, the path
 //             between died with no FIN or RST. Without this its socket, and everything hung on
-//             it (a chat's output buffer, a Devices page that keeps the agent polling), stayed for
+//             it (a chat's output buffer, a page (Settings › Devices) that keeps the agent polling), stayed for
 //             as long as the operating system chose to keep it, which can be never. Browsers
 //             answer a ping frame by themselves, also when the page is frozen, so a phone that is
 //             only asleep is not dropped.
