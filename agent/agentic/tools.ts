@@ -234,12 +234,12 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'ui_control',
     description:
-      "Do something on the app's screen, live, where Shubham watches it happen (a marker moves to what you press). action: goto (path: an app page like /chats, /tasks, /agents, /crm, /devices, /settings), crm_goto (path: a CRM page like dashboard, goals, leads, clients, invoices; opens the CRM first), click (ref from ui_screen), type (ref, text; clear:false to add; submit:true presses Enter), key (key: Enter, Escape, Tab, ArrowDown...; optional ref), scroll (direction up/down/top/bottom; amount in px; optional ref of something inside the scroller), wait (ms). Every action answers with the screen as it is afterwards (refs are then fresh); pass screen:false to skip that. Refs go stale when the page changes: if one is refused, read the screen again.",
+      "Do something on the app's screen, live, where Shubham watches it happen (a marker moves to what you press). action: goto (path: an app page like /agents, /tasks, /crm, /devices, /settings), crm_goto (path: a CRM page like dashboard, goals, leads, clients, invoices; opens the CRM first), click (ref from ui_screen), type (ref, text; clear:false to add; submit:true presses Enter), key (key: Enter, Escape, Tab, ArrowDown...; optional ref), scroll (direction up/down/top/bottom; amount in px; optional ref of something inside the scroller), wait (ms). Every action answers with the screen as it is afterwards (refs are then fresh); pass screen:false to skip that. Refs go stale when the page changes: if one is refused, read the screen again.",
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['goto', 'crm_goto', 'click', 'type', 'key', 'scroll', 'wait'] },
-        path: { type: 'string', description: 'goto: /chats. crm_goto: dashboard, goals/123.' },
+        path: { type: 'string', description: 'goto: /agents. crm_goto: dashboard, goals/123.' },
         ref: { type: 'string', description: 'An element from ui_screen, like e3.' },
         text: { type: 'string', description: 'type: what to write (for a <select>, the option).' },
         clear: { type: 'boolean', description: 'type: replace what is there (default true).' },

@@ -1,1 +1,0 @@
-var e=e=>e.trim().split(`@`)[0].split(/[\s._,-]+/u).filter(e=>e!==``),t=e=>Array.from(e)[0]??``;function n(n,r){for(let i of[n,r]){let n=e(i??``);if(n.length===0)continue;let r=n.length===1?Array.from(n[0]).slice(0,2).join(``):t(n[0])+t(n[n.length-1]);if(r!==``)return r.toLocaleUpperCase()}return``}export{n as t};
