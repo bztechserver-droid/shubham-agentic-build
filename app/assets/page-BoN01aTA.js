@@ -1,1 +1,0 @@
-export{i as default}from"./goal-row-BFSj_S6d.js";

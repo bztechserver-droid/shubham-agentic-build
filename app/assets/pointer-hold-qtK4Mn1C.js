@@ -1,1 +1,0 @@
-function e(e){if(!e.commit)return`cancel`;let t=e.mode===`body`&&e.moved<=e.slop;return t&&e.kind===`floor`?`tap`:t&&e.kind===`agent`&&e.hasLongPress?`long-press`:`drop`}export{e as t};
