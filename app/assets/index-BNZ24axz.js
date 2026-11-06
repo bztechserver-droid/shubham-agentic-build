@@ -1553,7 +1553,18 @@ now in this view im not being able to see it`,added:`2026-11-06`,notes:[`2026-11
   - the routes sit under the agentic mount;
   - the end-to-end run with a real Codex comes FIRST, then the patch goes into Dev (rebased, in a slot, shipping OFF);
   - in that run a fake in-memory CRM serves his login, the way the real CRM will, never printed and deleted at the end.
-- The run needs one more device sign-in from him. P1a (the CRM backend) is approved and stays in the clone until he chooses to deploy.`],done:null,doneNote:``},{id:`F-135`,title:`The Publish dialog fits every screen and keeps up`,said:`can you please make the published modal repsosive please it is less repsomnisinve`,added:`2026-11-06`,notes:[`2026-11-06 (Lead): His words, typed in Lead's chat at 16:44.
+- The run needs one more device sign-in from him. P1a (the CRM backend) is approved and stays in the clone until he chooses to deploy.`,`2026-11-06 (Accounts, passed on by Lead): P1b, the CRM page, is written in a plain file copy of the real sam-crm-fe (C:\\saw\\crm\\fe-work), on top of F-136. The patch is C:\\saw\\crm\\fe-p1b.patch, 5 files; nothing is merged back.
+- src/lib/auth.ts: the Codex client functions, and codex_subscription_id in the model-setting saves.
+- CodexDialog.tsx: add, edit or replace a login.
+  - The login goes into a masked box or is read from a chosen auth.json, sent once and never logged.
+  - The seeding instructions say to use a throw-away CODEX_HOME, delete it afterwards, and never run codex logout.
+- CodexSection.tsx:
+  - subscription cards with rename, replace, restore the earlier login, office default, disable and remove;
+  - "Who runs on which", with a select per person: Office default, a subscription, or No Codex.
+- A new Codex tab, and the Codex section in Classic layout too.
+- Not yet type-checked or seen in a browser. Lead turned down a download (npm ci) and pointed Accounts to Web's way, with no install:
+  - build the page with Dev's crm-host and SAD_CRM_SRC pointed at the copy;
+  - view it in a stand-in page with a stand-in CRM API, never the live CRM.`],done:null,doneNote:``},{id:`F-135`,title:`The Publish dialog fits every screen and keeps up`,said:`can you please make the published modal repsosive please it is less repsomnisinve`,added:`2026-11-06`,notes:[`2026-11-06 (Lead): His words, typed in Lead's chat at 16:44.
 - The dialog is "Publish a new build" (src/build/PublishButton.tsx, F-119). It opens from the rocket in the app's bar and in the page picker (src/app/Shell.tsx, page-picker.tsx).
 - Today it is the standard dialog, scrolled as a whole when it is too tall, with the publish log in a 160 px box.
 - Lead's reading, both meanings of "responsive":
