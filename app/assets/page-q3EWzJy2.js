@@ -1,0 +1,1 @@
+export{i as default}from"./goal-row-Di2ic2Ts.js";

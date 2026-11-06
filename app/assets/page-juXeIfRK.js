@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-BXp6uvy8.js";function t(){e(`/wpages`)}export{t as default};
