@@ -87,6 +87,7 @@ import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServer
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
 import { switchConversation } from '../codex/switch-conversation.ts'
+import { conversationCwd } from '../codex/from-claude.ts'
 import type { CodexSettings } from '../codex/settings.ts'
 import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
@@ -104,6 +105,7 @@ import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } 
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmProxy } from './crmproxy.ts'
+import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
@@ -932,9 +934,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
     const cx = o.codex
     if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
-    const cwd = codeDirOf(floor)
     const thread = agent.codexThread ?? learnThread(sid, floor.id, agent.id, 0)?.thread ?? null
-    const resume = !!thread && !!findRollout(cx.paths.home, thread)
+    const rollout = thread ? findRollout(cx.paths.home, thread) : null
+    const resume = !!rollout
+    const cwd = (rollout && conversationCwd(rollout)) || codeDirOf(floor)
     if (thread && !resume) {
       throw Object.assign(apiError(409, "This Codex conversation isn't on this PC: Codex conversations stay on the PC that started them (for now). Open the chat on that PC, or change the agent's engine to start a new conversation."), {
         code: 'codex-conversation-elsewhere',
@@ -2762,7 +2765,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
         : findClaudeTranscript(sid, projectsDir)
       if (!file) throw new Error('source transcript is unavailable on this PC')
-      const converted = switchConversation({ to, file, cwd: codeDirOf(floor), codexHome: o.codex?.paths.home, projectsDir })
+      const cwd = chats.info(sid)?.cwd || conversationCwd(file) || codeDirOf(floor)
+      const converted = switchConversation({ to, file, cwd, codexHome: o.codex?.paths.home, projectsDir })
       log?.info(`chat ${sid.slice(0, 8)}: conversation carried to ${to}, ${converted.id.slice(0, 8)}`)
       return { sessionId: to === 'claude' ? converted.id : randomUUID(), codexThread: to === 'codex' ? converted.id : null,
         homePc: self().id, homePcName: self().name }
@@ -4262,6 +4266,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
     raw: (rest, url) => {
+      const saved = /^\/saved-views\/(pc|phone)$/.exec(rest)
+      if (saved) return (req, res, caller) => {
+        if (url.search) throw apiError(400, 'Saved views do not accept selectors')
+        return savedViewsRequest(o.auth, req, res, caller, saved[1])
+      }
       if (rest.startsWith('/crm-proxy/')) {
         return (req, res, caller) => {
           // The built-in CRM runs on this PC's own CRM session: the owner's.

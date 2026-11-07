@@ -28,7 +28,8 @@ import { authError, type Caller } from './types.ts'
 // (mode 0600): the sha-256 of each session token (never the token), who it is (CRM id, username,
 // name), when it began and was last used; the CRM's member list for the Share picker; and the
 // settings. NEVER a password, a CRM cookie or a session token: the password goes to the CRM once,
-// the CRM's own cookie is used for who-am-I and the member list, and both are dropped.
+// the CRM cookie is retained only in a private memory companion for F-144 saved-view sync;
+// it is removed with its app session and is unavailable after restart. No CRM cookie is persisted.
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_MS = AUTH_SESSION_DAYS * DAY_MS
@@ -137,6 +138,9 @@ export interface SignedIn {
 }
 
 export interface Auth {
+  /** F-144: exact private app-session binding; CRM credentials remain in memory. */
+  viewerCrm(headers: Record<string, string | string[] | undefined>): CrmSession | null
+  forgetViewerCrm(headers: Record<string, string | string[] | undefined>): void
   /** The request's caller: its cookie's session (touched: it was used now), and where it came from. */
   caller(headers: Record<string, string | string[] | undefined>): Caller
   /** The sign-in level in force now: the break-glass 'off', or a trial's, or the saved one. */
@@ -183,6 +187,7 @@ export function createAuth(o: AuthOptions): Auth {
   const crm = o.crm ?? { signIn: crmSignIn, listMembers }
 
   let f = load()
+  const viewerSessions = new Map<string, CrmSession>()
   let dirty = false
   let savedAt = 0
   const fails = new Map<string, number[]>()
@@ -257,6 +262,7 @@ export function createAuth(o: AuthOptions): Auth {
   }
 
   function drop(h: string, why: AuthEnded) {
+    viewerSessions.delete(h)
     const i = f.sessions.findIndex(s => s.h === h)
     if (i === -1) return
     f.sessions.splice(i, 1)
@@ -367,6 +373,8 @@ export function createAuth(o: AuthOptions): Auth {
     const token = randomBytes(32).toString('base64url')
     const t = now()
     f.sessions.push({ h: hash(token), user, createdAt: t, lastSeen: t })
+    // Only a validated office member gets a viewer transport; never persist it.
+    if (self && self.role !== 'client') viewerSessions.set(hash(token), session)
     sweep()
     save()
     log?.info(`${user.username} (${user.id.slice(0, 8)}) signed in${c.via === 'tailnet' ? ' over the tailnet' : ''}`)
@@ -478,6 +486,17 @@ export function createAuth(o: AuthOptions): Auth {
   }
 
   return {
+    viewerCrm(headers) {
+      const c = caller(headers)
+      const token = cookieOf(headers)
+      if (!c.person || !token) return null
+      const session = viewerSessions.get(hash(token))
+      return session?.user.id.toLowerCase() === c.person.id ? session : null
+    },
+    forgetViewerCrm(headers) {
+      const token = cookieOf(headers)
+      if (token) viewerSessions.delete(hash(token))
+    },
     caller,
     require,
     needsSignIn,
@@ -509,6 +528,7 @@ export function createAuth(o: AuthOptions): Auth {
       log?.warn(`auth ${status} ${code}: ${who} ${route.slice(0, 120)}${chatId ? ` chat ${chatId.slice(0, 8)}` : ''}`)
     },
     close() {
+      viewerSessions.clear()
       if (dirty) save()
       watchers.clear()
     },

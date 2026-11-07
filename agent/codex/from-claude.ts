@@ -60,6 +60,21 @@ export function* conversationLines(file: string): Generator<string> {
   } finally { closeSync(fd) }
 }
 
+/** Only inspect transcript metadata near the start; never load a large conversation to learn its cwd. */
+export function conversationCwd(file: string): string | null {
+  let count = 0
+  for (const line of conversationLines(file)) {
+    if (++count > 128) break
+    try {
+      const row: unknown = JSON.parse(line.replace(/^\uFEFF/, ''))
+      if (!object(row)) continue
+      const cwd = row.type === 'session_meta' && object(row.payload) ? row.payload.cwd : row.cwd
+      if (typeof cwd === 'string' && path.isAbsolute(cwd)) return cwd
+    } catch { /* Tolerate malformed transcript lines. */ }
+  }
+  return null
+}
+
 export interface ConversionStats { inputLines: number; compactions: number; omittedTurns: number; outputBytes: number }
 
 /** Scan for the final main-session boundary before sanitizing any obsolete history. Two bounded passes. */
@@ -148,26 +163,34 @@ export function fromClaude(lines: Iterable<string>, options: ConversionOptions):
 /** Claude JSONL -> Codex 0.163.0 rollout JSONL. Unknown/malformed rows and private metadata are skipped. */
 function mapClaude(lines: Iterable<string>, options: ConversionOptions): string[] {
   const out: string[] = []
-  const emit = (type: string, payload: Row, timestamp = options.timestamp) => out.push(JSON.stringify({ timestamp, type, payload }))
-  emit('session_meta', { id: options.id, timestamp: options.timestamp, cwd: options.cwd, originator: 'codex_cli_rs', cli_version: options.cliVersion ?? '0.163.0', source: 'cli', model_provider: 'openai', base_instructions: { text: '' } })
+  const emit = (type: string, payload: Row, timestamp = options.timestamp) => out.push(JSON.stringify({ timestamp, ordinal: out.length, type, payload }))
+  emit('session_meta', { session_id: options.id, id: options.id, timestamp: options.timestamp, cwd: options.cwd, runtime_workspace_roots: [options.cwd], originator: 'codex_cli_rs', cli_version: options.cliVersion ?? '0.163.0', source: 'cli', thread_source: 'user', model_provider: 'openai', base_instructions: { text: '' }, history_mode: 'paginated' })
   let turn = 0
+  let messageNumber = 0
   let active = false
+  const turnId = () => `${options.id}-${turn}`
   const pending = new Set<string>()
   const finish = (at: string) => {
     for (const call_id of pending) emit('response_item', { type: 'custom_tool_call_output', call_id, output: '[No result preserved in imported transcript]' }, at)
     pending.clear()
-    if (active) emit('event_msg', { type: 'task_complete', turn_id: `${options.id}-${turn}`, last_agent_message: null }, at)
+    if (active) emit('event_msg', { type: 'task_complete', turn_id: turnId(), last_agent_message: null }, at)
     active = false
   }
   const start = (at: string) => {
     if (!active) {
       active = true
       turn++
-      emit('event_msg', { type: 'task_started', turn_id: `${options.id}-${turn}`, model_context_window: null, collaboration_mode_kind: 'default' }, at)
+      emit('event_msg', { type: 'task_started', turn_id: turnId(), model_context_window: null, collaboration_mode_kind: 'default' }, at)
+      emit('turn_context', { turn_id: turnId(), cwd: options.cwd, approval_policy: 'never', sandbox_policy: { type: 'danger-full-access' }, model: 'gpt-6.1-sol', summary: 'none' }, at)
     }
   }
   const message = (role: string, body: string, at: string) => {
-    if (body) emit('response_item', { type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: body }] }, at)
+    if (!body) return
+    const id = `import-${options.id}-${++messageNumber}`
+    emit('response_item', { type: 'message', id, role, ...(role === 'assistant' ? { phase: 'final_answer' } : {}), content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: body }] }, at)
+    emit('event_msg', { type: 'item_completed', thread_id: options.id, turn_id: turnId(), item: role === 'assistant'
+      ? { type: 'AgentMessage', id, content: [{ type: 'Text', text: body }], phase: 'final_answer' }
+      : { type: 'UserMessage', id, client_id: null, content: [{ type: 'text', text: body, text_elements: [] }] } }, at)
   }
   for (const line of lines) {
     if (line.length > 8 * 1024 * 1024) continue
