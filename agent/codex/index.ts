@@ -53,8 +53,6 @@ export interface CodexOptions {
   deviceId: string
   /** The person signed in to the CRM here (the session F-007 keeps), or null. Read every time: the session can end or change. */
   session: () => CrmSession | null
-  /** Settings › Chats › "Codex chats". */
-  enabled: () => boolean
   /** The Codex CLI on this PC, or null. */
   find: () => CodexInstall | null
   log: Logger
@@ -150,7 +148,7 @@ export function createCodex(o: CodexOptions): CodexManager {
       hint = lastOutcome && lastOutcome !== 'ok' ? outcomeHint : null
     }
     return {
-      enabled: o.enabled(),
+      enabled: true,
       installed: !!install,
       version: install?.version ?? null,
       state,
@@ -374,7 +372,6 @@ export function createCodex(o: CodexOptions): CodexManager {
 
     acquire: sessionId =>
       serial(async () => {
-        if (!o.enabled()) throw codexError(409, 'turned-off', "Codex chats are turned off on this PC (Settings › Chats).")
         if (!o.find()) throw codexError(503, 'not-installed', "The Codex CLI isn't installed on this PC.")
         writeBase(paths)
         if (changed()) {
@@ -410,7 +407,7 @@ export function createCodex(o: CodexOptions): CodexManager {
 
     check: () =>
       serial(async () => {
-        if (!o.enabled() || !o.find()) return status()
+        if (!o.find()) return status()
         if (changed()) await settleNow()
         else await pull()
         tidy()

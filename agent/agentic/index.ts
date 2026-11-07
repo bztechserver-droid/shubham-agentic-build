@@ -94,7 +94,6 @@ import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
 import { switchConversation } from '../codex/switch-conversation.ts'
 import { conversationCwd } from '../codex/from-claude.ts'
-import type { CodexSettings } from '../codex/settings.ts'
 import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
@@ -231,8 +230,6 @@ export interface AgenticOptions {
   openCodeBackend?: OpenCodePoolOptions['backend']
   openCodeFreeMemory?: () => number
   codex?: CodexManager | null
-  /** F-134: Settings › Chats › "Codex chats" (off unless turned on). */
-  codexSettings?: CodexSettings | null
   /** F-134, tests: shorter waits for the sender of a Codex chat. */
   codexSend?: SendOptions
   /** F-138: the Claude credential the CRM handed out (claude/index.ts credentialEnv): exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY. Left out (tests), `token` applies as before. */
@@ -1594,7 +1591,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function codexAnswer(): CodexStatus {
     if (o.codex) return o.codex.status()
     return {
-      enabled: false,
+      enabled: true,
       installed: false,
       version: null,
       state: 'not-installed',
@@ -1606,19 +1603,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  function setCodexSettings(raw: unknown, r: MountRequest) {
-    if (!isObject(raw) || typeof raw.enabled !== 'boolean') throw apiError(400, 'Expected {enabled: true | false}')
+  function retireCodexSettings(r: MountRequest) {
     const c = callerOf(r)
-    // A machine setting, like the offline-chats one: a signed-in sbskrrt's to change.
+    // Preserve the old endpoint's person/admin checks even though it can no longer change anything.
     if (o.auth && c.person?.canSeeAll !== true) {
       o.auth.deny(c, c.person ? 403 : 401, c.person ? 'admin-only' : 'sign-in', 'PUT /agent-api/agentic/codex/settings')
       throw c.person ? authError(403, 'Only the owner of this app changes this.', 'admin-only') : authError(401, 'Sign in first.', 'sign-in')
     }
-    if (!o.codexSettings) throw apiError(503, "Codex isn't set up on this PC.")
-    o.codexSettings.set(raw.enabled)
-    log?.warn(`${c.person?.username ?? 'someone'} turned "Codex chats" ${raw.enabled ? 'ON' : 'off'}`)
-    emitWhere()
-    return { enabled: o.codexSettings.on() }
+    throw apiError(410, 'The local Codex chats setting has been retired. Codex uses installation and CRM access checks.')
   }
 
   function setOfflineChats(raw: unknown, r: MountRequest) {
@@ -3598,8 +3590,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         await o.codex?.check()
         return codexAnswer()
       }, 'local'],
-    ['GET', /^\/codex\/settings$/, () => ({ enabled: o.codexSettings?.on() === true }), 'local'],
-    ['PUT', /^\/codex\/settings$/, (_, r) => setCodexSettings(r.body, r), 'local'],
+    ['GET', /^\/codex\/settings$/, () => ({ enabled: true }), 'local'],
+    ['PUT', /^\/codex\/settings$/, (_, r) => retireCodexSettings(r), 'local'],
     ['PUT', /^\/offline-chats$/, (_, r) => setOfflineChats(r.body, r), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],

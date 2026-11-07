@@ -16,7 +16,6 @@ import { createFailover } from './claude/failover.ts'
 import { CHECK_EVERY_MS, createClaudeSubscription, loadSession, TOKEN_VAR } from './claude/index.ts'
 import { findCodex } from './codex/find.ts'
 import { createCodex } from './codex/index.ts'
-import { createCodexSettings } from './codex/settings.ts'
 import { startRowWatch } from './claude/rowwatch.ts'
 import { loadUserEnv } from './claude/userenv.ts'
 import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './config.ts'
@@ -221,14 +220,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   let crmFilesService: CrmFilesService | null = null
   const crmFilesLinux = process.platform === 'linux' && extras.agents !== false ? createLinuxMount({ dir: path.join(paths.agent, 'agentic'), service: () => crmFilesService, log: log.child('crm-drive') }) : undefined
   // F-134: Codex on this PC runs on the Codex subscription the CRM gives the person signed in here (their CRM session, the one F-007 keeps). Off until Settings › Chats turns it on.
-  const codexSettings = extras.agents === false ? null : createCodexSettings(path.join(paths.agent, 'agentic', 'codex-settings.json'))
   const codex = extras.agents === false
     ? null
     : createCodex({
         dir: path.join(paths.agent, 'codex'),
         deviceId: identity.id,
         session: () => loadSession(paths.crmSession),
-        enabled: () => codexSettings?.on() === true,
         find: () => findCodex(),
         log: log.child('codex'),
         // A newer login came while Codex chats ran: they hold the older one, so they restart on it (their conversations resume).
@@ -238,7 +235,6 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
     codex,
-    codexSettings,
     openCodeCredential: provider => openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
     openCodeIdentity: () => { const s = loadSession(paths.crmSession); return s ? `${s.user.id}:${s.signedInAt}` : null },
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).

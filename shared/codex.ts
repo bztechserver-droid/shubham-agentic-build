@@ -38,7 +38,7 @@ export type CodexState =
   | 'error'
 
 export interface CodexStatus {
-  /** Settings › Chats › "Codex chats": ships OFF. */
+  /** @deprecated Always true. Availability is determined by installation and CRM access. */
   enabled: boolean
   installed: boolean
   version: string | null
@@ -51,11 +51,6 @@ export interface CodexStatus {
   lastWrittenBackAt: string | null
   /** A refreshed login that has not reached the CRM yet (kept on this PC, retried); the page can say so. */
   waitingToWriteBack: boolean
-}
-
-/** What the page sends and reads for the one setting. */
-export interface CodexSettings {
-  enabled: boolean
 }
 
 /** The code of a 409 when an agent's engine changes while it has a conversation. */
