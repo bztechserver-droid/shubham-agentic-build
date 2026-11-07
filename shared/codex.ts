@@ -10,7 +10,7 @@
 export type CodexKind = 'chatgpt' | 'api_key'
 
 /** Which engine runs an agent's chat. '' follows the default in Settings › Chats (Claude unless that is changed). */
-export const AGENT_ENGINES = ['', 'claude', 'codex'] as const
+export const AGENT_ENGINES = ['', 'claude', 'codex', 'opencode'] as const
 export type AgentEngine = (typeof AGENT_ENGINES)[number]
 
 /** How hard a Codex chat thinks (model_reasoning_effort); '' leaves it to Codex. The installed CLI has the last word. */
@@ -63,7 +63,7 @@ export const ENGINE_CHANGE_CODE = 'engine-change-new-conversation'
 export const ENGINE_CHANGE_MESSAGE = 'Changing the engine carries your conversation over to the new engine. The original stays saved. If conversion is unavailable, a new conversation starts.'
 
 /** The engine an agent actually runs, given its own setting and the default. */
-export function engineOf(own: AgentEngine | undefined, dflt: AgentEngine | undefined): 'claude' | 'codex' {
+export function engineOf(own: AgentEngine | undefined, dflt: AgentEngine | undefined): 'claude' | 'codex' | 'opencode' {
   const e = own || dflt || ''
-  return e === 'codex' ? 'codex' : 'claude'
+  return e === 'opencode' ? 'opencode' : e === 'codex' ? 'codex' : 'claude'
 }

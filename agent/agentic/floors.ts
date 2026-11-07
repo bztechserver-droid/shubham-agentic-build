@@ -1,3 +1,4 @@
+import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE } from '../../shared/opencode.ts'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync } from 'node:fs'
 import {
@@ -82,6 +83,9 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
     // F-134: the engine and the Codex model and effort are the page's to set; the Codex conversation id is the agent's (patch() puts the old one back).
     engine: isEngine(a.engine) ? a.engine : '',
+    opencodeProvider: a.opencodeProvider === 'openai' || a.opencodeProvider === 'anthropic' ? a.opencodeProvider : '',
+    opencodeModel: openCodeModel(a.opencodeModel),
+    opencodeSession: typeof a.opencodeSession === 'string' && OPENCODE_SESSION_RE.test(a.opencodeSession) ? a.opencodeSession : null,
     codexModel: typeof a.codexModel === 'string' ? a.codexModel.trim().slice(0, CODEX_MODEL_MAX) : '',
     codexEffort: isCodexEffort(a.codexEffort) ? a.codexEffort : '',
     codexThread: typeof a.codexThread === 'string' && THREAD_ID_RE.test(a.codexThread) ? a.codexThread.toLowerCase() : null,
@@ -166,6 +170,7 @@ function shareList(v: unknown): ChatShare[] {
 }
 
 export interface FloorStore {
+  validatePatch(id: string, patch: FloorPatch, as?: ChatOwner): Floor
   list(): Floor[]
   get(id: string): Floor | null
   /** `as` (F-118): who makes it; the floor and its Lead are theirs. */
@@ -194,6 +199,7 @@ export interface FloorStore {
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
   /** F-134: the Codex conversation id of an agent's chat (null: none yet). Only the agent calls this, never a page. */
+  setOpenCodeSession(floorId: string, agentId: string, native: string | null): Floor
   setCodexThread(floorId: string, agentId: string, thread: string | null): Floor
   /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
   setHome(floorId: string, agentId: string, home: { id: string; name: string } | null): Floor
@@ -231,17 +237,19 @@ export function ensureDuty(floors: Floor[]): boolean {
 
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
 export interface FloorStoreOptions {
+  seed?: Floor[]
+  readOnly?: boolean
   /** F-134: the engine an agent set to "Default" runs, so changing it is judged by what really runs. */
   defaultEngine?: () => AgentEngine
   /** F-142: after validation, carry a confirmed engine change into a fresh server-owned binding. */
-  switchConversation?: (floor: Floor, previous: FloorAgent, to: 'claude' | 'codex') => Pick<FloorAgent, 'sessionId' | 'codexThread' | 'homePc' | 'homePcName'> | null
+  switchConversation?: (floor: Floor, previous: FloorAgent, to: 'claude' | 'codex' | 'opencode') => Pick<FloorAgent, 'sessionId' | 'codexThread' | 'opencodeSession' | 'homePc' | 'homePcName'> | null
 }
 
 export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
   const defaultEngine = () => opts.defaultEngine?.() ?? ''
-  let floors: Floor[] = load()
+  let floors: Floor[] = opts.seed ? clone(opts.seed) : load()
   // F-086: the migration runs at the start; what it changed is written with the next change at the latest (and at once if it can be).
-  if (ensureDuty(floors)) {
+  if (ensureDuty(floors) && !opts.readOnly) {
     try {
       writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`)
     } catch {
@@ -269,8 +277,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
 
   function save() {
     ensureDuty(floors)
-    writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`)
-    onChange()
+    if (!opts.readOnly) { writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`); onChange() }
   }
 
   function find(id: string): Floor {
@@ -291,6 +298,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
   }
 
   return {
+    validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine }).patch(id, patch, as) },
     list: () => clone(floors),
     get: id => {
       const f = floors.find(x => x.id === id)
@@ -345,6 +353,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         // The boss can be removed too: the page marks who takes over (else repairAgents makes
         // it the first agent), and taking the last agent off leaves an empty floor.
         const next = p.agents.map((raw, i) => {
+          if (isObject(raw)) {
+            if (raw.opencodeProvider !== undefined && !['', 'openai', 'anthropic'].includes(String(raw.opencodeProvider))) throw apiError(400, 'OpenCode provider is openai or anthropic')
+            if (raw.opencodeModel !== undefined && !validOpenCodeModel(raw.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
+          }
           const a = hydrateAgent(raw, i)
           // The binding is the server's: kept from what was there, never taken from the page.
           a.sessionId = before.get(a.id)?.sessionId ?? null
@@ -355,12 +367,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           a.duty = before.get(a.id)?.duty ?? null
           // The conversation binding is server-owned. F-142 carries it across engines after validation below.
           const had = before.get(a.id)
+          a.opencodeSession = had?.opencodeSession ?? null
           a.codexThread = had?.codexThread ?? null
           if (had && had.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
             if (p.confirmNewConversation !== true) {
               throw Object.assign(apiError(409, ENGINE_CHANGE_MESSAGE), { code: ENGINE_CHANGE_CODE })
             }
             a.sessionId = null
+            a.opencodeSession = null
             a.codexThread = null
             a.homePc = null
             a.homePcName = null
@@ -456,7 +470,9 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       }
       if (req.model !== undefined && !isModel(req.model)) throw apiError(400, 'model is opus, sonnet or haiku')
       if (req.effort !== undefined && !isEffort(req.effort)) throw apiError(400, 'effort is low, medium, high, xhigh or max')
-      if (req.engine !== undefined && !isEngine(req.engine)) throw apiError(400, 'engine is claude, codex, or "" for the default')
+      if (req.engine !== undefined && !isEngine(req.engine)) throw apiError(400, 'engine is claude, codex, opencode, or "" for the default')
+      if (req.opencodeProvider !== undefined && !['', 'openai', 'anthropic'].includes(req.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai or anthropic')
+      if (req.opencodeModel !== undefined && !validOpenCodeModel(req.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
       if (req.codexEffort !== undefined && !isCodexEffort(req.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
       const index = floor.agents.length
       // The first agent on an empty floor is its boss, at the boss's desk; the rest go in rows below.
@@ -470,6 +486,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           model: req.model ?? '',
           effort: req.effort ?? '',
           engine: req.engine ?? '',
+          opencodeProvider: req.opencodeProvider,
+          opencodeModel: req.opencodeModel,
           codexModel: req.codexModel ?? '',
           codexEffort: req.codexEffort ?? '',
           owner: as,
@@ -547,12 +565,20 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (agent.sessionId !== sessionId) {
         agent.homePc = null
         agent.homePcName = null
+        agent.opencodeSession = null
         agent.codexThread = null
       }
       agent.sessionId = sessionId
       floor.updatedAt = now()
       save()
       return clone(floor)
+    },
+
+    setOpenCodeSession(floorId, agentId, native) {
+      if (native !== null && !OPENCODE_SESSION_RE.test(native)) throw apiError(400, 'Invalid OpenCode session id')
+      const floor = find(floorId), agent = agentOf(floor, agentId)
+      agent.opencodeSession = native
+      floor.updatedAt = now(); save(); return clone(floor)
     },
 
     setCodexThread(floorId, agentId, thread) {

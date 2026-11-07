@@ -131,7 +131,7 @@ export interface StartChat {
   cols?: number
   rows?: number
   /** F-134: which engine runs it (Claude when left out). */
-  engine?: 'claude' | 'codex'
+  engine?: 'claude' | 'codex' | 'opencode'
   /**
    * F-134, for the Codex engine: the Codex home it runs in (CODEX_HOME), its profile (codex -p <profile>) and, to resume, the Codex conversation id.
    * model/effort/brief/MCP servers are in the profile file (codex/home.ts writeProfile), so none of the Claude flags above are used.
@@ -145,7 +145,7 @@ export interface ChatEnded {
   floorId: string
   agentId: string
   /** F-134 */
-  engine: 'claude' | 'codex'
+  engine: 'claude' | 'codex' | 'opencode'
   cause: string
   code: number | null
   startedAt: string
@@ -160,7 +160,7 @@ export interface ChatInfo {
   floorId: string
   agentId: string
   /** F-134: the engine it really runs. */
-  engine: 'claude' | 'codex'
+  engine: 'claude' | 'codex' | 'opencode'
   cwd: string
   state: ChatState
   startedAt: string
@@ -223,7 +223,7 @@ export interface AdoptChat {
   floorId: string
   agentId: string
   /** F-134: from the host's record of the chat (Claude when it has none). */
-  engine?: 'claude' | 'codex'
+  engine?: 'claude' | 'codex' | 'opencode'
   cwd: string
   startedAt: string
   key: string
@@ -306,7 +306,7 @@ const DROP_ENV = /^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLA
 
 interface Chat {
   info: Omit<ChatInfo, 'state' | 'viewers'>
-  engine: 'claude' | 'codex'
+  engine: 'claude' | 'codex' | 'opencode'
   pty: PtyLike
   key: string
   state: ChatState

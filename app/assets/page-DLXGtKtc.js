@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-Cim95dCV.js";function t(){e(`/goals`)}export{t as default};

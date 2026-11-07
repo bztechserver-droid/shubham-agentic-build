@@ -57,6 +57,7 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/offline-chats$/, SIGNED],
   // F-134: Codex on this PC: its status (names only), asking the CRM now, and the setting.
   ['GET', /^\/codex\/status$/, SIGNED],
+  ['GET', /^\/opencode\/status$/, SIGNED],
   ['POST', /^\/codex\/refresh$/, OWNER],
   ['GET', /^\/codex\/settings$/, SIGNED],
   ['PUT', /^\/codex\/settings$/, OWNER],

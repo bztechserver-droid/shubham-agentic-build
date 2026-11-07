@@ -1,3 +1,4 @@
+import { openCodeProvider, openCodeModel, validOpenCodeModel, OPENCODE_PROVIDERS } from '../../shared/opencode.ts'
 import { readFileSync } from 'node:fs'
 import { AGENT_EFFORTS, AGENT_MODELS, NO_DEFAULTS, type AgentEffort, type AgentModel, type ChatDefaults } from '../../shared/agentic.ts'
 import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
@@ -24,6 +25,7 @@ export function parseDefaults(raw: unknown): ChatDefaults {
     ultracode: r.ultracode === true,
     // F-134: the engine "Default" means, and the Codex model and effort (a file or state from before it has none: Claude, Codex's own).
     engine: isEngine(r.engine) ? r.engine : '',
+    ...(r.opencodeProvider !== undefined || r.opencodeModel !== undefined ? { opencodeProvider: openCodeProvider(r.opencodeProvider), opencodeModel: openCodeModel(r.opencodeModel) } : {}),
     codexModel: codexModelOf(r.codexModel),
     codexEffort: isCodexEffort(r.codexEffort) ? r.codexEffort : '',
   }
@@ -53,7 +55,13 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
       if (p.engine !== undefined && !isEngine(p.engine)) throw apiError(400, 'engine is claude, codex, or "" for Claude')
       if (p.codexEffort !== undefined && !isCodexEffort(p.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
       if (p.codexModel !== undefined && typeof p.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
+      if (p.opencodeProvider !== undefined && !(OPENCODE_PROVIDERS as readonly unknown[]).includes(p.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai or anthropic')
+      if (p.opencodeModel !== undefined && !validOpenCodeModel(p.opencodeModel)) throw apiError(400, 'Invalid OpenCode model name')
       const next: ChatDefaults = {
+        ...(p.opencodeProvider !== undefined || p.opencodeModel !== undefined || now.opencodeProvider !== undefined || now.opencodeModel !== undefined ? {
+          opencodeProvider: p.opencodeProvider !== undefined ? openCodeProvider(p.opencodeProvider) : openCodeProvider(now.opencodeProvider),
+          opencodeModel: p.opencodeModel !== undefined ? openCodeModel(p.opencodeModel) : openCodeModel(now.opencodeModel),
+        } : {}),
         model: p.model !== undefined ? (p.model as AgentModel) : now.model,
         effort: p.effort !== undefined ? (p.effort as AgentEffort) : now.effort,
         ultracode: p.ultracode !== undefined ? p.ultracode === true : now.ultracode,
@@ -62,6 +70,8 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
         codexEffort: p.codexEffort !== undefined ? (p.codexEffort as CodexEffort) : (now.codexEffort ?? ''),
       }
       if (
+        next.opencodeProvider === openCodeProvider(now.opencodeProvider) &&
+        next.opencodeModel === openCodeModel(now.opencodeModel) &&
         next.model === now.model &&
         next.effort === now.effort &&
         next.ultracode === now.ultracode &&

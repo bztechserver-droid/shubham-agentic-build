@@ -5,6 +5,7 @@
 // tools Claude chats call (`/agentic/mcp/...`) with the chat's own key instead.
 
 import type { AuthEnded, ChatAccess, ChatCan, ChatOwner, ChatShare } from './auth.ts'
+import type { OpenCodeProvider } from './opencode.ts'
 import type { AgentEngine, CodexEffort } from './codex.ts'
 
 export const AGENTIC_PREFIX = '/agentic'
@@ -37,6 +38,8 @@ export interface ChatDefaults {
   ultracode: boolean
   /** F-134: which engine an agent set to "Default" runs ('' = Claude), and the model and effort a Codex chat gets ('' = Codex's own). Absent on an older copy. */
   engine?: AgentEngine
+  opencodeProvider?: OpenCodeProvider | ''
+  opencodeModel?: string
   codexModel?: string
   codexEffort?: CodexEffort
 }
@@ -98,6 +101,8 @@ export interface FloorAgent {
    * With the engine 'codex' its model and effort are these two (the Claude ones above are not used).
    */
   engine?: AgentEngine
+  opencodeProvider?: OpenCodeProvider | ''
+  opencodeModel?: string
   codexModel?: string
   codexEffort?: CodexEffort
   /**
@@ -105,6 +110,7 @@ export interface FloorAgent {
    * is still the app's id of the chat). Set by the agent only, never taken from a page.
    */
   codexThread?: string | null
+  opencodeSession?: string | null
   /** Skills and MCP servers it was given; named in its brief (advisory, as in the original). */
   skills: string[]
   mcpServers: string[]
@@ -247,6 +253,8 @@ export interface NewAgent {
   effort?: AgentEffort
   /** F-134 */
   engine?: AgentEngine
+  opencodeProvider?: OpenCodeProvider | ''
+  opencodeModel?: string
   codexModel?: string
   codexEffort?: CodexEffort
 }
@@ -432,6 +440,8 @@ export interface TuneRequest {
   effort?: AgentEffort
   ultracode?: AgentUltracode
   /** Codex tuning applies on the next start. */
+  opencodeProvider?: OpenCodeProvider | ''
+  opencodeModel?: string
   codexModel?: string
   codexEffort?: CodexEffort
 }

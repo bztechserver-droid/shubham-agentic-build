@@ -1,3 +1,4 @@
+import { openCodeCredential } from './opencode/crm.ts'
 import type net from 'node:net'
 import { copyFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
@@ -238,6 +239,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     dir: path.join(paths.agent, 'agentic'),
     codex,
     codexSettings,
+    openCodeCredential: provider => openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
+    openCodeIdentity: () => { const s = loadSession(paths.crmSession); return s ? `${s.user.id}:${s.signedInAt}` : null },
     // F-138: the CRM's Claude credential for this account, exactly one of CLAUDE_CODE_OAUTH_TOKEN (a subscription) and ANTHROPIC_API_KEY (an API key).
     credential: () => claude.credentialEnv(),
     auth,

@@ -1,3 +1,9 @@
+import { prepareConversation, jsonLines, type PreparedConversation } from '../opencode/switch.ts'
+import { interchange } from '../opencode/backend.ts'
+import { createOpenCodePool, combinePools, type OpenCodePoolOptions } from '../opencode/pool.ts'
+import type { OpenCodeProvider } from '../../shared/opencode.ts'
+import { openCodeProvider } from '../../shared/opencode.ts'
+import type { ApiCredential } from '../opencode/crm.ts'
 import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
@@ -47,7 +53,7 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
-import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chats.ts'
+import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type PtySpawn } from './chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
@@ -219,6 +225,11 @@ export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
   /** F-134: Codex on this PC (the CRM's Codex login, the home, the chats). Left out (tests, older callers): agents set to Codex are refused with a plain sentence. */
+  openCodeCredential?: (provider: OpenCodeProvider) => Promise<ApiCredential>
+  openCodeIdentity?: () => string | null
+  openCodeFind?: OpenCodePoolOptions['find']
+  openCodeBackend?: OpenCodePoolOptions['backend']
+  openCodeFreeMemory?: () => number
   codex?: CodexManager | null
   /** F-134: Settings › Chats › "Codex chats" (off unless turned on). */
   codexSettings?: CodexSettings | null
@@ -441,7 +452,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     log: o.log,
     screen: sid => chats.screen(sid),
     // F-134: a Codex chat's conversation is its rollout file, read in Codex's format.
-    fileOf: sid => codexRollout(sid),
+    fileOf: sid => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid),
     formatOf: sid => (isCodexSession(sid) ? CODEX_FORMAT : CLAUDE_FORMAT),
   })
   // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
@@ -536,6 +547,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     list: () => pickFloors().list(),
     get: id => pickFloors().get(id),
     create: (name, as) => pickFloors().create(name, as),
+    validatePatch: (id, p, as) => pickFloors().validatePatch(id, p, as),
+    setOpenCodeSession: (f, a, n) => pickFloors().setOpenCodeSession(f, a, n),
     patch: (id, p, as) => pickFloors().patch(id, p, as),
     setShare: (f, a, l) => pickFloors().setShare(f, a, l),
     assignUnowned: owner => pickFloors().assignUnowned(owner),
@@ -731,7 +744,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   const defaultEngine = (): AgentEngine => defaultsNow().engine ?? ''
   /** The engine an agent really runs: its own setting, else Settings › Chats'. */
-  const engineFor = (agent: FloorAgent): 'claude' | 'codex' => engineOf(agent.engine, defaultEngine())
+  const engineFor = (agent: FloorAgent): 'claude' | 'codex' | 'opencode' => engineOf(agent.engine, defaultEngine())
   const isCodexSession = (sid: string): boolean => {
     const at = bySession(sid)
     return !!at && engineFor(at.agent) === 'codex'
@@ -751,10 +764,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return found
   }
   /** Every place that looks for a chat's conversation goes through this: a Codex chat's is its rollout, any other chat's is Claude's JSONL. */
-  const findTranscript = (sid: string, dir: string): string | null => codexRollout(sid) ?? findClaudeTranscript(sid, dir)
+  const isOpenCode = (sid: string) => { const at = bySession(sid); return !!at && engineFor(at.agent) === 'opencode' }
+  const findTranscript = (sid: string, dir: string): string | null => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid) ?? findClaudeTranscript(sid, dir)
 
   /** Where this PC keeps a session's JSONL, whether it has it yet or not. */
   function fileOf(sid: string): string {
+    if (isOpenCode(sid)) return openCode.mirror(sid)
     const found = findTranscript(sid, projectsDir)
     if (found) return found
     const at = bySession(sid)
@@ -794,7 +809,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
   /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
   const startCause = new Map<string, string>()
-  const chats = createChatPool({
+  const poolOptions: ChatPoolOptions = {
     addDirs: [uploads.dir],
     // F-083: a chat with an open order or unfinished work is never ended for being idle.
     keep: sid => workOf(sid) !== null,
@@ -841,7 +856,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }, 150)
       liveTimer.unref()
     },
+  }
+  const openCode = createOpenCodePool({
+    dir: path.join(o.dir, 'opencode'), toolsUrl: () => poolOptions.toolsUrl(), shim,
+    credential: o.openCodeCredential ?? (async () => { throw apiError(503, 'OpenCode CRM credentials are not configured on this PC.') }),
+    find: o.openCodeFind, backend: o.openCodeBackend, freeMemory: o.openCodeFreeMemory, spawn: o.spawn,
+    keep: sid => workOf(sid) !== null,
+    identity: o.openCodeIdentity,
+    onBind: async (sid, native) => {
+      const at = bySession(sid)
+      if (!at) throw apiError(409, 'The OpenCode chat binding changed during start.')
+      if (mode() === 'member' && !isLocalFloor(at.floor.id)) await request(needHub(), 'opencode-bind', { sessionId: sid, native })
+      else floors.setOpenCodeSession(at.floor.id, at.agent.id, native)
+    },
+    onChange: () => poolOptions.onChange?.(), onEnded: e => poolOptions.onEnded?.(e),
   })
+  const chats = combinePools(createChatPool(poolOptions), openCode.pool)
 
   // F-075: the chats the agent before this one left running in the chat host are taken over at once.
   const adopted: Promise<void> = o.chatHost
@@ -1029,6 +1059,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Starts the agent's chat on this PC (its lease already got). */
   async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+    if (engineFor(agent) === 'opencode') {
+      const dflt = defaultsNow(), cwd = codeDirOf(floor)
+      if (agent.opencodeSession && agent.homePc && agent.homePc !== self().id) throw apiError(409, 'OpenCode conversations resume on their home PC.')
+      const mcp: NonNullable<import('../opencode/backend.ts').BackendOptions['mcp']> = {}
+      const registry = readRegistry(mcpRegistryFile)
+      for (const name of chosen(registry, agent.mcpServers)) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
+      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: openCodeProvider(agent.opencodeProvider || dflt.opencodeProvider), selectedModel: agent.opencodeModel || dflt.opencodeModel || '', native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'OpenCode'), mcp })
+      heartbeat.opened(sid)
+      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new' })
+      if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
+      return !!agent.opencodeSession
+    }
     if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size)
     const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
@@ -1408,7 +1450,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // F-134: a Codex chat's conversation is not mirrored between PCs yet: it stays on the PC that started it.
       const codexHere = (() => {
         try {
-          return engineFor(agentOf(floorOf(floorId), agentId)) === 'codex'
+          return engineFor(agentOf(floorOf(floorId), agentId)) !== 'claude'
         } catch {
           return false
         }
@@ -1642,8 +1684,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
     // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
-    if (mode() === 'member' && isLocalFloor(floorId)) needClaudeHere()
-    else if (mode() === 'member') return openOnMember(floorId, agentId, req)
+    if (mode() === 'member') {
+      if (!isLocalFloor(floorId)) return openOnMember(floorId, agentId, req)
+      if (engineFor(agentOf(floorOf(floorId), agentId)) === 'claude') needClaudeHere()
+    }
     let floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
@@ -1677,6 +1721,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return false
     const at = floors.bySession(sid)
     if (!at || !chats.info(sid)) return false
+    if (chats.info(sid)?.engine === 'opencode') {
+      await openCode.abort(sid)
+      chats.kill(sid, 'restart')
+      await openCode.waitStopped(sid)
+      return resumeChat(sid)
+    }
     // The same draft rule as every message to a chat: /exit pasted after Shubham's unsent words would be sent WITH them, and a
     // chat stopped under them would lose them. A real draft: nothing is typed, nothing is stopped, 409. (A grey suggestion is not one.)
     if (hasDraft(sid)) throw apiError(409, `${at.agent.name}'s chat has unsent text in its box; nothing was typed and it was not restarted.`)
@@ -2753,14 +2803,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { agent: agentOf(floor, agentId) }
   }
 
+  const preparedSwitches = new Map<string, (PreparedConversation & { homePc: string; homePcName: string }) | null>()
+  const floorMutations = new Map<string, Promise<unknown>>()
+
   /** F-142: snapshot the old engine's history into a new id, keeping the original file intact. */
-  function carryConversation(floor: Floor, previous: FloorAgent, to: 'claude' | 'codex') {
+  function carryConversation(floor: Floor, previous: FloorAgent, to: 'claude' | 'codex' | 'opencode') {
     const sid = previous.sessionId!
     try {
       const location = whereAll()[sid]
       if ((location && location.id !== self().id) || (previous.homePc && previous.homePc !== self().id)) {
         throw new Error('conversation lives on another PC; local conversion is unavailable')
       }
+      if (to === 'opencode' || engineFor(previous) === 'opencode') return preparedSwitches.get(previous.id) ?? null
       const file = engineFor(previous) === 'codex'
         ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
         : findClaudeTranscript(sid, projectsDir)
@@ -2777,18 +2831,75 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function patchFloor(id: string, body: unknown, as?: ChatOwner) {
+    const pending = (floorMutations.get(id) ?? Promise.resolve()).catch(() => {}).then(() => patchFloorPrepared(id, body, as))
+    floorMutations.set(id, pending)
+    void pending.finally(() => { if (floorMutations.get(id) === pending) floorMutations.delete(id) }).catch(() => {})
+    return pending
+  }
+
+  async function patchFloorPrepared(id: string, body: unknown, as?: ChatOwner) {
     if (!isObject(body)) throw apiError(400, 'Expected {name?, globalPrompt?, codeDir?, agents?}')
     const before = floorOf(id)
     if (typeof body.codeDir === 'string' && body.codeDir.trim()) checkFolder(body.codeDir)
-    const floor = floors.patch(id, body as FloorPatch, as)
+    const preview = floors.validatePatch(id, body as FloorPatch, as)
+    const fingerprint = JSON.stringify(before)
+    const prepared: string[] = []
+    const conversionNotes: string[] = []
+    try {
+      for (const previous of before.agents) {
+        const next = preview.agents.find(a => a.id === previous.id)
+        const from = engineFor(previous), to = next ? engineFor(next) : from
+        if (!next || !previous.sessionId || from === to || (from !== 'opencode' && to !== 'opencode')) continue
+        const sid = previous.sessionId
+        if (to === 'opencode') {
+          if (!openCode.install() || !o.openCodeCredential) throw apiError(503, 'OpenCode is not configured on this PC.')
+          await o.openCodeCredential(openCodeProvider(next.opencodeProvider || defaultsNow().opencodeProvider))
+          if (openCode.status().live >= 2) throw apiError(503, 'OpenCode is at this PC’s two-backend limit.')
+        }
+        if (previous.homePc && previous.homePc !== self().id) {
+          preparedSwitches.set(previous.id, null); prepared.push(previous.id)
+          conversionNotes.push(`${previous.name}: the original history is on another PC; the new engine starts a fresh conversation.`)
+          continue
+        }
+        try {
+        let cwd = chats.info(sid)?.cwd || codeDirOf(preview)
+        let source: unknown
+        if (from === 'opencode') {
+          if (chats.info(sid)) source = await openCode.snapshot(sid)
+          else {
+            const install = openCode.install()
+            if (!install || !previous.opencodeSession) throw apiError(409, 'OpenCode history is unavailable on this PC.')
+            source = JSON.parse(await interchange(install, openCode.rootOf(sid), codeDirOf(before), ['export', previous.opencodeSession]))
+          }
+          if (isObject(source) && isObject(source.info) && typeof source.info.directory === 'string' && path.isAbsolute(source.info.directory)) cwd = source.info.directory
+        } else {
+          const file = from === 'codex' ? (previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null) : findClaudeTranscript(sid, projectsDir)
+          if (!file) throw apiError(409, 'The source conversation is unavailable on its home PC.')
+          cwd = conversationCwd(file) || cwd
+          if (chats.info(sid)) { chats.kill(sid, 'engine-change'); await settled(file) }
+          source = jsonLines(file)
+        }
+        const result = await prepareConversation({ from, to, source, cwd, projectsDir, codexHome: o.codex?.paths.home, openCodeRoot: openCode.rootOf, install: openCode.install() })
+        preparedSwitches.set(previous.id, { ...result, homePc: self().id, homePcName: self().name }); prepared.push(previous.id)
+        } catch (error) {
+          preparedSwitches.set(previous.id, null); prepared.push(previous.id)
+          const detail = `${previous.name}: history could not be imported and verified on this PC (${message(error)}). Starting a fresh conversation; the original remains saved.`
+          conversionNotes.push(detail); log?.warn(detail)
+        }
+      }
+      if (JSON.stringify(floorOf(id)) !== fingerprint) throw apiError(409, 'This floor changed while the conversation was prepared. Try again.')
+    } catch (error) { for (const agentId of prepared) preparedSwitches.delete(agentId); throw error }
+    let floor: Floor
+    try { floor = floors.patch(id, body as FloorPatch, as) }
+    finally { for (const agentId of prepared) preparedSwitches.delete(agentId) }
     // An agent taken off the floor takes its running chat with it, wherever it runs.
     const kept = new Set(floor.agents.map(a => a.id))
     for (const a of before.agents) {
       const after = floor.agents.find(next => next.id === a.id)
       // Also stop an old engine whose binding has just been replaced (including conversion fallback).
-      if (a.sessionId && (!kept.has(a.id) || after?.sessionId !== a.sessionId)) stopAnywhere(a.sessionId)
+      if (a.sessionId && (!kept.has(a.id) || after?.sessionId !== a.sessionId || (engineFor(a) === 'opencode' && (a.opencodeProvider !== after?.opencodeProvider || a.opencodeModel !== after?.opencodeModel)))) stopAnywhere(a.sessionId)
     }
-    return { floor }
+    return { floor, ...(conversionNotes.length ? { conversionNotes } : {}) }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -3207,7 +3318,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (req.model === undefined && req.effort === undefined && req.ultracode === undefined) throw apiError(400, 'Nothing to change: give model, effort or ultracode')
     const before = floorOf(floorId)
     const a = agentOf(before, agentId)
-    if (engineFor(a) === 'codex') throw apiError(400, `${a.name} runs Codex: its model and effort are codexModel and codexEffort (Claude's model, effort and ultracode don't apply to it).`)
+    if (engineFor(a) !== 'claude') throw apiError(400, `${a.name} runs ${engineFor(a)}: use that engine’s provider/model settings.`)
     const model = req.model ?? a.model
     const effort = req.effort ?? a.effort
     const ultracode = req.ultracode ?? a.ultracode
@@ -3481,6 +3592,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
     // F-134: Codex on this PC.
+    ['GET', /^\/opencode\/status$/, () => openCode.status(), 'local'],
     ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
     ['POST', /^\/codex\/refresh$/, async () => {
         await o.codex?.check()
@@ -3585,6 +3697,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const say = isObject(r.body) && typeof r.body.say === 'string' ? r.body.say.slice(0, MAX_SAY_TEXT) : undefined
         if (mode() === 'member') return await request<ChatOpened>(needHub(), 'http', { method: 'POST', rest: `/floors/${enc(id)}/agents/${enc(agentId)}/run-on`, body: { pc, say } }, 60_000)
         const agent = agentOf(floorOf(id), agentId)
+        if (engineFor(agent) === 'opencode' && agent.opencodeSession && agent.homePc && agent.homePc !== pc) throw apiError(409, 'OpenCode conversations resume on their home PC. Switch engines to carry the conversation to another PC.')
         let opened: ChatOpened
         let name = self().name
         if (pc === self().id) {
@@ -3978,6 +4091,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'adopt':
           // F-127: floors a member made while it could not reach this PC, taken in whole.
           return answer(raw => adoptFloors(from, raw))
+        case 'opencode-bind':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.native !== 'string') throw apiError(400, 'Expected OpenCode binding')
+            const at = bySession(raw.sessionId)
+            if (!at || engineFor(at.agent) !== 'opencode' || held.get(raw.sessionId)?.holder !== from.id) throw apiError(403, 'This PC does not hold that OpenCode conversation')
+            floors.setOpenCodeSession(at.floor.id, at.agent.id, raw.native)
+            return { ok: true }
+          })
         case 'http':
           return answer(body => fromMember(from, body))
         case 'lease':

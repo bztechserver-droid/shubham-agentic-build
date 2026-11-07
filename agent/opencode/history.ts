@@ -43,6 +43,7 @@ export function readHistory(engine: Engine, input: unknown, fallback: string): H
           parts.push(t)
         } else if (!['reasoning', 'step-start', 'step-finish', 'snapshot', 'patch'].includes(String(p.type))) parts.push(note(p.type === 'compaction' ? 'Compaction boundary' : 'Unsupported part'))
       }
+      if (m.info.role === 'assistant' && row(m.info.error)) parts.push({ type: 'text', text: '[OpenCode provider error: check the selected API key and model.]' })
       add(m.info.role as 'user' | 'assistant', at(row(m.info.time) ? m.info.time.created : undefined, fallback), parts)
     }
     return out
@@ -52,10 +53,10 @@ export function readHistory(engine: Engine, input: unknown, fallback: string): H
     if (typeof line !== 'string' || line.length > 8 * 1024 * 1024) continue
     let r: unknown
     try { r = JSON.parse(line.replace(/^\uFEFF/, '')) } catch { continue }
-    if (!row(r) || r.isMeta === true || r.isSidechain === true) continue
+    if (!row(r) || r.isSidechain === true || (r.isMeta === true && !(engine === 'claude' && ((r.type === 'user' && r.isCompactSummary === true) || (r.type === 'system' && r.subtype === 'compact_boundary'))))) continue
     const time = at(r.timestamp, fallback)
     if (engine === 'claude') {
-      if (r.type === 'system' && r.subtype === 'compact_boundary') { add('user', time, [note('Compaction boundary')]); continue }
+      if (r.type === 'system' && r.subtype === 'compact_boundary') { out.length = 0; pending.clear(); add('user', time, [note('Compaction boundary')]); continue }
       if (r.type === 'attachment' && row(r.attachment) && r.attachment.type === 'queued_command' && r.attachment.commandMode === 'prompt') { add('user', time, [{ type: 'text', text: body(r.attachment.prompt) }]); continue }
       if (!['user', 'assistant'].includes(String(r.type)) || !row(r.message)) continue
       const parts: Part[] = []
@@ -110,25 +111,17 @@ export function emitHistory(engine: Engine, history: HistoryMessage[], options: 
     out.push(JSON.stringify({ type: role, uuid, parentUuid, sessionId: options.id, cwd: options.cwd, timestamp: time, version: '2.1.319', isSidechain: false, userType: 'external', message: { role, content, ...(role === 'assistant' ? { id: `msg_import_${seq}`, type: 'message', model: 'imported-opencode', stop_reason: content.some(p => p.type === 'tool_use') ? 'tool_use' : 'end_turn' } : {}) } }))
     parentUuid = uuid
   }
-  if (engine === 'codex') out.push(JSON.stringify({ type: 'session_meta', timestamp: options.timestamp, payload: { id: options.id, cwd: options.cwd, timestamp: options.timestamp, originator: 'codex_cli_rs', cli_version: '0.163.0', source: 'cli', model_provider: 'openai', base_instructions: { text: '' } } }))
-  const response = (payload: Row, time: string) => out.push(JSON.stringify({ type: 'response_item', timestamp: time, payload }))
-  let turn = 0
-  let active = false
-  const event = (type: string, time: string) => out.push(JSON.stringify({ type: 'event_msg', timestamp: time, payload: { type, turn_id: `${options.id}-${turn}`, ...(type === 'task_started' ? { model_context_window: null, collaboration_mode_kind: 'default' } : { last_agent_message: null }) } }))
-  for (const m of history) {
-    if (engine === 'codex') {
-      if (active && m.role === 'user') { event('task_complete', m.time); active = false }
-      if (!active) { turn++; event('task_started', m.time); active = true }
-    }
-    for (const p of m.parts) {
-    if (engine === 'claude') {
-      if (p.type === 'text') push(m.role, [{ type: 'text', text: safe(p.text) }], m.time)
-      else { const id = `call_import_${++seq}`; push('assistant', [{ type: 'tool_use', id, name: safe(p.name), input: sanitizeConversationValue(p.input) }], m.time); push('user', [{ type: 'tool_result', tool_use_id: id, content: safe(p.output), is_error: p.error }], m.time) }
-    } else if (p.type === 'text') response({ type: 'message', role: m.role, content: [{ type: m.role === 'user' ? 'input_text' : 'output_text', text: safe(p.text) }] }, m.time)
-    else { const call_id = `call_import_${++seq}`; response({ type: 'custom_tool_call', call_id, name: safe(p.name), input: JSON.stringify(sanitizeConversationValue(p.input)), status: 'completed' }, m.time); response({ type: 'custom_tool_call_output', call_id, output: `${p.error ? '[Tool error]\n' : ''}${safe(p.output)}` }, m.time) }
+  for (const m of history) for (const p of m.parts) {
+    if (p.type === 'text') push(m.role, [{ type: 'text', text: safe(p.text) }], m.time)
+    else {
+      const id = `call_import_${++seq}`
+      push('assistant', [{ type: 'tool_use', id, name: safe(p.name), input: sanitizeConversationValue(p.input) }], m.time)
+      push('user', [{ type: 'tool_result', tool_use_id: id, content: safe(p.output), is_error: p.error }], m.time)
     }
   }
-  if (active) event('task_complete', options.timestamp)
+  // One native Codex emitter: its current CLI shape and turn events are owned by
+  // F-142. This transient block representation never touches disk.
+  if (engine === 'codex') return fromClaude(out, options)
   return out
 }
 
