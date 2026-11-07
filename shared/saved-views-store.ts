@@ -1,10 +1,12 @@
 import { parseViews } from './views.ts'
-import { rebaseViews, validSnapshot, type SyncedView, type ViewDeviceKind, type ViewOperation, type ViewSnapshot } from './view-sync.ts'
+import { rebaseViews, sameView, validSnapshot, type SyncedView, type ViewDeviceKind, type ViewOperation, type ViewSnapshot } from './view-sync.ts'
 
 export type SyncState = 'local' | 'pending' | 'synced' | 'offline' | 'reauth' | 'conflict' | 'blocked' | 'unsupported'
 interface Cache { remote: SyncedView[]; revision: number; operations: ViewOperation[]; conflicts: ViewOperation[]; examined: boolean; legacy: SyncedView[] }
 interface StorageLike { getItem(key: string): string | null; setItem(key: string, value: string): void }
 export interface ViewsState { views: SyncedView[]; status: SyncState; conflicts: ViewOperation[]; persistent: boolean }
+export type ViewArrangement = Pick<SyncedView, 'count' | 'layout' | 'slots'>
+export interface ViewOverrideConfirmation { scope: number; view: SyncedView }
 export interface ViewTransport {
   get(kind: ViewDeviceKind): Promise<ViewSnapshot & { crmOrigin: string }>
   put(kind: ViewDeviceKind, revision: number, views: SyncedView[]): Promise<ViewSnapshot & { crmOrigin: string }>
@@ -88,6 +90,19 @@ export class SavedViewsStore {
     const before = this.state.views.find(v => v.id === id)
     const clean = name.replace(/\s+/gu, ' ').trim().slice(0, 40)
     if (before && clean && clean !== before.name) this.operation(before, { ...before, name: clean })
+  }
+  prepareOverride(id: string): ViewOverrideConfirmation {
+    const view = this.state.views.find(v => v.id === id)
+    if (!view) throw new Error('This saved view is no longer available.')
+    return { scope: this.generation, view: { ...view, slots: [...view.slots] } }
+  }
+  override(confirmation: ViewOverrideConfirmation, now: ViewArrangement): boolean {
+    const before = this.state.views.find(v => v.id === confirmation.view.id)
+    if (confirmation.scope !== this.generation || !before || !sameView(before, confirmation.view)) throw new Error('This saved view changed. Cancel and review it before overriding.')
+    const after = { ...before, count: now.count, layout: now.layout, slots: Array.from({ length: now.count }, (_, i) => now.slots[i] ?? null) }
+    if (sameView(before, after)) return false
+    this.operation(before, after)
+    return true
   }
   remove(id: string) { const before = this.state.views.find(v => v.id === id); if (before) this.operation(before, null) }
   importLocal() {
