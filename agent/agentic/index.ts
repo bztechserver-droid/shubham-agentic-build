@@ -1,4 +1,4 @@
-import { prepareConversation, jsonLines, type PreparedConversation } from '../opencode/switch.ts'
+import { prepareConversation, type PreparedConversation } from '../opencode/switch.ts'
 import { interchange } from '../opencode/backend.ts'
 import { createOpenCodePool, combinePools, type OpenCodePoolOptions } from '../opencode/pool.ts'
 import type { OpenCodeProvider } from '../../shared/opencode.ts'
@@ -93,7 +93,10 @@ import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServer
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
 import { switchConversation } from '../codex/switch-conversation.ts'
-import { conversationCwd } from '../codex/from-claude.ts'
+import { claudeFileContext, conversationCwd, conversationLines, convertClaude } from '../codex/from-claude.ts'
+import { toClaude } from '../codex/to-claude.ts'
+import { createSwitchFences } from './switch-fence.ts'
+import { validatePreparedConversation, type ConversationBinding } from './prepared-conversation.ts'
 import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
@@ -116,7 +119,7 @@ import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions }
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
-import { answer, pullFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
+import { answer, pullFrom as pullTranscriptFrom, readLines, request, servePull, writeLine, type LinkPeer } from './roam.ts'
 import {
   claudeProjectsDir,
   copyTranscript,
@@ -431,6 +434,7 @@ interface Held {
 
 /** F-021, on a member: the hub's floors and sessions as it last said them. */
 interface Replica {
+  engineSwitchContinuity?: FloorsAnswer['engineSwitchContinuity']
   floors: Floor[]
   /** F-067: the hub's defaults for model, effort and ultracode. */
   defaults?: ChatDefaults
@@ -747,6 +751,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return !!at && engineFor(at.agent) === 'codex'
   }
   const rolloutCache = new Map<string, string>()
+  const switchFences = createSwitchFences(path.join(o.dir, 'engine-switches.json'))
+  const activeSwitches = new Set<string>()
+  const pullFrom = (peer: LinkPeer, sid: string, file: string) => pullTranscriptFrom(peer, sid, file, () => !switchFences.blocked(sid))
   const threadWatchers = new Map<string, () => void>()
   /** A Codex chat's rollout file, once its conversation id is known and the file is there; null for every other chat. */
   function codexRollout(sid: string): string | null {
@@ -868,7 +875,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     onChange: () => poolOptions.onChange?.(), onEnded: e => poolOptions.onEnded?.(e),
   })
-  const chats = combinePools(createChatPool(poolOptions), openCode.pool)
+  const nativeChats = combinePools(createChatPool(poolOptions), openCode.pool)
+  const chats: ChatPool = { ...nativeChats,
+    start: options => { switchFences.assertWritable(options.sessionId); return nativeChats.start(options) },
+    input: (sid, data) => !switchFences.blocked(sid) && nativeChats.input(sid, data),
+    press: (sid, data) => !switchFences.blocked(sid) && nativeChats.press(sid, data),
+    type: (sid, text, options) => !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
+    typeWhenReady: (sid, text, options) => { switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
+    adopt: (info, pty, replay) => { const result = nativeChats.adopt(info, pty, replay); if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery'); return result },
+  }
 
   // F-075: the chats the agent before this one left running in the chat host are taken over at once.
   const adopted: Promise<void> = o.chatHost
@@ -1014,15 +1029,30 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function unboundCodex(sid: string, floorId: string, agentId: string) {
-    const agent = floors.get(floorId)?.agents.find(a => a.id === agentId)
-    return agent?.sessionId === sid && engineFor(agent) === 'codex' && !agent.codexThread
+    const at = bySession(sid)
+    return at?.floor.id === floorId && at.agent.id === agentId && engineFor(at.agent) === 'codex' && !at.agent.codexThread
   }
 
+  const threadBinds = new Set<string>()
   function learnThread(sid: string, floorId: string, agentId: string, sinceMs: number) {
     if (!o.codex || !unboundCodex(sid, floorId, agentId)) return null
     const found = discoverThread(o.codex.paths.home, sid, sinceMs)
     if (!found || !unboundCodex(sid, floorId, agentId)) return null
-    floors.setCodexThread(floorId, agentId, found.thread)
+    if (mode() === 'member' && !isLocalFloor(floorId)) {
+      if (!threadBinds.has(sid)) {
+        threadBinds.add(sid)
+        void request(needHub(), 'codex-bind', { sessionId: sid, native: found.thread }).then(() => {
+          const at = bySession(sid)
+          if (at?.floor.id === floorId && at.agent.id === agentId && engineFor(at.agent) === 'codex' && !at.agent.codexThread) {
+            replica.floors = replica.floors.map(f => f.id !== floorId ? f : { ...f, agents: f.agents.map(a => a.id !== agentId ? a : { ...a, codexThread: found.thread }) })
+            if (chats.info(sid)) tail.track(sid, found.file, 0)
+          }
+        }).catch(error => {
+          log?.warn(`Could not record the remote Codex conversation: ${message(error)}`)
+          if (!closing && chats.info(sid) && unboundCodex(sid, floorId, agentId)) watchThread(sid, floorId, agentId, sinceMs)
+        }).finally(() => threadBinds.delete(sid))
+      }
+    } else floors.setCodexThread(floorId, agentId, found.thread)
     rolloutCache.set(found.thread, found.file)
     log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
     if (team && chats.info(sid)) tail.track(sid, found.file, 0)
@@ -1217,6 +1247,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * when it is elsewhere and `takeOver` wasn't asked. Answers where it was taken from.
    */
   async function lease(sid: string, who: { id: string; name: string }, takeOver: boolean, agentName: string): Promise<string | undefined> {
+    switchFences.assertWritable(sid)
     const there = whereAll()[sid]
     const h = held.get(sid)
     let from: { id: string; name: string } | null = null
@@ -1230,6 +1261,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!takeOver) throw apiError(409, `${agentName}'s chat is running on ${from.name}. Take it over to run it here; it stops there first.`)
       await stopAt(from.id, sid)
     }
+    switchFences.assertWritable(sid)
     hold(sid, who)
     return from?.name
   }
@@ -1242,7 +1274,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() !== 'hub' || !subs.size || pushTimer) return
     pushTimer = setTimeout(() => {
       pushTimer = null
-      const state = { t: 'state', floors: floors.list(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere() }
+      const state = { t: 'state', floors: floors.list(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -1264,12 +1296,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const pulling = new Set<string>()
   let pulls: Promise<void> = Promise.resolve()
   function backfill(link: LinkPeer, sid: string) {
-    if (pulling.has(sid) || chats.info(sid)) return
+    if (pulling.has(sid) || chats.info(sid) || switchFences.blocked(sid)) return
     pulling.add(sid)
     pulls = pulls
       .then(async () => {
         // Started here meanwhile: this PC writes it now.
-        if (chats.info(sid)) return
+        if (chats.info(sid) || switchFences.blocked(sid)) return
         const m = await pullFrom(link, sid, fileOf(sid))
         log?.info(`chat ${sid.slice(0, 8)}: copy brought up from ${link.name} (${m.bytes} bytes)`)
       })
@@ -1306,6 +1338,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // Only from the PC running it (or granted it, starting), and never into a copy this PC writes.
         if (chats.info(raw.sid) || (held.get(raw.sid)?.holder !== from.id && remote.get(from.id)?.live[raw.sid] === undefined)) return
         const data = Buffer.from(raw.d, 'base64')
+        if (switchFences.blocked(raw.sid)) return
         const r = appendAt(fileOf(raw.sid), raw.from, data)
         if (r === 'ok') {
           for (const [id, s] of subs) if (id !== from.id) writeLine(s, raw)
@@ -1346,6 +1379,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function memberTick() {
+    void reconcileSwitchFences().catch(error => log?.warn('Engine-switch recovery remains fenced: ' + message(error)))
     if (mode() !== 'member') {
       downSince = null
       if (sub) dropSub()
@@ -1363,6 +1397,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       stream => {
         subscribing = false
         sub = { token: link.token, stream }
+        replica.engineSwitchContinuity = undefined
         downSince = null
         writeLine(stream, { t: 'hello', live: chats.states(), marks: marksHere() })
         readLines(stream, raw => onHubEvent(link, raw))
@@ -1398,6 +1433,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw)) return
     if (raw.t === 'state' && Array.isArray(raw.floors)) {
       replica = {
+        engineSwitchContinuity: isObject(raw.engineSwitchContinuity) && raw.engineSwitchContinuity.version === 1 && raw.engineSwitchContinuity.failClosed === true && raw.engineSwitchContinuity.homePcPreparation === true
+          ? { version: 1, failClosed: true, homePcPreparation: true } : undefined,
         floors: raw.floors as Floor[],
         defaults: parseDefaults(raw.defaults),
         where: isObject(raw.where) ? (raw.where as Replica['where']) : {},
@@ -1414,7 +1451,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (mine.bytes < theirs.bytes || (mine.bytes === theirs.bytes && mine.tail !== theirs.tail)) backfill(link, sid)
       }
     } else if (raw.t === 'jsonl' && typeof raw.sid === 'string' && typeof raw.from === 'number' && typeof raw.d === 'string') {
-      if (chats.info(raw.sid)) return
+      if (chats.info(raw.sid) || switchFences.blocked(raw.sid)) return
       // A gap or a fork is left to catch-up.
       appendAt(fileOf(raw.sid), raw.from, Buffer.from(raw.d, 'base64'))
     } else if (raw.t === 'memory' && typeof raw.floorId === 'string') {
@@ -1431,7 +1468,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
-    if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    if (sid) switchFences.assertWritable(sid)
+    if (sid && chats.info(sid)) {
+      await request(link, 'lease', { sessionId: sid, takeOver: false })
+      switchFences.assertWritable(sid)
+      return { sessionId: sid, started: false, resumed: false }
+    }
     const atHome = await resumeAtHome(floor, agent, sid, req)
     if (atHome) return atHome
     if (!sid) {
@@ -1675,6 +1717,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
+    const selected = agentOf(floorOf(floorId), agentId).sessionId
+    if (selected) switchFences.assertWritable(selected)
     // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
     if (mode() === 'member') {
       if (!isLocalFloor(floorId)) return openOnMember(floorId, agentId, req)
@@ -2774,7 +2818,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const all = allFloors()
     const seen = access.visible(c, all)
     const mine = <T>(m: Record<string, T>) => (seen ? Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid))) : m)
-    return { floors: access.scope(c, all, want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir }
+    return { floors: access.scope(c, all, want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir,
+      engineSwitchContinuity: mode() === 'member' ? replica.engineSwitchContinuity : { version: 1, failClosed: true, homePcPreparation: true } }
   }
 
   /** F-118: replaces who a chat is shared with. People are named by CRM id; their names are the CRM's, from the sign-in directory. */
@@ -2795,32 +2840,141 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { agent: agentOf(floor, agentId) }
   }
 
-  const preparedSwitches = new Map<string, (PreparedConversation & { homePc: string; homePcName: string }) | null>()
+  const preparedSwitches = new Map<string, ConversationBinding>()
   const floorMutations = new Map<string, Promise<unknown>>()
 
-  /** F-142: snapshot the old engine's history into a new id, keeping the original file intact. */
-  function carryConversation(floor: Floor, previous: FloorAgent, to: 'claude' | 'codex' | 'opencode') {
+  /** Conversions are prepared before the atomic chart commit; never substitute an empty binding. */
+  function carryConversation(_floor: Floor, previous: FloorAgent, _to: 'claude' | 'codex' | 'opencode') {
+    const result = preparedSwitches.get(previous.id)
+    if (!result) throw Object.assign(apiError(409, 'History was not prepared. The current conversation is unchanged.'), { code: 'engine-change-conversion-failed' })
+    return { sessionId: result.sessionId, codexThread: result.codexThread, opencodeSession: result.opencodeSession, homePc: result.homePc, homePcName: result.homePcName }
+  }
+
+  function localSwitchSource(previous: FloorAgent): string | null {
     const sid = previous.sessionId!
-    try {
-      const location = whereAll()[sid]
-      if ((location && location.id !== self().id) || (previous.homePc && previous.homePc !== self().id)) {
-        throw new Error('conversation lives on another PC; local conversion is unavailable')
-      }
-      if (to === 'opencode' || engineFor(previous) === 'opencode') return preparedSwitches.get(previous.id) ?? null
-      const file = engineFor(previous) === 'codex'
-        ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
-        : findClaudeTranscript(sid, projectsDir)
-      if (!file) throw new Error('source transcript is unavailable on this PC')
-      const cwd = chats.info(sid)?.cwd || conversationCwd(file) || codeDirOf(floor)
-      const converted = switchConversation({ to, file, cwd, codexHome: o.codex?.paths.home, projectsDir })
-      log?.info(`chat ${sid.slice(0, 8)}: conversation carried to ${to}, ${converted.id.slice(0, 8)}`)
-      return { sessionId: to === 'claude' ? converted.id : randomUUID(), codexThread: to === 'codex' ? converted.id : null,
-        homePc: self().id, homePcName: self().name }
-    } catch (e) {
-      log?.warn(`chat ${sid.slice(0, 8)}: couldn't carry conversation to ${to}; starting a new conversation: ${message(e)}`)
+    if (engineFor(previous) === 'opencode') {
+      if (!chats.info(sid) && (!openCode.install() || !previous.opencodeSession)) throw Object.assign(apiError(409, 'OpenCode history is unavailable on its home PC. The current conversation is unchanged.'), { code: 'engine-change-conversion-failed' })
       return null
     }
+    const file = engineFor(previous) === 'codex'
+      ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
+      : findClaudeTranscript(sid, projectsDir)
+    if (!file) throw Object.assign(apiError(409, `${previous.name}: source transcript is unavailable on its home PC. The current engine and conversation are unchanged.`), { code: 'engine-change-conversion-failed' })
+    return file
   }
+
+  function switchSourcePc(previous: FloorAgent) {
+    const active = whereAll()[previous.sessionId!]
+    if (active) return active
+    const last = lastAll()[previous.sessionId!]?.pc
+    if (last) {
+      const known = pcs().filter(p => p.name === last)
+      if (known.length === 1) return known[0]
+      if (known.length > 1) throw Object.assign(apiError(409, 'More than one PC has the last source PC name. Resume the original conversation on its PC before switching.'), { code: 'engine-change-conversion-failed' })
+      if (previous.homePc && previous.homePcName === last) return { id: previous.homePc, name: last }
+      throw Object.assign(apiError(424, `The newest history is on ${last}, which is offline. The current conversation is unchanged.`), { code: 'engine-change-home-offline' })
+    }
+    return previous.homePc ? { id: previous.homePc, name: previous.homePcName ?? previous.homePc } : self()
+  }
+
+  async function prepareLocalSwitch(floor: Floor, previous: FloorAgent, next: FloorAgent, switchId: string) {
+    const file = localSwitchSource(previous)
+    const sid = previous.sessionId!, from = engineFor(previous), to = engineFor(next)
+    switchFences.begin(sid, switchId)
+    if (from !== 'opencode' && chats.info(sid)) {
+      chats.kill(sid, 'engine-change')
+      await chats.waitStopped?.(sid)
+      if (file) await settled(file)
+    }
+    if (file) switchFences.snapshot(sid, switchId, file)
+    if (to === 'opencode') {
+      if (!openCode.install() || !o.openCodeCredential) throw apiError(503, 'OpenCode is not configured on this PC.')
+      await o.openCodeCredential(openCodeProvider(next.opencodeProvider || defaultsNow().opencodeProvider))
+      if (openCode.status().live >= 2) throw apiError(503, 'OpenCode is at this PC’s two-backend limit.')
+    }
+    let cwd = chats.info(sid)?.cwd || (file && conversationCwd(file)) || codeDirOf(floor)
+    let result: PreparedConversation
+    if (from !== 'opencode' && to !== 'opencode') {
+      if (!file) throw apiError(409, 'Source transcript is unavailable')
+      cwd = chats.info(sid)?.cwd || conversationCwd(file) || cwd
+      const converted = switchConversation({ to, file, cwd, codexHome: o.codex?.paths.home, projectsDir })
+      result = { sessionId: to === 'claude' ? converted.id : randomUUID(), codexThread: to === 'codex' ? converted.id : null, opencodeSession: null, file: converted.file }
+    } else {
+      let source: unknown
+      let sourceEngine = from
+      if (from === 'opencode') {
+        if (chats.info(sid)) { await openCode.abort(sid); chats.kill(sid, 'engine-change'); await openCode.waitStopped(sid) }
+        source = JSON.parse(await interchange(openCode.install()!, openCode.rootOf(sid), cwd, ['export', previous.opencodeSession!]))
+        const mirror = openCode.file(sid)
+        if (!mirror) throw apiError(409, 'The stopped OpenCode source has no verified history mirror')
+        switchFences.snapshot(sid, switchId, mirror)
+        if (isObject(source) && isObject(source.info) && typeof source.info.directory === 'string' && path.isAbsolute(source.info.directory)) cwd = source.info.directory
+      } else {
+        if (!file) throw apiError(409, 'Source transcript is unavailable')
+        cwd = chats.info(sid)?.cwd || conversationCwd(file) || cwd
+        // Normalize only bounded current context, never read a whole large JSONL into the heap.
+        const timestamp = new Date().toISOString()
+        source = from === 'claude'
+          ? convertClaude(claudeFileContext(file).lines, { id: randomUUID(), cwd, timestamp }).lines
+          : toClaude(conversationLines(file), { sessionId: sid, cwd, timestamp })
+        sourceEngine = from === 'claude' ? 'codex' : 'claude'
+      }
+      result = await prepareConversation({ from: sourceEngine, to, source, cwd, projectsDir, codexHome: o.codex?.paths.home, openCodeRoot: openCode.rootOf, install: openCode.install() })
+    }
+
+    return { ...result, homePc: self().id, homePcName: self().name }
+  }
+
+  /** Only the authenticated hub can ask a member to prepare its own current native history. No floor mutation here. */
+  async function prepareSwitchPeer(raw: unknown) {
+    if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || !isObject(raw.expected) || !isObject(raw.next) ||
+      !['claude', 'codex', 'opencode'].includes(String(raw.next.engine))) throw apiError(400, 'Expected an engine-switch preparation')
+    const floor = floorOf(raw.floorId), previous = agentOf(floor, raw.agentId), expected = raw.expected
+    const matches = () => {
+      const current = agentOf(floorOf(floor.id), previous.id)
+      return current.sessionId === expected.sessionId && engineFor(current) === expected.engine &&
+        (current.codexThread ?? null) === (expected.codexThread ?? null) && (current.opencodeSession ?? null) === (expected.opencodeSession ?? null)
+    }
+    if (!matches()) throw Object.assign(apiError(409, 'The source conversation changed on its home PC. Refresh and confirm again.'), { code: 'engine-change-stale' })
+    if (!previous.sessionId || (!chats.info(previous.sessionId) && previous.homePc && previous.homePc !== self().id && lastAll()[previous.sessionId]?.pc !== self().name)) throw apiError(409, 'This PC does not hold the source conversation')
+    localSwitchSource(previous)
+    if (raw.checkOnly === true) return { ready: true }
+    const next = { ...previous, engine: raw.next.engine, opencodeProvider: raw.next.opencodeProvider, opencodeModel: raw.next.opencodeModel } as FloorAgent
+    if (typeof raw.switchId !== 'string') throw apiError(400, 'Expected an engine-switch operation id')
+    const binding = await prepareLocalSwitch(floor, previous, next, raw.switchId)
+    if (!matches()) throw Object.assign(apiError(409, 'The source conversation changed during conversion. Refresh and confirm again.'), { code: 'engine-change-stale' })
+    return { binding, sourceSessionId: previous.sessionId, to: engineFor(next) }
+  }
+
+  async function finishSwitchPeer(raw: unknown) {
+    if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.switchId !== 'string') throw apiError(400, 'Expected a source session and operation id')
+    if (raw.action === 'seal') switchFences.seal(raw.sessionId, raw.switchId)
+    else if (raw.action === 'retire') switchFences.retire(raw.sessionId, raw.switchId)
+    else if (raw.action === 'cancel') { if (!chats.info(raw.sessionId)) await chats.waitStopped?.(raw.sessionId); switchFences.cancel(raw.sessionId, raw.switchId) }
+    else throw apiError(400, 'Expected seal, retire or cancel')
+    return { ok: true }
+  }
+
+  let reconcilingSwitches = false
+  async function reconcileSwitchFences() {
+    if (reconcilingSwitches || closing) return
+    reconcilingSwitches = true
+    try {
+      for (const fence of switchFences.pending()) {
+        if (activeSwitches.has(fence.token)) continue
+        let action: string
+        if (mode() === 'member') {
+          const link = team?.hub()?.link
+          if (!link || !sub) continue
+          try { action = (await request<{ state: string }>(link, 'engine-switch-status', { sessionId: fence.sessionId, switchId: fence.token })).state }
+          catch { continue /* Keep a durable fence until the authoritative hub can answer. */ }
+        } else action = bySession(fence.sessionId) ? 'cancel' : 'retire'
+        if (action === 'cancel') { if (!chats.info(fence.sessionId)) await chats.waitStopped?.(fence.sessionId); switchFences.cancel(fence.sessionId, fence.token) }
+        else if (action === 'retire') { switchFences.retire(fence.sessionId, fence.token); chats.kill(fence.sessionId, 'engine-switch-retired') }
+      }
+    } finally { reconcilingSwitches = false }
+  }
+  setImmediate(() => { void reconcileSwitchFences().catch(error => log?.warn('Engine-switch recovery remains fenced: ' + message(error))) })
 
   function patchFloor(id: string, body: unknown, as?: ChatOwner) {
     const pending = (floorMutations.get(id) ?? Promise.resolve()).catch(() => {}).then(() => patchFloorPrepared(id, body, as))
@@ -2834,64 +2988,72 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const before = floorOf(id)
     if (typeof body.codeDir === 'string' && body.codeDir.trim()) checkFolder(body.codeDir)
     const preview = floors.validatePatch(id, body as FloorPatch, as)
-    const fingerprint = JSON.stringify(before)
-    const prepared: string[] = []
-    const conversionNotes: string[] = []
-    try {
-      for (const previous of before.agents) {
-        const next = preview.agents.find(a => a.id === previous.id)
-        const from = engineFor(previous), to = next ? engineFor(next) : from
-        if (!next || !previous.sessionId || from === to || (from !== 'opencode' && to !== 'opencode')) continue
-        const sid = previous.sessionId
-        if (to === 'opencode') {
-          if (!openCode.install() || !o.openCodeCredential) throw apiError(503, 'OpenCode is not configured on this PC.')
-          await o.openCodeCredential(openCodeProvider(next.opencodeProvider || defaultsNow().opencodeProvider))
-          if (openCode.status().live >= 2) throw apiError(503, 'OpenCode is at this PC’s two-backend limit.')
-        }
-        if (previous.homePc && previous.homePc !== self().id) {
-          preparedSwitches.set(previous.id, null); prepared.push(previous.id)
-          conversionNotes.push(`${previous.name}: the original history is on another PC; the new engine starts a fresh conversation.`)
-          continue
-        }
-        try {
-        let cwd = chats.info(sid)?.cwd || codeDirOf(preview)
-        let source: unknown
-        if (from === 'opencode') {
-          if (chats.info(sid)) source = await openCode.snapshot(sid)
-          else {
-            const install = openCode.install()
-            if (!install || !previous.opencodeSession) throw apiError(409, 'OpenCode history is unavailable on this PC.')
-            source = JSON.parse(await interchange(install, openCode.rootOf(sid), codeDirOf(before), ['export', previous.opencodeSession]))
-          }
-          if (isObject(source) && isObject(source.info) && typeof source.info.directory === 'string' && path.isAbsolute(source.info.directory)) cwd = source.info.directory
-        } else {
-          const file = from === 'codex' ? (previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null) : findClaudeTranscript(sid, projectsDir)
-          if (!file) throw apiError(409, 'The source conversation is unavailable on its home PC.')
-          cwd = conversationCwd(file) || cwd
-          if (chats.info(sid)) { chats.kill(sid, 'engine-change'); await settled(file) }
-          source = jsonLines(file)
-        }
-        const result = await prepareConversation({ from, to, source, cwd, projectsDir, codexHome: o.codex?.paths.home, openCodeRoot: openCode.rootOf, install: openCode.install() })
-        preparedSwitches.set(previous.id, { ...result, homePc: self().id, homePcName: self().name }); prepared.push(previous.id)
-        } catch (error) {
-          preparedSwitches.set(previous.id, null); prepared.push(previous.id)
-          const detail = `${previous.name}: history could not be imported and verified on this PC (${message(error)}). Starting a fresh conversation; the original remains saved.`
-          conversionNotes.push(detail); log?.warn(detail)
-        }
-      }
-      if (JSON.stringify(floorOf(id)) !== fingerprint) throw apiError(409, 'This floor changed while the conversation was prepared. Try again.')
-    } catch (error) { for (const agentId of prepared) preparedSwitches.delete(agentId); throw error }
-    let floor: Floor
-    try { floor = floors.patch(id, body as FloorPatch, as) }
-    finally { for (const agentId of prepared) preparedSwitches.delete(agentId) }
-    // An agent taken off the floor takes its running chat with it, wherever it runs.
-    const kept = new Set(floor.agents.map(a => a.id))
-    for (const a of before.agents) {
-      const after = floor.agents.find(next => next.id === a.id)
-      // Also stop an old engine whose binding has just been replaced (including conversion fallback).
-      if (a.sessionId && (!kept.has(a.id) || after?.sessionId !== a.sessionId || (engineFor(a) === 'opencode' && (a.opencodeProvider !== after?.opencodeProvider || a.opencodeModel !== after?.opencodeModel)))) stopAnywhere(a.sessionId)
+    const fingerprint = JSON.stringify(before), defaultEngine = defaultsNow().engine
+    const switchId = randomUUID(), peers = new Map<string, LinkPeer>()
+    const changes = before.agents.flatMap(previous => {
+      const next = preview.agents.find(a => a.id === previous.id)
+      return next && previous.sessionId && engineFor(previous) !== engineFor(next) ? [{ previous, next }] : []
+    })
+    const peerBody = (previous: FloorAgent, next: FloorAgent) => ({ floorId: id, agentId: previous.id, switchId,
+      expected: { sessionId: previous.sessionId, engine: engineFor(previous), codexThread: previous.codexThread ?? null, opencodeSession: previous.opencodeSession ?? null },
+      next: { engine: engineFor(next), opencodeProvider: next.opencodeProvider, opencodeModel: next.opencodeModel } })
+    const finishPeer = (previous: FloorAgent, action: string) => {
+      const peer = peers.get(previous.id)
+      return peer ? request(peer, 'engine-switch-finish', { sessionId: previous.sessionId, switchId, action }, 10_000) : Promise.resolve()
     }
-    return { floor, ...(conversionNotes.length ? { conversionNotes } : {}) }
+    let committed: Floor | undefined
+    activeSwitches.add(switchId)
+    try {
+      // Hub lease/open/input barrier begins before any async preparation. The source host also fences itself.
+      for (const { previous } of changes) switchFences.begin(previous.sessionId!, switchId)
+      for (const { previous, next } of changes) {
+        const location = switchSourcePc(previous)
+        if (location.id !== self().id) {
+          const peer = team?.member(location.id)
+          if (!peer) throw Object.assign(apiError(424, `${previous.name}'s newest history is on ${location.name}, which is offline. The current conversation is unchanged.`), { code: 'engine-change-home-offline' })
+          peers.set(previous.id, peer)
+          await request(peer, 'engine-switch-prepare', { ...peerBody(previous, next), checkOnly: true }, 120_000)
+        } else localSwitchSource(previous)
+      }
+      for (const { previous, next } of changes) {
+        const peer = peers.get(previous.id)
+        let raw: unknown
+        if (peer) {
+          const reply = await request<{ binding: unknown; sourceSessionId: string; to: string }>(peer, 'engine-switch-prepare', peerBody(previous, next), 120_000)
+          if (reply.sourceSessionId !== previous.sessionId || reply.to !== engineFor(next)) throw new Error('Home PC returned a mismatched source or target')
+          raw = reply.binding
+        } else raw = await prepareLocalSwitch(before, previous, next, switchId)
+        preparedSwitches.set(previous.id, validatePreparedConversation(raw, engineFor(next), previous, peer?.id ?? self().id, allFloors().flatMap(f => f.agents), [...preparedSwitches.values()]))
+      }
+      // Seal remote source hashes while every old session remains fenced, then check local sources synchronously.
+      for (const { previous } of changes) if (peers.has(previous.id)) await finishPeer(previous, 'seal')
+      for (const { previous } of changes) if (!peers.has(previous.id)) switchFences.seal(previous.sessionId!, switchId)
+      if (JSON.stringify(floorOf(id)) !== fingerprint || defaultsNow().engine !== defaultEngine) throw Object.assign(apiError(409, 'This floor changed while the conversation was prepared. Refresh and confirm again.'), { code: 'engine-change-stale' })
+      committed = floors.patch(id, body as FloorPatch, as)
+      // Never release an old session after success, even while the member still has a debounced old replica.
+      for (const { previous } of changes) {
+        try { switchFences.retire(previous.sessionId!, switchId) } catch (error) { log?.warn('Could not persist retirement; durable preparation fence remains: ' + message(error)) }
+        await finishPeer(previous, 'retire').catch(error => log?.warn('Home PC retirement awaits reconnect; source remains fenced: ' + message(error)))
+      }
+      const kept = new Set(committed.agents.map(a => a.id))
+      for (const old of before.agents) {
+        const after = committed.agents.find(a => a.id === old.id)
+        if (old.sessionId && (!kept.has(old.id) || after?.sessionId !== old.sessionId || (engineFor(old) === 'opencode' && (old.opencodeProvider !== after?.opencodeProvider || old.opencodeModel !== after?.opencodeModel)))) stopAnywhere(old.sessionId)
+      }
+      return { floor: committed }
+    } catch (error) {
+      if (committed) { log?.warn('Conversation switch committed; cleanup will be retried: ' + message(error)); return { floor: committed } }
+      if (isObject(error) && ['engine-change-stale', 'engine-change-home-offline', 'engine-change-in-progress'].includes(String(error.code))) throw error
+      log?.warn('Engine switch blocked: ' + message(error))
+      throw Object.assign(apiError(409, 'History could not be carried over: ' + message(error) + '. The current engine and conversation are unchanged; resume it or retry after fixing the source.'), { code: 'engine-change-conversion-failed' })
+    } finally {
+      if (!committed) for (const { previous } of changes) {
+        try { switchFences.cancel(previous.sessionId!, switchId) } catch (error) { log?.warn('Original conversation unlock awaits recovery: ' + message(error)) }
+        await finishPeer(previous, 'cancel').catch(error => log?.warn('Home PC unlock awaits reconnect: ' + message(error)))
+      }
+      for (const { previous } of changes) preparedSwitches.delete(previous.id)
+      activeSwitches.delete(switchId)
+    }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -3621,7 +3783,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
       () => ({ defaults: defaultsNow() }),
       'local',
     ],
-    ['PUT', /^\/defaults$/, (_, r) => ({ defaults: chatDefaults.set(r.body) })],
+    ['PUT', /^\/defaults$/, (_, r) => {
+      if (isObject(r.body) && typeof r.body.engine === 'string' && ['', 'claude', 'codex', 'opencode'].includes(r.body.engine) &&
+        engineOf(r.body.engine as AgentEngine, '') !== engineOf(defaultsNow().engine, '') &&
+        allFloors().some(f => f.agents.some(a => !a.engine && a.sessionId))) {
+        throw Object.assign(apiError(409, 'Some existing conversations follow the default engine. Choose an explicit engine for those agents with conversation carry-over before changing the default.'), { code: 'engine-change-conversion-failed' })
+      }
+      return { defaults: chatDefaults.set(r.body) }
+    }],
+    // Forwarded on members: an old hub must answer 404, rather than a new member promising safety for it.
+    ['GET', /^\/engine-switch-capabilities$/, () => ({ version: 1, failClosed: true, homePcRouting: true })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
@@ -4078,6 +4249,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'hub') {
       switch (op) {
+        case 'engine-switch-status':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.switchId !== 'string') throw apiError(400, 'Expected source and operation id')
+            return { state: activeSwitches.has(raw.switchId) ? 'active' : bySession(raw.sessionId) ? 'cancel' : 'retire' }
+          })
         case 'subscribe':
           return stream => onSubscribe(from, stream)
         case 'adopt':
@@ -4089,6 +4265,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const at = bySession(raw.sessionId)
             if (!at || engineFor(at.agent) !== 'opencode' || held.get(raw.sessionId)?.holder !== from.id) throw apiError(403, 'This PC does not hold that OpenCode conversation')
             floors.setOpenCodeSession(at.floor.id, at.agent.id, raw.native)
+            return { ok: true }
+          })
+        case 'codex-bind':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.native !== 'string') throw apiError(400, 'Expected Codex binding')
+            const at = bySession(raw.sessionId)
+            if (!at || engineFor(at.agent) !== 'codex' || (held.get(raw.sessionId)?.holder !== from.id && at.agent.homePc !== from.id)) throw apiError(403, 'This PC does not hold that Codex conversation')
+            if (at.agent.codexThread && at.agent.codexThread !== raw.native) throw apiError(409, 'The native Codex binding changed')
+            floors.setCodexThread(at.floor.id, at.agent.id, raw.native)
+            if (at.agent.homePc !== from.id) floors.setHome(at.floor.id, at.agent.id, from)
             return { ok: true }
           })
         case 'http':
@@ -4146,6 +4332,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     } else if (m === 'member' && from.id === team!.hub()?.id) {
       switch (op) {
+        case 'engine-switch-finish':
+          return answer(finishSwitchPeer)
+        case 'engine-switch-prepare':
+          return answer(prepareSwitchPeer)
         case 'stop':
           return answer(async raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')

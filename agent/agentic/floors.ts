@@ -20,6 +20,7 @@ import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, ENGINE_CHANGE_CODE, ENGI
 import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
+import { conversationHistory, rememberConversation } from './conversation-history.ts'
 
 // F-018: floors and their agents (agentic-claude-manager server/lib/floors.js), kept in
 // <state>/agent/agentic/floors.json. A floor starts with its boss seated; the page owns the
@@ -89,6 +90,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     codexModel: typeof a.codexModel === 'string' ? a.codexModel.trim().slice(0, CODEX_MODEL_MAX) : '',
     codexEffort: isCodexEffort(a.codexEffort) ? a.codexEffort : '',
     codexThread: typeof a.codexThread === 'string' && THREAD_ID_RE.test(a.codexThread) ? a.codexThread.toLowerCase() : null,
+    conversationHistory: conversationHistory(a.conversationHistory),
     skills: strList(a.skills),
     mcpServers: strList(a.mcpServers),
     x: num(a.x, 80 + (index % 4) * 250),
@@ -324,7 +326,17 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     patch(id, p, as) {
-      const floor = find(id)
+      // Stage the entire chart: a failure in any conversion must not mutate another binding or field.
+      const floor = clone(find(id))
+      const expected = p.expectedConversation
+      if (expected) {
+        const a = floor.agents.find(a => a.id === expected.agentId)
+        if (!a || engineOf(a.engine, defaultEngine()) !== expected.engine || a.sessionId !== expected.sessionId ||
+          (expected.codexThread !== undefined && (a.codexThread ?? null) !== expected.codexThread) ||
+          (expected.opencodeSession !== undefined && (a.opencodeSession ?? null) !== expected.opencodeSession)) {
+          throw Object.assign(apiError(409, 'This conversation changed after confirmation. Refresh the agent and confirm again.'), { code: 'engine-change-stale' })
+        }
+      }
       if (p.name !== undefined) {
         if (typeof p.name !== 'string' || !p.name.trim()) throw apiError(400, 'A floor needs a name')
         floor.name = p.name.trim().slice(0, NAME_MAX)
@@ -367,11 +379,15 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           a.duty = before.get(a.id)?.duty ?? null
           // The conversation binding is server-owned. F-142 carries it across engines after validation below.
           const had = before.get(a.id)
+          a.conversationHistory = clone(had?.conversationHistory ?? [])
           a.opencodeSession = had?.opencodeSession ?? null
           a.codexThread = had?.codexThread ?? null
           if (had && had.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
             if (p.confirmNewConversation !== true) {
               throw Object.assign(apiError(409, ENGINE_CHANGE_MESSAGE), { code: ENGINE_CHANGE_CODE })
+            }
+            if (isObject(raw) && raw.sessionId !== undefined && raw.sessionId !== had.sessionId) {
+              throw Object.assign(apiError(409, 'This conversation changed after confirmation. Refresh the agent and confirm again.'), { code: 'engine-change-stale' })
             }
             a.sessionId = null
             a.opencodeSession = null
@@ -392,17 +408,41 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           names.add(n)
         }
         // Conversion has disk side effects, so only run after the whole chart has passed validation.
+        const carriedIds = new Set<string>(), carriedNative = new Set<string>()
         for (const a of next) {
           const had = before.get(a.id)
           if (had?.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
-            const carried = opts.switchConversation?.(floor, had, engineOf(a.engine, defaultEngine()))
-            if (carried) Object.assign(a, carried)
+            if (!opts.readOnly) {
+              const carried = opts.switchConversation?.(floor, had, engineOf(a.engine, defaultEngine()))
+              if (!carried?.sessionId) throw Object.assign(apiError(409, 'History could not be carried over. The current engine and conversation are unchanged.'), { code: 'engine-change-conversion-failed' })
+              const to = engineOf(a.engine, defaultEngine())
+              const native = to === 'codex' ? carried.codexThread : to === 'opencode' ? carried.opencodeSession : null
+              const badNative = to === 'codex' ? !carried.codexThread || !THREAD_ID_RE.test(carried.codexThread) || carried.opencodeSession != null
+                : to === 'opencode' ? !carried.opencodeSession || !OPENCODE_SESSION_RE.test(carried.opencodeSession) || carried.codexThread != null
+                  : carried.codexThread != null || carried.opencodeSession != null
+              if (!SESSION_ID_RE.test(carried.sessionId) || carried.sessionId === had.sessionId || badNative || carriedIds.has(carried.sessionId) || (native && carriedNative.has(native)) ||
+                floors.some(f => f.agents.some(old => old.sessionId === carried.sessionId || (carried.codexThread && old.codexThread === carried.codexThread) || (carried.opencodeSession && old.opencodeSession === carried.opencodeSession)))) {
+                throw Object.assign(apiError(409, 'Prepared conversation aliases an existing session or has invalid native bindings. The chart is unchanged.'), { code: 'engine-change-conversion-failed' })
+              }
+              carriedIds.add(carried.sessionId)
+              if (native) carriedNative.add(native)
+              const archived = clone(had)
+              // Conversion runs where the current source actually lives (which can correct an old home mark).
+              archived.homePc = carried.homePc ?? archived.homePc
+              archived.homePcName = carried.homePcName ?? archived.homePcName
+              rememberConversation(archived, engineOf(had.engine, defaultEngine()))
+              a.conversationHistory = archived.conversationHistory
+              Object.assign(a, carried)
+              rememberConversation(a, engineOf(a.engine, defaultEngine()), had.sessionId)
+            }
           }
         }
         floor.agents = repairAgents(next)
       }
       floor.updatedAt = now()
-      save()
+      const previousFloors = floors
+      floors = floors.map(f => f.id === floor.id ? floor : f)
+      try { save() } catch (error) { floors = previousFloors; throw error }
       return clone(floor)
     },
 
@@ -563,12 +603,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       }
       // A different chat starts without a home: the PC that starts it becomes it (F-064).
       if (agent.sessionId !== sessionId) {
+        rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
         agent.homePc = null
         agent.homePcName = null
         agent.opencodeSession = null
         agent.codexThread = null
       }
       agent.sessionId = sessionId
+      rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
       floor.updatedAt = now()
       save()
       return clone(floor)
@@ -578,6 +620,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (native !== null && !OPENCODE_SESSION_RE.test(native)) throw apiError(400, 'Invalid OpenCode session id')
       const floor = find(floorId), agent = agentOf(floor, agentId)
       agent.opencodeSession = native
+      rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
       floor.updatedAt = now(); save(); return clone(floor)
     },
 
@@ -588,6 +631,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       const next = thread === null ? null : thread.toLowerCase()
       if ((agent.codexThread ?? null) !== next) {
         agent.codexThread = next
+        rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
         floor.updatedAt = now()
         save()
       }
@@ -602,6 +646,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (agent.homePc === id && agent.homePcName === name) return clone(floor)
       agent.homePc = id
       agent.homePcName = name
+      rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
       floor.updatedAt = now()
       save()
       return clone(floor)

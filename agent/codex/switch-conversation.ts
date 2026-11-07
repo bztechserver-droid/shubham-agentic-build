@@ -1,6 +1,7 @@
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { statSync } from 'node:fs'
 import { claudeFileContext, conversationLines, writeClaudeRollout } from './from-claude.ts'
 import { writeCodexAsClaude } from './to-claude.ts'
 
@@ -14,12 +15,18 @@ export interface SwitchConversationOptions {
 
 /** Standalone disk conversion. Returns a fresh binding; reads only the specified transcript. */
 export function switchConversation(options: SwitchConversationOptions): { id: string; file: string } {
+  const before = statSync(options.file)
+  const verify = <T>(result: T): T => {
+    const after = statSync(options.file)
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error('Source changed during conversion; current binding must be kept')
+    return result
+  }
   if (options.to === 'claude') {
     if (!options.projectsDir) throw new Error('Claude projects directory is required')
-    return writeCodexAsClaude(conversationLines(options.file), options.projectsDir, options.cwd)
+    return verify(writeCodexAsClaude(conversationLines(options.file), options.projectsDir, options.cwd))
   }
   if (!options.codexHome) throw new Error('Codex home is required')
-  return writeClaudeRollout(claudeFileContext(options.file).lines, options.codexHome, options.cwd, new Date(), true)
+  return verify(writeClaudeRollout(claudeFileContext(options.file).lines, options.codexHome, options.cwd, new Date(), true))
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

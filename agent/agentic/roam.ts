@@ -97,10 +97,10 @@ export async function request<T>(peer: LinkPeer, op: string, body: unknown = {},
   } catch (e) {
     throw apiError(504, `${peer.name} didn't answer: ${message(e)}`)
   }
-  const a = lines[0] as { ok?: boolean; value?: T; status?: number; error?: string } | undefined
+  const a = lines[0] as { ok?: boolean; value?: T; status?: number; error?: string; code?: string } | undefined
   if (!a || typeof a !== 'object') throw apiError(502, `${peer.name} gave no answer`)
   if (a.ok) return a.value as T
-  throw apiError(typeof a.status === 'number' ? a.status : 502, a.error ?? `${peer.name} said no`)
+  throw Object.assign(apiError(typeof a.status === 'number' ? a.status : 502, a.error ?? `${peer.name} said no`), typeof a.code === 'string' ? { code: a.code } : {})
 }
 
 /** The far end of `request`: reads its one line, answers with what `run` gives (or its error). */
@@ -116,7 +116,8 @@ export function answer(run: (body: unknown) => Promise<unknown> | unknown): (str
           value => stream.end(`${JSON.stringify({ ok: true, value: value ?? null })}\n`),
           (e: unknown) => {
             const status = typeof (e as { status?: unknown }).status === 'number' ? (e as { status: number }).status : 500
-            stream.end(`${JSON.stringify({ ok: false, status, error: message(e) })}\n`)
+            const code = typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : undefined
+            stream.end(`${JSON.stringify({ ok: false, status, error: message(e), code })}\n`)
           },
         )
     })
@@ -172,7 +173,8 @@ export function servePull(fileOf: (sessionId: string) => string | null): (stream
  * Brings `file` up to `peer`'s copy of the session. Resolves with the mark it ends at (that
  * copy's size then). A copy that disagrees is replaced whole, written beside and swapped in.
  */
-export async function pullFrom(peer: LinkPeer, sessionId: string, file: string): Promise<FileMark> {
+export async function pullFrom(peer: LinkPeer, sessionId: string, file: string, mayWrite: () => boolean = () => true): Promise<FileMark> {
+  if (!mayWrite()) throw apiError(409, 'This conversation is fenced while changing engines')
   const stream = await peer.open({ op: 'pull' })
   stream.write(`${JSON.stringify({ sessionId, have: markOf(file) } satisfies PullAsk)}\n`)
   return new Promise<FileMark>((resolve, reject) => {
@@ -189,6 +191,7 @@ export async function pullFrom(peer: LinkPeer, sessionId: string, file: string):
     }
     readLines(stream, v => {
       if (failed) return
+      if (!mayWrite()) return fail(apiError(409, 'This conversation became fenced during transcript transfer'))
       const line = v as { replace?: boolean; bytes?: number; d?: string }
       if (!head) {
         head = { replace: line.replace === true, bytes: typeof line.bytes === 'number' ? line.bytes : 0 }
@@ -211,6 +214,7 @@ export async function pullFrom(peer: LinkPeer, sessionId: string, file: string):
       if (!head) return fail(new Error(`${peer.name} sent nothing`))
       if (at !== head.bytes) return fail(new Error(`${peer.name} sent ${at} of ${head.bytes} bytes`))
       try {
+        if (!mayWrite()) return fail(apiError(409, 'This conversation became fenced before transcript replacement'))
         into?.done()
       } catch (e) {
         return fail(e instanceof Error ? e : new Error(String(e)))

@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto'
-import { closeSync, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { closeSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 type Row = Record<string, unknown>
@@ -17,7 +17,8 @@ export function sanitizeConversationValue(v: unknown, depth = 0, limit = LIMIT):
       if (object(parsed) || Array.isArray(parsed)) return cap(JSON.stringify(sanitizeConversationValue(parsed, depth + 1, limit)), limit)
     } catch { /* Ordinary conversation text. */ }
     return cap(cap(v, limit).replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~-]+)/gi, '[redacted]')
-      .replace(/((?:[\w-]{0,80}(?:token|api[_-]?key|password|secret)[\w-]{0,80})\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi, '$1[redacted]'), limit)
+      .replace(/(\b[\w-]+\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/g,
+        (match, field: string) => /token|api[_-]?key|password|secret/i.test(field) ? `${field}[redacted]` : match), limit)
   }
   if (Array.isArray(v)) return v.slice(0, 1000).map(x => sanitizeConversationValue(x, depth + 1, limit))
   if (object(v)) return Object.fromEntries(Object.entries(v).filter(([k]) => !secret.test(k)).map(([k, x]) => [k, sanitizeConversationValue(x, depth + 1, limit)]))
@@ -62,6 +63,20 @@ export function* conversationLines(file: string): Generator<string> {
 
 /** Only inspect transcript metadata near the start; never load a large conversation to learn its cwd. */
 export function conversationCwd(file: string): string | null {
+  // A moved conversation can retain another PC's cwd near its head. Prefer recent native metadata.
+  const fd = openSync(file, 'r')
+  try {
+    const size = statSync(file).size, tail = Buffer.alloc(Math.min(size, 256 * 1024))
+    readSync(fd, tail, 0, tail.length, Math.max(0, size - tail.length))
+    for (const line of tail.toString('utf8').split('\n').reverse()) {
+      try {
+        const row: unknown = JSON.parse(line)
+        if (!object(row) || row.isSidechain === true) continue
+        const cwd = ['session_meta', 'turn_context'].includes(String(row.type)) && object(row.payload) ? row.payload.cwd : row.cwd
+        if (typeof cwd === 'string' && path.isAbsolute(cwd)) return cwd
+      } catch { /* The first tail line may be partial. */ }
+    }
+  } finally { closeSync(fd) }
   let count = 0
   for (const line of conversationLines(file)) {
     if (++count > 128) break
@@ -102,6 +117,7 @@ export function convertClaude(lines: Iterable<string>, options: ConversionOption
   const budget = Math.max(8192, options.budgetBytes ?? 400 * 1024)
   const stats: ConversionStats = { inputLines: 0, compactions: 0, omittedTurns: 0, outputBytes: 0 }
   let summary: string[] = [], turns: string[][] = [], active: string[] = [], bytes = 0, dropped = false
+  const seen = new Set<string>()
   const length = (rows: string[]) => rows.reduce((n, row) => n + Buffer.byteLength(row) + 1, 0)
   const finish = () => { if (active.length) turns.push(active); active = []; dropped = false }
   for (const line of lines) {
@@ -113,10 +129,18 @@ export function convertClaude(lines: Iterable<string>, options: ConversionOption
     if (r.type === 'system' && r.subtype === 'compact_boundary') {
       summary = []; turns = []; active = []; bytes = 0; dropped = false
       stats.compactions++; stats.omittedTurns = 0
+      seen.clear()
       continue
     }
     const isSummary = r.type === 'user' && r.isCompactSummary === true
     if (r.isMeta === true && !isSummary) continue
+    if (typeof r.uuid === 'string') {
+      // A replayed row is not another user turn. Different content under the same UUID is retained.
+      const key = r.uuid + ':' + createHash('sha256').update(JSON.stringify([r.type, r.message, r.attachment])).digest('hex')
+      if (seen.has(key)) continue
+      if (seen.size >= 4096) seen.delete(seen.values().next().value!)
+      seen.add(key)
+    }
     if (isSummary) {
       // A summary is context even when Claude marks it metadata. Keep it separately from evictable turns.
       const content = object(r.message) ? r.message.content : ''
@@ -238,7 +262,10 @@ export function writeClaudeRollout(lines: Iterable<string>, home: string, cwd: s
   const dir = path.join(home, 'sessions', ...day.split('-'))
   const file = path.join(dir, `rollout-${stamp}-${id}.jsonl`)
   const converted = convertClaude(lines, { id, cwd, timestamp: now.toISOString() })
-  if (requireMessages && !converted.lines.some(line => JSON.parse(line).type === 'response_item')) throw new Error('No convertible conversation messages')
+  if (requireMessages && !converted.lines.some(line => {
+    const row = JSON.parse(line)
+    return row.type === 'response_item' && (row.payload.type !== 'message' || row.payload.content.some((p: Row) => typeof p.text === 'string' && !p.text.startsWith('[Import omitted ')))
+  })) throw new Error('No convertible conversation messages fit the import budget')
   mkdirSync(dir, { recursive: true })
   writeFileSync(file, `${converted.lines.join('\n')}\n`, { flag: 'wx', mode: 0o600 })
   return { id, file, stats: converted.stats }

@@ -70,6 +70,7 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PATCH', /^\/floors\/([^/]+)$/, floor('manage')],
   ['DELETE', /^\/floors\/([^/]+)$/, floor('delete')],
   ['GET', /^\/defaults$/, SIGNED],
+  ['GET', /^\/engine-switch-capabilities$/, SIGNED],
   ['PUT', /^\/defaults$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, chat('owner')],
   ['GET', /^\/approvals$/, OWNER],

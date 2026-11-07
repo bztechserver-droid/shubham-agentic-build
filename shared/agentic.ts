@@ -63,6 +63,19 @@ export const isOrchestratorAgent = (floorName: string, agent: { name: string; du
   agent.duty === undefined ? floorName.trim().toLowerCase() === 'assistant' && agent.name.trim().toLowerCase() === 'assistant' : agent.duty === 'orchestrator'
 
 /** One agent on a floor: a desk on the chart, and one Claude Code chat once it is opened. */
+/** Server-owned native bindings. Artifacts stay on their recorded PC; switching never deletes them. */
+export interface ConversationRecord {
+  engine: 'claude' | 'codex' | 'opencode'
+  sessionId: string
+  codexThread: string | null
+  opencodeSession: string | null
+  homePc: string | null
+  homePcName: string | null
+  recordedAt: string
+  /** The current chain this session was converted from, rather than an older archived snapshot. */
+  sourceSessionId?: string
+}
+
 export interface FloorAgent {
   id: string
   name: string
@@ -111,6 +124,8 @@ export interface FloorAgent {
    */
   codexThread?: string | null
   opencodeSession?: string | null
+  /** Native session lineage, maintained by the server and ignored in page PATCH bodies. */
+  conversationHistory?: ConversationRecord[]
   /** Skills and MCP servers it was given; named in its brief (advisory, as in the original). */
   skills: string[]
   mcpServers: string[]
@@ -214,6 +229,8 @@ export interface AdoptStatus {
 
 /** GET /agentic/floors */
 export interface FloorsAnswer {
+  /** Missing on an old hub: clients must not promise safe history carry-over or send confirmed engine changes. */
+  engineSwitchContinuity?: { version: 1; failClosed: true; homePcPreparation: true }
   floors: Floor[]
   /** Live chats on this PC, by session id; a session not here has no running claude on this PC. */
   live: Record<string, ChatState>
@@ -236,10 +253,13 @@ export interface FloorPatch {
   /** F-021, a member to its hub: that member's folder for the floor (null: the default). */
   folderFor?: { id: string; dir: string | null }
   /**
-   * F-142: true when the page has shown ENGINE_CHANGE_MESSAGE and the person agreed: carry the conversation to the new engine, or start a new one if conversion fails.
+   * True when the person agreed to carry the current conversation to the new engine.
+   * A failed carry-over leaves the current engine and binding intact; this never authorizes a blank conversation.
    * Without it that change is refused with a 409 (code engine-change-new-conversation).
    */
   confirmNewConversation?: boolean
+  /** Compare-and-swap for a confirmation captured before another switch or session change. */
+  expectedConversation?: { agentId: string; engine: 'claude' | 'codex' | 'opencode'; sessionId: string | null; codexThread?: string | null; opencodeSession?: string | null }
 }
 
 /** POST /agentic/floors/:id/agents (the sidebar's Add agent, and agent_hire). */

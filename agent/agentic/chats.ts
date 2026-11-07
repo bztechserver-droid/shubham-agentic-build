@@ -196,6 +196,8 @@ export interface ChatPool {
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
   typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
   kill(sessionId: string, why?: string): boolean
+  /** Native PTY exit acknowledgement, rather than removal of its in-memory chat entry. */
+  waitStopped?(sessionId: string): Promise<void>
   /**
    * F-075: takes hold of a chat that is already running in the chat host (an agent that started after the one that
    * began it): its terminal, what the host kept of its output (read to find what it is doing), and its key.
@@ -334,6 +336,7 @@ interface Chat {
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
   const chats = new Map<string, Chat>()
+  const actualExits = new Map<string, Promise<void>>()
   const keys = new Map<string, Chat>()
   const log = o.log
   let spawnPty = o.spawn ?? null
@@ -552,6 +555,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   /** The chat's terminal feeds its buffer, its screen, its state and its viewers. */
   function register(c: Chat) {
     const pty = c.pty
+    let exited!: () => void
+    const exit = new Promise<void>(resolve => { exited = resolve })
+    actualExits.set(c.info.sessionId, exit)
     chats.set(c.info.sessionId, c)
     keys.set(c.key, c)
     pty.onData(data => {
@@ -571,7 +577,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         }
       }
     })
-    pty.onExit(e => finish(c, typeof e?.exitCode === 'number' ? e.exitCode : null))
+    pty.onExit(e => {
+      exited()
+      if (actualExits.get(c.info.sessionId) === exit) actualExits.delete(c.info.sessionId)
+      finish(c, typeof e?.exitCode === 'number' ? e.exitCode : null)
+    })
   }
 
   function bufferText(c: Chat) {
@@ -881,6 +891,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       killTree(c)
       finish(c, null)
       return true
+    },
+
+    async waitStopped(id) {
+      const exit = actualExits.get(id)
+      if (!exit) return
+      let timer: NodeJS.Timeout | undefined
+      try { await Promise.race([exit, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('The original process has not acknowledged exit; engine switch blocked')), 5000) })]) }
+      finally { clearTimeout(timer) }
     },
 
     adopt(a, pty, replay) {

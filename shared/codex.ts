@@ -55,7 +55,10 @@ export interface CodexStatus {
 
 /** The code of a 409 when an agent's engine changes while it has a conversation. */
 export const ENGINE_CHANGE_CODE = 'engine-change-new-conversation'
-export const ENGINE_CHANGE_MESSAGE = 'Changing the engine carries your conversation over to the new engine. The original stays saved. If conversion is unavailable, a new conversation starts.'
+export const ENGINE_CHANGE_MESSAGE = 'Changing the engine carries your current conversation over to the new engine. Original sessions stay saved. If history cannot be carried over, the switch is blocked and your current conversation stays selected.'
+export const ENGINE_CHANGE_FAILED_CODE = 'engine-change-conversion-failed'
+export const ENGINE_CHANGE_STALE_CODE = 'engine-change-stale'
+export const ENGINE_CHANGE_HOME_OFFLINE_CODE = 'engine-change-home-offline'
 
 /** The engine an agent actually runs, given its own setting and the default. */
 export function engineOf(own: AgentEngine | undefined, dflt: AgentEngine | undefined): 'claude' | 'codex' | 'opencode' {
