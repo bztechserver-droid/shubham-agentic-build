@@ -1,1 +1,0 @@
-var e=`/agentic`,t=[``,`opus`,`sonnet`,`haiku`],n=[``,`low`,`medium`,`high`,`xhigh`,`max`],r=[``,`on`,`off`],i={model:``,effort:``,ultracode:!1},a=8e3,o=2e4,s=(e,t)=>t.duty===void 0?e.trim().toLowerCase()===`assistant`&&t.name.trim().toLowerCase()===`assistant`:t.duty===`orchestrator`;export{r as a,s as c,t as i,o as n,a as o,n as r,i as s,e as t};

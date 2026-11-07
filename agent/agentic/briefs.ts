@@ -22,12 +22,12 @@ const cut = (text: string, max: number, what: string) =>
   text.length > max ? `${text.slice(0, max)}\n\n[...truncated: this ${what} is longer than ${max} characters]` : text
 
 /** `memory` (F-051): the memory layer's section (what it is, core.md, the wiki's pages), added last. */
-export function composeAgentBrief(floor: Floor, agent: FloorAgent, memory = '', orderReplies = false): string {
+export function composeAgentBrief(floor: Floor, agent: FloorAgent, memory = '', orderReplies = false, engine = 'Claude'): string {
   const out: string[] = []
 
   out.push(`## Working alongside other chats
 
-You are one of several Claude chats running side by side in Shubham Agentic, one per agent on the floor **${floor.name}**. The tools below come from the \`${MCP_SERVER_NAME}\` MCP server.
+You are one of several ${engine} chats running side by side in Shubham Agentic, one per agent on the floor **${floor.name}**. The tools below come from the \`${MCP_SERVER_NAME}\` MCP server.
 
 - To see and reach the other chats on your floor: \`list_chats\`, \`read_chat\`, \`send_to_chat\`, \`broadcast_to_chats\`.
 - To see and reach any chat in the whole app (every floor, on the server and the laptop): \`app_chats\`, \`app_read_chat\`, \`app_read_conversation\`, \`app_send_to_chat\`, \`app_open_chat\`, \`app_stop_chat\`, and \`app_set_effort\` (how hard an agent's chat thinks).

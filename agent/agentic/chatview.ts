@@ -42,7 +42,7 @@ const READ_CAP = 16 * 1024 * 1024
 /** Tool calls remembered, to match their answers to. */
 const TOOLS_KEPT = 600
 
-type Row = Record<string, unknown>
+export type Row = Record<string, unknown>
 const isObject = (v: unknown): v is Row => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 const cap = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s)
@@ -165,6 +165,18 @@ function resultText(c: unknown): string {
 
 export type ChatOp = { op: 'add'; item: ChatItem } | { op: 'patch'; id: string; patch: ChatPatch }
 
+/** F-134: what turns rows into items. Claude's `Converter` and Codex's (agent/codex/rollout.ts) both are one. */
+export interface RowConverter {
+  feed(row: Row): ChatOp[]
+  readonly tools: Map<string, ChatToolItem>
+}
+
+/** F-134: a conversation file's format: how a line is read as a row, and the converter for the rows. */
+export interface RowFormat {
+  parse(line: string): Row | null
+  make(): RowConverter
+}
+
 /**
  * Rows in file order to items and patches. It keeps the tool calls it has made items of, so a
  * later row carrying their answer patches them; one whose call is out of reach is dropped.
@@ -261,7 +273,7 @@ export class Converter {
   }
 
   /** What was typed to the agent, as it is stored: some of it is claude's wrapping, not the person's words. */
-  private userText(raw: string, at: string | null, uuid: string | null): Op[] {
+  protected userText(raw: string, at: string | null, uuid: string | null): Op[] {
     const t = unwrapPaste(raw).trim()
     if (!t || !uuid) return []
     if (t.startsWith('<task-notification') || t.startsWith('<local-command-caveat') || t.startsWith('<system-reminder')) return []
@@ -298,11 +310,14 @@ export class Converter {
 }
 
 type Op = ChatOp
-const add = (item: ChatItem): Op => ({ op: 'add', item })
-const notice = (id: string, at: string | null, text: string, tone: ChatNoticeItem['tone']): ChatNoticeItem => ({ kind: 'notice', id, at, text, tone })
+export const add = (item: ChatItem): Op => ({ op: 'add', item })
+export const notice = (id: string, at: string | null, text: string, tone: ChatNoticeItem['tone']): ChatNoticeItem => ({ kind: 'notice', id, at, text, tone })
 
 // The bookkeeping rows, by their prefix, so a megabyte `api-request-blob` is never parsed.
 const BOOKKEEPING = /^\{"type":"(?!user"|assistant"|system"|attachment")/
+
+/** F-134: Claude's format, the default everywhere. */
+export const CLAUDE_FORMAT: RowFormat = { parse: line => parseRow(line), make: () => new Converter() }
 
 /** A line of the file as a row, or null for one that isn't a conversation row (or isn't JSON). */
 export function parseRow(line: string): Row | null {
@@ -366,7 +381,7 @@ export interface Tail {
   /** The end of the last whole line read: where following goes on from. */
   end: number
   /** Its tool calls, for matching the answers that come later. */
-  conv: Converter
+  conv: RowConverter
   /** How many bytes were looked at (tests: it is not the file). */
   scanned: number
 }
@@ -380,10 +395,13 @@ export interface TailOptions {
   maxSpan?: number
   /** The read ends where the file does now and goes on being followed: tool calls without an answer are still running. */
   live?: boolean
+  /** F-134: the file's format (Claude's when left out). */
+  format?: RowFormat
 }
 
 /** The last `messages` of the conversation in `file` (before `end`, when given), reading only as far back as that takes. */
 export function readTail(file: string, o: TailOptions = {}): Tail {
+  const format = o.format ?? CLAUDE_FORMAT
   const fd = openSync(file, 'r')
   try {
     const size = fstatSync(fd).size
@@ -402,18 +420,18 @@ export function readTail(file: string, o: TailOptions = {}): Tail {
         // Start on a line: drop the piece of the line the cut went through.
         const nl = buf.indexOf(0x0a)
         if (nl === -1) {
-          if (span >= maxSpan) return { items: [], before: from, end, conv: new Converter(), scanned }
+          if (span >= maxSpan) return { items: [], before: from, end, conv: format.make(), scanned }
           span *= 2
           continue
         }
         buf = buf.subarray(nl + 1)
         base = from + nl + 1
       }
-      const conv = new Converter()
+      const conv = format.make()
       const items: ChatItem[] = []
       const offs: number[] = []
       for (const line of splitLines(buf, base)) {
-        const row = parseRow(line.text)
+        const row = format.parse(line.text)
         if (!row) continue
         for (const op of conv.feed(row)) {
           if (op.op !== 'add') continue
@@ -459,7 +477,9 @@ interface Follow {
   ident: string
   /** Bytes consumed: the end of the last whole line handled. */
   pos: number
-  conv: Converter
+  conv: RowConverter
+  /** F-134: the format of its file. */
+  format: RowFormat
   subs: Set<(m: ChatFeedMessage) => void>
   timer: ReturnType<typeof setInterval> | null
   /** What was last said of the screen (JSON), so a change is said once. */
@@ -478,6 +498,10 @@ export interface ChatFeedsOptions {
    * file has neither (claude writes a tool call and its answer together, once it has one).
    */
   screen?: (sessionId: string) => string[] | null
+  /** F-134: a chat's conversation file when it is not found by Claude's rules (a Codex chat's rollout), or null. */
+  fileOf?: (sessionId: string) => string | null
+  /** F-134: the format of a chat's file (Claude's when left out). */
+  formatOf?: (sessionId: string) => RowFormat
 }
 
 export interface ChatFeeds {
@@ -497,6 +521,8 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   const pollMs = o.pollMs ?? 350
   const follows = new Map<string, Follow>()
   const previews = new Map<string, { key: string; value: ChatPreview | null }>()
+  const formatOf = (sessionId: string): RowFormat => o.formatOf?.(sessionId) ?? CLAUDE_FORMAT
+  const fileOf = (sessionId: string): string | null => o.fileOf?.(sessionId) ?? findTranscript(sessionId, projectsDir)
 
   const send = (f: Follow, m: ChatFeedMessage) => {
     for (const s of f.subs) {
@@ -526,7 +552,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
 
   /** The file, found (it may not exist yet: a chat's file appears with its first message). */
   function locate(f: Follow): boolean {
-    f.file ??= findTranscript(f.sessionId, projectsDir)
+    f.file ??= fileOf(f.sessionId)
     return f.file !== null
   }
 
@@ -534,7 +560,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   function hello(f: Follow): ChatFeedMessage {
     if (!f.file) return { t: 'hello', sessionId: f.sessionId, items: [], before: null, size: 0 }
     const st = statSync(f.file)
-    const tail = readTail(f.file, { live: true })
+    const tail = readTail(f.file, { live: true, format: f.format })
     f.ident = identOf(st)
     f.pos = tail.end
     f.conv = tail.conv
@@ -607,7 +633,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
       f.pos += whole.length
       const ops: ChatOp[] = []
       for (const line of splitLines(whole, base)) {
-        const row = parseRow(line.text)
+        const row = f.format.parse(line.text)
         if (row) ops.push(...f.conv.feed(row))
       }
       emit(f, ops)
@@ -622,10 +648,11 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
       if (f) {
         // Join up with the others exactly: catch the follow up first, then read the end up to where it is.
         tick(f)
-        const t = f.file ? readTail(f.file, { end: f.pos, live: true }) : null
+        const t = f.file ? readTail(f.file, { end: f.pos, live: true, format: f.format }) : null
         sendTo({ t: 'hello', sessionId, items: t?.items ?? [], before: t?.before ?? null, size: f.pos })
       } else {
-        f = { sessionId, file: null, ident: '', pos: 0, conv: new Converter(), subs: new Set(), timer: null, menu: 'null', status: 'null' }
+        const format = formatOf(sessionId)
+        f = { sessionId, file: null, ident: '', pos: 0, conv: format.make(), format, subs: new Set(), timer: null, menu: 'null', status: 'null' }
         locate(f)
         try {
           sendTo(hello(f))
@@ -657,14 +684,14 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
     },
 
     history(sessionId, before, limit = CHAT_WINDOW_MESSAGES) {
-      const file = findTranscript(sessionId, projectsDir)
+      const file = fileOf(sessionId)
       if (!file || !(before > 0)) return { items: [], before: null }
-      const t = readTail(file, { end: before, messages: Math.max(1, Math.min(limit, 200)) })
+      const t = readTail(file, { end: before, messages: Math.max(1, Math.min(limit, 200)), format: formatOf(sessionId) })
       return { items: t.items, before: t.before }
     },
 
     preview(sessionId) {
-      const file = findTranscript(sessionId, projectsDir)
+      const file = fileOf(sessionId)
       if (!file) return null
       let st: Stats
       try {
@@ -677,7 +704,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
       if (hit?.key === key) return hit.value
       let value: ChatPreview | null = null
       try {
-        const tail = readTail(file, { messages: 6, maxSpan: 4 * 1024 * 1024 })
+        const tail = readTail(file, { messages: 6, maxSpan: 4 * 1024 * 1024, format: formatOf(sessionId) })
         for (let i = tail.items.length - 1; i >= 0 && !value; i--) {
           const item = tail.items[i]
           if (item.kind === 'assistant' || (item.kind === 'user' && !item.command)) {

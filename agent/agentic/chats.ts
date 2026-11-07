@@ -4,6 +4,8 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
+import * as cxs from '../codex/screen.ts'
+import { sendToCodex, type SendOptions } from '../codex/sender.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, type Screen } from './screen.ts'
@@ -67,6 +69,10 @@ const RESUME_GATE_RE = /resumefromsummary|resumingthefullsession|resumefullsessi
 /** Both gates are drawn while it starts, or not at all; one later is a person's to answer. */
 const GATE_WINDOW_MS = 15_000
 
+/** F-134: the words a Codex chat's state is read from (codex/screen.ts has the screens they come from). */
+const CODEX_RES = { question: cxs.CODEX_QUESTION_RE, running: cxs.CODEX_RUNNING_RE, done: cxs.CODEX_DONE_RE, idle: cxs.CODEX_IDLE_RE }
+const CLAUDE_RES = { question: TURN_QUESTION_RE, running: TURN_RUNNING_RE, done: TURN_DONE_RE, idle: TURN_IDLE_RE }
+
 const MAX_BUFFER_BYTES = 256 * 1024
 /** A chat nobody is looking at and that isn't working is stopped after this long. */
 export const IDLE_REAP_MS = 4 * 60 * 60 * 1000
@@ -124,6 +130,13 @@ export interface StartChat {
   resume: boolean
   cols?: number
   rows?: number
+  /** F-134: which engine runs it (Claude when left out). */
+  engine?: 'claude' | 'codex'
+  /**
+   * F-134, for the Codex engine: the Codex home it runs in (CODEX_HOME), its profile (codex -p <profile>) and, to resume, the Codex conversation id.
+   * model/effort/brief/MCP servers are in the profile file (codex/home.ts writeProfile), so none of the Claude flags above are used.
+   */
+  codex?: { home: string; profile: string; thread: string | null }
 }
 
 /** F-078: how a chat ended. cause: stopped (by him), idle-reaper, agent-stop (the app stopping: an Update, a restart), exited (it ended itself, code 0), crashed (a non-zero code), ended (no code). */
@@ -131,6 +144,8 @@ export interface ChatEnded {
   sessionId: string
   floorId: string
   agentId: string
+  /** F-134 */
+  engine: 'claude' | 'codex'
   cause: string
   code: number | null
   startedAt: string
@@ -144,6 +159,8 @@ export interface ChatInfo {
   sessionId: string
   floorId: string
   agentId: string
+  /** F-134: the engine it really runs. */
+  engine: 'claude' | 'codex'
   cwd: string
   state: ChatState
   startedAt: string
@@ -205,6 +222,8 @@ export interface AdoptChat {
   sessionId: string
   floorId: string
   agentId: string
+  /** F-134: from the host's record of the chat (Claude when it has none). */
+  engine?: 'claude' | 'codex'
   cwd: string
   startedAt: string
   key: string
@@ -222,8 +241,20 @@ export interface ChatPoolOptions {
   spawn?: PtySpawn
   /** The claude executable; found on PATH when left out. */
   claude?: string
+  /** F-134: the codex executable for Codex chats (null/absent: none installed; a Codex chat is refused). */
+  codexBin?: () => string | null
+  /** F-138: the API key the CRM gave this person for Codex chats, as the variable Codex reads (codex/index.ts credentialEnv), or null. A ChatGPT login is a file in the Codex home instead. */
+  codexCredential?: () => { name: string; value: string } | null
+  /** F-134, tests: shorter waits for a Codex chat's sender. */
+  codexSend?: SendOptions
   /** CLAUDE_CODE_OAUTH_TOKEN as this Windows account has it now (F-007 keeps it there); null: leave the inherited one. */
   token?: () => string | null
+  /**
+   * F-138: the credential the CRM handed out for this account (claude/index.ts credentialEnv): the variable and its value, exactly ONE of CLAUDE_CODE_OAUTH_TOKEN (a subscription)
+   * and ANTHROPIC_API_KEY (an API key). When it gives one, a Claude chat is started with that one and with the other two ways in (and an inherited ANTHROPIC_AUTH_TOKEN) taken
+   * out of its environment, because an API key silently wins over a subscription. When it gives none, `token` applies exactly as before.
+   */
+  credential?: () => { name: string; value: string } | null
   /** Live set or a chat's state changed. */
   onChange?: () => void
   /** F-078: a chat ended, and why (chat-log.ts keeps the pattern). */
@@ -270,10 +301,12 @@ export function findClaude(env: NodeJS.ProcessEnv = process.env): string | null 
 
 // What the agent's own environment must not pass on: it may itself have been started from a
 // Claude chat (or Christopher's), and a claude that inherits those thinks it is a child session.
-const DROP_ENV = /^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_MESSAGING_.*|CLAUDE_PID|CLAUDE_CONFIG_DIR|COS_.*|MDV2_PORT|SAD_AGENTIC_.*)$/i
+// F-134: nor a Codex login or key of the person's own: the Codex chats run on the CRM's login (CODEX_HOME is set for them below), and a stray OPENAI_API_KEY must not win over it.
+const DROP_ENV = /^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_MESSAGING_.*|CLAUDE_PID|CLAUDE_CONFIG_DIR|COS_.*|MDV2_PORT|SAD_AGENTIC_.*|CODEX_HOME|CODEX_API_KEY|CODEX_ACCESS_TOKEN|OPENAI_API_KEY)$/i
 
 interface Chat {
   info: Omit<ChatInfo, 'state' | 'viewers'>
+  engine: 'claude' | 'codex'
   pty: PtyLike
   key: string
   state: ChatState
@@ -353,6 +386,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   }
   function draftOnScreen(c: Chat): boolean {
     try {
+      if (c.engine === 'codex') return !menuOnScreen(c) && cxs.draftText(c.screen.lines()) !== ''
       return !menuOnScreen(c) && boxText(c.screen.lines(), c.screen.typedLines()) !== ''
     } catch {
       return false
@@ -362,6 +396,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function menuSeen(c: Chat): boolean | null {
     try {
       const lines = c.screen.lines()
+      if (c.engine === 'codex') return cxs.menuOnScreen(lines)
       let last = -1
       for (let i = lines.length - 1; i >= 0 && last < 0; i--) if (OPTION_UNDER_CURSOR_RE.test(lines[i]) || MENU_FOOTER_RE.test(lines[i])) last = i
       if (last < 0) return false
@@ -418,13 +453,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     const carry = c.carry
     c.carry = clean.slice(-96)
     // This chunk decides when it says anything; the carry only catches a marker split in two.
-    const decides = (t: string) => TURN_QUESTION_RE.test(t) || TURN_RUNNING_RE.test(t) || TURN_DONE_RE.test(t) || TURN_IDLE_RE.test(t)
+    const re = c.engine === 'codex' ? CODEX_RES : CLAUDE_RES
+    const decides = (t: string) => re.question.test(t) || re.running.test(t) || re.done.test(t) || re.idle.test(t)
     const t = decides(clean) ? clean : carry + clean
     const before = c.state
     // A question outranks working: a permission prompt comes mid-turn, and while it's up the agent waits on you.
-    if (TURN_QUESTION_RE.test(t)) c.state = 'question'
-    else if (TURN_RUNNING_RE.test(t)) c.state = 'running'
-    else if (TURN_DONE_RE.test(t) || TURN_IDLE_RE.test(t)) c.state = 'idle'
+    if (re.question.test(t)) c.state = 'question'
+    else if (re.running.test(t)) c.state = 'running'
+    else if (re.done.test(t) || re.idle.test(t)) c.state = 'idle'
     if (c.state === 'question' && before !== 'question') c.questionAt = Date.now()
     if (c.state !== before) {
       c.lastActive = Date.now() // a turn started or ended
@@ -495,7 +531,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     keys.delete(c.key)
     if (chats.get(c.info.sessionId) === c) chats.delete(c.info.sessionId)
     try {
-      o.onEnded?.({ sessionId: c.info.sessionId, floorId: c.info.floorId, agentId: c.info.agentId, cause: c.why ?? (code === 0 ? 'exited' : code === null ? 'ended' : 'crashed'), code, startedAt: c.info.startedAt })
+      o.onEnded?.({ sessionId: c.info.sessionId, floorId: c.info.floorId, agentId: c.info.agentId, engine: c.engine, cause: c.why ?? (code === 0 ? 'exited' : code === null ? 'ended' : 'crashed'), code, startedAt: c.info.startedAt })
     } catch {
       // The log is the log's trouble.
     }
@@ -548,6 +584,18 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     // This one guard covers every way in (the tools, the chat view, the heartbeat, a member PC's 'type', the chat host).
     // Approvals answer a question on purpose with input(), not with this.
     if (blocked(c)) return false
+    if (c.engine === 'codex') {
+      // F-134: Codex takes a message its own way (codex/sender.ts: paste, wait, Enter, look, Enter again). The caller is told it is on its way; a message that
+      // could not be taken is said in the log (and a question that appeared in the meantime stops it before any Enter).
+      c.lastActive = Date.now()
+      void sendToCodex({ write: d => write(c, d), lines: () => c.screen.lines(), sleep: ms => new Promise<void>(r => setTimeout(r, ms).unref()) }, text, o.codexSend).then(
+        r => {
+          if (r !== 'sent') log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: a message for this Codex chat was not taken (${r})`)
+        },
+        () => undefined,
+      )
+      return true
+    }
     if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false
     c.lastActive = Date.now()
     setTimeout(() => {
@@ -583,7 +631,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       }
       // What is on screen now: a gate answered a minute ago is still in the scrollback.
       const tail = bufferText(c).slice(-4000).replace(/\s+/g, '')
-      if (TRUST_GATE_RE.test(tail) || !PROMPT_READY_RE.test(tail)) return
+      if (c.engine === 'codex') {
+        // Codex draws its prompt while it works too: it is ready when the prompt is there and no turn is running.
+        if (!cxs.CODEX_PROMPT_READY_RE.test(tail) || c.state === 'running') return
+      } else if (TRUST_GATE_RE.test(tail) || !PROMPT_READY_RE.test(tail)) return
       clearInterval(poll)
       setTimeout(() => {
         if (c.exited) return
@@ -596,7 +647,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   function backgroundOf(c: Chat): string | null {
     try {
-      return backgroundWork(c.screen.lines())
+      return c.engine === 'codex' ? cxs.backgroundWork(c.screen.lines()) : backgroundWork(c.screen.lines())
     } catch {
       return null
     }
@@ -640,7 +691,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         if ('error' in loaded) throw Object.assign(new Error(loaded.error), { status: 503 })
         spawnPty = loaded.spawn
       }
-      const claude = o.claude ?? findClaude(o.env)
+      const engine = s.engine === 'codex' ? 'codex' : 'claude'
+      const codexBin = engine === 'codex' ? (o.codexBin?.() ?? null) : null
+      if (engine === 'codex' && (!codexBin || !s.codex)) throw Object.assign(new Error("The Codex CLI isn't installed on this PC"), { status: 503, code: 'not-installed' })
+      const claude = engine === 'codex' ? codexBin! : (o.claude ?? findClaude(o.env))
       if (!claude) throw Object.assign(new Error("Claude Code isn't installed on this PC (no claude on PATH)"), { status: 503 })
 
       const key = `sad_${randomBytes(24).toString('hex')}`
@@ -651,25 +705,47 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       // with the mouse captured) keeps no scrollback in the page's terminal and scrolls only by
       // wheel events, which don't get through Windows' pseudo-terminal: the chat couldn't be
       // scrolled. SAD_CLAUDE_FULLSCREEN=1 keeps the full-screen one, as before.
-      if ((o.env ?? process.env).SAD_CLAUDE_FULLSCREEN !== '1') Object.assign(env, { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1', CLAUDE_CODE_DISABLE_MOUSE: '1' })
-      const token = o.token?.()
-      if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
+      let args: string[]
+      if (engine === 'codex') {
+        // F-134: the Codex home is the one shared by this PC's Codex chats; this chat's own settings are its profile (-p). The login in it was put there by
+        // codex/index.ts from the CRM's copy. The chat's key comes through the terminal's environment (the profile names SAD_AGENTIC_KEY in env_vars).
+        env.CODEX_HOME = s.codex!.home
+        // The person's own OPENAI_API_KEY / CODEX_API_KEY were dropped above (DROP_ENV); the CRM's key, if that is the kind, is the one credential this chat has.
+        const key = o.codexCredential?.() ?? null
+        if (key) env[key.name] = key.value
+        // Claude's credentials have no place in a Codex chat's environment (nor does Codex need them).
+        for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
+        // Codex's plain screen, with scrollback, as Claude's F-040: not the full-screen one.
+        args = ['-p', s.codex!.profile, '--no-alt-screen']
+        if (s.resume && s.codex!.thread) args.push('resume', s.codex!.thread)
+      } else {
+        if ((o.env ?? process.env).SAD_CLAUDE_FULLSCREEN !== '1') Object.assign(env, { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1', CLAUDE_CODE_DISABLE_MOUSE: '1' })
+        const cred = o.credential?.() ?? null
+        if (cred) {
+          for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
+          env[cred.name] = cred.value
+        } else {
+          const token = o.token?.()
+          if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
+        }
 
-      const args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
-      if (s.strictMcp) args.push('--strict-mcp-config')
-      // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
-      for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
-      if (s.model) args.push('--model', s.model)
-      if (s.effort) args.push('--effort', s.effort)
-      if (o.settings) args.push('--settings', o.settings)
+        args = [s.resume ? '--resume' : '--session-id', s.sessionId, '--append-system-prompt-file', s.briefPath, '--mcp-config', s.mcpConfig ?? o.mcpConfig]
+        if (s.strictMcp) args.push('--strict-mcp-config')
+        // One folder each, before the options that follow (--add-dir takes more than one value, up to the next option).
+        for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
+        if (s.model) args.push('--model', s.model)
+        if (s.effort) args.push('--effort', s.effort)
+        if (o.settings) args.push('--settings', o.settings)
+      }
       const file = /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }
       const startedAt = new Date().toISOString()
-      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt } satisfies Record<string, unknown> })
+      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt, engine } satisfies Record<string, unknown> })
 
       const c: Chat = {
-        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt },
+        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, engine, cwd: s.cwd, startedAt },
+        engine,
         pty,
         key,
         state: 'idle',
@@ -683,7 +759,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         lastOutputAt: Date.now(),
         size,
         screen: createScreen(size.cols, size.rows),
-        gates: { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
+        // F-134: Codex has no start-up questions to answer here (its folder is trusted in the profile's world and approvals are off).
+        gates: engine === 'codex' ? { trust: false, trustTries: 0, resume: false, scan: '', until: 0 } : { trust: true, trustTries: 0, resume: s.resume, scan: '', until: Date.now() + GATE_WINDOW_MS },
       }
       register(c)
       log?.info(`chat ${s.sessionId.slice(0, 8)}: ${s.resume ? 'resumed' : 'started'} in ${s.cwd}`)
@@ -806,7 +883,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (existing && !existing.exited) return infoOf(existing)
       const size = { cols: a.cols, rows: a.rows }
       const c: Chat = {
-        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, cwd: a.cwd, startedAt: a.startedAt },
+        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, engine: a.engine === 'codex' ? 'codex' : 'claude', cwd: a.cwd, startedAt: a.startedAt },
+        engine: a.engine === 'codex' ? 'codex' : 'claude',
         pty,
         key: a.key,
         state: 'idle',

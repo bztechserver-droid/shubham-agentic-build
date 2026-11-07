@@ -20,6 +20,12 @@ export const SESSION_MS = 7 * 24 * 60 * 60 * 1000
 const TIMEOUT_MS = 20_000
 /** What `claude setup-token` prints, as the CRM and Christopher check it. */
 export const SETUP_TOKEN = /^sk-ant-oat\d{2}-[A-Za-z0-9_-]{20,}$/
+/** F-138: an Anthropic API key (sk-ant-api03-…): the other kind of Claude credential the CRM can hand out. Billed per use, no weekly limit. */
+export const API_KEY = /^sk-ant-api\d{2}-[A-Za-z0-9_-]{20,}$/
+/** What a Claude credential is: the token `claude setup-token` prints (a subscription), or an API key. */
+export type ClaudeKind = 'subscription' | 'api_key'
+/** Sent with the credential request: this build can use both. The CRM hands an API key only to a caller that says so (older Christopher builds can't, and are refused 409 KIND_UNSUPPORTED instead of being given a key they would misuse). */
+export const CREDENTIAL_KINDS = 'subscription,api_key'
 
 export interface CrmUser {
   id: string
@@ -51,18 +57,18 @@ export class CrmError extends Error {
 }
 
 export type Credential =
-  | { kind: 'ok'; subscription: { id: string; name: string }; token: string }
+  | { kind: 'ok'; subscription: { id: string; name: string }; token: string; /** F-138: what `token` is. Absent (an older CRM, a test double): a subscription. */ credKind?: ClaudeKind }
   /** The CRM gives this person no subscription now: none assigned, Claude turned off for them, their weekly share used up, or theirs turned off. */
   | { kind: 'none'; code: string | null; message: string }
   /** The session is no longer good (401). */
   | { kind: 'expired' }
 
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
-const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
+export const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+export const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
 
 export const trimUrl = (url: string) => url.replace(/\/+$/, '')
 
-async function call(url: string, init: RequestInit): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> {
+export async function call(url: string, init: RequestInit): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> {
   let res: Response
   try {
     res = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS) })
@@ -80,7 +86,7 @@ async function call(url: string, init: RequestInit): Promise<{ status: number; b
   return { status: res.status, body: isObject(body) ? body : {}, headers: res.headers }
 }
 
-const refusal = (r: { status: number; body: Record<string, unknown> }, fallback: string) =>
+export const refusal = (r: { status: number; body: Record<string, unknown> }, fallback: string) =>
   new CrmError(text(r.body.error) ?? `${fallback} (the CRM answered ${r.status})`, r.status, text(r.body.code))
 
 function userOf(raw: unknown): CrmUser {
@@ -123,15 +129,17 @@ export async function me(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<CrmUser
  */
 export async function credential(s: Pick<CrmSession, 'url' | 'cookie'>, build: string): Promise<Credential> {
   const r = await call(`${s.url}/v1/org/claude-subscriptions/mine/credential`, {
-    headers: { cookie: s.cookie, accept: 'application/json', 'x-christopher-build': build },
+    headers: { cookie: s.cookie, accept: 'application/json', 'x-christopher-build': build, 'x-credential-kinds': CREDENTIAL_KINDS },
   })
   if (r.status === 200) {
     const token = text(r.body.token)
     const sub = r.body.subscription
-    if (!token || !SETUP_TOKEN.test(token) || !isObject(sub) || text(sub.id) === null) {
-      throw new CrmError("The CRM's answer had no Claude token in the shape `claude setup-token` prints", 200)
+    const credKind: ClaudeKind = r.body.kind === 'api_key' ? 'api_key' : 'subscription'
+    // Each kind is checked against its own shape: an API key is never taken for a setup token, nor the other way round.
+    if (!token || !(credKind === 'api_key' ? API_KEY : SETUP_TOKEN).test(token) || !isObject(sub) || text(sub.id) === null) {
+      throw new CrmError(credKind === 'api_key' ? "The CRM's answer had no Claude API key in the shape Anthropic's keys have" : "The CRM's answer had no Claude token in the shape `claude setup-token` prints", 200)
     }
-    return { kind: 'ok', subscription: { id: String(sub.id), name: text(sub.name) ?? 'Claude' }, token }
+    return { kind: 'ok', subscription: { id: String(sub.id), name: text(sub.name) ?? 'Claude' }, token, credKind }
   }
   if (r.status === 401) return { kind: 'expired' }
   // 404 none assigned; 403 Claude off for them, their weekly share used, or no organisation;
@@ -167,6 +175,8 @@ export type Read<T> = { kind: 'ok'; value: T } | { kind: 'forbidden'; message: s
 export interface CrmSubscription {
   id: string
   name: string
+  /** F-138: 'api_key' has no weekly limit and is never a switch target; a CRM that predates kinds says nothing: a subscription. */
+  kind?: ClaudeKind
   /** Last four characters of its token. */
   hint: string | null
   disabled: boolean
@@ -198,7 +208,7 @@ export interface WeeklyCap {
 
 /** GET /v1/org/model-settings/me, without the model settings: which subscription, and their cap on it. */
 export interface CrmSetting {
-  subscription: { id: string; name: string; source: 'user' | 'org'; disabled: boolean } | null
+  subscription: { id: string; name: string; source: 'user' | 'org'; disabled: boolean; kind?: ClaudeKind } | null
   /** An office that manages subscriptions and none for them: no Claude. */
   noClaude: boolean
   claudeBlocked: boolean
@@ -248,6 +258,7 @@ export async function listSubscriptions(s: Pick<CrmSession, 'url' | 'cookie'>): 
       out.push({
         id: lower(x.id)!,
         name: text(x.name)!,
+        kind: x.kind === 'api_key' ? 'api_key' : 'subscription',
         hint: text(x.tokenHint),
         disabled: x.disabled === true,
         isDefault: x.isDefault === true,
@@ -268,7 +279,7 @@ export async function mySetting(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<
     return {
       subscription:
         isObject(sub) && lower(sub.id) !== null
-          ? { id: lower(sub.id)!, name: text(sub.name) ?? 'Claude', source: sub.source === 'org' ? 'org' : 'user', disabled: sub.disabled === true }
+          ? { id: lower(sub.id)!, name: text(sub.name) ?? 'Claude', source: sub.source === 'org' ? 'org' : 'user', disabled: sub.disabled === true, kind: sub.kind === 'api_key' ? 'api_key' : 'subscription' }
           : null,
       noClaude: body.noClaude === true,
       claudeBlocked: body.claudeBlocked === true,
@@ -311,7 +322,7 @@ export async function subscriptionReadings(s: Pick<CrmSession, 'url' | 'cookie'>
 }
 
 /** The CRM's CSRF token for this session (routes/authRoutes.js GET /csrf-token). */
-async function csrfToken(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<string> {
+export async function csrfToken(s: Pick<CrmSession, 'url' | 'cookie'>): Promise<string> {
   const r = await call(`${s.url}/v1/auth/csrf-token`, { headers: { cookie: s.cookie, accept: 'application/json' } })
   const token = text(r.body.csrfToken)
   if (r.status !== 200 || !token || !/^[A-Za-z0-9_-]{16,256}$/.test(token)) throw refusal(r, 'The CRM gave no CSRF token')

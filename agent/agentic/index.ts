@@ -51,7 +51,7 @@ import { createChatPool, findClaude, type ChatPool, type PtySpawn } from './chat
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
-import { mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
+import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
 import { createOrders, FAST_FROM, phoneUser, scanMessages, type HandoffApi, type Order, type OrderProgress } from './orders.ts'
 import { readStatus } from './screen.ts'
 import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
@@ -81,6 +81,13 @@ import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, Prepa
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, type FloorStore } from './floors.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
+import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexEffort, type CodexStatus } from '../../shared/codex.ts'
+import type { CodexManager } from '../codex/index.ts'
+import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
+import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
+import type { CodexSettings } from '../codex/settings.ts'
+import type { SendOptions } from '../codex/sender.ts'
+import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
@@ -105,7 +112,7 @@ import {
   claudeProjectsDir,
   copyTranscript,
   encodeProjectPath,
-  findTranscript,
+  findTranscript as findClaudeTranscript,
   findTranscriptCwd,
   listSessions,
   sessionFiles,
@@ -207,6 +214,14 @@ export interface ProofRequest {
 export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
+  /** F-134: Codex on this PC (the CRM's Codex login, the home, the chats). Left out (tests, older callers): agents set to Codex are refused with a plain sentence. */
+  codex?: CodexManager | null
+  /** F-134: Settings › Chats › "Codex chats" (off unless turned on). */
+  codexSettings?: CodexSettings | null
+  /** F-134, tests: shorter waits for the sender of a Codex chat. */
+  codexSend?: SendOptions
+  /** F-138: the Claude credential the CRM handed out (claude/index.ts credentialEnv): exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY. Left out (tests), `token` applies as before. */
+  credential?: () => { name: string; value: string } | null
   /** F-127, tests: how long the Server must be out of reach before new chats are made here (default 20 s). */
   offlineAfterMs?: number
   /** F-127, tests: how long after a failed joining it is tried again (default 30 s). */
@@ -325,6 +340,8 @@ export interface Agentic {
    * false: it isn't running here, or this PC is a member (the hub holds the session).
    */
   restartChat(sessionId: string): Promise<boolean>
+  /** F-134: a newer Codex login was put in place while Codex chats were running: each is restarted (its conversation resumes), one after the other. */
+  restartCodexChats(): void
   /**
    * F-058: a chat that was open when the app stopped, opened again (its conversation resumed) and,
    * when `text` is given, told it once it is at its prompt (up to 90 s). true: it is running
@@ -415,7 +432,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
   // F-050: the chat view's reading of conversations (chatview.ts): the end of a file, never all of it.
-  const chatFeeds = createChatFeeds({ projectsDir, log: o.log, screen: sid => chats.screen(sid) })
+  const chatFeeds = createChatFeeds({
+    projectsDir,
+    log: o.log,
+    screen: sid => chats.screen(sid),
+    // F-134: a Codex chat's conversation is its rollout file, read in Codex's format.
+    fileOf: sid => codexRollout(sid),
+    formatOf: sid => (isCodexSession(sid) ? CODEX_FORMAT : CLAUDE_FORMAT),
+  })
   // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
   const launched = new Map<string, { effort: string; at: string; ultracode: boolean }>()
   const claudeJson = o.claudeJson ?? claudeJsonPath()
@@ -495,13 +519,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  })
+  }, { defaultEngine: () => defaultsNow().engine ?? '' })
   // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
   // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
   // the hub's and a PC alone's is the usual one.
   const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
     if (mode() === 'member') emitFloors()
-  })
+  }, { defaultEngine: () => defaultsNow().engine ?? '' })
   const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
   const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
   const floors: FloorStore = {
@@ -517,6 +541,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     moveAgent: (from, agent, to, before) => pickFloors().moveAgent(from, agent, to, before),
     addAgent: (f, req, as) => pickFloors().addAgent(f, req, as),
     bindSession: (f, a, s) => pickFloors().bindSession(f, a, s),
+    setCodexThread: (f, a, t) => pickFloors().setCodexThread(f, a, t),
     setHome: (f, a, h) => pickFloors().setHome(f, a, h),
     bySession: sid => pickFloors().bySession(sid),
   }
@@ -697,6 +722,32 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return floor.codeDir
   }
 
+  // ---------------------------------------------------------------------------------------
+  // F-134: the engine of an agent, and where a Codex chat's conversation is
+
+  const defaultEngine = (): AgentEngine => defaultsNow().engine ?? ''
+  /** The engine an agent really runs: its own setting, else Settings › Chats'. */
+  const engineFor = (agent: FloorAgent): 'claude' | 'codex' => engineOf(agent.engine, defaultEngine())
+  const isCodexSession = (sid: string): boolean => {
+    const at = bySession(sid)
+    return !!at && engineFor(at.agent) === 'codex'
+  }
+  const rolloutCache = new Map<string, string>()
+  /** A Codex chat's rollout file, once its conversation id is known and the file is there; null for every other chat. */
+  function codexRollout(sid: string): string | null {
+    const at = bySession(sid)
+    const thread = at && engineFor(at.agent) === 'codex' ? at.agent.codexThread : null
+    if (!thread || !o.codex) return null
+    const cached = rolloutCache.get(thread)
+    if (cached && existsSync(cached)) return cached
+    const found = findRollout(o.codex.paths.home, thread)
+    if (found) rolloutCache.set(thread, found)
+    else rolloutCache.delete(thread)
+    return found
+  }
+  /** Every place that looks for a chat's conversation goes through this: a Codex chat's is its rollout, any other chat's is Claude's JSONL. */
+  const findTranscript = (sid: string, dir: string): string | null => codexRollout(sid) ?? findClaudeTranscript(sid, dir)
+
   /** Where this PC keeps a session's JSONL, whether it has it yet or not. */
   function fileOf(sid: string): string {
     const found = findTranscript(sid, projectsDir)
@@ -745,6 +796,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     idleReapMs: o.idleReapMs,
     reapEveryMs: o.reapEveryMs,
     onEnded: e => {
+      // F-134: a Codex chat that ended lets the login go (the last one puts a changed login back to the CRM first, then takes the file out) and its profile.
+      if (e.engine === 'codex' && o.codex) {
+        removeProfile(o.codex.paths, e.sessionId)
+        void o.codex.release(e.sessionId).catch(err => log?.warn(`Codex login: ${message(err)}`))
+      }
       const at = bySession(e.sessionId)
       chatLog.append({ event: 'stop', sessionId: e.sessionId, agent: at?.agent.name ?? '?', floor: at?.floor.name ?? '?', cause: e.cause, code: e.code, ranMin: Math.max(0, Math.round((Date.now() - Date.parse(e.startedAt)) / 60_000)) })
     },
@@ -756,7 +812,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     treeKill: o.chatHost ? () => {} : o.treeKill,
     keepOnClose: !!o.chatHost,
     claude: o.claude,
+    codexBin: () => o.codex?.bin() ?? null,
+    codexCredential: () => o.codex?.credentialEnv() ?? null,
+    codexSend: o.codexSend,
     token: o.token,
+    credential: o.credential,
     // F-051: recall in every prompt, once the memory layer is on (main.ts).
     settings: o.memory?.start ? hooksFile : undefined,
     onChange: () => {
@@ -783,10 +843,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ? o.chatHost
         .adopt(chats)
         .then(r => {
+          // F-134: a Codex chat the host kept running holds the Codex login file: it counts as one of the chats that keep it.
+          for (const c of chats.live()) if (c.engine === 'codex') o.codex?.adopt(c.sessionId)
           if (r.adopted.length || r.ended.length) log?.info(`chat host: took over ${r.adopted.length} running chat${r.adopted.length === 1 ? '' : 's'}${r.ended.length ? `; ${r.ended.length} ended while no agent was there` : ''}`)
         })
         .catch(e => void log?.warn(`chat host: could not take over its chats: ${message(e)}`))
     : Promise.resolve()
+  // F-134, once the chats the host kept are known: profiles of chats that are gone are swept, and a Codex login file left by a crash is settled (put back to the CRM
+  // first if Codex had refreshed it) and taken out when no Codex chat runs.
+  void adopted.then(async () => {
+    const cx = o.codex
+    if (!cx) return
+    try {
+      sweepProfiles(cx.paths, new Set(chats.live().filter(c => c.engine === 'codex').map(c => profileName(c.sessionId))))
+      await cx.sweep()
+    } catch (e) {
+      log?.warn(`Codex start-up sweep: ${message(e)}`)
+    }
+  })
   // The host is lost (it died): the chats that ran in it end. Noted first; reopened (resumed) when a host is back.
   let lostWithHost: Array<{ sid: string; state: ChatState }> = []
   o.chatHost?.onLost(why => {
@@ -842,8 +916,104 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } else release(sid, self())
   }
 
+  /**
+   * F-134: starts an agent's chat on this PC with Codex. The CRM's login is made ready first (codex/index.ts acquire: refused with a Codex code if it can't be), the
+   * chat's profile is written (its brief, model, effort and MCP servers; the chat's own key is only NAMED there), and codex is started in the shared home.
+   * A chat whose conversation id is not known yet is a new conversation; its id is learnt from its rollout file once Codex has written it.
+   */
+  async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+    const cx = o.codex
+    if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
+    const cwd = codeDirOf(floor)
+    const thread = agent.codexThread ?? null
+    const resume = !!thread && !!findRollout(cx.paths.home, thread)
+    if (thread && !resume) {
+      throw Object.assign(apiError(409, "This Codex conversation isn't on this PC: Codex conversations stay on the PC that started them (for now). Open the chat on that PC, or change the agent's engine to start a new conversation."), {
+        code: 'codex-conversation-elsewhere',
+      })
+    }
+    await cx.acquire(sid)
+    try {
+      const dflt = defaultsNow()
+      const brief = composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'Codex')
+      const mcp: Record<string, McpServerToml> = {
+        // The shim is told whose chat it is by the terminal's environment, never by a file.
+        [MCP_SERVER_NAME]: { command: process.execPath, args: [shim], env_vars: ['SAD_AGENTIC_KEY', 'SAD_AGENTIC_URL'] },
+      }
+      const registry = readRegistry(mcpRegistryFile)
+      for (const name of chosen(registry, agent.mcpServers)) {
+        const def = registry[name]
+        mcp[name] = { command: def.command, args: def.args, ...(def.env && Object.keys(def.env).length ? { env: def.env } : {}) }
+      }
+      writeProfile(cx.paths, { sessionId: sid, brief, model: agent.codexModel || dflt.codexModel || '', effort: agent.codexEffort || dflt.codexEffort || '', mcp, ...(cx.credentialEnv() ? { keyVar: cx.credentialEnv()!.name } : {}) })
+      log?.info(`chat ${sid.slice(0, 8)}: Codex, MCP servers ${Object.keys(mcp).join(', ')}`)
+      const startedMs = Date.now()
+      chats.start({
+        sessionId: sid,
+        floorId: floor.id,
+        agentId: agent.id,
+        cwd,
+        briefPath: '',
+        model: '',
+        resume,
+        cols: size.cols,
+        rows: size.rows,
+        engine: 'codex',
+        codex: { home: cx.paths.home, profile: profileName(sid), thread: resume ? thread : null },
+      })
+      launched.set(sid, { effort: agent.codexEffort || dflt.codexEffort || '', at: new Date().toISOString(), ultracode: false })
+      heartbeat.opened(sid)
+      chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
+      startCause.delete(sid)
+      if (!resume) watchThread(sid, floor.id, agent.id, startedMs)
+      if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
+      return resume
+    } catch (e) {
+      removeProfile(cx.paths, sid)
+      await cx.release(sid)
+      throw e
+    }
+  }
+
+  /** A new Codex chat: its conversation id is whatever Codex called it, learnt from the first lines of its rollout (the marker in its instructions), then kept on the agent. */
+  function watchThread(sid: string, floorId: string, agentId: string, startedMs: number) {
+    const cx = o.codex
+    if (!cx) return
+    const began = Date.now()
+    const timer = setInterval(() => {
+      if (closing || !chats.info(sid) || Date.now() - began > 120_000) return void clearInterval(timer)
+      const found = discoverThread(cx.paths.home, sid, startedMs)
+      if (!found) return
+      clearInterval(timer)
+      try {
+        floors.setCodexThread(floorId, agentId, found.thread)
+        rolloutCache.set(found.thread, found.file)
+        log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
+        if (team) tail.track(sid, found.file, 0)
+      } catch (e) {
+        log?.warn(`chat ${sid.slice(0, 8)}: couldn't keep its Codex conversation id: ${message(e)}`)
+      }
+    }, 1000)
+    timer.unref()
+  }
+
+  /** A newer login was put in place while Codex chats were running: they hold the older one, so each is restarted (its conversation resumes), one after the other. */
+  function restartCodexChats() {
+    void (async () => {
+      for (const c of chats.live()) {
+        if (closing || c.engine !== 'codex') continue
+        try {
+          await restartChat(c.sessionId)
+        } catch (e) {
+          log?.warn(`couldn't restart chat ${c.sessionId.slice(0, 8)} on the newer Codex login: ${message(e)}`)
+        }
+      }
+    })()
+  }
+
   /** Starts the agent's chat on this PC (its lease already got). */
-  function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): boolean {
+  async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+    if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size)
     const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
     try {
@@ -1219,9 +1389,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // This PC's copy brought up to the hub's first, unless it already has all of it.
       const file = fileOf(sid)
       const mark = isMark(granted.mark) ? granted.mark : NO_FILE
-      if (mark.bytes && !(markOf(file).bytes >= mark.bytes && sameMark(markOf(file, mark.bytes), mark))) await pullFrom(link, sid, file)
+      // F-134: a Codex chat's conversation is not mirrored between PCs yet: it stays on the PC that started it.
+      const codexHere = (() => {
+        try {
+          return engineFor(agentOf(floorOf(floorId), agentId)) === 'codex'
+        } catch {
+          return false
+        }
+      })()
+      if (!codexHere && mark.bytes && !(markOf(file).bytes >= mark.bytes && sameMark(markOf(file, mark.bytes), mark))) await pullFrom(link, sid, file)
       const now = floorOf(floorId)
-      const resumed = startHere(now, agentOf(now, agentId), sid, req)
+      const resumed = await startHere(now, agentOf(now, agentId), sid, req)
       return { sessionId: sid, started: true, resumed, ...(granted.tookOverFrom ? { tookOverFrom: granted.tookOverFrom } : {}) }
     } catch (e) {
       void request(link, 'release', { sessionId: sid, mark: markOf(fileOf(sid)) }).catch(() => {})
@@ -1354,6 +1532,37 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { ...(t?.offline ?? { on: offlineSettings.on(), active: false, since: null, hubName: null }), adopt: adoptStatus }
   }
 
+  /** GET /agentic/codex/status: names and plain sentences only, never a login. */
+  function codexAnswer(): CodexStatus {
+    if (o.codex) return o.codex.status()
+    return {
+      enabled: false,
+      installed: false,
+      version: null,
+      state: 'not-installed',
+      hint: "Codex isn't set up on this PC.",
+      assigned: null,
+      lastFetchedAt: null,
+      lastWrittenBackAt: null,
+      waitingToWriteBack: false,
+    }
+  }
+
+  function setCodexSettings(raw: unknown, r: MountRequest) {
+    if (!isObject(raw) || typeof raw.enabled !== 'boolean') throw apiError(400, 'Expected {enabled: true | false}')
+    const c = callerOf(r)
+    // A machine setting, like the offline-chats one: a signed-in sbskrrt's to change.
+    if (o.auth && c.person?.canSeeAll !== true) {
+      o.auth.deny(c, c.person ? 403 : 401, c.person ? 'admin-only' : 'sign-in', 'PUT /agent-api/agentic/codex/settings')
+      throw c.person ? authError(403, 'Only the owner of this app changes this.', 'admin-only') : authError(401, 'Sign in first.', 'sign-in')
+    }
+    if (!o.codexSettings) throw apiError(503, "Codex isn't set up on this PC.")
+    o.codexSettings.set(raw.enabled)
+    log?.warn(`${c.person?.username ?? 'someone'} turned "Codex chats" ${raw.enabled ? 'ON' : 'off'}`)
+    emitWhere()
+    return { enabled: o.codexSettings.on() }
+  }
+
   function setOfflineChats(raw: unknown, r: MountRequest) {
     if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on: true | false}')
     const c = callerOf(r)
@@ -1432,7 +1641,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const tookOverFrom = mode() === 'hub' ? await lease(sid, self(), req.takeOver === true, agent.name) : undefined
     try {
       const now = floorOf(floorId)
-      const resumed = startHere(now, agentOf(now, agentId), sid, req)
+      const resumed = await startHere(now, agentOf(now, agentId), sid, req)
       return { sessionId: sid, started: true, resumed, ...(tookOverFrom ? { tookOverFrom } : {}) }
     } catch (e) {
       if (mode() === 'hub') release(sid, self())
@@ -2052,7 +2261,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (!c) return null
             return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
           },
-          env: () => librarianEnv(process.env, o.token?.() ?? null),
+          env: () => librarianEnv(process.env, o.token?.() ?? null, o.credential?.() ?? null),
           dir: path.join(o.dir, 'fast'),
           toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
           shim,
@@ -2926,6 +3135,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return card
   }
 
+  type Row = Record<string, unknown>
   /** F-067: pauses between the commands typed into one chat, so claude has taken the first before the next arrives. */
   const TUNE_GAP_MS = o.tuneGapMs ?? 800
 
@@ -2937,6 +3147,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    */
   async function tuneAgent(floorId: string, agentId: string, raw: unknown): Promise<TuneAnswer> {
     if (!isObject(raw)) throw apiError(400, 'Expected {model?, effort?, ultracode?}')
+    if (raw.codexModel !== undefined || raw.codexEffort !== undefined) return tuneCodex(floorId, agentId, raw)
     const req: TuneRequest = {}
     if (raw.model !== undefined) {
       if (!(AGENT_MODELS as readonly unknown[]).includes(raw.model)) throw apiError(400, 'model is opus, sonnet, haiku, or "" for the default')
@@ -2953,6 +3164,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (req.model === undefined && req.effort === undefined && req.ultracode === undefined) throw apiError(400, 'Nothing to change: give model, effort or ultracode')
     const before = floorOf(floorId)
     const a = agentOf(before, agentId)
+    if (engineFor(a) === 'codex') throw apiError(400, `${a.name} runs Codex: its model and effort are codexModel and codexEffort (Claude's model, effort and ultracode don't apply to it).`)
     const model = req.model ?? a.model
     const effort = req.effort ?? a.effort
     const ultracode = req.ultracode ?? a.ultracode
@@ -2979,6 +3191,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     log?.info(`${a.name}: ${commands.join(', ')}`)
     return { floor, applied: 'now', detail: `${a.name}'s ${what} is set in its running chat (on ${w.name}) now: ${commands.join(', ')} ${commands.length > 1 ? 'were' : 'was'} typed into it.` }
+  }
+
+  /**
+   * F-134: a Codex agent's model and effort. They are kept on the agent and used at its chat's next start (a running Codex chat is not typed into: its model and
+   * reasoning level are read from its profile when it starts).
+   */
+  async function tuneCodex(floorId: string, agentId: string, raw: Row): Promise<TuneAnswer> {
+    const before = floorOf(floorId)
+    const a = agentOf(before, agentId)
+    if (engineFor(a) !== 'codex') throw apiError(409, `${a.name} runs Claude: change its model and effort with model and effort, or change its engine first.`)
+    if (raw.codexModel !== undefined && typeof raw.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
+    if (raw.codexEffort !== undefined && !(CODEX_EFFORTS as readonly unknown[]).includes(raw.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
+    const codexModel = raw.codexModel !== undefined ? String(raw.codexModel).trim().slice(0, CODEX_MODEL_MAX) : (a.codexModel ?? '')
+    const codexEffort = raw.codexEffort !== undefined ? (raw.codexEffort as CodexEffort) : (a.codexEffort ?? '')
+    const floor = floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, codexModel, codexEffort } : x)) })
+    const running = !!a.sessionId && !!whereAll()[a.sessionId]
+    return {
+      floor,
+      applied: 'next',
+      detail: running
+        ? `${a.name}'s Codex model and effort are kept; its chat is running, so they apply when the chat next starts.`
+        : `${a.name}'s Codex model and effort are kept; they apply when its chat next starts.`,
+    }
   }
 
   function checkFolder(raw: string) {
@@ -3202,6 +3437,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
+    // F-134: Codex on this PC.
+    ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
+    ['POST', /^\/codex\/refresh$/, async () => {
+        await o.codex?.check()
+        return codexAnswer()
+      }, 'local'],
+    ['GET', /^\/codex\/settings$/, () => ({ enabled: o.codexSettings?.on() === true }), 'local'],
+    ['PUT', /^\/codex\/settings$/, (_, r) => setCodexSettings(r.body, r), 'local'],
     ['PUT', /^\/offline-chats$/, (_, r) => setOfflineChats(r.body, r), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
@@ -4071,6 +4314,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     driveRequest: async (body, timeoutMs) => request<unknown>(needHub(), 'drive', body, timeoutMs ?? 30_000),
     serve,
     restartChat,
+    restartCodexChats,
     resumeChat,
     busyChats: () => Object.values(chats.states()).filter(st => st === 'running' || st === 'question').length,
     async retireChatHost() {

@@ -227,7 +227,7 @@ export interface ClaudeInfo {
    */
   store?: 'keyring' | 'memory'
   /** What the app put there, while `token` is 'set': never the token, only its last four characters. */
-  subscription: { id: string; name: string; hint: string; setAt: string } | null
+  subscription: { id: string; name: string; hint: string; setAt: string; /** F-138: a Claude subscription (the setup token) or a Claude API key (billed per use, no weekly limit). Absent from an older agent. */ kind?: 'subscription' | 'api_key' } | null
   /** The CRM this PC signs in to: https://crmbe.bhole.co, or SAD_CRM_URL. */
   url: string
   /** Who is signed in to the CRM on this PC, or null. The session ends at `expiresAt` (7 days). */

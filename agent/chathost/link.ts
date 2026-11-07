@@ -48,7 +48,7 @@ export function adoptable(c: HostChat) {
   const cwd = str(c.meta.cwd)
   const startedAt = str(c.meta.startedAt)
   if (!key || !floorId || !agentId || !cwd || !startedAt) return null
-  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows }
+  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows, engine: c.meta.engine === 'codex' ? ('codex' as const) : ('claude' as const) }
 }
 
 export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {

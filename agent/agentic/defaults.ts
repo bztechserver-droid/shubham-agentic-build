@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { AGENT_EFFORTS, AGENT_MODELS, NO_DEFAULTS, type AgentEffort, type AgentModel, type ChatDefaults } from '../../shared/agentic.ts'
+import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 
@@ -9,12 +10,23 @@ import { writeAtomic } from '../config.ts'
 
 const isModel = (v: unknown): v is AgentModel => typeof v === 'string' && (AGENT_MODELS as readonly string[]).includes(v)
 const isEffort = (v: unknown): v is AgentEffort => typeof v === 'string' && (AGENT_EFFORTS as readonly string[]).includes(v)
+const isEngine = (v: unknown): v is AgentEngine => typeof v === 'string' && (AGENT_ENGINES as readonly string[]).includes(v)
+const isCodexEffort = (v: unknown): v is CodexEffort => typeof v === 'string' && (CODEX_EFFORTS as readonly string[]).includes(v)
+const codexModelOf = (v: unknown) => (typeof v === 'string' ? v.trim().slice(0, CODEX_MODEL_MAX) : '')
 
 /** What a file or a hub's state says, repaired to something valid (a value it can't use is the CLI's own / off). */
 export function parseDefaults(raw: unknown): ChatDefaults {
   if (typeof raw !== 'object' || raw === null) return { ...NO_DEFAULTS }
   const r = raw as Record<string, unknown>
-  return { model: isModel(r.model) ? r.model : '', effort: isEffort(r.effort) ? r.effort : '', ultracode: r.ultracode === true }
+  return {
+    model: isModel(r.model) ? r.model : '',
+    effort: isEffort(r.effort) ? r.effort : '',
+    ultracode: r.ultracode === true,
+    // F-134: the engine "Default" means, and the Codex model and effort (a file or state from before it has none: Claude, Codex's own).
+    engine: isEngine(r.engine) ? r.engine : '',
+    codexModel: codexModelOf(r.codexModel),
+    codexEffort: isCodexEffort(r.codexEffort) ? r.codexEffort : '',
+  }
 }
 
 export interface DefaultsStore {
@@ -38,12 +50,27 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
       if (p.model !== undefined && !isModel(p.model)) throw apiError(400, 'model is opus, sonnet, haiku, or "" for the one claude chooses')
       if (p.effort !== undefined && !isEffort(p.effort)) throw apiError(400, 'effort is low, medium, high, xhigh, max, or "" for the one claude chooses')
       if (p.ultracode !== undefined && typeof p.ultracode !== 'boolean') throw apiError(400, 'ultracode is true or false')
+      if (p.engine !== undefined && !isEngine(p.engine)) throw apiError(400, 'engine is claude, codex, or "" for Claude')
+      if (p.codexEffort !== undefined && !isCodexEffort(p.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
+      if (p.codexModel !== undefined && typeof p.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
       const next: ChatDefaults = {
         model: p.model !== undefined ? (p.model as AgentModel) : now.model,
         effort: p.effort !== undefined ? (p.effort as AgentEffort) : now.effort,
         ultracode: p.ultracode !== undefined ? p.ultracode === true : now.ultracode,
+        engine: p.engine !== undefined ? (p.engine as AgentEngine) : (now.engine ?? ''),
+        codexModel: p.codexModel !== undefined ? codexModelOf(p.codexModel) : (now.codexModel ?? ''),
+        codexEffort: p.codexEffort !== undefined ? (p.codexEffort as CodexEffort) : (now.codexEffort ?? ''),
       }
-      if (next.model === now.model && next.effort === now.effort && next.ultracode === now.ultracode) return { ...now }
+      if (
+        next.model === now.model &&
+        next.effort === now.effort &&
+        next.ultracode === now.ultracode &&
+        next.engine === (now.engine ?? '') &&
+        next.codexModel === (now.codexModel ?? '') &&
+        next.codexEffort === (now.codexEffort ?? '')
+      ) {
+        return { ...now }
+      }
       now = next
       writeAtomic(file, `${JSON.stringify(now, null, 2)}\n`)
       onChange?.()

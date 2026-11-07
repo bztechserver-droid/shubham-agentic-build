@@ -88,7 +88,10 @@ export function buildChoices(i: {
   now: number
 }): SwitchChoice[] {
   const activeId = i.mine?.subscription?.id ?? null
-  return i.list.subscriptions.map(s => ({
+  // F-138: an API key has no weekly limit to run out of and costs money per use, so it is never offered as somewhere to switch to (the super admin puts a person on one in the CRM).
+  return i.list.subscriptions
+    .filter(s => s.kind !== 'api_key')
+    .map(s => ({
     id: s.id,
     name: s.name,
     hint: s.hint,

@@ -145,10 +145,14 @@ export interface LibrarianRunOptions {
 const DROP_ENV = /^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_MESSAGING_.*|CLAUDE_PID|CLAUDE_CONFIG_DIR|COS_.*|MDV2_PORT|SAD_.*)$/i
 
 /** The environment claude -p is given: this one, without what would make it think it is a child session, with the sign-in. */
-export function librarianEnv(from: NodeJS.ProcessEnv, token: string | null): Record<string, string> {
+export function librarianEnv(from: NodeJS.ProcessEnv, token: string | null, credential: { name: string; value: string } | null = null): Record<string, string> {
   const env: Record<string, string> = {}
   for (const [k, v] of Object.entries(from)) if (v !== undefined && !DROP_ENV.test(k)) env[k] = v
-  if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
+  // F-138: the CRM's credential, exactly one of the two variables (an API key would silently win over a subscription's token); else the token as before.
+  if (credential) {
+    for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
+    env[credential.name] = credential.value
+  } else if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
   return env
 }
 

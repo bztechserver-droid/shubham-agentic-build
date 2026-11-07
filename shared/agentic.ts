@@ -5,6 +5,7 @@
 // tools Claude chats call (`/agentic/mcp/...`) with the chat's own key instead.
 
 import type { AuthEnded, ChatAccess, ChatCan, ChatOwner, ChatShare } from './auth.ts'
+import type { AgentEngine, CodexEffort } from './codex.ts'
 
 export const AGENTIC_PREFIX = '/agentic'
 
@@ -34,8 +35,12 @@ export interface ChatDefaults {
   model: AgentModel
   effort: AgentEffort
   ultracode: boolean
+  /** F-134: which engine an agent set to "Default" runs ('' = Claude), and the model and effort a Codex chat gets ('' = Codex's own). Absent on an older copy. */
+  engine?: AgentEngine
+  codexModel?: string
+  codexEffort?: CodexEffort
 }
-export const NO_DEFAULTS: ChatDefaults = { model: '', effort: '', ultracode: false }
+export const NO_DEFAULTS: ChatDefaults = { model: '', effort: '', ultracode: false, engine: '', codexModel: '', codexEffort: '' }
 
 /** At most this many agents on one floor (agentic-claude-manager's limit). */
 export const MAX_AGENTS_PER_FLOOR = 24
@@ -88,6 +93,18 @@ export interface FloorAgent {
   effort: AgentEffort
   /** F-067: ultracode on or off for its chat; '' follows the default (Settings › Chats). */
   ultracode: AgentUltracode
+  /**
+   * F-134: which engine runs its chat: '' follows the default in Settings › Chats (Claude unless that is changed). Absent on a copy that predates it.
+   * With the engine 'codex' its model and effort are these two (the Claude ones above are not used).
+   */
+  engine?: AgentEngine
+  codexModel?: string
+  codexEffort?: CodexEffort
+  /**
+   * F-134: Codex chooses the id of its own conversation, so it is learnt from the rollout file once the chat has started and kept here ({@link sessionId}
+   * is still the app's id of the chat). Set by the agent only, never taken from a page.
+   */
+  codexThread?: string | null
   /** Skills and MCP servers it was given; named in its brief (advisory, as in the original). */
   skills: string[]
   mcpServers: string[]
@@ -212,6 +229,11 @@ export interface FloorPatch {
   agents?: FloorAgent[]
   /** F-021, a member to its hub: that member's folder for the floor (null: the default). */
   folderFor?: { id: string; dir: string | null }
+  /**
+   * F-134: true when the page has shown ENGINE_CHANGE_MESSAGE and the person agreed: an agent whose engine changes while it has a conversation then starts a NEW
+   * one. Without it that change is refused with a 409 (code engine-change-new-conversation).
+   */
+  confirmNewConversation?: boolean
 }
 
 /** POST /agentic/floors/:id/agents (the sidebar's Add agent, and agent_hire). */
@@ -223,6 +245,10 @@ export interface NewAgent {
   reportsTo?: string
   model?: AgentModel
   effort?: AgentEffort
+  /** F-134 */
+  engine?: AgentEngine
+  codexModel?: string
+  codexEffort?: CodexEffort
 }
 
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */

@@ -15,6 +15,7 @@ import {
   type FloorPatch,
   type NewAgent,
 } from '../../shared/agentic.ts'
+import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, ENGINE_CHANGE_CODE, ENGINE_CHANGE_MESSAGE, engineOf, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
 import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '../../shared/auth.ts'
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
@@ -37,6 +38,10 @@ const strList = (v: unknown) =>
 const isModel = (v: unknown): v is AgentModel => typeof v === 'string' && (AGENT_MODELS as readonly string[]).includes(v)
 const isUltracode = (v: unknown): v is AgentUltracode => typeof v === 'string' && (AGENT_ULTRACODES as readonly string[]).includes(v)
 const isEffort = (v: unknown): v is AgentEffort => typeof v === 'string' && (AGENT_EFFORTS as readonly string[]).includes(v)
+const isEngine = (v: unknown): v is AgentEngine => typeof v === 'string' && (AGENT_ENGINES as readonly string[]).includes(v)
+const isCodexEffort = (v: unknown): v is CodexEffort => typeof v === 'string' && (CODEX_EFFORTS as readonly string[]).includes(v)
+/** A Codex conversation id (a UUID, as Codex makes it). */
+const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 /** F-021: a floor's folder on each of the hub's other PCs: device id to an absolute path. */
 const folderMap = (v: unknown): Record<string, string> =>
@@ -75,6 +80,11 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     model: isModel(a.model) ? a.model : '',
     effort: isEffort(a.effort) ? a.effort : '',
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
+    // F-134: the engine and the Codex model and effort are the page's to set; the Codex conversation id is the agent's (patch() puts the old one back).
+    engine: isEngine(a.engine) ? a.engine : '',
+    codexModel: typeof a.codexModel === 'string' ? a.codexModel.trim().slice(0, CODEX_MODEL_MAX) : '',
+    codexEffort: isCodexEffort(a.codexEffort) ? a.codexEffort : '',
+    codexThread: typeof a.codexThread === 'string' && THREAD_ID_RE.test(a.codexThread) ? a.codexThread.toLowerCase() : null,
     skills: strList(a.skills),
     mcpServers: strList(a.mcpServers),
     x: num(a.x, 80 + (index % 4) * 250),
@@ -183,6 +193,8 @@ export interface FloorStore {
   addAgent(floorId: string, req: NewAgent, as?: ChatOwner | null): { floor: Floor; agent: FloorAgent }
   /** Binds (or with null unbinds) an agent's chat. A different chat has no home PC yet. */
   bindSession(floorId: string, agentId: string, sessionId: string | null): Floor
+  /** F-134: the Codex conversation id of an agent's chat (null: none yet). Only the agent calls this, never a page. */
+  setCodexThread(floorId: string, agentId: string, thread: string | null): Floor
   /** F-064: the PC an agent's chat lives on (null: none yet). Only the hub calls this, never a page. */
   setHome(floorId: string, agentId: string, home: { id: string; name: string } | null): Floor
   /** The floor and agent a chat belongs to: how a tool call knows who is calling. */
@@ -218,7 +230,13 @@ export function ensureDuty(floors: Floor[]): boolean {
 }
 
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
-export function createFloorStore(file: string, onChange: () => void = () => {}): FloorStore {
+export interface FloorStoreOptions {
+  /** F-134: the engine an agent set to "Default" runs, so changing it is judged by what really runs. */
+  defaultEngine?: () => AgentEngine
+}
+
+export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
+  const defaultEngine = () => opts.defaultEngine?.() ?? ''
   let floors: Floor[] = load()
   // F-086: the migration runs at the start; what it changed is written with the next change at the latest (and at once if it can be).
   if (ensureDuty(floors)) {
@@ -333,6 +351,19 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           a.homePcName = before.get(a.id)?.homePcName ?? null
           // F-086: nor the job (Orchestrator) the hub gave it.
           a.duty = before.get(a.id)?.duty ?? null
+          // F-134: nor the id Codex gave its conversation. Changing the ENGINE of an agent that has a chat starts a new conversation:
+          // refused until the page has said so, then the old binding is let go (the old transcript stays on disk).
+          const had = before.get(a.id)
+          a.codexThread = had?.codexThread ?? null
+          if (had && had.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
+            if (p.confirmNewConversation !== true) {
+              throw Object.assign(apiError(409, ENGINE_CHANGE_MESSAGE), { code: ENGINE_CHANGE_CODE })
+            }
+            a.sessionId = null
+            a.codexThread = null
+            a.homePc = null
+            a.homePcName = null
+          }
           // F-118: nor whose it is or who it is shared with; an agent the chart adds is the editor's.
           const was = before.get(a.id)
           a.owner = was ? (was.owner ?? null) : (as ?? null)
@@ -416,6 +447,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       }
       if (req.model !== undefined && !isModel(req.model)) throw apiError(400, 'model is opus, sonnet or haiku')
       if (req.effort !== undefined && !isEffort(req.effort)) throw apiError(400, 'effort is low, medium, high, xhigh or max')
+      if (req.engine !== undefined && !isEngine(req.engine)) throw apiError(400, 'engine is claude, codex, or "" for the default')
+      if (req.codexEffort !== undefined && !isCodexEffort(req.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
       const index = floor.agents.length
       // The first agent on an empty floor is its boss, at the boss's desk; the rest go in rows below.
       const desk = index === 0 ? { x: 320, y: 40 } : { x: 80 + ((index - 1) % 4) * 250, y: 240 + Math.floor((index - 1) / 4) * 190 }
@@ -427,6 +460,9 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
           reportsTo,
           model: req.model ?? '',
           effort: req.effort ?? '',
+          engine: req.engine ?? '',
+          codexModel: req.codexModel ?? '',
+          codexEffort: req.codexEffort ?? '',
           owner: as,
           ...desk,
         },
@@ -502,10 +538,24 @@ export function createFloorStore(file: string, onChange: () => void = () => {}):
       if (agent.sessionId !== sessionId) {
         agent.homePc = null
         agent.homePcName = null
+        agent.codexThread = null
       }
       agent.sessionId = sessionId
       floor.updatedAt = now()
       save()
+      return clone(floor)
+    },
+
+    setCodexThread(floorId, agentId, thread) {
+      const floor = find(floorId)
+      const agent = agentOf(floor, agentId)
+      if (thread !== null && !THREAD_ID_RE.test(thread)) throw apiError(400, 'Not a Codex conversation id')
+      const next = thread === null ? null : thread.toLowerCase()
+      if ((agent.codexThread ?? null) !== next) {
+        agent.codexThread = next
+        floor.updatedAt = now()
+        save()
+      }
       return clone(floor)
     },
 

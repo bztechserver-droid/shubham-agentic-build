@@ -12,6 +12,7 @@ import {
   SESSION_MS,
   UUID,
   trimUrl,
+  type ClaudeKind,
   type CrmReadings,
   type CrmSession,
   type CrmSetting,
@@ -56,6 +57,9 @@ import { loadUserEnv, userEnvStore, type UserEnv } from './userenv.ts'
 // it every few seconds.
 
 export const TOKEN_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
+/** F-138: where an Anthropic API key (the CRM's "Claude API" kind) goes. A subscription's token is TOKEN_VAR; the two are NEVER both set by this app, because an API key silently wins over a subscription. */
+export const API_KEY_VAR = 'ANTHROPIC_API_KEY'
+const varOf = (kind: ClaudeKind) => (kind === 'api_key' ? API_KEY_VAR : TOKEN_VAR)
 export const CHECK_EVERY_MS = 60 * 60 * 1000
 /** The CRM's own codes for a person whose subscription's week is used up, or that was turned off. */
 export const USED_UP_CODES: ReadonlySet<string> = new Set(['WEEKLY_CAP_REACHED', 'SUBSCRIPTION_DISABLED'])
@@ -92,6 +96,9 @@ interface Placed {
   sha256: string
   hint: string
   setAt: string
+  /** F-138: which kind it is, and so which variable holds it. A file from before kinds says nothing: a subscription, in TOKEN_VAR. */
+  kind: ClaudeKind
+  var: string
 }
 
 export interface SwitchOptions {
@@ -133,6 +140,8 @@ export type CheckHook = (outcome: CheckOutcome) => 'hold' | 'proceed' | void
 
 export interface ClaudeSubscription {
   status(): ClaudeInfo
+  /** F-138: the credential the app put in this account for the CRM's Claude subscription or API key, as the variable it is in and its value, for the chats and tools the app starts (exactly one of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY). Null when the app put nothing there. Never logged or sent to a page. */
+  credentialEnv(): { name: string; value: string } | null
   /** Signs in to the CRM and asks it at once; throws CrmError when the CRM says no or can't be reached. */
   signIn(login: string, password: string): Promise<ClaudeInfo>
   /** Asks the CRM again (when signed in). `replace` takes over a CLAUDE_CODE_OAUTH_TOKEN something else set. */
@@ -179,7 +188,7 @@ function readJson(file: string): unknown {
   }
 }
 
-function loadSession(file: string): CrmSession | null {
+export function loadSession(file: string): CrmSession | null {
   const raw = readJson(file)
   if (!isObject(raw) || !str(raw.url) || !str(raw.cookie) || !str(raw.signedInAt) || !isObject(raw.user)) return null
   const u = raw.user
@@ -197,7 +206,8 @@ function loadPlaced(file: string): Placed | null {
   if (!isObject(raw) || !isObject(raw.subscription) || !str(raw.sha256) || !str(raw.hint) || !str(raw.setAt)) return null
   const s = raw.subscription
   if (!str(s.id) || !str(s.name)) return null
-  return { subscription: { id: s.id, name: s.name }, sha256: raw.sha256, hint: raw.hint, setAt: raw.setAt }
+  const kind: ClaudeKind = raw.kind === 'api_key' ? 'api_key' : 'subscription'
+  return { subscription: { id: s.id, name: s.name }, sha256: raw.sha256, hint: raw.hint, setAt: raw.setAt, kind, var: varOf(kind) }
 }
 
 export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
@@ -247,16 +257,17 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   const iso = (ms: number) => new Date(ms).toISOString()
 
   /** The variable as it is now; an empty one counts as not set. Null when it can't be read. */
-  function current(): string | null {
+  function current(name: string = TOKEN_VAR): string | null {
     if (!userEnv) return null
     try {
-      return userEnv.get(TOKEN_VAR) || null
+      return userEnv.get(name) || null
     } catch (e) {
-      log.warn(`couldn't read ${TOKEN_VAR}: ${message(e)}`)
+      log.warn(`couldn't read ${name}: ${message(e)}`)
       return null
     }
   }
-  const ours = (value: string | null) => value !== null && placed !== null && sha256(value) === placed.sha256
+  /** Is this value of variable `name` the one the app put there? (Its hash, and which variable, are in claude-subscription.json.) */
+  const ours = (value: string | null, name: string = TOKEN_VAR) => value !== null && placed !== null && placed.var === name && sha256(value) === placed.sha256
 
   function savePlaced(next: Placed | null) {
     placed = next
@@ -309,13 +320,14 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   }
 
   function status(): ClaudeInfo {
-    const value = current()
-    const token: ClaudeInfo['token'] = !userEnv ? 'unsupported' : value === null ? 'empty' : ours(value) ? 'set' : 'taken'
+    const name = placed?.var ?? TOKEN_VAR
+    const value = current(name)
+    const token: ClaudeInfo['token'] = !userEnv ? 'unsupported' : value === null ? 'empty' : ours(value, name) ? 'set' : 'taken'
     return {
       token,
       // F-116: on Linux, where the token is kept (the kernel keyring or memory only); absent on Windows.
       ...(o.userEnv === undefined && userEnvStore() !== null ? { store: userEnvStore() as 'keyring' | 'memory' } : {}),
-      subscription: token === 'set' && placed ? { ...placed.subscription, hint: placed.hint, setAt: placed.setAt } : null,
+      subscription: token === 'set' && placed ? { ...placed.subscription, hint: placed.hint, setAt: placed.setAt, kind: placed.kind } : null,
       url,
       crm: session
         ? { name: session.user.name, username: session.user.username, url: session.url, signedInAt: session.signedInAt, expiresAt: iso(expiresAt(session)) }
@@ -334,39 +346,70 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     }
   }
 
-  /** Puts the subscription's token in, unless something else's is there and `replace` is false. */
+  /**
+   * Puts the CRM's credential in, unless something else's is there and `replace` is false. A subscription's token goes in TOKEN_VAR exactly as always (F-007); an API key
+   * (F-138) goes in API_KEY_VAR. The two are never both set by the app: the one it put there for the OTHER kind comes out (after the new one is in, so a refused
+   * replacement never leaves the person with nothing). A value of the person's own that the app did not place is left alone, as always.
+   */
   async function place(cred: Extract<Credential, { kind: 'ok' }>, replace: boolean) {
     if (!userEnv) return
-    const value = current()
+    const credKind: ClaudeKind = cred.credKind ?? 'subscription'
+    const name = varOf(credKind)
+    const other = name === TOKEN_VAR ? API_KEY_VAR : TOKEN_VAR
+    const value = current(name)
     const hint = cred.token.slice(-4)
-    const record: Placed = { subscription: cred.subscription, sha256: sha256(cred.token), hint, setAt: iso(now()) }
+    const record: Placed = { subscription: cred.subscription, sha256: sha256(cred.token), hint, setAt: iso(now()), kind: credKind, var: name }
+    /** The variable of the other kind, when the app is the one that put it there. */
+    const dropOther = async () => {
+      if (placed && placed.var === other && ours(current(other), other)) {
+        try {
+          userEnv.remove(other)
+          log.info(`took ${other} out: the CRM's credential for this PC is now ${credKind === 'api_key' ? 'an API key' : 'a subscription'}, and the two are never both set`)
+          await announce()
+        } catch (e) {
+          log.error(`couldn't take ${other} out: ${message(e)}`)
+          throw e
+        }
+      }
+    }
+    /** A value of the person's own in the other variable stays, but says so: in programs the app doesn't start it can override the CRM's credential. */
+    const noteStray = () => {
+      if (current(other) !== null && !(placed && placed.var === other)) {
+        log.warn(`${other} is also set in this account by something else: programs the app does not start may use it instead of the CRM's credential (the chats the app starts get only the CRM's)`)
+      }
+    }
     if (value === cred.token) {
       // Already there (put in by this app before, or by hand): from now on it's the app's.
-      if (!placed || placed.sha256 !== record.sha256 || placed.subscription.id !== cred.subscription.id || placed.subscription.name !== cred.subscription.name) {
-        savePlaced(placed?.sha256 === record.sha256 ? { ...record, setAt: placed.setAt } : record)
+      await dropOther()
+      if (!placed || placed.sha256 !== record.sha256 || placed.var !== name || placed.subscription.id !== cred.subscription.id || placed.subscription.name !== cred.subscription.name) {
+        savePlaced(placed?.sha256 === record.sha256 && placed.var === name ? { ...record, setAt: placed.setAt } : record)
       }
+      noteStray()
       return
     }
-    if (value !== null && !ours(value) && !replace) {
-      log.info(`${TOKEN_VAR} is already set by something else: left alone`)
+    if (value !== null && !ours(value, name) && !replace) {
+      log.info(`${name} is already set by something else: left alone`)
       return
     }
-    userEnv.set(TOKEN_VAR, cred.token)
+    userEnv.set(name, cred.token)
+    await dropOther()
     savePlaced(record)
-    log.info(`Claude on this PC now runs on the CRM's subscription "${cred.subscription.name}" (…${hint})`)
+    log.info(`Claude on this PC now runs on the CRM's ${credKind === 'api_key' ? 'API key' : 'subscription'} "${cred.subscription.name}" (…${hint})`)
+    noteStray()
     await announce()
   }
 
-  /** Takes out the token the app put in; anything else's stays. */
+  /** Takes out the credential the app put in (whichever variable it went in); anything else's stays. */
   async function unplace(why: string) {
-    const value = current()
-    if (userEnv && ours(value)) {
+    const name = placed?.var ?? TOKEN_VAR
+    const value = current(name)
+    if (userEnv && ours(value, name)) {
       try {
-        userEnv.remove(TOKEN_VAR)
-        log.info(`took the CRM's Claude subscription off this PC: ${why}`)
+        userEnv.remove(name)
+        log.info(`took the CRM's Claude credential off this PC: ${why}`)
         await announce()
       } catch (e) {
-        log.error(`couldn't take ${TOKEN_VAR} out: ${message(e)}`)
+        log.error(`couldn't take ${name} out: ${message(e)}`)
         throw e
       }
     }
@@ -481,6 +524,8 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
   function autoRefusal(to: SwitchChoice): string | null {
     const st = store.state()
     if (!st.auto) return 'Switching by itself is turned off.'
+    // F-138: an API key has no weekly limit to run out of; the app never moves a person off one (the super admin does, in the CRM).
+    if (mine?.subscription?.kind === 'api_key') return 'You run on an API key. It has no weekly limit to run out, so the app does not switch you by itself.'
     const ep = st.episode
     if (ep && now() - Date.parse(ep.at) < AUTO_COOLDOWN_MS) {
       return `The app already switched you by itself at ${ep.at}, and does not do it again within 24 hours.`
@@ -507,7 +552,9 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
         : { ok: false, reason: 'unknown', message: 'That is not one of the office’s Claude subscriptions.' }
     }
     const from = choices.find(c => c.active) ?? null
-    const fromId = from?.id ?? mine?.subscription?.id ?? null
+    // F-138: an API key is not in the picker's list (never a target), so a person on one has no "from" there: a plain "use this one", and the key itself is what they leave.
+    const onKey = !from && mine?.subscription?.kind === 'api_key'
+    const fromId = onKey ? null : (from?.id ?? mine?.subscription?.id ?? null)
 
     // Already there in the CRM (another PC of the same person moved them): no write, only the token.
     const alreadyThere = fromId === to.id
@@ -547,7 +594,11 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
     }
 
     // What the CRM now says, and the new subscription's token.
-    const fromRef: SwitchSubscription = from ? refOf(from) : { id: '', name: 'no subscription', hint: null }
+    const fromRef: SwitchSubscription = from
+      ? refOf(from)
+      : onKey && placed
+        ? { id: placed.subscription.id, name: placed.subscription.name, hint: placed.hint }
+        : { id: '', name: 'no subscription', hint: null }
     const after = await crm.mySetting(s).catch(() => null)
     if (after && after.kind === 'ok') mine = after.value
     if (mine?.subscription && mine.subscription.id !== toId) {
@@ -620,6 +671,11 @@ export function createClaudeSubscription(o: ClaudeOptions): ClaudeSubscription {
 
   return {
     status,
+    credentialEnv() {
+      if (!placed) return null
+      const value = current(placed.var)
+      return value !== null && ours(value, placed.var) ? { name: placed.var, value } : null
+    },
 
     signIn: (login, password) =>
       serial(async () => {

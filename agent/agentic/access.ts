@@ -55,6 +55,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/heartbeat\/beat$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
   ['GET', /^\/offline-chats$/, SIGNED],
+  // F-134: Codex on this PC: its status (names only), asking the CRM now, and the setting.
+  ['GET', /^\/codex\/status$/, SIGNED],
+  ['POST', /^\/codex\/refresh$/, OWNER],
+  ['GET', /^\/codex\/settings$/, SIGNED],
+  ['PUT', /^\/codex\/settings$/, OWNER],
   ['PUT', /^\/offline-chats$/, OWNER],
   ['GET', /^\/sessions$/, OWNER],
   ['GET', /^\/sessions\/copy-all$/, OWNER],
