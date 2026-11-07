@@ -1,0 +1,1 @@
+export{i as default}from"./goal-row-VkfuYAvJ.js";

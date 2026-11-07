@@ -96,7 +96,7 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
  * The pages that talk to the PC itself (its devices, ports, build, tasks, drive, phone, WhatsApp, CRM) are for the admin (sbskrrt) only once people sign in: the agent
  * answers everyone else 403 {code:'admin-only'} on every route they use. Everyone else keeps Home, Features, Themes, Agents, Chats and Settings.
  */
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm']
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts']
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

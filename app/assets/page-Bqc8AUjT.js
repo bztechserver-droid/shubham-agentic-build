@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-BXp6uvy8.js";function t(){e(`/goals`)}export{t as default};
