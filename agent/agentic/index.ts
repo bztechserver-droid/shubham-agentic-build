@@ -2,8 +2,9 @@ import { prepareConversation, type PreparedConversation } from '../opencode/swit
 import { interchange } from '../opencode/backend.ts'
 import { createOpenCodePool, combinePools, type OpenCodePoolOptions } from '../opencode/pool.ts'
 import type { OpenCodeProvider } from '../../shared/opencode.ts'
-import { openCodeProvider } from '../../shared/opencode.ts'
-import type { ApiCredential } from '../opencode/crm.ts'
+import { openCodeSelection } from '../../shared/opencode.ts'
+import type { OpenCodeCredential } from '../opencode/crm.ts'
+import { freeModel } from '../opencode/free-model.ts'
 import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
@@ -227,7 +228,7 @@ export interface AgenticOptions {
   /** <state>/agent/agentic */
   dir: string
   /** F-134: Codex on this PC (the CRM's Codex login, the home, the chats). Left out (tests, older callers): agents set to Codex are refused with a plain sentence. */
-  openCodeCredential?: (provider: OpenCodeProvider) => Promise<ApiCredential>
+  openCodeCredential?: (provider: OpenCodeProvider) => Promise<OpenCodeCredential>
   openCodeIdentity?: () => string | null
   openCodeFind?: OpenCodePoolOptions['find']
   openCodeBackend?: OpenCodePoolOptions['backend']
@@ -1088,11 +1089,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
+      const selection = openCodeSelection(agent, dflt)
       if (agent.opencodeSession && agent.homePc && agent.homePc !== self().id) throw apiError(409, 'OpenCode conversations resume on their home PC.')
       const mcp: NonNullable<import('../opencode/backend.ts').BackendOptions['mcp']> = {}
       const registry = readRegistry(mcpRegistryFile)
       for (const name of chosen(registry, agent.mcpServers)) { const def = registry[name]; mcp[name] = { command: [def.command, ...def.args], environment: def.env } }
-      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: openCodeProvider(agent.opencodeProvider || dflt.opencodeProvider), selectedModel: agent.opencodeModel || dflt.opencodeModel || '', native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'OpenCode'), mcp })
+      await openCode.prepare({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: '', model: '', resume: !!agent.opencodeSession, engine: 'opencode', provider: selection.provider, selectedModel: selection.model, native: agent.opencodeSession ?? null, brief: composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'OpenCode'), mcp })
       heartbeat.opened(sid)
       chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: agent.opencodeSession ? 'resumed' : 'new' })
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
@@ -2888,8 +2890,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     if (file) switchFences.snapshot(sid, switchId, file)
     if (to === 'opencode') {
-      if (!openCode.install() || !o.openCodeCredential) throw apiError(503, 'OpenCode is not configured on this PC.')
-      await o.openCodeCredential(openCodeProvider(next.opencodeProvider || defaultsNow().opencodeProvider))
+      const { provider, model } = openCodeSelection(next, defaultsNow())
+      if (!openCode.install() || (provider !== 'opencode' && !o.openCodeCredential)) throw apiError(503, 'OpenCode is not configured on this PC.')
+      if (provider === 'opencode') freeModel(model)
+      else await o.openCodeCredential!(provider)
       if (openCode.status().live >= 2) throw apiError(503, 'OpenCode is at this PC’s two-backend limit.')
     }
     let cwd = chats.info(sid)?.cwd || (file && conversationCwd(file)) || codeDirOf(floor)

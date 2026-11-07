@@ -1,4 +1,4 @@
-import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE } from '../../shared/opencode.ts'
+import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE, OPENCODE_PROVIDERS, isOpenCodeFreeModel } from '../../shared/opencode.ts'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, renameSync } from 'node:fs'
 import {
@@ -84,7 +84,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
     // F-134: the engine and the Codex model and effort are the page's to set; the Codex conversation id is the agent's (patch() puts the old one back).
     engine: isEngine(a.engine) ? a.engine : '',
-    opencodeProvider: a.opencodeProvider === 'openai' || a.opencodeProvider === 'anthropic' ? a.opencodeProvider : '',
+    opencodeProvider: (OPENCODE_PROVIDERS as readonly unknown[]).includes(a.opencodeProvider) ? a.opencodeProvider as FloorAgent['opencodeProvider'] : '',
     opencodeModel: openCodeModel(a.opencodeModel),
     opencodeSession: typeof a.opencodeSession === 'string' && OPENCODE_SESSION_RE.test(a.opencodeSession) ? a.opencodeSession : null,
     codexModel: typeof a.codexModel === 'string' ? a.codexModel.trim().slice(0, CODEX_MODEL_MAX) : '',
@@ -366,10 +366,11 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         // it the first agent), and taking the last agent off leaves an empty floor.
         const next = p.agents.map((raw, i) => {
           if (isObject(raw)) {
-            if (raw.opencodeProvider !== undefined && !['', 'openai', 'anthropic'].includes(String(raw.opencodeProvider))) throw apiError(400, 'OpenCode provider is openai or anthropic')
+            if (raw.opencodeProvider !== undefined && !['', ...OPENCODE_PROVIDERS].includes(String(raw.opencodeProvider))) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
             if (raw.opencodeModel !== undefined && !validOpenCodeModel(raw.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
           }
           const a = hydrateAgent(raw, i)
+          if (a.opencodeProvider === 'opencode' && a.opencodeModel && !isOpenCodeFreeModel(a.opencodeModel)) throw apiError(400, 'Choose a verified OpenCode free model')
           // The binding is the server's: kept from what was there, never taken from the page.
           a.sessionId = before.get(a.id)?.sessionId ?? null
           // F-064: and so is the PC it lives on.
@@ -511,7 +512,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (req.model !== undefined && !isModel(req.model)) throw apiError(400, 'model is opus, sonnet or haiku')
       if (req.effort !== undefined && !isEffort(req.effort)) throw apiError(400, 'effort is low, medium, high, xhigh or max')
       if (req.engine !== undefined && !isEngine(req.engine)) throw apiError(400, 'engine is claude, codex, opencode, or "" for the default')
-      if (req.opencodeProvider !== undefined && !['', 'openai', 'anthropic'].includes(req.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai or anthropic')
+      if (req.opencodeProvider !== undefined && !['', ...OPENCODE_PROVIDERS].includes(req.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
+      if (req.opencodeProvider === 'opencode' && req.opencodeModel && !isOpenCodeFreeModel(req.opencodeModel)) throw apiError(400, 'Choose a verified OpenCode free model')
       if (req.opencodeModel !== undefined && !validOpenCodeModel(req.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
       if (req.codexEffort !== undefined && !isCodexEffort(req.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
       const index = floor.agents.length

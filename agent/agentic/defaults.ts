@@ -1,4 +1,4 @@
-import { openCodeProvider, openCodeModel, validOpenCodeModel, OPENCODE_PROVIDERS } from '../../shared/opencode.ts'
+import { openCodeProvider, openCodeModel, validOpenCodeModel, OPENCODE_PROVIDERS, isOpenCodeFreeModel } from '../../shared/opencode.ts'
 import { readFileSync } from 'node:fs'
 import { AGENT_EFFORTS, AGENT_MODELS, NO_DEFAULTS, type AgentEffort, type AgentModel, type ChatDefaults } from '../../shared/agentic.ts'
 import { AGENT_ENGINES, CODEX_EFFORTS, CODEX_MODEL_MAX, type AgentEngine, type CodexEffort } from '../../shared/codex.ts'
@@ -55,7 +55,7 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
       if (p.engine !== undefined && !isEngine(p.engine)) throw apiError(400, 'engine is claude, codex, or "" for Claude')
       if (p.codexEffort !== undefined && !isCodexEffort(p.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
       if (p.codexModel !== undefined && typeof p.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
-      if (p.opencodeProvider !== undefined && !(OPENCODE_PROVIDERS as readonly unknown[]).includes(p.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai or anthropic')
+      if (p.opencodeProvider !== undefined && !(OPENCODE_PROVIDERS as readonly unknown[]).includes(p.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
       if (p.opencodeModel !== undefined && !validOpenCodeModel(p.opencodeModel)) throw apiError(400, 'Invalid OpenCode model name')
       const next: ChatDefaults = {
         ...(p.opencodeProvider !== undefined || p.opencodeModel !== undefined || now.opencodeProvider !== undefined || now.opencodeModel !== undefined ? {
@@ -69,6 +69,7 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
         codexModel: p.codexModel !== undefined ? codexModelOf(p.codexModel) : (now.codexModel ?? ''),
         codexEffort: p.codexEffort !== undefined ? (p.codexEffort as CodexEffort) : (now.codexEffort ?? ''),
       }
+      if (next.opencodeProvider === 'opencode' && next.opencodeModel && !isOpenCodeFreeModel(next.opencodeModel)) throw apiError(400, 'Choose a verified OpenCode free model')
       if (
         next.opencodeProvider === openCodeProvider(now.opencodeProvider) &&
         next.opencodeModel === openCodeModel(now.opencodeModel) &&

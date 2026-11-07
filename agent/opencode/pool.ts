@@ -7,7 +7,9 @@ import { writeAtomic } from '../config.ts'
 import type { ChatState } from '../../shared/agentic.ts'
 import type { OpenCodeProvider, OpenCodeStatus } from '../../shared/opencode.ts'
 import { OPENCODE_SESSION_RE } from '../../shared/opencode.ts'
-import type { ApiCredential } from './crm.ts'
+import { FREE_CREDENTIAL, type OpenCodeCredential } from './crm.ts'
+import { freeModel } from './free-model.ts'
+import { providerErrorMessage } from './provider-error.ts'
 import { findOpenCode, type OpenCodeInstall } from './install.ts'
 import { createAdmission, TUI_RESERVATION } from './capacity.ts'
 import { startBackend, type Backend, type BackendOptions } from './backend.ts'
@@ -19,7 +21,7 @@ export interface OpenCodePoolOptions {
   dir: string
   toolsUrl: () => string
   shim: string
-  credential: (provider: OpenCodeProvider) => Promise<ApiCredential>
+  credential: (provider: OpenCodeProvider) => Promise<OpenCodeCredential>
   onBind: (sid: string, native: string) => void | Promise<void>
   identity?: () => string | null
   onChange: () => void
@@ -47,6 +49,7 @@ interface Live {
   fingerprint: string
   identity: string | null
   pending: { text: string; holdForDraft?: boolean }[]
+  failure: string | null
 }
 /** The HTTP backend owns status and sends. The PTY is a lazily attached viewer of it. */
 export function createOpenCodePool(o: OpenCodePoolOptions) {
@@ -56,6 +59,11 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
   const install = () => (o.find ?? findOpenCode)()
   const fingerprint = (key: string) => createHash('sha256').update(key).digest('hex')
   let checking = false, stopped = false, lastCheck = Date.now()
+  function historyFor(c: Live, document: unknown) {
+    const history = readHistory('opencode', document, c.info.startedAt)
+    if (c.failure && !history.some(m => m.parts.some(p => p.type === 'text' && p.text.includes(c.failure!)))) history.push({ role: 'assistant', time: new Date().toISOString(), parts: [{ type: 'text', text: c.failure }] })
+    return history
+  }
   async function refresh(sid: string) {
     const c = live.get(sid); if (!c) return
     if (c.refreshing) { c.refreshAgain = true; return }
@@ -64,7 +72,7 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
       do {
         c.refreshAgain = false
         const doc = await c.backend.snapshot()
-        const history = readHistory('opencode', doc, c.info.startedAt)
+        const history = historyFor(c, doc)
         const rows = emitHistory('claude', history, { id: sid, cwd: c.info.cwd, timestamp: c.info.startedAt }) as string[]
         writeAtomic(mirror(sid), rows.join('\n') + '\n')
         c.text = history.flatMap(m => m.parts.map(p => p.type === 'text' ? `${m.role}: ${p.text}` : `${p.name}: ${p.output}`)).join('\n')
@@ -73,13 +81,27 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
     finally { c.refreshing = false }
   }
   function change(sid: string, state: ChatState) { const c = live.get(sid); if (c && c.info.state !== state) { c.info.state = state; c.lastActive = Date.now(); o.onChange() } }
+  function failure(sid: string, error: unknown) {
+    const c = live.get(sid); if (!c) return
+    c.failure = providerErrorMessage(error, c.provider)
+    c.text += '\n' + c.failure; c.screen = (c.screen + '\r\n' + c.failure + '\r\n').slice(-256 * 1024)
+    for (const viewer of c.viewers) viewer.send({ t: 'out', d: '\r\n' + c.failure + '\r\n' })
+    change(sid, 'idle'); o.onChange()
+    void refresh(sid).then(() => o.onChange())
+  }
   function event(sid: string, e: any) {
     const c = live.get(sid); if (!c) return
     if (e.properties?.sessionID && e.properties.sessionID !== c.backend.native) return
-    if (e.type === 'session.status') change(sid, e.properties?.status?.type === 'idle' ? 'idle' : 'running')
+    if (e.type === 'session.status') {
+      const status = e.properties?.status
+      if (c.provider === 'opencode' && status?.type === 'retry' && providerErrorMessage(status, c.provider).startsWith('OpenCode free usage limit reached.')) {
+        failure(sid, status)
+        void c.backend.abort().catch(() => {})
+      } else change(sid, status?.type === 'idle' ? 'idle' : 'running')
+    }
     if (e.type === 'session.idle') change(sid, 'idle')
     if (e.type === 'permission.asked' || e.type === 'question.asked') change(sid, 'question')
-    if (e.type === 'session.error') change(sid, 'idle')
+    if (e.type === 'session.error') failure(sid, e.properties?.error)
     if (e.type === 'reconnect') void c.backend.client.request('/session/status').then(status => change(sid, status[c.backend.native]?.type === 'busy' ? 'running' : 'idle')).catch(() => {})
     if (e.type.startsWith('message.') || e.type === 'session.idle' || e.type === 'reconnect') void refresh(sid)
   }
@@ -92,7 +114,7 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
     live.delete(sid); detachTerminal(sid, c)
     const finished = why === 'agent-stop' ? c.backend.close().finally(() => { stopping.delete(sid); admission.release(sid) }) : c.backend.abort().catch(() => {}).then(async () => {
       try {
-        const history = readHistory('opencode', await c.backend.snapshot(), c.info.startedAt)
+        const history = historyFor(c, await c.backend.snapshot())
         const rows = emitHistory('claude', history, { id: sid, cwd: c.info.cwd, timestamp: c.info.startedAt }) as string[]
         writeAtomic(mirror(sid), rows.join('\n') + '\n')
       } catch { /* Preserve the last successfully mirrored history. */ }
@@ -105,17 +127,20 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
   }
   const timer = setInterval(() => {
     for (const [sid, c] of live) {
-      if (o.identity && c.identity !== o.identity()) { kill(sid, 'crm-sign-out'); continue }
+      if (c.provider !== 'opencode' && o.identity && c.identity !== o.identity()) { kill(sid, 'crm-sign-out'); continue }
       const queued = c.pending[0]
-      if (queued && c.info.state === 'idle' && (!queued.holdForDraft || !c.draft) && pool.type(sid, queued.text, queued.holdForDraft ? { refuseDraft: true } : undefined)) c.pending.shift()
+      if (queued && (!c.failure || c.provider !== 'opencode') && c.info.state === 'idle' && (!queued.holdForDraft || !c.draft) && pool.type(sid, queued.text, queued.holdForDraft ? { refuseDraft: true } : undefined)) c.pending.shift()
       if (!c.viewers.size && c.info.state === 'idle' && !o.keep?.(sid) && Date.now() - c.lastActive > (o.idleMs ?? 5 * 60_000)) kill(sid, 'idle-reaper')
     }
     if (!checking && Date.now() - lastCheck >= 60_000 && live.size) {
       checking = true; lastCheck = Date.now()
       void (async () => {
         for (const provider of new Set([...live.values()].map(c => c.provider))) {
+          if (provider === 'opencode') continue
           try {
-            const credential = await o.credential(provider), next = fingerprint(credential.key)
+            const credential = await o.credential(provider)
+            if (credential.kind !== 'api_key' || credential.provider !== provider || !credential.key.trim()) throw apiError(401, 'OpenCode API key is unavailable.')
+            const next = fingerprint(credential.key)
             for (const [sid, c] of live) if (c.provider === provider && c.fingerprint !== next) kill(sid, 'credential-changed')
           } catch (error) {
             // A temporary CRM outage does not revoke an in-memory key. A definitive
@@ -144,15 +169,18 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
       admission.reserve(sid); starting.add(sid)
       let backend: Backend | null = null
       try {
-        const identity = o.identity?.() ?? null
-        const credential = await o.credential(p.provider)
+        const free = p.provider === 'opencode'
+        const selectedModel = free ? freeModel(p.selectedModel) : p.selectedModel
+        const identity = free ? null : o.identity?.() ?? null
+        const credential = free ? FREE_CREDENTIAL : await o.credential(p.provider)
+        if (!free && (credential.kind !== 'api_key' || credential.provider !== p.provider || !credential.key.trim())) throw apiError(401, 'OpenCode API key is unavailable.')
         if (stopped) throw apiError(503, 'The agent is stopping.')
-        if (o.identity && identity !== o.identity()) throw apiError(401, 'The PC’s CRM sign-in changed while OpenCode was starting.')
+        if (!free && o.identity && identity !== o.identity()) throw apiError(401, 'The PC’s CRM sign-in changed while OpenCode was starting.')
         const key = randomBytes(32).toString('hex')
         mkdirSync(rootOf(sid), { recursive: true })
-        backend = await (o.backend ?? startBackend)({ install: found, root: rootOf(sid), cwd: p.cwd, credential, model: p.selectedModel, native: p.native, brief: p.brief, toolsUrl: o.toolsUrl(), chatKey: key, shim: o.shim, mcp: p.mcp, event: e => event(sid, e), exited: () => { kill(sid, 'crashed') } })
-        if (stopped || (o.identity && identity !== o.identity())) throw apiError(401, 'The agent stopped or its CRM sign-in changed during OpenCode start.')
-        const c: Live = { info: { sessionId: sid, floorId: p.floorId, agentId: p.agentId, engine: 'opencode', cwd: p.cwd, state: 'idle', startedAt: new Date().toISOString(), viewers: 0 }, key, backend, terminal: null, viewers: new Set(), screen: '', text: '', draft: false, lastActive: Date.now(), refreshing: false, refreshAgain: false, provider: p.provider, fingerprint: fingerprint(credential.key), identity, pending: [] }
+        backend = await (o.backend ?? startBackend)({ install: found, root: rootOf(sid), cwd: p.cwd, credential, model: selectedModel, native: p.native, brief: p.brief, toolsUrl: o.toolsUrl(), chatKey: key, shim: o.shim, mcp: p.mcp, event: e => event(sid, e), exited: () => { kill(sid, 'crashed') } })
+        if (stopped || (!free && o.identity && identity !== o.identity())) throw apiError(401, 'The agent stopped or its CRM sign-in changed during OpenCode start.')
+        const c: Live = { info: { sessionId: sid, floorId: p.floorId, agentId: p.agentId, engine: 'opencode', cwd: p.cwd, state: 'idle', startedAt: new Date().toISOString(), viewers: 0 }, key, backend, terminal: null, viewers: new Set(), screen: '', text: '', draft: false, lastActive: Date.now(), refreshing: false, refreshAgain: false, provider: p.provider, fingerprint: credential.kind === 'api_key' ? fingerprint(credential.key) : '', identity, pending: [], failure: null }
         live.set(sid, c)
         await o.onBind(sid, backend.native)
         await refresh(sid); o.onChange()
@@ -202,8 +230,9 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
     drafting: sid => live.get(sid)?.draft ?? false,
     type(sid, text, opt) {
       const c = live.get(sid); if (!c || c.info.state === 'running' || (opt?.refuseDraft && c.draft)) return false
+      c.failure = null
       change(sid, 'running')
-      void c.backend.send(text).then(() => refresh(sid)).catch(() => { change(sid, 'idle') })
+      void c.backend.send(text).then(() => refresh(sid)).catch(error => failure(sid, error))
       return true
     },
     typeWhenReady(sid, text, opt) {

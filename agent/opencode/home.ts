@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
-import type { ApiCredential } from './crm.ts'
+import type { OpenCodeCredential } from './crm.ts'
 
 export function isolatedEnvironment(root: string, base: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {}
@@ -22,6 +22,9 @@ export function isolatedEnvironment(root: string, base: NodeJS.ProcessEnv = proc
   return env
 }
 /** Key is added to the backend environment only, after all non-secret config is built. */
-export function providerEnvironment(env: Record<string, string>, credential: ApiCredential): Record<string, string> {
-  return { ...env, [credential.provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY']: credential.key }
+export function providerEnvironment(env: Record<string, string>, credential: OpenCodeCredential): Record<string, string> {
+  const clean = Object.fromEntries(Object.entries(env).filter(([k]) => !/(?:API_?KEY|TOKEN|AUTHORIZATION|CREDENTIAL|SECRET|PASSWORD)/i.test(k) || k === 'OPENCODE_SERVER_PASSWORD'))
+  if (credential.kind === 'free') return { ...clean, OPENCODE_AUTH_CONTENT: '{}' }
+  if (!credential.key?.trim()) throw new Error('OpenCode API key is required.')
+  return { ...clean, OPENCODE_AUTH_CONTENT: '{}', [credential.provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY']: credential.key }
 }

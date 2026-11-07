@@ -1,5 +1,6 @@
 import { sanitizeConversationValue, fromClaude } from '../codex/from-claude.ts'
 import { toClaude } from '../codex/to-claude.ts'
+import { providerErrorMessage } from './provider-error.ts'
 
 type Row = Record<string, unknown>
 const row = (v: unknown): v is Row => !!v && typeof v === 'object' && !Array.isArray(v)
@@ -43,7 +44,7 @@ export function readHistory(engine: Engine, input: unknown, fallback: string): H
           parts.push(t)
         } else if (!['reasoning', 'step-start', 'step-finish', 'snapshot', 'patch'].includes(String(p.type))) parts.push(note(p.type === 'compaction' ? 'Compaction boundary' : 'Unsupported part'))
       }
-      if (m.info.role === 'assistant' && row(m.info.error)) parts.push({ type: 'text', text: '[OpenCode provider error: check the selected API key and model.]' })
+      if (m.info.role === 'assistant' && row(m.info.error)) parts.push({ type: 'text', text: `[${providerErrorMessage(m.info.error, typeof m.info.providerID === 'string' ? m.info.providerID : undefined)}]` })
       add(m.info.role as 'user' | 'assistant', at(row(m.info.time) ? m.info.time.created : undefined, fallback), parts)
     }
     return out

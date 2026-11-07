@@ -4,7 +4,8 @@ import net from 'node:net'
 import { readFileSync } from 'node:fs'
 import { OpenCodeClient } from './client.ts'
 import { isolatedEnvironment, providerEnvironment } from './home.ts'
-import type { ApiCredential } from './crm.ts'
+import type { OpenCodeCredential } from './crm.ts'
+import { freeModel, verifyFreeModel } from './free-model.ts'
 import type { OpenCodeInstall } from './install.ts'
 import { killTree } from '../proc-tree.ts'
 
@@ -12,7 +13,7 @@ export interface BackendOptions {
   install: OpenCodeInstall
   root: string
   cwd: string
-  credential: ApiCredential
+  credential: OpenCodeCredential
   model: string
   native: string | null
   brief: string
@@ -44,8 +45,20 @@ async function port(): Promise<number> {
   await new Promise<void>(resolve => server.close(() => resolve()))
   return p
 }
+/** Free sessions expose exactly one verified choice to HTTP and the attached TUI. */
+export function modelConfiguration(credential: OpenCodeCredential, selected: string, mockBaseUrl?: string) {
+  const model = credential.kind === 'free' ? freeModel(selected) : selected
+  return {
+    enabled_providers: [credential.provider],
+    ...(model ? { model: `${credential.provider}/${model}`, small_model: `${credential.provider}/${model}` } : {}),
+    ...(credential.kind === 'free' ? { provider: { opencode: { whitelist: [model] } } } : mockBaseUrl ? { provider: { [credential.provider]: {
+      options: { baseURL: mockBaseUrl }, models: { [model]: { name: 'Synthetic mock', limit: { context: 32000, output: 4000 } } },
+    } } } : {}),
+  }
+}
 /** One process, one isolated database, one provider credential, no credential files. */
 export async function startBackend(o: BackendOptions): Promise<Backend> {
+  const selectedModel = o.credential.kind === 'free' ? freeModel(o.model) : o.model
   const p = await port(), password = randomBytes(32).toString('hex')
   const env = isolatedEnvironment(o.root)
   env.OPENCODE_SERVER_PASSWORD = password
@@ -55,14 +68,10 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
   mcp['shubham-agentic'] = { type: 'local', command: [process.execPath, o.shim], environment: strip }
   if (o.mockBaseUrl && new URL(o.mockBaseUrl).hostname !== '127.0.0.1') throw new Error('Synthetic provider must be loopback')
   env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-    permission: 'allow', autoupdate: false, share: 'disabled', enabled_providers: [o.credential.provider],
+    permission: 'allow', autoupdate: false, share: 'disabled',
     // Native TUI turns must receive the same agent brief as HTTP turns.
     default_agent: 'build', agent: { build: { prompt: o.brief } },
-    ...(o.model ? { model: `${o.credential.provider}/${o.model}`, small_model: `${o.credential.provider}/${o.model}` } : {}),
-    ...(o.mockBaseUrl ? { provider: { [o.credential.provider]: {
-      options: { baseURL: o.mockBaseUrl },
-      models: { [o.model]: { name: 'Synthetic mock', limit: { context: 32000, output: 4000 } } },
-    } } } : {}),
+    ...modelConfiguration(o.credential, selectedModel, o.mockBaseUrl),
     mcp,
   })
   const started = Date.now()
@@ -92,7 +101,7 @@ export async function startBackend(o: BackendOptions): Promise<Backend> {
     }
     if (!ready) throw new Error('OpenCode did not become ready.')
     const providers = await client.request('/provider')
-    const model = o.model || providers.default?.[o.credential.provider]
+    const model = o.credential.kind === 'free' ? verifyFreeModel(providers, selectedModel) : selectedModel || providers.default?.[o.credential.provider]
     if (typeof model !== 'string' || !providers.all?.find((x: any) => x.id === o.credential.provider)?.models?.[model]) throw new Error('Choose a model supported by the installed OpenCode provider.')
     // Config is supplied through environment only. PATCH /config writes in the
     // project directory and must never be used to set app-managed defaults.
