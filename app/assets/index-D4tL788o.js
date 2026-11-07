@@ -1682,7 +1682,15 @@ now in this view im not being able to see it`,added:`2026-11-06`,notes:[`2026-11
   - test:agent 2549 (2546 pass, 0 fail, 3 skipped);
   - test:e2e 12 of 12;
   - lowest free RAM 3.34 GiB.
-- Ready to publish together with F-142 and the F-143 converters.`],done:null,doneNote:``},{id:`F-135`,title:`The Publish dialog fits every screen and keeps up`,said:`can you please make the published modal repsosive please it is less repsomnisinve`,added:`2026-11-06`,notes:[`2026-11-06 (Lead): His words, typed in Lead's chat at 16:44.
+- Ready to publish together with F-142 and the F-143 converters.`,`2026-11-07 13:34 (Lead): PUBLISHED as build 2026.11.07-1334 (pushed to shubham-agentic-build; each PC gets it with Update). Shubham's word: "please publish".
+- Checks: types, lint, and agent tests (2549: 2546 pass, 0 fail, 3 skipped). The Server's screen showed LogonUI, and the keyboard-hook test passed anyway.
+- The build was tried before the push: the page served, the build knew itself, and node-pty and koffi loaded.
+- The pushed bundle carries "carries your conversation over", "Default engine", "Codex chats", the from-claude converters and Codex thread discovery.
+- In it:
+  - F-142, the Claude and Codex conversation switch, compaction-aware;
+  - F-143, the six-way converters;
+  - F-134's page (Engine select, chips, the "Codex chats" switch, Default engine);
+  - the Codex fixes: MCP auto-approval, the long-message sender, kept trust and sandbox settings, and thread discovery and backfill.`],done:null,doneNote:``},{id:`F-135`,title:`The Publish dialog fits every screen and keeps up`,said:`can you please make the published modal repsosive please it is less repsomnisinve`,added:`2026-11-06`,notes:[`2026-11-06 (Lead): His words, typed in Lead's chat at 16:44.
 - The dialog is "Publish a new build" (src/build/PublishButton.tsx, F-119). It opens from the rocket in the app's bar and in the page picker (src/app/Shell.tsx, page-picker.tsx).
 - Today it is the standard dialog, scrolled as a whole when it is too tall, with the publish log in a 160 px box.
 - Lead's reading, both meanings of "responsive":
@@ -2025,7 +2033,15 @@ tell the codex chat to make a changes to dev to bring in a convert to convert cl
   - test:agent 2549 (2546 pass, 0 fail, 3 skipped);
   - test:e2e 12 of 12;
   - lowest free RAM 3.34 GiB.
-- Ready to publish together with F-142 and the F-143 converters.`],done:null,doneNote:``},{id:`F-143`,title:`OpenCode as a third engine for agents, with conversation converters`,said:`now we need to integrate one more thign that is open code and make converter for this also please`,added:`2026-11-07`,notes:[`2026-11-07 11:52 (Lead): His words, typed in Lead's chat at 11:52, right after F-142 (the Claude and Codex conversation converter and switcher) merged.
+- Ready to publish together with F-142 and the F-143 converters.`,`2026-11-07 13:34 (Lead): PUBLISHED as build 2026.11.07-1334 (pushed to shubham-agentic-build; each PC gets it with Update). Shubham's word: "please publish".
+- Checks: types, lint, and agent tests (2549: 2546 pass, 0 fail, 3 skipped). The Server's screen showed LogonUI, and the keyboard-hook test passed anyway.
+- The build was tried before the push: the page served, the build knew itself, and node-pty and koffi loaded.
+- The pushed bundle carries "carries your conversation over", "Default engine", "Codex chats", the from-claude converters and Codex thread discovery.
+- In it:
+  - F-142, the Claude and Codex conversation switch, compaction-aware;
+  - F-143, the six-way converters;
+  - F-134's page (Engine select, chips, the "Codex chats" switch, Default engine);
+  - the Codex fixes: MCP auto-approval, the long-message sender, kept trust and sandbox settings, and thread discovery and backfill.`],done:null,doneNote:``},{id:`F-143`,title:`OpenCode as a third engine for agents, with conversation converters`,said:`now we need to integrate one more thign that is open code and make converter for this also please`,added:`2026-11-07`,notes:[`2026-11-07 11:52 (Lead): His words, typed in Lead's chat at 11:52, right after F-142 (the Claude and Codex conversation converter and switcher) merged.
 - Lead's reading: OpenCode (the open-source coding agent CLI, sst/opencode) becomes a third ENGINE for agents, beside Claude (F-007) and Codex (F-134). Its conversations get converters both ways with Claude's JSONL and Codex's rollout, so the F-142 engine switch carries a conversation between all three.
 - The first step is P0, research only, by the Codex agent; nothing is installed. It covers:
   - OpenCode's session storage format and resume;
@@ -2085,7 +2101,15 @@ tell the codex chat to make a changes to dev to bring in a convert to convert cl
 - Not offered: Anthropic Pro/Max OAuth, which Anthropic does not support.
 - Build order: API keys first, then Zen, then the ChatGPT subscription.
 - Owner: Codex 3, design first: the engine adapter, the CRM kinds, the hand-out, and the page select.
-- The CRM backend part ships only on Shubham's word, and he runs the push and the database step himself.`],done:null,doneNote:``},{id:`F-144`,title:`Saved views kept in the CRM backend, per person, on every device`,said:`i wnat it in the crm backend please`,added:`2026-11-07`,notes:[`2026-11-07 12:10 (Lead): His words, typed in Lead's chat at 12:10. The thread before it:
+- The CRM backend part ships only on Shubham's word, and he runs the push and the database step himself.`,`2026-11-07 13:34 (Lead): PUBLISHED as build 2026.11.07-1334 (pushed to shubham-agentic-build; each PC gets it with Update). Shubham's word: "please publish".
+- Checks: types, lint, and agent tests (2549: 2546 pass, 0 fail, 3 skipped). The Server's screen showed LogonUI, and the keyboard-hook test passed anyway.
+- The build was tried before the push: the page served, the build knew itself, and node-pty and koffi loaded.
+- The pushed bundle carries "carries your conversation over", "Default engine", "Codex chats", the from-claude converters and Codex thread discovery.
+- In it:
+  - F-142, the Claude and Codex conversation switch, compaction-aware;
+  - F-143, the six-way converters;
+  - F-134's page (Engine select, chips, the "Codex chats" switch, Default engine);
+  - the Codex fixes: MCP auto-approval, the long-message sender, kept trust and sandbox settings, and thread discovery and backfill.`],done:null,doneNote:``},{id:`F-144`,title:`Saved views kept in the CRM backend, per person, on every device`,said:`i wnat it in the crm backend please`,added:`2026-11-07`,notes:[`2026-11-07 12:10 (Lead): His words, typed in Lead's chat at 12:10. The thread before it:
 - he asked "now one more thing where is the windows and views stored in this pc can you tell me please". Lead answered: in each browser's localStorage (sad-agentic-views, sad-agentic-windows, sad-agentic-slots, sad-agentic-layout, sad-window-views…), per browser and per page address, nothing on the agent or disk folders (F-106 made them per device on purpose);
 - he asked "wher will we save the views". Lead proposed the Server's agent folder (agentic\\views.json, per person by CRM login), with the CRM database as the other choice;
 - he chose the CRM.
