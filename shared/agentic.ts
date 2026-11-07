@@ -230,8 +230,8 @@ export interface FloorPatch {
   /** F-021, a member to its hub: that member's folder for the floor (null: the default). */
   folderFor?: { id: string; dir: string | null }
   /**
-   * F-134: true when the page has shown ENGINE_CHANGE_MESSAGE and the person agreed: an agent whose engine changes while it has a conversation then starts a NEW
-   * one. Without it that change is refused with a 409 (code engine-change-new-conversation).
+   * F-142: true when the page has shown ENGINE_CHANGE_MESSAGE and the person agreed: carry the conversation to the new engine, or start a new one if conversion fails.
+   * Without it that change is refused with a 409 (code engine-change-new-conversation).
    */
   confirmNewConversation?: boolean
 }
@@ -431,6 +431,9 @@ export interface TuneRequest {
   model?: AgentModel
   effort?: AgentEffort
   ultracode?: AgentUltracode
+  /** Codex tuning applies on the next start. */
+  codexModel?: string
+  codexEffort?: CodexEffort
 }
 
 /** F-067: what a tune did to a running chat: `now` (typed into it), or `next` (at its next start). */

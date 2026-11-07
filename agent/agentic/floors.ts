@@ -233,6 +233,8 @@ export function ensureDuty(floors: Floor[]): boolean {
 export interface FloorStoreOptions {
   /** F-134: the engine an agent set to "Default" runs, so changing it is judged by what really runs. */
   defaultEngine?: () => AgentEngine
+  /** F-142: after validation, carry a confirmed engine change into a fresh server-owned binding. */
+  switchConversation?: (floor: Floor, previous: FloorAgent, to: 'claude' | 'codex') => Pick<FloorAgent, 'sessionId' | 'codexThread' | 'homePc' | 'homePcName'> | null
 }
 
 export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
@@ -351,8 +353,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           a.homePcName = before.get(a.id)?.homePcName ?? null
           // F-086: nor the job (Orchestrator) the hub gave it.
           a.duty = before.get(a.id)?.duty ?? null
-          // F-134: nor the id Codex gave its conversation. Changing the ENGINE of an agent that has a chat starts a new conversation:
-          // refused until the page has said so, then the old binding is let go (the old transcript stays on disk).
+          // The conversation binding is server-owned. F-142 carries it across engines after validation below.
           const had = before.get(a.id)
           a.codexThread = had?.codexThread ?? null
           if (had && had.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
@@ -375,6 +376,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           const n = a.name.trim().toLowerCase()
           if (names.has(n)) throw apiError(400, `Two agents are called "${a.name}"; names are unique on a floor`)
           names.add(n)
+        }
+        // Conversion has disk side effects, so only run after the whole chart has passed validation.
+        for (const a of next) {
+          const had = before.get(a.id)
+          if (had?.sessionId && engineOf(a.engine, defaultEngine()) !== engineOf(had.engine, defaultEngine())) {
+            const carried = opts.switchConversation?.(floor, had, engineOf(a.engine, defaultEngine()))
+            if (carried) Object.assign(a, carried)
+          }
         }
         floor.agents = repairAgents(next)
       }

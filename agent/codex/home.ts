@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:f
 import path from 'node:path'
 import { writeAtomic } from '../config.ts'
 import { renderToml, type TomlTable, type TomlValue } from './toml.ts'
+import { keepRuntimeConfig } from './config-runtime.ts'
 
 // F-134: the one Codex home of this PC (CODEX_HOME), and what is written into it. Everything here is plain file work; nothing talks to the CRM.
 //
@@ -43,7 +44,7 @@ export function baseConfigToml(): string {
     approval_policy: 'never',
     sandbox_mode: 'danger-full-access',
     check_for_update_on_startup: false,
-  })}`
+  }, [{ path: ['windows'], body: { sandbox: 'unelevated' } }])}`
 }
 
 export const FIXED_AGENTS_MD = `# Shubham Agentic
@@ -63,8 +64,9 @@ export function writeBase(p: CodexPaths): boolean {
     } catch {
       // Not there yet.
     }
-    if (current !== text) {
-      writeAtomic(file, text)
+    const next = file === p.config ? keepRuntimeConfig(current ?? '', text) : text
+    if (current !== next) {
+      writeAtomic(file, next)
       wrote = true
     }
   }
@@ -93,6 +95,8 @@ export interface McpServerToml {
 
 export interface ProfileSpec {
   sessionId: string
+  /** Approved chat folder: seed trust before the first TUI starts. */
+  cwd?: string
   /** The chat's brief (composeAgentBrief), written as developer_instructions behind a marker line naming the chat. */
   brief: string
   /** '' = Codex's own. */
@@ -115,6 +119,15 @@ export function profileToml(spec: ProfileSpec): string {
   if (spec.model) top.model = spec.model
   if (spec.effort) top.model_reasoning_effort = spec.effort
   const tables: TomlTable[] = []
+  if (spec.cwd) {
+    const cwd = path.resolve(spec.cwd)
+    const trusted = new Set([cwd])
+    for (let dir = cwd; ; dir = path.dirname(dir)) {
+      if (existsSync(path.join(dir, '.git'))) { trusted.add(dir); break }
+      if (path.dirname(dir) === dir) break
+    }
+    for (const dir of trusted) tables.push({ path: ['projects', process.platform === 'win32' ? dir.toLowerCase() : dir], body: { trust_level: 'trusted' } })
+  }
   if (spec.keyVar) {
     top.model_provider = KEY_PROVIDER
     tables.push({ path: ['model_providers', KEY_PROVIDER], body: { name: 'OpenAI', base_url: 'https://api.openai.com/v1', env_key: spec.keyVar, wire_api: 'responses' } })
@@ -128,6 +141,8 @@ export function profileToml(spec: ProfileSpec): string {
     if (s.url !== undefined) body.url = s.url
     if (s.startup_timeout_sec !== undefined) body.startup_timeout_sec = s.startup_timeout_sec
     if (s.tool_timeout_sec !== undefined) body.tool_timeout_sec = s.tool_timeout_sec
+    // Execution approvals and MCP approvals are independent in Codex 0.163.0.
+    if (name === 'shubham-agentic') body.default_tools_approval_mode = 'approve'
     tables.push({ path: ['mcp_servers', name], body })
   }
   return renderToml(top, tables)
@@ -136,7 +151,11 @@ export function profileToml(spec: ProfileSpec): string {
 /** Writes (or rewrites) a chat's profile and returns its name. */
 export function writeProfile(p: CodexPaths, spec: ProfileSpec): string {
   const name = profileName(spec.sessionId)
-  writeAtomic(profileFile(p, name), profileToml(spec))
+  const file = profileFile(p, name)
+  let current = ''
+  try { current = readFileSync(file, 'utf8') } catch { /* New profile. */ }
+  const next = keepRuntimeConfig(current, profileToml(spec))
+  if (current !== next) writeAtomic(file, next)
   return name
 }
 

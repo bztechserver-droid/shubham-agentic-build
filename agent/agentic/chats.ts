@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
 import * as cxs from '../codex/screen.ts'
-import { sendToCodex, type SendOptions } from '../codex/sender.ts'
+import { sendToCodex, type SendOptions, type SendResult } from '../codex/sender.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, type Screen } from './screen.ts'
@@ -328,6 +328,8 @@ interface Chat {
   gates: { trust: boolean; trustTries: number; resume: boolean; scan: string; until: number }
   /** When the state last became 'question' (the grace before a phantom one is corrected). */
   questionAt?: number
+  /** Keep pastes and their delayed Enters from separate messages together. */
+  codexSending?: Promise<SendResult>
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
@@ -588,12 +590,15 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       // F-134: Codex takes a message its own way (codex/sender.ts: paste, wait, Enter, look, Enter again). The caller is told it is on its way; a message that
       // could not be taken is said in the log (and a question that appeared in the meantime stops it before any Enter).
       c.lastActive = Date.now()
-      void sendToCodex({ write: d => write(c, d), lines: () => c.screen.lines(), sleep: ms => new Promise<void>(r => setTimeout(r, ms).unref()) }, text, o.codexSend).then(
+      const send = () => sendToCodex({ write: d => write(c, d), lines: () => c.screen.lines(), sleep: ms => new Promise<void>(r => setTimeout(r, ms).unref()) }, text, o.codexSend)
+      const sending = (c.codexSending ? c.codexSending.then(result => result === 'sent' ? send() : result) : send())
+        .catch(() => 'unconfirmed' as const)
+      c.codexSending = sending
+      void sending.then(
         r => {
           if (r !== 'sent') log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: a message for this Codex chat was not taken (${r})`)
         },
-        () => undefined,
-      )
+      ).finally(() => { if (c.codexSending === sending) c.codexSending = undefined })
       return true
     }
     if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false

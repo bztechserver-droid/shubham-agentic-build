@@ -85,6 +85,8 @@ import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexE
 import type { CodexManager } from '../codex/index.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
+import { watchForThread } from '../codex/discovery.ts'
+import { switchConversation } from '../codex/switch-conversation.ts'
 import type { CodexSettings } from '../codex/settings.ts'
 import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
@@ -519,13 +521,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  }, { defaultEngine: () => defaultsNow().engine ?? '' })
+  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation })
   // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
   // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
   // the hub's and a PC alone's is the usual one.
   const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
     if (mode() === 'member') emitFloors()
-  }, { defaultEngine: () => defaultsNow().engine ?? '' })
+  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation })
   const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
   const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
   const floors: FloorStore = {
@@ -733,6 +735,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return !!at && engineFor(at.agent) === 'codex'
   }
   const rolloutCache = new Map<string, string>()
+  const threadWatchers = new Map<string, () => void>()
   /** A Codex chat's rollout file, once its conversation id is known and the file is there; null for every other chat. */
   function codexRollout(sid: string): string | null {
     const at = bySession(sid)
@@ -854,6 +857,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   void adopted.then(async () => {
     const cx = o.codex
     if (!cx) return
+    for (const floor of floors.list()) for (const agent of floor.agents) {
+      if (engineFor(agent) !== 'codex' || !agent.sessionId || agent.codexThread) continue
+      const sid = agent.sessionId
+      if (!learnThread(sid, floor.id, agent.id, 0) && chats.info(sid)) watchThread(sid, floor.id, agent.id, 0)
+    }
     try {
       sweepProfiles(cx.paths, new Set(chats.live().filter(c => c.engine === 'codex').map(c => profileName(c.sessionId))))
       await cx.sweep()
@@ -925,7 +933,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const cx = o.codex
     if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
     const cwd = codeDirOf(floor)
-    const thread = agent.codexThread ?? null
+    const thread = agent.codexThread ?? learnThread(sid, floor.id, agent.id, 0)?.thread ?? null
     const resume = !!thread && !!findRollout(cx.paths.home, thread)
     if (thread && !resume) {
       throw Object.assign(apiError(409, "This Codex conversation isn't on this PC: Codex conversations stay on the PC that started them (for now). Open the chat on that PC, or change the agent's engine to start a new conversation."), {
@@ -945,7 +953,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const def = registry[name]
         mcp[name] = { command: def.command, args: def.args, ...(def.env && Object.keys(def.env).length ? { env: def.env } : {}) }
       }
-      writeProfile(cx.paths, { sessionId: sid, brief, model: agent.codexModel || dflt.codexModel || '', effort: agent.codexEffort || dflt.codexEffort || '', mcp, ...(cx.credentialEnv() ? { keyVar: cx.credentialEnv()!.name } : {}) })
+      writeProfile(cx.paths, { sessionId: sid, cwd, brief, model: agent.codexModel || dflt.codexModel || '', effort: agent.codexEffort || dflt.codexEffort || '', mcp, ...(cx.credentialEnv() ? { keyVar: cx.credentialEnv()!.name } : {}) })
       log?.info(`chat ${sid.slice(0, 8)}: Codex, MCP servers ${Object.keys(mcp).join(', ')}`)
       const startedMs = Date.now()
       chats.start({
@@ -975,26 +983,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
-  /** A new Codex chat: its conversation id is whatever Codex called it, learnt from the first lines of its rollout (the marker in its instructions), then kept on the agent. */
+  function unboundCodex(sid: string, floorId: string, agentId: string) {
+    const agent = floors.get(floorId)?.agents.find(a => a.id === agentId)
+    return agent?.sessionId === sid && engineFor(agent) === 'codex' && !agent.codexThread
+  }
+
+  function learnThread(sid: string, floorId: string, agentId: string, sinceMs: number) {
+    if (!o.codex || !unboundCodex(sid, floorId, agentId)) return null
+    const found = discoverThread(o.codex.paths.home, sid, sinceMs)
+    if (!found || !unboundCodex(sid, floorId, agentId)) return null
+    floors.setCodexThread(floorId, agentId, found.thread)
+    rolloutCache.set(found.thread, found.file)
+    log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
+    if (team && chats.info(sid)) tail.track(sid, found.file, 0)
+    return found
+  }
+
+  /** Includes adopted chats. A delayed first write is not a reason to abandon a live conversation. */
   function watchThread(sid: string, floorId: string, agentId: string, startedMs: number) {
-    const cx = o.codex
-    if (!cx) return
-    const began = Date.now()
-    const timer = setInterval(() => {
-      if (closing || !chats.info(sid) || Date.now() - began > 120_000) return void clearInterval(timer)
-      const found = discoverThread(cx.paths.home, sid, startedMs)
-      if (!found) return
-      clearInterval(timer)
-      try {
-        floors.setCodexThread(floorId, agentId, found.thread)
-        rolloutCache.set(found.thread, found.file)
-        log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
-        if (team) tail.track(sid, found.file, 0)
-      } catch (e) {
-        log?.warn(`chat ${sid.slice(0, 8)}: couldn't keep its Codex conversation id: ${message(e)}`)
-      }
-    }, 1000)
-    timer.unref()
+    if (!o.codex) return
+    threadWatchers.get(sid)?.()
+    threadWatchers.set(sid, watchForThread({
+      active: () => !closing && !!chats.info(sid) && unboundCodex(sid, floorId, agentId),
+      discover: () => !!learnThread(sid, floorId, agentId, startedMs),
+      failed: e => log?.warn(`chat ${sid.slice(0, 8)}: couldn't keep its Codex conversation id: ${message(e)}`),
+    }))
   }
 
   /** A newer login was put in place while Codex chats were running: they hold the older one, so each is restarted (its conversation resumes), one after the other. */
@@ -2737,6 +2750,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return { agent: agentOf(floor, agentId) }
   }
 
+  /** F-142: snapshot the old engine's history into a new id, keeping the original file intact. */
+  function carryConversation(floor: Floor, previous: FloorAgent, to: 'claude' | 'codex') {
+    const sid = previous.sessionId!
+    try {
+      const location = whereAll()[sid]
+      if ((location && location.id !== self().id) || (previous.homePc && previous.homePc !== self().id)) {
+        throw new Error('conversation lives on another PC; local conversion is unavailable')
+      }
+      const file = engineFor(previous) === 'codex'
+        ? previous.codexThread && o.codex ? findRollout(o.codex.paths.home, previous.codexThread) : null
+        : findClaudeTranscript(sid, projectsDir)
+      if (!file) throw new Error('source transcript is unavailable on this PC')
+      const converted = switchConversation({ to, file, cwd: codeDirOf(floor), codexHome: o.codex?.paths.home, projectsDir })
+      log?.info(`chat ${sid.slice(0, 8)}: conversation carried to ${to}, ${converted.id.slice(0, 8)}`)
+      return { sessionId: to === 'claude' ? converted.id : randomUUID(), codexThread: to === 'codex' ? converted.id : null,
+        homePc: self().id, homePcName: self().name }
+    } catch (e) {
+      log?.warn(`chat ${sid.slice(0, 8)}: couldn't carry conversation to ${to}; starting a new conversation: ${message(e)}`)
+      return null
+    }
+  }
+
   function patchFloor(id: string, body: unknown, as?: ChatOwner) {
     if (!isObject(body)) throw apiError(400, 'Expected {name?, globalPrompt?, codeDir?, agents?}')
     const before = floorOf(id)
@@ -2744,7 +2779,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const floor = floors.patch(id, body as FloorPatch, as)
     // An agent taken off the floor takes its running chat with it, wherever it runs.
     const kept = new Set(floor.agents.map(a => a.id))
-    for (const a of before.agents) if (!kept.has(a.id) && a.sessionId) stopAnywhere(a.sessionId)
+    for (const a of before.agents) {
+      const after = floor.agents.find(next => next.id === a.id)
+      // Also stop an old engine whose binding has just been replaced (including conversion fallback).
+      if (a.sessionId && (!kept.has(a.id) || after?.sessionId !== a.sessionId)) stopAnywhere(a.sessionId)
+    }
     return { floor }
   }
 
@@ -4326,6 +4365,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
+      for (const cancel of threadWatchers.values()) cancel()
+      threadWatchers.clear()
       void crmFiles.close()
       recovery?.freeze()
       if (resumeTimer) clearTimeout(resumeTimer)

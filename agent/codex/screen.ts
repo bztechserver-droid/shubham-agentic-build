@@ -18,7 +18,7 @@
 /** Squashed text (all whitespace removed), like the pool's: the TUI paints with cursor moves, so spaced words aren't there to match. */
 export const CODEX_RUNNING_RE = /esctointerrupt/i
 export const CODEX_IDLE_RE = /\?forshortcuts/i
-export const CODEX_DONE_RE = /Workedfor\d/i
+export const CODEX_DONE_RE = /Workedfor<?\d/i
 /** A question is up: a menu footer, a numbered option, or a sign-in screen (Codex without a login asks how to sign in). */
 export const CODEX_QUESTION_RE = /pressentertoconfirm|pressentertoselect|pressentertocontinue|entertoconfirm|entertoselect|escapetogoback|esctogoback|signinwithchatgpt|provideyourownapikey|doyouwant/i
 /** The prompt line is drawn (the chat can be typed into). */

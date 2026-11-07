@@ -60,7 +60,7 @@ export interface CodexSettings {
 
 /** The code of a 409 when an agent's engine changes while it has a conversation. */
 export const ENGINE_CHANGE_CODE = 'engine-change-new-conversation'
-export const ENGINE_CHANGE_MESSAGE = "Changing the engine starts a NEW conversation: the old one stays readable, but the new engine can't continue it."
+export const ENGINE_CHANGE_MESSAGE = 'Changing the engine carries your conversation over to the new engine. The original stays saved. If conversion is unavailable, a new conversation starts.'
 
 /** The engine an agent actually runs, given its own setting and the default. */
 export function engineOf(own: AgentEngine | undefined, dflt: AgentEngine | undefined): 'claude' | 'codex' {
