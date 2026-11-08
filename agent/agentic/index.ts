@@ -1171,13 +1171,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
           ? expected.codexThread && o.codex ? findRollout(o.codex.paths.home, expected.codexThread) : null
           : findClaudeTranscript(expected.sessionId, projectsDir)
         if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
-        switchFences.begin(expected.sessionId, token)
+        switchFences.begin(expected.sessionId, token, 'execution-profile-v1')
         if (nativeChats.info(expected.sessionId)) { nativeChats.kill(expected.sessionId, 'execution-selection'); await nativeChats.waitStopped?.(expected.sessionId) }
         await settled(file)
-        switchFences.snapshot(expected.sessionId, token, file); switchFences.seal(expected.sessionId, token)
+        switchFences.snapshot(expected.sessionId, token, file, 'execution-profile-v1'); switchFences.seal(expected.sessionId, token, 'execution-profile-v1')
         const digest = sourceHash(file)
         return { assertCurrent: () => { if (sourceHash(file) !== digest) throw executionHttpError('execution-stale', 'selection') },
-          finish: (committed, changed) => { if (committed && changed) switchFences.retire(expected.sessionId!, token); else switchFences.cancel(expected.sessionId!, token) } }
+          finish: (committed, changed) => { if (committed && changed) switchFences.retire(expected.sessionId!, token, 'execution-profile-v1'); else switchFences.cancel(expected.sessionId!, token, 'execution-profile-v1') } }
       },
       prepare: async (scope, expected, target) => {
         const floor = floorOf(scope.floorId), file = expected.execution.engine === 'codex'
