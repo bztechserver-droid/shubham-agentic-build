@@ -53,7 +53,7 @@ export function createDefaultsStore(file: string, onChange?: () => void): Defaul
       if (p.effort !== undefined && !isEffort(p.effort)) throw apiError(400, 'effort is low, medium, high, xhigh, max, or "" for the one claude chooses')
       if (p.ultracode !== undefined && typeof p.ultracode !== 'boolean') throw apiError(400, 'ultracode is true or false')
       if (p.engine !== undefined && !isEngine(p.engine)) throw apiError(400, 'engine is claude, codex, or "" for Claude')
-      if (p.codexEffort !== undefined && !isCodexEffort(p.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
+      if (p.codexEffort !== undefined && !isCodexEffort(p.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, max, or "" for the one Codex chooses')
       if (p.codexModel !== undefined && typeof p.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
       if (p.opencodeProvider !== undefined && !(OPENCODE_PROVIDERS as readonly unknown[]).includes(p.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
       if (p.opencodeModel !== undefined && !validOpenCodeModel(p.opencodeModel)) throw apiError(400, 'Invalid OpenCode model name')

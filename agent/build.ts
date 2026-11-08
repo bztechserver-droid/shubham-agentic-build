@@ -99,6 +99,9 @@ export interface Build {
   info(): BuildInfo
   check(): Promise<BuildInfo>
   close(): void
+  /** F154: typed target-local update; no force/body accepted. */
+  requestUpdate(): BuildInfo & { restarting: boolean }
+  busy(): number
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -392,6 +395,8 @@ export function createBuild(o: BuildOptions): Build {
   }
 
   return {
+    requestUpdate: () => startUpdate(),
+    busy: () => o.chatHostGate?.current?.busy() ?? 0,
     mount: {
       prefix: '/build',
       async http(r) {

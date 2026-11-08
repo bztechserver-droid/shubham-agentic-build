@@ -1,3 +1,4 @@
+import { engineMismatch } from './runtime-engine.ts'
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -711,8 +712,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   return {
     start(s) {
+      if (s.engine && s.engine !== 'claude' && s.engine !== 'codex') throw Object.assign(new Error('This native terminal pool does not support the requested engine.'), { status: 503, code: 'engine-not-supported' })
       const existing = chats.get(s.sessionId)
-      if (existing && !existing.exited) return infoOf(existing)
+      if (existing && !existing.exited) {
+        if (existing.engine !== (s.engine ?? 'claude')) throw engineMismatch(s.engine ?? 'claude', existing.engine)
+        return infoOf(existing)
+      }
       if (!spawnPty) {
         const loaded = loadNodePty()
         if ('error' in loaded) throw Object.assign(new Error(loaded.error), { status: 503 })

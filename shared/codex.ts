@@ -14,7 +14,7 @@ export const AGENT_ENGINES = ['', 'claude', 'codex', 'opencode'] as const
 export type AgentEngine = (typeof AGENT_ENGINES)[number]
 
 /** How hard a Codex chat thinks (model_reasoning_effort); '' leaves it to Codex. The installed CLI has the last word. */
-export const CODEX_EFFORTS = ['', 'low', 'medium', 'high', 'xhigh'] as const
+export const CODEX_EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type CodexEffort = (typeof CODEX_EFFORTS)[number]
 
 /** A Codex model name is free text ('' = Codex's own default); the page offers these as suggestions only. */

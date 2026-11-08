@@ -1,6 +1,6 @@
 import { openCodeModel, validOpenCodeModel, OPENCODE_SESSION_RE, OPENCODE_PROVIDERS, isOpenCodeFreeModel } from '../../shared/opencode.ts'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, renameSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import {
   AGENT_BRIEF_MAX,
   AGENT_EFFORTS,
@@ -69,6 +69,7 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
   const name = str(a.name, NAME_MAX).trim()
   return {
     id: typeof a.id === 'string' && a.id ? a.id.slice(0, 64) : randomUUID(),
+    ...(a.pcControlSlot === 1 || a.pcControlSlot === 2 ? { pcControlSlot: a.pcControlSlot } : {}),
     name: name || 'Untitled',
     role: str(a.role, ROLE_MAX).trim(),
     isBoss: a.isBoss === true,
@@ -138,8 +139,10 @@ function repairAgents(agents: FloorAgent[]): FloorAgent[] {
 function hydrateFloor(raw: unknown): Floor | null {
   if (!isObject(raw) || typeof raw.id !== 'string' || !raw.id) return null
   const created = typeof raw.createdAt === 'string' ? raw.createdAt : now()
+  const agents = (Array.isArray(raw.agents) ? raw.agents : []).slice(0, MAX_AGENTS_PER_FLOOR).map(hydrateAgent)
   return {
     id: raw.id,
+    ...(raw.workspace === 'pc-control' && typeof raw.targetPcId === 'string' && raw.targetPcId ? { workspace: 'pc-control' as const, targetPcId: raw.targetPcId } : {}),
     name: str(raw.name, NAME_MAX).trim() || 'New floor',
     globalPrompt: str(raw.globalPrompt, FLOOR_PREAMBLE_MAX),
     codeDir: typeof raw.codeDir === 'string' && raw.codeDir.trim() ? raw.codeDir.trim() : null,
@@ -147,7 +150,7 @@ function hydrateFloor(raw: unknown): Floor | null {
     createdAt: created,
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : created,
     createdBy: ownerOf(raw.createdBy),
-    agents: repairAgents((Array.isArray(raw.agents) ? raw.agents : []).slice(0, MAX_AGENTS_PER_FLOOR).map(hydrateAgent)),
+    agents: raw.workspace === 'pc-control' ? agents : repairAgents(agents),
   }
 }
 
@@ -239,12 +242,36 @@ export function ensureDuty(floors: Floor[]): boolean {
 
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
 export interface FloorStoreOptions {
+  /** Check the other canonical stores before persisting a discovered native binding. */
+  validateCodexThread?: (floorId: string, agentId: string, thread: string | null) => void
+  /** Internal PC Control store: only exact engine-only chart changes are accepted. */
+  pcControl?: boolean
   seed?: Floor[]
   readOnly?: boolean
   /** F-134: the engine an agent set to "Default" runs, so changing it is judged by what really runs. */
   defaultEngine?: () => AgentEngine
   /** F-142: after validation, carry a confirmed engine change into a fresh server-owned binding. */
   switchConversation?: (floor: Floor, previous: FloorAgent, to: 'claude' | 'codex' | 'opencode') => Pick<FloorAgent, 'sessionId' | 'codexThread' | 'opencodeSession' | 'homePc' | 'homePcName'> | null
+}
+
+/** Only the already-selected native binding is idempotent; an app SID or older native ID is never a new thread. */
+export function assertCodexThreadAvailable(rows: Floor[], floorId: string, agentId: string, thread: string | null): void {
+  if (thread === null) return
+  const target = rows.find(f => f.id === floorId)?.agents.find(a => a.id === agentId)
+  if (!target) throw apiError(404, 'No such agent on this floor')
+  const matches = (value: string | null | undefined) => typeof value === 'string' && value.toLowerCase() === thread.toLowerCase()
+  const fail = () => { throw Object.assign(apiError(409, 'That native conversation already belongs to a protected identity or another conversation. The binding is unchanged.'), { code: 'engine-change-conversion-failed' }) }
+  for (const floor of rows) {
+    if (matches(floor.id)) fail()
+    for (const a of floor.agents) {
+      const same = floor.id === floorId && a.id === agentId && matches(a.codexThread)
+      if (matches(a.id) || matches(a.sessionId) || matches(a.opencodeSession) || (matches(a.codexThread) && !same)) fail()
+      for (const h of a.conversationHistory ?? []) {
+        if (matches(h.sessionId) || matches(h.opencodeSession) || matches(h.sourceSessionId) ||
+            (matches(h.codexThread) && !(same && h.sessionId === target.sessionId))) fail()
+      }
+    }
+  }
 }
 
 export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
@@ -300,7 +327,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
   }
 
   return {
-    validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine }).patch(id, patch, as) },
+    validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine, pcControl: opts.pcControl }).patch(id, patch, as) },
     list: () => clone(floors),
     get: id => {
       const f = floors.find(x => x.id === id)
@@ -328,6 +355,13 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     patch(id, p, as) {
       // Stage the entire chart: a failure in any conversion must not mutate another binding or field.
       const floor = clone(find(id))
+      if (floor.workspace === 'pc-control') {
+        if (!opts.pcControl || Object.keys(p).some(k => !['agents','confirmNewConversation','expectedConversation'].includes(k)) || !Array.isArray(p.agents) || p.agents.length !== 2 || p.agents.some((raw, i) => {
+          if (!isObject(raw) || raw.id !== floor.agents[i]?.id || !['claude','codex'].includes(String(raw.engine))) return true
+          const expected = { ...floor.agents[i], engine: raw.engine }
+          return JSON.stringify(raw) !== JSON.stringify(expected)
+        })) throw Object.assign(apiError(409, 'PC Control slots are immutable except for their engine.'), { code: 'pc-control-immutable' })
+      }
       const expected = p.expectedConversation
       if (expected) {
         const a = floor.agents.find(a => a.id === expected.agentId)
@@ -370,6 +404,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
             if (raw.opencodeModel !== undefined && !validOpenCodeModel(raw.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
           }
           const a = hydrateAgent(raw, i)
+          // A page cannot forge or remove a managed slot marker.
+          const managedSlot = before.get(a.id)?.pcControlSlot
+          if (managedSlot) a.pcControlSlot = managedSlot
+          else delete a.pcControlSlot
           if (a.opencodeProvider === 'opencode' && a.opencodeModel && !isOpenCodeFreeModel(a.opencodeModel)) throw apiError(400, 'Choose a verified OpenCode free model')
           // The binding is the server's: kept from what was there, never taken from the page.
           a.sessionId = before.get(a.id)?.sessionId ?? null
@@ -438,7 +476,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
             }
           }
         }
-        floor.agents = repairAgents(next)
+        floor.agents = floor.workspace === 'pc-control' ? next : repairAgents(next)
       }
       floor.updatedAt = now()
       const previousFloors = floors
@@ -450,12 +488,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     remove(id) {
       const f = floors.find(x => x.id === id)
       if (!f) return null
+      if (f.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control cannot be removed.'), { code: 'pc-control-immutable' })
       floors = floors.filter(x => x !== f)
       save()
       return clone(f)
     },
 
     reorder(order) {
+      if (floors.some(f => f.workspace === 'pc-control')) throw Object.assign(apiError(409, 'PC Control cannot be reordered.'), { code: 'pc-control-immutable' })
       const rank = new Map(order.map((id, i) => [id, i]))
       floors = [...floors].sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity))
       save()
@@ -465,6 +505,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     moveAgent(fromFloorId, agentId, toFloorId, before) {
       const from = find(fromFloorId)
       const to = find(toFloorId)
+      if (from.workspace === 'pc-control' || to.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control slots cannot move.'), { code: 'pc-control-immutable' })
       const agent = agentOf(from, agentId)
       if (to !== from) {
         if (to.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `${to.name} already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
@@ -494,6 +535,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
 
     addAgent(floorId, req, as) {
       const floor = find(floorId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control has exactly two persistent slots.'), { code: 'pc-control-immutable' })
       if (floor.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `This floor already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
       let name = typeof req.name === 'string' ? req.name.trim().slice(0, NAME_MAX) : ''
       if (!name) {
@@ -515,7 +557,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if (req.opencodeProvider !== undefined && !['', ...OPENCODE_PROVIDERS].includes(req.opencodeProvider)) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
       if (req.opencodeProvider === 'opencode' && req.opencodeModel && !isOpenCodeFreeModel(req.opencodeModel)) throw apiError(400, 'Choose a verified OpenCode free model')
       if (req.opencodeModel !== undefined && !validOpenCodeModel(req.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
-      if (req.codexEffort !== undefined && !isCodexEffort(req.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
+      if (req.codexEffort !== undefined && !isCodexEffort(req.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, max, or "" for the one Codex chooses')
       const index = floor.agents.length
       // The first agent on an empty floor is its boss, at the boss's desk; the rest go in rows below.
       const desk = index === 0 ? { x: 320, y: 40 } : { x: 80 + ((index - 1) % 4) * 250, y: 240 + Math.floor((index - 1) / 4) * 190 }
@@ -545,6 +587,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
 
     setShare(floorId, agentId, list) {
       const floor = find(floorId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control sharing is managed by the server.'), { code: 'pc-control-immutable' })
       const agent = agentOf(floor, agentId)
       agent.sharedWith = shareList(list).filter(x => x.id !== agent.owner?.id)
       floor.updatedAt = now()
@@ -555,6 +598,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     adopt(raw, from) {
       const f = hydrateFloor(raw)
       if (!f) throw apiError(400, 'Not a floor')
+      if (f.workspace === 'pc-control' || floors.some(x => x.id === f.id && x.workspace === 'pc-control')) throw Object.assign(apiError(409, 'PC Control cannot be adopted.'), { code: 'pc-control-immutable' })
       const have = floors.find(x => x.id === f.id)
       if (have) return { floor: clone(have), created: false, renamedFrom: null }
       for (const a of f.agents) {
@@ -598,6 +642,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     bindSession(floorId, agentId, sessionId) {
       const floor = find(floorId)
       const agent = agentOf(floor, agentId)
+      if (sessionId && floors.some(f => f.agents.some(a => a.id !== agentId && a.pcControlSlot && (a.sessionId === sessionId || a.conversationHistory?.some(h => h.sessionId === sessionId || h.codexThread === sessionId || h.opencodeSession === sessionId))))) throw Object.assign(apiError(409, 'A PC Control conversation cannot be reassigned.'), { code: 'pc-control-immutable' })
       if (sessionId !== null && !SESSION_ID_RE.test(sessionId)) throw apiError(400, 'Not a chat id')
       if (sessionId !== null) {
         // One chat, one agent: taking it from whoever had it.
@@ -606,8 +651,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       // A different chat starts without a home: the PC that starts it becomes it (F-064).
       if (agent.sessionId !== sessionId) {
         rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
-        agent.homePc = null
-        agent.homePcName = null
+        agent.homePc = floor.workspace === 'pc-control' ? floor.targetPcId ?? null : null
+        agent.homePcName = floor.workspace === 'pc-control' ? floor.name : null
         agent.opencodeSession = null
         agent.codexThread = null
       }
@@ -627,21 +672,37 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     setCodexThread(floorId, agentId, thread) {
-      const floor = find(floorId)
-      const agent = agentOf(floor, agentId)
+      const current = find(floorId)
+      const previous = agentOf(current, agentId)
       if (thread !== null && !THREAD_ID_RE.test(thread)) throw apiError(400, 'Not a Codex conversation id')
       const next = thread === null ? null : thread.toLowerCase()
-      if ((agent.codexThread ?? null) !== next) {
+      assertCodexThreadAvailable(floors, floorId, agentId, next)
+      opts.validateCodexThread?.(floorId, agentId, next)
+      if ((previous.codexThread ?? null) !== next) {
+        const before = floors
+        const bytes = !opts.readOnly && existsSync(file) ? readFileSync(file) : null
+        floors = clone(floors)
+        const floor = find(floorId), agent = agentOf(floor, agentId)
         agent.codexThread = next
         rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
         floor.updatedAt = now()
-        save()
+        try { save() } catch (error) {
+          floors = before
+          if (!opts.readOnly) {
+            if (bytes !== null && (!existsSync(file) || !readFileSync(file).equals(bytes))) {
+              const tmp = `${file}.native-rollback-${randomUUID()}.tmp`
+              writeFileSync(tmp, bytes); renameSync(tmp, file)
+            } else if (bytes === null && existsSync(file)) unlinkSync(file)
+          }
+          throw error
+        }
       }
-      return clone(floor)
+      return clone(find(floorId))
     },
 
     setHome(floorId, agentId, home) {
       const floor = find(floorId)
+      if (floor.workspace === 'pc-control' && home?.id !== floor.targetPcId) throw Object.assign(apiError(409, 'This chat is pinned to its PC.'), { code: 'pc-control-wrong-device' })
       const agent = agentOf(floor, agentId)
       const id = home?.id.trim().slice(0, 64) || null
       const name = id ? home!.name.trim().slice(0, NAME_MAX) || id : null

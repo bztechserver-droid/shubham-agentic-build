@@ -77,6 +77,8 @@ export interface ConversationRecord {
 }
 
 export interface FloorAgent {
+  /** Server-owned persistent PC Control slot; never accepted from chart edits. */
+  pcControlSlot?: 1 | 2
   id: string
   name: string
   role: string
@@ -146,6 +148,9 @@ export interface FloorAgent {
 
 /** A floor: a team of agents, each with its own chat, working in one folder. */
 export interface Floor {
+  /** Server-owned PC Control workspace identity. */
+  workspace?: 'pc-control'
+  targetPcId?: string
   id: string
   name: string
   /** The floor preamble: "the work this floor does", before every agent's brief. */
@@ -281,6 +286,8 @@ export interface NewAgent {
 
 /** POST /agentic/floors/:id/agents/:agentId/chat: its chat is running (started or resumed if it wasn't). */
 export interface ChatOpened {
+  /** Actual native runtime engine; absent on legacy apps. */
+  engine?: 'claude' | 'codex' | 'opencode'
   /** F-064: the PC it is on, when it was started or found on another PC than this one (its home). */
   on?: string
   sessionId: string
@@ -398,6 +405,7 @@ export interface MemoryEntry {
 
 /** The page's events WebSocket at `${AGENT_API_PREFIX}/agentic/events`. */
 export type AgenticEvent =
+  | { t: 'pc-control'; answer: import('./pc-control.ts').PcControlAnswer }
   | { t: 'floors'; floors: Floor[] }
   | { t: 'live'; live: Record<string, ChatState> }
   | { t: 'memory'; floorId: string }

@@ -1,3 +1,4 @@
+import { createPcBuild, safeHubOrigin, PC_BUILD_STREAM, type BuildControl } from './pc-build.ts'
 import { FREE_CREDENTIAL, openCodeCredential } from './opencode/crm.ts'
 import type net from 'node:net'
 import { copyFileSync, existsSync } from 'node:fs'
@@ -93,6 +94,7 @@ export interface Agent {
 /** F-020: what the entry adds: more of the API (the build's), and Dev's folder on this PC. */
 export interface AgentExtras {
   mounts?: ApiMount[]
+  buildControl?: BuildControl
   /** On the hub, a floor with no folder of its own works in Dev: the build is how Dev is edited. */
   devDir?: string | null
   /** False: the Agents section is off here (Dev beside the build, which runs the chats). On when left out. */
@@ -180,7 +182,12 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       announceScreens()
     },
   })
+  let pcBuild: ReturnType<typeof createPcBuild> | null = null
   const onOpen = {
+    [PC_BUILD_STREAM]: (meta: OpenMeta) => {
+      if (!pcBuild) throw new Error('PC build controls unavailable')
+      return pcBuild.serve(meta)
+    },
     // F-116: dialled at an address RustDesk's IP whitelist lets in (read from its own settings at each stream; never changed).
     rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, tailnet, whitelist: () => readRustdeskWhitelist(), log: log.child('rustdesk') }),
     screen: appScreen.handler,
@@ -232,8 +239,11 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         onNewerLogin: () => agentic?.restartCodexChats(),
         onChange: () => changed(),
       })
+  let hub: { servers: Servers; pairing: PairingHub; links: HubLinks; stop: () => Promise<void> } | null = null
+  let member: { links: MemberLinks; discovery: DiscoveryClient } | null = null
   const agentic = extras.agents === false ? null : createAgentic({
     dir: path.join(paths.agent, 'agentic'),
+    pcControlDevices: () => [{ id: identity.id, name: config.name, online: true }, ...(role === 'hub' ? devices.members().map(p => ({ id: p.id, name: p.name, online: !!hub?.links.mux(p.id) })) : (() => { const h = devices.hub(); return h ? [{ id: h.id, name: h.name, online: !!member?.links.mux() }] : [] })())],
     codex,
     openCodeCredential: provider => provider === 'opencode' ? Promise.resolve(FREE_CREDENTIAL) : openCodeCredential(loadSession(paths.crmSession), provider, `sad-${identity.id}`),
     openCodeIdentity: () => { const s = loadSession(paths.crmSession); return s ? `${s.user.id}:${s.signedInAt}` : null },
@@ -309,8 +319,6 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       })
     : null
 
-  let hub: { servers: Servers; pairing: PairingHub; links: HubLinks; stop: () => Promise<void> } | null = null
-  let member: { links: MemberLinks; discovery: DiscoveryClient } | null = null
   let join: Join | null = null
   let joinSeq = 0
   let joinState: JoinState = IDLE_JOIN
@@ -318,6 +326,14 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   // dialog's list), or while it has lost its hub (where is it now?).
   let pageOpen = false
   let seekingHub = false
+
+  pcBuild = createPcBuild({
+    selfId: identity.id, role: () => role, hubId: () => devices.hub()?.id ?? null,
+    hubOrigin: () => safeHubOrigin(devices.hub()?.tailnetName),
+    generation: () => member?.links.mux() ?? null,
+    peer: id => { const mux = hub?.links.mux(id); return mux ? { generation: mux, open: () => mux.open(PC_BUILD_STREAM, {}) } : null },
+    build: extras.buildControl ?? null,
+  })
 
   if (role === 'hub') hub = await startHub()
   else member = startMember()
@@ -874,7 +890,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, ...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -1009,7 +1025,7 @@ if (import.meta.main) {
     const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
     speech = createEngine({ log: log.child('speech') })
-    agent = await startAgent(config, log, { mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
+    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

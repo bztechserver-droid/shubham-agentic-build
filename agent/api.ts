@@ -71,6 +71,15 @@ const PUSH_DEBOUNCE_MS = 100
 const MAX_WS_BACKLOG = 4 * 1024 * 1024
 
 /** An error the API answers with this status and message. */
+/** F154: only a canonical HTTPS tailnet origin may accompany this specific error. */
+export function hubSignInHint(status: number, code: unknown, raw: unknown): { hubOrigin: string | null } | Record<string, never> {
+  if (status !== 409 || code !== 'hub-sign-in-required') return {}
+  if (raw === null) return { hubOrigin: null }
+  if (typeof raw !== 'string' || !/^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)+\.ts\.net:5173$/.test(raw)) return {}
+  try { const u = new URL(raw); if (u.origin === raw && !u.username && !u.password && u.pathname === '/' && !u.search && !u.hash) return { hubOrigin: raw } } catch { /* omitted */ }
+  return {}
+}
+
 export function apiError(status: number, message: string): Error & { status: number } {
   return Object.assign(new Error(message), { status })
 }
@@ -738,7 +747,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
       const code = typeof status === 'number' && status >= 400 && status < 600 ? status : 500
       if (code === 500) log?.error(`${req.method} ${req.url}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
       const why = (e as { code?: unknown }).code
-      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}) })
+      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}), ...hubSignInHint(code, why, (e as { hubOrigin?: unknown }).hubOrigin) })
       else res.destroy()
     })
   })

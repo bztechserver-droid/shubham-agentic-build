@@ -46,6 +46,11 @@ const floor = (need: 'view' | 'manage' | 'delete'): Rule => ({ kind: 'floor', ne
 
 /** Every route of the agentic mount and what it needs. Keyed by method and the route's own regular expression. */
 export const POLICY: readonly [string, RegExp, Rule][] = [
+  ['GET', /^\/pc-control$/, SIGNED],
+  ['GET', /^\/pc-control\/pcs\/([^/]+)$/, SIGNED],
+  ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/open$/, SIGNED],
+  ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/stop$/, SIGNED],
+  ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, SIGNED],
   ['GET', /^\/watchdog$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
   ['POST', /^\/fast\/names$/, OWNER],
@@ -162,6 +167,10 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
   const person = (c: Caller): Pick<AuthPerson, 'id'> | null => c.person
 
   function rights(c: Caller, agent: FloorAgent) {
+    if (agent.pcControlSlot) {
+      if (c.machine) return { access: 'mine' as const, can: 'owner' as const }
+      if (!c.person) return null
+    }
     return chatRights(person(c), agent.owner ?? null, agent.sharedWith ?? [], admins())
   }
 
@@ -207,7 +216,7 @@ export function createAccess(auth: Auth | undefined, onDeny?: (c: Caller, route:
       return scopeFloors(floors, person(c), admins(), scope)
     },
     visible(c, floors) {
-      if (isAdmin(c)) return null
+      if (isAdmin(c) && (c.machine || c.person || !floors.some(f => f.workspace === 'pc-control'))) return null
       const out = new Set<string>()
       for (const f of floors) for (const a of f.agents) if (a.sessionId && rights(c, a)) out.add(a.sessionId)
       return out

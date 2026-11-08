@@ -1,3 +1,6 @@
+import { createPcControlStore, isPcControl, immutablePcControl, pcControlError, pcControlRevision, assertPcControlExpected, checkedPcControlNamespace, type PcControlKnownDevice } from './pc-control.ts'
+import type { PcControlAnswer, PcControlWorkspace, PcControlCapability, PcControlSlot } from '../../shared/pc-control.ts'
+import { requireRunningEngine, engineUpdateRequired, type RuntimeEngine } from './runtime-engine.ts'
 import { prepareConversation, type PreparedConversation } from '../opencode/switch.ts'
 import { interchange } from '../opencode/backend.ts'
 import { createOpenCodePool, combinePools, type OpenCodePoolOptions } from '../opencode/pool.ts'
@@ -86,7 +89,7 @@ import type { DevicesAnswer, PublicJwk, RecoveryFinished, RecoveryStarted, Signe
 import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
-import { createFloorStore, type FloorStore } from './floors.ts'
+import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from './floors.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
 import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexEffort, type CodexStatus } from '../../shared/codex.ts'
 import type { CodexManager } from '../codex/index.ts'
@@ -225,6 +228,8 @@ export interface ProofRequest {
 }
 
 export interface AgenticOptions {
+  /** Canonical self + registered devices, including offline devices. Never starts chats. */
+  pcControlDevices?: () => Array<{ id: string; name: string; online: boolean }>
   /** <state>/agent/agentic */
   dir: string
   /** F-134: Codex on this PC (the CRM's Codex login, the home, the chats). Left out (tests, older callers): agents set to Codex are refused with a plain sentence. */
@@ -435,6 +440,7 @@ interface Held {
 
 /** F-021, on a member: the hub's floors and sessions as it last said them. */
 interface Replica {
+  pcControl?: PcControlAnswer
   engineSwitchContinuity?: FloorsAnswer['engineSwitchContinuity']
   floors: Floor[]
   /** F-067: the hub's defaults for model, effort and ultracode. */
@@ -496,7 +502,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const f = allFloors().find(x => x.id === e.floorId)
       return f && access.floorSeen(c, f) ? JSON.stringify(e) : null
     }
-    if (e.t === 'floors') return JSON.stringify({ t: 'floors', floors: access.scope(c, e.floors) } satisfies AgenticEvent)
+    if (e.t === 'pc-control') return JSON.stringify({ t: 'pc-control', answer: scopePcControl(e.answer, c) } satisfies AgenticEvent)
+    if (e.t === 'floors') return JSON.stringify({ t: 'floors', floors: access.scope(c, e.floors.filter(f => !isPcControl(f))) } satisfies AgenticEvent)
     const seen = access.visible(c, allFloors())
     if (seen === null) return JSON.stringify(e)
     const mine = <T>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid)))
@@ -525,7 +532,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Callers with the same rights get the same text: made once.
     const made = new Map<string, string | null>()
     for (const [s, c] of events) {
-      const key = c.person ? c.person.id : '*'
+      const key = JSON.stringify(c)
       if (!made.has(key)) made.set(key, eventFor(e, c))
       const t = made.get(key)
       if (t) s.sendText(t)
@@ -536,33 +543,35 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation })
+  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
   // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
   // the hub's and a PC alone's is the usual one.
   const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
     if (mode() === 'member') emitFloors()
-  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation })
+  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
+  const controlFloors = createPcControlStore(path.join(o.dir, 'pc-control.json'), () => { emitFloors(); if (mode() !== 'member') pushState() }, { switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
+  const storeFor = (id: string) => controlFloors.store.get(id) ? controlFloors.store : pickFloors()
   const floors: FloorStore = {
-    list: () => pickFloors().list(),
-    get: id => pickFloors().get(id),
+    list: () => mode() === 'member' ? allFloors() : checkedPcControlNamespace([...pickFloors().list(), ...controlFloors.store.list()]),
+    get: id => storeFor(id).get(id) ?? (mode() === 'member' ? replica.floors.find(f => f.id === id && isPcControl(f)) ?? null : null),
     create: (name, as) => pickFloors().create(name, as),
-    validatePatch: (id, p, as) => pickFloors().validatePatch(id, p, as),
-    setOpenCodeSession: (f, a, n) => pickFloors().setOpenCodeSession(f, a, n),
-    patch: (id, p, as) => pickFloors().patch(id, p, as),
-    setShare: (f, a, l) => pickFloors().setShare(f, a, l),
+    validatePatch: (id, p, as) => storeFor(id).validatePatch(id, p, as),
+    setOpenCodeSession: (f, a, n) => storeFor(f).setOpenCodeSession(f, a, n),
+    patch: (id, p, as) => storeFor(id).patch(id, p, as),
+    setShare: (f, a, l) => storeFor(f).setShare(f, a, l),
     assignUnowned: owner => pickFloors().assignUnowned(owner),
     adopt: (raw, from) => hubFloors.adopt(raw, from),
-    remove: id => pickFloors().remove(id),
+    remove: id => storeFor(id).remove(id),
     reorder: order => pickFloors().reorder(order),
-    moveAgent: (from, agent, to, before) => pickFloors().moveAgent(from, agent, to, before),
-    addAgent: (f, req, as) => pickFloors().addAgent(f, req, as),
-    bindSession: (f, a, s) => pickFloors().bindSession(f, a, s),
-    setCodexThread: (f, a, t) => pickFloors().setCodexThread(f, a, t),
-    setHome: (f, a, h) => pickFloors().setHome(f, a, h),
-    bySession: sid => pickFloors().bySession(sid),
+    moveAgent: (from, agent, to, before) => storeFor(from).moveAgent(from, agent, to, before),
+    addAgent: (f, req, as) => storeFor(f).addAgent(f, req, as),
+    bindSession: (f, a, s) => storeFor(f).bindSession(f, a, s),
+    setCodexThread: (f, a, t) => storeFor(f).setCodexThread(f, a, t),
+    setHome: (f, a, h) => storeFor(f).setHome(f, a, h),
+    bySession: sid => bySession(sid),
   }
   // F-118: every floor and chat that has no owner is sbskrrt's (the one-time move; it is idempotent, so a chat some older path
   // made without an owner is covered at the next start too). A member keeps no floors of its own: this changes nothing there.
@@ -702,7 +711,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-127: this PC's own floors the Server does not have yet (once it has one, it is the Server's: the copy here is dropped from the list).
     const have = new Set(theirs.map(f => f.id))
     const mine = localFloors.list().filter(f => !have.has(f.id)).map(f => ({ ...f, local: true }))
-    return [...mine, ...theirs]
+    return checkedPcControlNamespace([...mine, ...theirs])
   }
 
   /** F-127: a floor made on this PC that the Server does not have yet (it is run here, whatever the link says). */
@@ -727,6 +736,196 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (agent) return { floor, agent }
     }
     return null
+  }
+
+  const validTransferSid = (id: string) => /^[0-9a-zA-Z-]{8,64}$/.test(id)
+  const sameControlId = (a: string | null | undefined, b: string) => a === b || (typeof a === 'string' && UUID_RE.test(a) && UUID_RE.test(b) && a.toLowerCase() === b.toLowerCase())
+  const controlBindingMatches = (a: Floor['agents'][number], id: string) =>
+    [a.sessionId,a.codexThread,a.opencodeSession].some(v => sameControlId(v,id)) ||
+    !!a.conversationHistory?.some(h => [h.sessionId,h.codexThread,h.opencodeSession].some(v => sameControlId(v,id)))
+  // Protected UUID aliases cannot bypass exact-key leases or conversion fences.
+  const validMirrorSid = (id: string) => validTransferSid(id) && !(UUID_RE.test(id) && id !== id.toLowerCase() && controlPinnedPc(id))
+  function controlPinnedPc(id: string): string | null {
+    return allFloors().filter(isPcControl).find(f => sameControlId(f.id,id) || f.agents.some(a =>
+      sameControlId(a.id,id) || controlBindingMatches(a,id)))?.targetPcId ?? null
+  }
+  const controlAlias = (id: string) => controlPinnedPc(id) !== null
+
+  /** Captured before I/O and rechecked by the writer after every async transfer boundary. */
+  function controlTransferGuard(peer: LinkPeer, sid: string): () => void {
+    if (!validMirrorSid(sid)) throw apiError(400, 'Expected a canonical session id')
+    const proof = () => {
+      const pin = controlPinnedPc(sid)
+      if (!pin) return null
+      const floor = allFloors().filter(isPcControl).find(f => f.agents.some(a => controlBindingMatches(a,sid)))
+      const agent = floor?.agents.find(a => controlBindingMatches(a,sid))
+      if (!floor || !agent) throw immutablePcControl()
+      const hub = team?.hub()
+      const mirrorFromHub = mode() === 'member' && pin === self().id && peer.id === hub?.id && peer.token === hub.link?.token && !chats.info(sid)
+      if (peer.id !== pin && !mirrorFromHub) throw pcControlError('pc-control-wrong-device', 'Only the pinned PC can supply this managed conversation.')
+      const current = mode() === 'member' ? hub?.link : team?.member(peer.id)
+      if (!current || current.token !== peer.token) throw pcControlError('pc-control-stale', 'The source PC connection changed before history transfer.')
+      return JSON.stringify([floor.id,pin,controlGeneration(agent)])
+    }
+    const captured = proof()
+    return () => { if (proof() !== captured) throw pcControlError('pc-control-stale', 'The managed conversation changed while history transfer was queued.') }
+  }
+
+  function assertPcControlTarget(floor: Floor, target: string, req: { here?: boolean; takeOver?: boolean }) {
+    if (!isPcControl(floor)) return
+    if (target !== floor.targetPcId || req.here || req.takeOver) throw pcControlError('pc-control-wrong-device', 'This chat is pinned to its registered PC. Takeover and fallback are unavailable.')
+    const live = whereAll()
+    for (const a of floor.agents) if (a.sessionId && live[a.sessionId] && live[a.sessionId].id !== floor.targetPcId) {
+      throw pcControlError('pc-control-wrong-device', 'A conflicting runtime exists on another PC. Nothing was stopped or moved.')
+    }
+    for (const a of floor.agents) if (a.sessionId && held.get(a.sessionId)?.holder && held.get(a.sessionId)!.holder !== floor.targetPcId) throw pcControlError('pc-control-wrong-device', 'A conflicting lease exists on another PC. Nothing was stopped or moved.')
+  }
+
+  function guardPcControlRoute(r: MountRequest, params: string[]) {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(r.method) || r.rest.startsWith('/pc-control')) return
+    if (!/^\/floors(?:\/|$)/.test(r.rest)) return
+    const id = params[0], f = id ? allFloors().find(f => f.id === id) : null
+    if (isPcControl(f)) throw immutablePcControl()
+    if (isObject(r.body)) {
+      const body = r.body
+      if (r.body.workspace === 'pc-control' || r.body.pcControlSlot !== undefined ||
+          (typeof body.floorId === 'string' && isPcControl(allFloors().find(f => f.id === body.floorId))) ||
+          [r.body.sessionId, r.body.codexThread, r.body.opencodeSession].some(x => typeof x === 'string' && controlAlias(x)) ||
+          (Array.isArray(body.agents) && body.agents.some(a => isObject(a) && [a.id,a.sessionId,a.codexThread,a.opencodeSession].some(x => typeof x === 'string' && controlAlias(x)))) ||
+          (Array.isArray(r.body.order) && r.body.order.some(x => typeof x === 'string' && isPcControl(allFloors().find(f => f.id === x))))) throw immutablePcControl()
+    }
+  }
+
+  const controlCapabilities = new Map<string, PcControlCapability | null>()
+  const controlRuntimes = new Map<string, { generation: string; token: object; at: number; runtime: PcControlSlot['runtime'] }>()
+  const controlGeneration = (a: FloorAgent) => JSON.stringify([a.id, a.sessionId, a.codexThread ?? null, a.opencodeSession ?? null])
+  const controlDeviceCatalogue = (): PcControlKnownDevice[] => o.pcControlDevices?.() ?? [{ ...self(), online: true }]
+  function scopePcControl(answer: PcControlAnswer, c: Caller): PcControlAnswer {
+    return { workspaces: answer.workspaces.flatMap(w => {
+      const agents = w.floor.agents.flatMap(a => {
+        const rights = access.rights(c, a)
+        if (!rights) return []
+        return [{ ...a, ...rights, sharedWith: rights.can === 'owner' ? a.sharedWith : [] }]
+      })
+      if (!agents.length) return []
+      const allowed = new Map(agents.map(a => [a.id, a]))
+      return [{ ...w, floor: { ...w.floor, agents }, slots: w.slots.map(s => {
+        const a = s.agentId ? allowed.get(s.agentId) : null
+        return a ? { ...s, agent: a, canOpen: s.canOpen && a.can !== 'view', canChangeEngine: s.canChangeEngine && a.can === 'owner' }
+          : { number: s.number, agentId: null, agent: null, runtime: null, canOpen: false, canChangeEngine: false }
+      }) as PcControlWorkspace['slots'] }]
+    }) }
+  }
+  function controlRawAnswer(): PcControlAnswer {
+    if (mode() === 'member' && replica.pcControl) return replica.pcControl
+    const known = new Map(controlDeviceCatalogue().map(d => [d.id, d]))
+    return { workspaces: allFloors().filter(isPcControl).map(f => {
+      const d = known.get(f.targetPcId) ?? { id: f.targetPcId, name: f.name, online: false }
+      const cap = d.id === self().id ? { version: 1 as const, pinnedWorkspace: true as const, actualEngineProof: true as const, engines: ['claude', 'codex'] as ('claude'|'codex')[] } : controlCapabilities.get(d.id) ?? null
+      const device = { ...d, capability: cap, unavailable: !d.online ? 'offline' as const : !cap ? 'update-required' as const : null }
+      return { device, floor: f, revision: pcControlRevision(f), slots: ([1,2] as const).map(number => {
+        const agent = f.agents.find(a => a.pcControlSlot === number)!
+        const info = agent.sessionId ? chats.info(agent.sessionId) : null
+        const proof = controlRuntimes.get(`${d.id}:${agent.id}`)
+        const remoteRuntime = d.online && proof?.generation === controlGeneration(agent) && proof.token === team?.member(d.id)?.token && Date.now() - proof.at < 10_000 ? proof.runtime : null
+        const runtime = d.id !== self().id ? remoteRuntime : info && (info.engine === 'claude' || info.engine === 'codex') ? { engine: info.engine, startedAt: info.startedAt, state: info.state } : null
+        return { number, agentId: agent.id, agent, runtime, canOpen: device.unavailable === null, canChangeEngine: device.unavailable === null }
+      }) as PcControlWorkspace['slots'] }
+    }) }
+  }
+  async function requirePcControlPeer(link: LinkPeer) {
+    let cap: unknown
+    try { cap = await request(link, 'pc-control-capabilities', {}, 5000) } catch { cap = null }
+    if (!isObject(cap) || cap.version !== 1 || cap.pinnedWorkspace !== true || cap.actualEngineProof !== true || !Array.isArray(cap.engines) || !cap.engines.includes('claude') || !cap.engines.includes('codex')) {
+      controlCapabilities.set(link.id, null)
+      throw pcControlError('pc-control-update-required', `${link.name} needs an app update before PC Control can start a chat.`)
+    }
+    controlCapabilities.set(link.id, cap as unknown as PcControlCapability)
+  }
+  function localControlRuntime(raw: unknown) {
+    if (!isObject(raw) || typeof raw.floorId !== 'string' || !Array.isArray(raw.slots) || raw.slots.length > 2 || Object.keys(raw).some(k => !['floorId','slots'].includes(k))) throw apiError(400, 'Expected managed runtime bindings.')
+    const f = floorOf(raw.floorId)
+    if (!isPcControl(f)) throw immutablePcControl()
+    assertPcControlTarget(f, self().id, {})
+    const ids = new Set<string>()
+    const slots = raw.slots.map(x => {
+      if (!isObject(x) || typeof x.agentId !== 'string' || typeof x.generation !== 'string' || Object.keys(x).some(k => !['agentId','generation'].includes(k)) || ids.has(x.agentId)) throw apiError(400, 'Expected unique managed slots.')
+      ids.add(x.agentId)
+      const a = agentOf(f, x.agentId)
+      if (x.generation !== controlGeneration(a)) throw pcControlError('pc-control-stale', 'The target conversation changed. Refresh PC Control.')
+      const info = a.sessionId ? chats.info(a.sessionId) : null
+      if (info && (info.floorId !== f.id || info.agentId !== a.id || !['claude','codex'].includes(info.engine))) throw pcControlError('engine-runtime-mismatch', 'The target runtime does not belong to this managed slot.')
+      return { agentId: a.id, generation: x.generation, runtime: info ? { engine: info.engine, startedAt: info.startedAt, state: info.state } : null }
+    })
+    return { pcId: self().id, floorId: f.id, slots }
+  }
+  async function refreshControlRuntime(link: LinkPeer, w: PcControlWorkspace) {
+    const slots = w.floor.agents.map(a => ({ agentId: a.id, generation: controlGeneration(a) }))
+    const raw = await request<unknown>(link, 'pc-control-runtime', { floorId: w.floor.id, slots }, 5000)
+    if (!isObject(raw) || raw.pcId !== link.id || raw.floorId !== w.floor.id || !Array.isArray(raw.slots) || raw.slots.length !== slots.length || team?.member(link.id)?.token !== link.token) throw pcControlError('pc-control-update-required', 'The target did not provide a current managed runtime proof.')
+    const checked = new Map<string, PcControlSlot['runtime']>()
+    for (const x of raw.slots) {
+      if (!isObject(x) || typeof x.agentId !== 'string' || checked.has(x.agentId) || !slots.some(s => s.agentId === x.agentId && s.generation === x.generation)) throw pcControlError('pc-control-stale', 'The target runtime proof belongs to a different conversation.')
+      const runtime = x.runtime
+      if (runtime !== null && (!isObject(runtime) || !['claude','codex'].includes(String(runtime.engine)) || typeof runtime.startedAt !== 'string' || !Number.isFinite(Date.parse(runtime.startedAt)) || !['idle','running','question'].includes(String(runtime.state)))) throw pcControlError('pc-control-update-required', 'The target returned malformed runtime proof.')
+      checked.set(x.agentId, runtime as PcControlSlot['runtime'])
+    }
+    const current = floorOf(w.floor.id)
+    for (const s of slots) if (!current.agents.some(a => a.id === s.agentId && controlGeneration(a) === s.generation)) throw pcControlError('pc-control-stale', 'The conversation changed while its runtime was checked.')
+    for (const s of slots) controlRuntimes.set(`${link.id}:${s.agentId}`, { generation: s.generation, token: link.token, at: Date.now(), runtime: checked.get(s.agentId)! })
+  }
+  async function controlAnswer(c: Caller): Promise<PcControlAnswer> {
+    if (mode() !== 'member') {
+      const devices = controlDeviceCatalogue()
+      const workflow = pickFloors().list()
+      const bindings = (a: FloorAgent) => [a.id, a.sessionId, a.codexThread, a.opencodeSession, ...(a.conversationHistory ?? []).flatMap(h => [h.sessionId, h.codexThread, h.opencodeSession])].filter((x): x is string => typeof x === 'string')
+      const ids = new Set(workflow.flatMap(f => [f.id, ...f.agents.flatMap(bindings)]))
+      for (const f of controlFloors.store.list()) if (ids.has(f.id) || f.agents.some(a => bindings(a).some(x => ids.has(x)))) throw immutablePcControl()
+      controlFloors.ensure(devices)
+    }
+    const scoped = scopePcControl(controlRawAnswer(), c)
+    await Promise.all(scoped.workspaces.map(async w => {
+      if (!w.device.online || w.device.id === self().id) return
+      const link = team?.member(w.device.id)
+      if (link) await requirePcControlPeer(link).then(() => refreshControlRuntime(link, w)).catch(() => {
+        controlCapabilities.set(link.id, null)
+        for (const a of w.floor.agents) controlRuntimes.delete(`${link.id}:${a.id}`)
+      })
+    }))
+    return scopePcControl(controlRawAnswer(), c)
+  }
+
+  const controlMutations = new Map<string, Promise<unknown>>()
+  function controlMutate(device: string, agentId: string, action: string, r: MountRequest) {
+    const pending = (controlMutations.get(device) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const c = callerOf(r), raw = r.body
+      if (!isObject(raw) || Object.keys(raw).some(k => !['expected', ...(action === 'engine' ? ['engine','confirmNewConversation'] : [])].includes(k))) throw apiError(400, 'PC Control requires an exact expected snapshot.')
+      const answer = await controlAnswer(c), w = answer.workspaces.find(w => w.device.id === device)
+      if (!w) throw pcControlError('pc-control-forbidden', 'That PC workspace is unavailable to you.', 403)
+      const f = floorOf(w.floor.id), a = agentOf(f, agentId)
+      access.needChat(c, a, action === 'engine' ? 'owner' : 'type', 'PC Control')
+      assertPcControlExpected(f, a, raw.expected)
+      if (w.device.unavailable) throw pcControlError(w.device.unavailable === 'offline' ? 'pc-control-offline' : 'pc-control-update-required', `${w.device.name} is ${w.device.unavailable}. Nothing was started or moved.`, w.device.unavailable === 'offline' ? 424 : 409)
+      assertPcControlTarget(f, device, {})
+      if (action === 'engine') {
+        if (!['claude','codex'].includes(String(raw.engine)) || (raw.confirmNewConversation !== undefined && raw.confirmNewConversation !== true)) throw apiError(400, 'Choose Claude or Codex.')
+        if (raw.engine !== a.engine) await patchFloor(f.id, { agents: f.agents.map(x => x.id === a.id ? { ...x, engine: raw.engine } : x),
+          confirmNewConversation: raw.confirmNewConversation, expectedConversation: { agentId: a.id, ...raw.expected } }, access.ownerOf(c))
+      } else if (action === 'stop') {
+        if (a.sessionId) await stopAt(device, a.sessionId)
+      } else if (action === 'open') {
+        const opened = device === self().id ? await openChat(f.id, a.id, {}) : await openOnPeer(peerOf(device), f, a)
+        const workspace = (await controlAnswer(c)).workspaces.find(w => w.device.id === device)!
+        emit({ t: 'pc-control', answer: controlRawAnswer() })
+        if (mode() !== 'member') pushState()
+        return { workspace, opened }
+      }
+      emit({ t: 'pc-control', answer: controlRawAnswer() })
+      return { workspace: (await controlAnswer(c)).workspaces.find(w => w.device.id === device)! }
+    })
+    controlMutations.set(device, pending)
+    void pending.finally(() => { if (controlMutations.get(device) === pending) controlMutations.delete(device) }).catch(() => {})
+    return pending
   }
 
   /** The floor's folder, made when it is the default one and missing. */
@@ -754,7 +953,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const rolloutCache = new Map<string, string>()
   const switchFences = createSwitchFences(path.join(o.dir, 'engine-switches.json'))
   const activeSwitches = new Set<string>()
-  const pullFrom = (peer: LinkPeer, sid: string, file: string) => pullTranscriptFrom(peer, sid, file, () => !switchFences.blocked(sid))
+  const pullFrom = (peer: LinkPeer, sid: string, file: string) => {
+    const guard = controlTransferGuard(peer, sid)
+    guard()
+    return pullTranscriptFrom(peer, sid, file, () => {
+      if (switchFences.blocked(sid)) return false
+      try { guard(); return true } catch { return false }
+    })
+  }
   const threadWatchers = new Map<string, () => void>()
   /** A Codex chat's rollout file, once its conversation id is known and the file is there; null for every other chat. */
   function codexRollout(sid: string): string | null {
@@ -774,6 +980,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Where this PC keeps a session's JSONL, whether it has it yet or not. */
   function fileOf(sid: string): string {
+    if (!validMirrorSid(sid)) throw apiError(400, 'Expected a canonical session id')
     if (isOpenCode(sid)) return openCode.mirror(sid)
     const found = findTranscript(sid, projectsDir)
     if (found) return found
@@ -914,7 +1121,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } catch (e) {
       log?.warn(`Codex start-up sweep: ${message(e)}`)
     }
-  })
+  }).catch(e => log?.warn(`Codex start-up discovery blocked: ${message(e)}`))
   // The host is lost (it died): the chats that ran in it end. Noted first; reopened (resumed) when a host is back.
   let lostWithHost: Array<{ sid: string; state: ChatState }> = []
   o.chatHost?.onLost(why => {
@@ -979,6 +1186,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const cx = o.codex
     if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
     const thread = agent.codexThread ?? learnThread(sid, floor.id, agent.id, 0)?.thread ?? null
+    // A discovered member-side candidate is not resumable until the hub commits its native binding.
+    const binding = threadBinds.get(sid)
+    if (binding) await binding
+    const requireConfirmedThread = () => {
+      const current = bySession(sid)
+      if (current?.floor.id !== floor.id || current.agent.id !== agent.id || engineFor(current.agent) !== 'codex' || (current.agent.codexThread ?? null) !== thread) {
+        throw pcControlError('engine-change-stale', 'The approved Codex conversation changed before launch. Refresh and open the chat again.')
+      }
+    }
+    requireConfirmedThread()
     const rollout = thread ? findRollout(cx.paths.home, thread) : null
     const resume = !!rollout
     const cwd = (rollout && conversationCwd(rollout)) || codeDirOf(floor)
@@ -989,6 +1206,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     await cx.acquire(sid)
     try {
+      requireConfirmedThread()
       const dflt = defaultsNow()
       const brief = composeAgentBrief(floor, agent, o.memory?.start ? memoryBrief() : '', orderReplies(), 'Codex')
       const mcp: Record<string, McpServerToml> = {
@@ -1035,29 +1253,36 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return at?.floor.id === floorId && at.agent.id === agentId && engineFor(at.agent) === 'codex' && !at.agent.codexThread
   }
 
-  const threadBinds = new Set<string>()
+  const threadBinds = new Map<string, Promise<void>>()
   function learnThread(sid: string, floorId: string, agentId: string, sinceMs: number) {
     if (!o.codex || !unboundCodex(sid, floorId, agentId)) return null
     const found = discoverThread(o.codex.paths.home, sid, sinceMs)
     if (!found || !unboundCodex(sid, floorId, agentId)) return null
+    assertCodexThreadAvailable(allFloors(), floorId, agentId, found.thread)
+    const record = () => {
+      rolloutCache.set(found.thread, found.file)
+      log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
+      if (team && chats.info(sid)) tail.track(sid, found.file, 0)
+    }
     if (mode() === 'member' && !isLocalFloor(floorId)) {
       if (!threadBinds.has(sid)) {
-        threadBinds.add(sid)
-        void request(needHub(), 'codex-bind', { sessionId: sid, native: found.thread }).then(() => {
+        const binding = request(needHub(), 'codex-bind', { sessionId: sid, native: found.thread }).then(reply => {
+          if (!isObject(reply) || reply.ok !== true) throw apiError(409, 'Native conversation binding was not confirmed by the hub.')
           const at = bySession(sid)
+          if (at?.floor.id !== floorId || at.agent.id !== agentId || engineFor(at.agent) !== 'codex' || (at.agent.codexThread && at.agent.codexThread !== found.thread)) throw pcControlError('engine-change-stale', 'The conversation changed while its native binding was being confirmed.')
           if (at?.floor.id === floorId && at.agent.id === agentId && engineFor(at.agent) === 'codex' && !at.agent.codexThread) {
             replica.floors = replica.floors.map(f => f.id !== floorId ? f : { ...f, agents: f.agents.map(a => a.id !== agentId ? a : { ...a, codexThread: found.thread }) })
-            if (chats.info(sid)) tail.track(sid, found.file, 0)
           }
+          record()
         }).catch(error => {
           log?.warn(`Could not record the remote Codex conversation: ${message(error)}`)
           if (!closing && chats.info(sid) && unboundCodex(sid, floorId, agentId)) watchThread(sid, floorId, agentId, sinceMs)
+          throw error
         }).finally(() => threadBinds.delete(sid))
+        threadBinds.set(sid, binding)
+        void binding.catch(() => {}) // Background discovery reports through its watcher; launchers await the same confirmation.
       }
-    } else floors.setCodexThread(floorId, agentId, found.thread)
-    rolloutCache.set(found.thread, found.file)
-    log?.info(`chat ${sid.slice(0, 8)}: Codex conversation ${found.thread.slice(0, 8)}`)
-    if (team && chats.info(sid)) tail.track(sid, found.file, 0)
+    } else { floors.setCodexThread(floorId, agentId, found.thread); record() }
     return found
   }
 
@@ -1088,6 +1313,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Starts the agent's chat on this PC (its lease already got). */
   async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+    assertPcControlTarget(floor, self().id, size)
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
       const selection = openCodeSelection(agent, dflt)
@@ -1185,9 +1411,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   const emitWhere = () => emit({ t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() })
-  const emitFloors = () => emit({ t: 'floors', floors: allFloors() })
+  const emitFloors = () => { emit({ t: 'floors', floors: allFloors() }); emit({ t: 'pc-control', answer: controlRawAnswer() }) }
 
   function hold(sid: string, who: { id: string; name: string }) {
+    const pin = controlPinnedPc(sid)
+    if (pin && pin !== who.id) throw pcControlError('pc-control-wrong-device', 'This lease belongs only to its pinned PC.')
     held.set(sid, { holder: who.id, holderName: who.name, heldAt: Date.now(), last: held.get(sid)?.last ?? null })
     saveHeld()
     // F-064: the first PC to run a chat is its home (a chat that has one keeps it, however it is run later).
@@ -1197,6 +1425,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Lets a session go: what `who` held is free, and ran last there. */
   function release(sid: string, who: { id: string; name: string }) {
+    const pin = controlPinnedPc(sid)
+    if (pin && pin !== who.id) return
     const h = held.get(sid)
     if (h?.holder && h.holder !== who.id) return
     held.set(sid, { holder: null, holderName: null, heldAt: 0, last: { pc: who.name, at: new Date().toISOString() } })
@@ -1215,6 +1445,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** The hub: stops the session where it runs (here, or on a member, whose last bytes then come here). */
   async function stopAt(id: string, sid: string): Promise<void> {
+    const managed = bySession(sid)
+    if (managed) assertPcControlTarget(managed.floor, id, {})
     if (id === self().id) {
       chats.kill(sid)
       await endFlush(sid)
@@ -1250,6 +1482,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * when it is elsewhere and `takeOver` wasn't asked. Answers where it was taken from.
    */
   async function lease(sid: string, who: { id: string; name: string }, takeOver: boolean, agentName: string): Promise<string | undefined> {
+    const pinned = bySession(sid)
+    if (pinned) assertPcControlTarget(pinned.floor, who.id, { takeOver })
     switchFences.assertWritable(sid)
     const there = whereAll()[sid]
     const h = held.get(sid)
@@ -1277,7 +1511,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() !== 'hub' || !subs.size || pushTimer) return
     pushTimer = setTimeout(() => {
       pushTimer = null
-      const state = { t: 'state', floors: floors.list(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
+      const state = { t: 'state', floors: floors.list(), pcControl: controlRawAnswer(), defaults: chatDefaults.get(), where: whereAll(), last: lastAll(), marks: marksHere(), engineSwitchContinuity: { version: 1, failClosed: true, homePcPreparation: true } }
       for (const s of subs.values()) writeLine(s, state)
     }, 150)
     pushTimer.unref()
@@ -1321,7 +1555,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     readLines(stream, raw => {
       if (!isObject(raw) || subs.get(from.id) !== stream) return
       if ((raw.t === 'hello' || raw.t === 'live') && isObject(raw.live)) {
-        const live = Object.fromEntries(Object.entries(raw.live).filter((e): e is [string, ChatState] => typeof e[1] === 'string'))
+        const live = Object.fromEntries(Object.entries(raw.live).filter((e): e is [string, ChatState] => typeof e[1] === 'string' && validMirrorSid(e[0]) && (!controlPinnedPc(e[0]) || controlPinnedPc(e[0]) === from.id)))
         remote.set(from.id, { name: from.name, live })
         // What it held and no longer runs (it stopped, or restarted): let go.
         for (const [sid, h] of held) if (h.holder === from.id && !live[sid] && Date.now() - h.heldAt > LEASE_GRACE_MS) release(sid, from)
@@ -1331,13 +1565,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if ((raw.t === 'hello' || raw.t === 'marks') && isObject(raw.marks)) {
         const l = link()
         for (const [sid, m] of Object.entries(raw.marks)) {
+          if (!validMirrorSid(sid)) continue
+          if (controlPinnedPc(sid) && controlPinnedPc(sid) !== from.id) continue
           if (!isMark(m) || chats.info(sid)) continue
           const h = held.get(sid)
           if (h?.holder && h.holder !== from.id) continue
           if (m.bytes > markOf(fileOf(sid)).bytes && l) backfill(l, sid)
         }
       }
-      if (raw.t === 'jsonl' && typeof raw.sid === 'string' && typeof raw.from === 'number' && typeof raw.d === 'string') {
+      if (raw.t === 'jsonl' && typeof raw.sid === 'string' && validMirrorSid(raw.sid) && typeof raw.from === 'number' && typeof raw.d === 'string') {
+        if (controlPinnedPc(raw.sid) && controlPinnedPc(raw.sid) !== from.id) return
         // Only from the PC running it (or granted it, starting), and never into a copy this PC writes.
         if (chats.info(raw.sid) || (held.get(raw.sid)?.holder !== from.id && remote.get(from.id)?.live[raw.sid] === undefined)) return
         const data = Buffer.from(raw.d, 'base64')
@@ -1439,6 +1676,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         engineSwitchContinuity: isObject(raw.engineSwitchContinuity) && raw.engineSwitchContinuity.version === 1 && raw.engineSwitchContinuity.failClosed === true && raw.engineSwitchContinuity.homePcPreparation === true
           ? { version: 1, failClosed: true, homePcPreparation: true } : undefined,
         floors: raw.floors as Floor[],
+        pcControl: isObject(raw.pcControl) && Array.isArray(raw.pcControl.workspaces) ? raw.pcControl as unknown as PcControlAnswer : undefined,
         defaults: parseDefaults(raw.defaults),
         where: isObject(raw.where) ? (raw.where as Replica['where']) : {},
         last: isObject(raw.last) ? (raw.last as Record<string, ChatLast>) : {},
@@ -1449,11 +1687,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       emitWhere()
       // Every copy here brought up to the hub's, unless this PC runs it (then it writes it).
       for (const [sid, theirs] of Object.entries(replica.marks)) {
-        if (!isMark(theirs) || chats.info(sid)) continue
+        if (!validMirrorSid(sid) || !isMark(theirs) || chats.info(sid)) continue
         const mine = markOf(fileOf(sid))
         if (mine.bytes < theirs.bytes || (mine.bytes === theirs.bytes && mine.tail !== theirs.tail)) backfill(link, sid)
       }
-    } else if (raw.t === 'jsonl' && typeof raw.sid === 'string' && typeof raw.from === 'number' && typeof raw.d === 'string') {
+    } else if (raw.t === 'jsonl' && typeof raw.sid === 'string' && validMirrorSid(raw.sid) && typeof raw.from === 'number' && typeof raw.d === 'string') {
       if (chats.info(raw.sid) || switchFences.blocked(raw.sid)) return
       // A gap or a fork is left to catch-up.
       appendAt(fileOf(raw.sid), raw.from, Buffer.from(raw.d, 'base64'))
@@ -1471,21 +1709,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
+    assertPcControlTarget(floor, self().id, req)
     if (sid) switchFences.assertWritable(sid)
+    await requirePeerEngine(link, engineFor(agent))
     if (sid && chats.info(sid)) {
-      await request(link, 'lease', { sessionId: sid, takeOver: false })
+      requireRunningEngine(engineFor(agent), chats.info(sid)!.engine)
+      const proof = await request<{ engine?: RuntimeEngine }>(link, 'lease', { sessionId: sid, takeOver: false, expectedEngine: engineFor(agent) })
+      if (engineFor(agent) !== 'claude') requireRunningEngine(engineFor(agent), proof.engine)
       switchFences.assertWritable(sid)
-      return { sessionId: sid, started: false, resumed: false }
+      return { sessionId: sid, started: false, resumed: false, engine: chats.info(sid)!.engine }
     }
     const atHome = await resumeAtHome(floor, agent, sid, req)
     if (atHome) return atHome
     if (!sid) {
       sid = randomUUID()
-      const r = await request<{ floor: Floor }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/session`, body: { sessionId: sid } })
+      const r = isPcControl(floor)
+        ? await request<{ floor: Floor }>(link, 'pc-control-bind', { floorId, agentId, sessionId: sid, revision: pcControlRevision(floor), expectedEngine: engineFor(agent) })
+        : await request<{ floor: Floor }>(link, 'http', { method: 'POST', rest: `/floors/${enc(floorId)}/agents/${enc(agentId)}/session`, body: { sessionId: sid } })
       replica.floors = replica.floors.map(f => (f.id === r.floor.id ? r.floor : f))
     }
-    const granted = await request<{ mark: FileMark; tookOverFrom: string | null }>(link, 'lease', { sessionId: sid, takeOver: req.takeOver === true }, 45_000)
+    const granted = await request<{ mark: FileMark; tookOverFrom: string | null; engine?: RuntimeEngine }>(link, 'lease', { sessionId: sid, takeOver: req.takeOver === true, expectedEngine: engineFor(agent) }, 45_000)
     try {
+      if (engineFor(agent) !== 'claude') requireRunningEngine(engineFor(agent), granted.engine)
       // This PC's copy brought up to the hub's first, unless it already has all of it.
       const file = fileOf(sid)
       const mark = isMark(granted.mark) ? granted.mark : NO_FILE
@@ -1500,9 +1745,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!codexHere && mark.bytes && !(markOf(file).bytes >= mark.bytes && sameMark(markOf(file, mark.bytes), mark))) await pullFrom(link, sid, file)
       const now = floorOf(floorId)
       const resumed = await startHere(now, agentOf(now, agentId), sid, req)
-      return { sessionId: sid, started: true, resumed, ...(granted.tookOverFrom ? { tookOverFrom: granted.tookOverFrom } : {}) }
+      requireRunningEngine(engineFor(agentOf(floorOf(floorId), agentId)), chats.info(sid)?.engine)
+      return { sessionId: sid, started: true, resumed, engine: chats.info(sid)!.engine, ...(granted.tookOverFrom ? { tookOverFrom: granted.tookOverFrom } : {}) }
     } catch (e) {
-      void request(link, 'release', { sessionId: sid, mark: markOf(fileOf(sid)) }).catch(() => {})
+      await request(link, 'release', { sessionId: sid, mark: markOf(fileOf(sid)) }).catch(() => {})
       throw e
     }
   }
@@ -1601,6 +1847,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const out: AdoptAnswer['floors'] = []
     const mine: Record<string, FileMark> = {}
     for (const f of raw.floors) {
+      if (isObject(f) && (f.workspace === 'pc-control' || (typeof f.id === 'string' && controlAlias(f.id)) || (Array.isArray(f.agents) && f.agents.some(a => isObject(a) && (a.pcControlSlot !== undefined || [a.id, a.sessionId, a.codexThread, a.opencodeSession].some(x => typeof x === 'string' && controlAlias(x))))))) throw immutablePcControl()
+    }
+    for (const f of raw.floors) {
       const { floor, created, renamedFrom } = hubFloors.adopt(f, from)
       out.push({ id: floor.id, name: floor.name, created, renamedFrom })
       const list = notes[floor.id]
@@ -1697,7 +1946,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * as before (the caller's 409, or `takeOver`). When the home can't be reached the answer is 424,
    * naming it (the page offers here).
    */
+  async function requirePeerEngine(link: LinkPeer, expectedEngine: RuntimeEngine) {
+    if (expectedEngine !== 'claude') {
+      let proof: unknown
+      try { proof = await request(link, 'engine-open-capabilities', {}, 5000) } catch { throw engineUpdateRequired(link.name) }
+      if (!isObject(proof) || proof.version !== 1 || !Array.isArray(proof.engines) || !proof.engines.includes(expectedEngine)) throw engineUpdateRequired(link.name)
+    }
+  }
+
+  async function openOnPeer(link: LinkPeer, floor: Floor, agent: FloorAgent, text?: string): Promise<ChatOpened> {
+    const expectedEngine = engineFor(agent)
+    if (isPcControl(floor)) { assertPcControlTarget(floor, link.id, {}); await requirePcControlPeer(link) }
+    await requirePeerEngine(link, expectedEngine)
+    const opened = await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, expectedEngine, text }, 60_000)
+    // Legacy Claude-only apps can still open Claude. They never prove support for a newer engine.
+    if (opened.engine === undefined && expectedEngine !== 'claude') throw engineUpdateRequired(link.name)
+    if (opened.engine !== undefined) requireRunningEngine(expectedEngine, opened.engine)
+    return opened
+  }
+
   async function resumeAtHome(floor: Floor, agent: FloorAgent, sid: string | null, req: OpenChatRequest): Promise<ChatOpened | null> {
+    if (isPcControl(floor) && agent.homePc !== floor.targetPcId) throw pcControlError('pc-control-wrong-device', 'The saved home does not match this PC workspace.')
     if (req.here || mode() === 'alone') return null
     const home = agent.homePc
     if (!home || home === self().id) return null
@@ -1708,7 +1977,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'hub') {
       const link = team?.member(home) ?? null
       if (!link) throw offline()
-      return { ...(await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, text: req.say }, 60_000)), on: name }
+      return { ...(await openOnPeer(link, floor, agent, req.say)), on: name }
     }
     // A member reaches every other PC through the hub, which does the same for it (the run-on route).
     if (!team?.hub()?.link || !sub) throw offline()
@@ -1720,6 +1989,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
+    const managed = floorOf(floorId)
+    if (isPcControl(managed) && (req.here || req.takeOver)) throw immutablePcControl()
     const selected = agentOf(floorOf(floorId), agentId).sessionId
     if (selected) switchFences.assertWritable(selected)
     // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
@@ -1730,7 +2001,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     let floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
     let sid = agent.sessionId
-    if (sid && chats.info(sid)) return { sessionId: sid, started: false, resumed: false }
+    if (sid && chats.info(sid)) {
+      const actual = chats.info(sid)!.engine
+      requireRunningEngine(engineFor(agent), actual)
+      return { sessionId: sid, started: false, resumed: false, engine: actual }
+    }
     const atHome = await resumeAtHome(floor, agent, sid, req)
     if (atHome) return atHome
     if (!sid) {
@@ -1741,7 +2016,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       const now = floorOf(floorId)
       const resumed = await startHere(now, agentOf(now, agentId), sid, req)
-      return { sessionId: sid, started: true, resumed, ...(tookOverFrom ? { tookOverFrom } : {}) }
+      requireRunningEngine(engineFor(agentOf(floorOf(floorId), agentId)), chats.info(sid)?.engine)
+      return { sessionId: sid, started: true, resumed, engine: chats.info(sid)!.engine, ...(tookOverFrom ? { tookOverFrom } : {}) }
     } catch (e) {
       if (mode() === 'hub') release(sid, self())
       throw e
@@ -1787,7 +2063,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!at) return false
     try {
       // Here: it was open on this PC when the app stopped (or needs its token again), so it comes back on this PC.
-      const opened = await openChat(at.floor.id, at.agent.id, { here: true })
+      const opened = await openChat(at.floor.id, at.agent.id, isPcControl(at.floor) ? {} : { here: true })
       if (opened.started && text) chats.typeWhenReady(sid, text)
       return opened.started || chats.info(sid) !== null
     } catch (e) {
@@ -2054,7 +2330,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // chat that has unfinished work, nudges it once, and wakes the Assistant only when there is news.
   const TRANSCRIPT_MAX_AGE_MS = 6 * 3_600_000
   const agentRefs = () =>
-    floors.list().flatMap(f => f.agents.map(a => ({ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, assistant: isOrchestratorAgent(f.name, a) })))
+    floors.list().filter(f => !isPcControl(f)).flatMap(f => f.agents.map(a => ({ sessionId: a.sessionId, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, assistant: isOrchestratorAgent(f.name, a) })))
   const tailOf = (sid: string) => {
     const file = findTranscript(sid, projectsDir)
     // A conversation not written to for hours is history: not even read.
@@ -2583,7 +2859,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (pcName && !pc) throw apiError(404, `No PC called ${String(args.pc)} within reach; app_chats lists them`)
         const opened =
           pc && !pc.here
-            ? await request<ChatOpened>(peerOf(pc.id), 'open', { floorId: f.id, agentId: a.id }, 60_000)
+            ? await openOnPeer(peerOf(pc.id), f, a)
             : await openChat(f.id, a.id, { takeOver: args.takeOver === true })
         return json({ ...opened, agent: a.name, floor: f.name, pc: pc?.name ?? self().name })
       }
@@ -2860,7 +3136,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const all = allFloors()
     const seen = access.visible(c, all)
     const mine = <T>(m: Record<string, T>) => (seen ? Object.fromEntries(Object.entries(m).filter(([sid]) => seen.has(sid))) : m)
-    return { floors: access.scope(c, all, want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir,
+    return { floors: access.scope(c, all.filter(f => !isPcControl(f)), want), live: mine(chats.states()), elsewhere: mine(elsewhere()), last: mine(lastAll()), team: teamInfo(), defaultCodeDir,
       engineSwitchContinuity: mode() === 'member' ? replica.engineSwitchContinuity : { version: 1, failClosed: true, homePcPreparation: true } }
   }
 
@@ -2894,6 +3170,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   function localSwitchSource(previous: FloorAgent): string | null {
     const sid = previous.sessionId!
+    const current = bySession(sid)
+    if (current && isPcControl(current.floor) && chats.info(sid)) requireRunningEngine(engineFor(previous), chats.info(sid)!.engine)
     if (engineFor(previous) === 'opencode') {
       if (!chats.info(sid) && (!openCode.install() || !previous.opencodeSession)) throw Object.assign(apiError(409, 'OpenCode history is unavailable on its home PC. The current conversation is unchanged.'), { code: 'engine-change-conversion-failed' })
       return null
@@ -2906,6 +3184,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function switchSourcePc(previous: FloorAgent) {
+    const managed = allFloors().find(f => isPcControl(f) && f.agents.some(a => a.id === previous.id))
+    if (isPcControl(managed)) {
+      assertPcControlTarget(managed, managed.targetPcId, {})
+      return { id: managed.targetPcId, name: managed.name }
+    }
     const active = whereAll()[previous.sessionId!]
     if (active) return active
     const last = lastAll()[previous.sessionId!]?.pc
@@ -2920,6 +3203,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   async function prepareLocalSwitch(floor: Floor, previous: FloorAgent, next: FloorAgent, switchId: string) {
+    assertPcControlTarget(floor, self().id, {})
+    if (isPcControl(floor) && previous.sessionId && chats.info(previous.sessionId)) requireRunningEngine(engineFor(previous), chats.info(previous.sessionId)!.engine)
     const file = localSwitchSource(previous)
     const sid = previous.sessionId!, from = engineFor(previous), to = engineFor(next)
     switchFences.begin(sid, switchId)
@@ -3087,7 +3372,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return { floor: committed }
     } catch (error) {
       if (committed) { log?.warn('Conversation switch committed; cleanup will be retried: ' + message(error)); return { floor: committed } }
-      if (isObject(error) && ['engine-change-stale', 'engine-change-home-offline', 'engine-change-in-progress'].includes(String(error.code))) throw error
+      if (isObject(error) && ['engine-change-stale', 'engine-change-home-offline', 'engine-change-in-progress', 'engine-runtime-mismatch', 'pc-control-wrong-device', 'pc-control-update-required'].includes(String(error.code))) throw error
       log?.warn('Engine switch blocked: ' + message(error))
       throw Object.assign(apiError(409, 'History could not be carried over: ' + message(error) + '. The current engine and conversation are unchanged; resume it or retry after fixing the source.'), { code: 'engine-change-conversion-failed' })
     } finally {
@@ -3554,7 +3839,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const a = agentOf(before, agentId)
     if (engineFor(a) !== 'codex') throw apiError(409, `${a.name} runs Claude: change its model and effort with model and effort, or change its engine first.`)
     if (raw.codexModel !== undefined && typeof raw.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
-    if (raw.codexEffort !== undefined && !(CODEX_EFFORTS as readonly unknown[]).includes(raw.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, or "" for the one Codex chooses')
+    if (raw.codexEffort !== undefined && !(CODEX_EFFORTS as readonly unknown[]).includes(raw.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, max, or "" for the one Codex chooses')
     const codexModel = raw.codexModel !== undefined ? String(raw.codexModel).trim().slice(0, CODEX_MODEL_MAX) : (a.codexModel ?? '')
     const codexEffort = raw.codexEffort !== undefined ? (raw.codexEffort as CodexEffort) : (a.codexEffort ?? '')
     const floor = floors.patch(before.id, { agents: before.agents.map(x => (x.id === a.id ? { ...x, codexModel, codexEffort } : x)) })
@@ -3693,6 +3978,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function importChat(floorId: string, body: unknown, as?: ChatOwner): Promise<ChatImported> {
     if (!isObject(body) || typeof body.sessionId !== 'string' || !UUID_RE.test(body.sessionId)) throw apiError(400, 'Expected {sessionId, agentId?, name?, role?}')
     const from = body.sessionId
+    if (isPcControl(floorOf(floorId)) || controlAlias(from)) throw immutablePcControl()
     const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
     const floor = floorOf(floorId)
     if (intoId) agentOf(floor, intoId)
@@ -3753,6 +4039,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
   type Handler = (m: string[], r: MountRequest) => unknown
   /** `local`: a member answers it itself; the rest it passes to its hub, which keeps the floors. */
   const routes: [string, RegExp, Handler, 'local'?][] = [
+    ['GET', /^\/pc-control$/, (_, r) => controlAnswer(callerOf(r))],
+    ['GET', /^\/pc-control\/pcs\/([^/]+)$/, async ([device], r) => {
+      const w = (await controlAnswer(callerOf(r))).workspaces.find(w => w.device.id === device)
+      if (!w) throw pcControlError('pc-control-forbidden', 'That PC workspace is unavailable to you.', 403)
+      return { workspace: w }
+    }],
+    ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/open$/, ([device, agent], r) => controlMutate(device, agent, 'open', r)],
+    ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/stop$/, ([device, agent], r) => controlMutate(device, agent, 'stop', r)],
+    ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, ([device, agent], r) => controlMutate(device, agent, 'engine', r)],
     // F-083: the watchdog: whether it runs, the heartbeat's last and next beat, and the chats it holds down now.
     ['GET', /^\/watchdog$/, () => watchdogView()],
     // F-086: "What the chats are called": old (the big chat is the Assistant, the fast one Quick) or new (Orchestrator / Assistant). The page sets it; the Assistant's words follow.
@@ -3914,7 +4209,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           const link = mode() === 'hub' ? (team?.member(pc) ?? null) : null
           if (!link) throw apiError(HOME_OFFLINE_STATUS, `${homeName(agent, pc)} can't be reached right now, so ${agent.name}'s chat can't move there.`)
           name = link.name
-          opened = { ...(await request<ChatOpened>(link, 'open', { floorId: id, agentId, text: say }, 60_000)), on: link.name }
+          opened = { ...(await openOnPeer(link, floorOf(id), agent, say)), on: link.name }
         }
         if (mode() === 'hub') floors.setHome(id, agentId, { id: pc, name })
         return opened
@@ -4241,6 +4536,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       } catch {
         throw apiError(400, 'Malformed path')
       }
+      guardPcControlRoute(r, params)
       checkRule(ruleOf(method, pattern), params, r)
       if (forward && where !== 'local' && !runsHere(method, pattern, params)) return await forward(r)
       return await run(params, r)
@@ -4293,6 +4589,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'hub') {
       switch (op) {
+        case 'pc-control-capabilities':
+          return answer(() => ({ version: 1, pinnedWorkspace: true, actualEngineProof: true, engines: ['claude', 'codex'] }))
+        case 'pc-control-runtime':
+          return answer(localControlRuntime)
+        case 'engine-open-capabilities':
+          return answer(() => ({ version: 1, engines: ['claude', 'codex', 'opencode'] }))
         case 'engine-switch-status':
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.switchId !== 'string') throw apiError(400, 'Expected source and operation id')
@@ -4315,6 +4617,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.native !== 'string') throw apiError(400, 'Expected Codex binding')
             const at = bySession(raw.sessionId)
+            if (at && isPcControl(at.floor)) assertPcControlTarget(at.floor, from.id, {})
             if (!at || engineFor(at.agent) !== 'codex' || (held.get(raw.sessionId)?.holder !== from.id && at.agent.homePc !== from.id)) throw apiError(403, 'This PC does not hold that Codex conversation')
             if (at.agent.codexThread && at.agent.codexThread !== raw.native) throw apiError(409, 'The native Codex binding changed')
             floors.setCodexThread(at.floor.id, at.agent.id, raw.native)
@@ -4328,14 +4631,33 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId, takeOver}')
             const at = floors.bySession(raw.sessionId)
             if (!at) throw apiError(404, "That chat isn't an agent's on a floor")
+            const expected = engineFor(at.agent)
+            if (raw.expectedEngine === undefined && expected !== 'claude') throw engineUpdateRequired(from.name)
+            if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
             const tookOverFrom = (await lease(raw.sessionId, from, raw.takeOver === true, at.agent.name)) ?? null
-            return { mark: markOf(fileOf(raw.sessionId)), tookOverFrom }
+            return { mark: markOf(fileOf(raw.sessionId)), tookOverFrom, engine: expected }
+          })
+        case 'pc-control-bind':
+          return answer(raw => {
+            if (!isObject(raw) || Object.keys(raw).some(k => !['floorId','agentId','sessionId','revision','expectedEngine'].includes(k)) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || typeof raw.sessionId !== 'string' || !UUID_RE.test(raw.sessionId)) throw apiError(400, 'Expected a pinned PC binding.')
+            const floor = floorOf(raw.floorId), agent = agentOf(floor, raw.agentId)
+            if (!isPcControl(floor)) throw immutablePcControl()
+            assertPcControlTarget(floor, from.id, {})
+            if (raw.revision !== pcControlRevision(floor) || agent.sessionId !== null || raw.expectedEngine !== engineFor(agent)) throw pcControlError('pc-control-stale', 'Refresh PC Control before opening this slot.')
+            if (controlAlias(raw.sessionId) || allFloors().some(f => f.agents.some(a => a.sessionId === raw.sessionId))) throw immutablePcControl()
+            return { floor: floors.bindSession(floor.id, agent.id, raw.sessionId) }
           })
         case 'release':
           return answer(async raw => {
-            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId, mark}')
+            if (!isObject(raw) || typeof raw.sessionId !== 'string' || !validTransferSid(raw.sessionId)) throw apiError(400, 'Expected {sessionId, mark}')
+            const pin = controlPinnedPc(raw.sessionId)
+            if (pin && pin !== from.id) throw pcControlError('pc-control-wrong-device', 'Only the pinned PC can release this managed conversation.')
             const link = team?.member(from.id)
+            if (pin && !link) throw pcControlError('pc-control-stale', 'The managed source PC connection is no longer current.')
+            const guard = link ? controlTransferGuard(link, raw.sessionId) : () => {}
+            guard()
             if (link && isMark(raw.mark)) await catchUpFrom(link, raw.sessionId, raw.mark).catch(e => log?.warn(`couldn't bring chat ${String(raw.sessionId).slice(0, 8)} up from ${from.name}: ${message(e)}`))
+            guard()
             release(raw.sessionId, from)
             return { ok: true }
           })
@@ -4366,16 +4688,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
-            return openChat(raw.floorId, raw.agentId, { takeOver: true, here: true }).then(opened => {
+            const expected = engineFor(agentOf(floorOf(raw.floorId), raw.agentId))
+            if (raw.expectedEngine === undefined && expected !== 'claude') throw engineUpdateRequired(from.name)
+            if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
+            const target = floorOf(raw.floorId)
+            if (isPcControl(target)) { assertPcControlTarget(target, self().id, {}); if (raw.expectedEngine === undefined) throw pcControlError('pc-control-update-required', 'PC Control requires explicit engine proof.') }
+            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }).then(opened => {
               if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
               return opened
             })
           })
         case 'pull':
-          return servePull(sid => findTranscript(sid, projectsDir))
+          return servePull(sid => validMirrorSid(sid) ? findTranscript(sid, projectsDir) : null)
       }
     } else if (m === 'member' && from.id === team!.hub()?.id) {
       switch (op) {
+        case 'pc-control-capabilities':
+          return answer(() => ({ version: 1, pinnedWorkspace: true, actualEngineProof: true, engines: ['claude', 'codex'] }))
+        case 'pc-control-runtime':
+          return answer(localControlRuntime)
+        case 'engine-open-capabilities':
+          return answer(() => ({ version: 1, engines: ['claude', 'codex', 'opencode'] }))
         case 'engine-switch-finish':
           return answer(finishSwitchPeer)
         case 'engine-switch-prepare':
@@ -4383,6 +4716,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'stop':
           return answer(async raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')
+            const current = bySession(raw.sessionId)
+            if (current) assertPcControlTarget(current.floor, self().id, {})
             if (chats.info(raw.sessionId)) chats.kill(raw.sessionId)
             const mark = flushing.has(raw.sessionId) ? await endFlush(raw.sessionId) : markOf(fileOf(raw.sessionId))
             return { mark }
@@ -4433,13 +4768,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
-            return openChat(raw.floorId, raw.agentId, { takeOver: true, here: true }).then(opened => {
+            const expected = engineFor(agentOf(floorOf(raw.floorId), raw.agentId))
+            if (raw.expectedEngine === undefined && expected !== 'claude') throw engineUpdateRequired(from.name)
+            if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)
+            const target = floorOf(raw.floorId)
+            if (isPcControl(target)) { assertPcControlTarget(target, self().id, {}); if (raw.expectedEngine === undefined) throw pcControlError('pc-control-update-required', 'PC Control requires explicit engine proof.') }
+            return openChat(raw.floorId, raw.agentId, isPcControl(target) ? {} : { takeOver: true, here: true }).then(opened => {
               if (opened.started && typeof raw.text === 'string' && raw.text) chats.typeWhenReady(opened.sessionId, raw.text.slice(0, MAX_SAY_TEXT))
               return opened
             })
           })
         case 'pull':
-          return servePull(sid => findTranscript(sid, projectsDir))
+          return servePull(sid => validMirrorSid(sid) ? findTranscript(sid, projectsDir) : null)
       }
     }
     throw new Error(`this PC doesn't do ${String(op)}`)
@@ -4457,6 +4797,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return !at || access.rights(caller, at.agent)?.can !== 'view'
     }
     return (ws: WsSocket) => {
+      const current = bySession(sid), running = chats.info(sid)
+      if (current && isPcControl(current.floor) && running && current.floor.targetPcId !== self().id) return ws.close(1008, 'This runtime is on the wrong PC.')
+      if (current && running) {
+        try { requireRunningEngine(engineFor(current.agent), running.engine) }
+        catch { ws.sendText(JSON.stringify({ t: 'exit', code: null })); return ws.close(1008, 'Saved and running engines disagree; reconcile the conversation first.') }
+      }
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
       // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
       if (!detach && remoteTerminal(sid, ws, typing)) return
@@ -4518,11 +4864,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
       closed = true
       stream?.destroy()
     })
-    link.open({ op: 'terminal' }).then(
+    const expected = bySession(sid)
+    const support = expected && isPcControl(expected.floor) ? requirePcControlPeer(link) : expected ? requirePeerEngine(link, engineFor(expected.agent)) : Promise.resolve()
+    support.then(() => link.open({ op: 'terminal' })).then(
       s => {
         if (closed) return void s.destroy()
         stream = s
-        writeLine(s, { sessionId: sid })
+        writeLine(s, { sessionId: sid, ...(expected ? { expectedEngine: engineFor(expected.agent) } : {}) })
         for (const raw of early.splice(0)) relayLine(s, raw)
         readLines(s, m => ws.sendText(JSON.stringify(m)))
         s.on('close', () => !closed && ws.close(1000, `The link to ${link.name} closed`))
@@ -4570,6 +4918,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!isObject(raw)) return
       if (sid === null) {
         sid = typeof raw.sessionId === 'string' ? raw.sessionId : ''
+        const current = bySession(sid), running = chats.info(sid)
+        try {
+          if (current && isPcControl(current.floor)) assertPcControlTarget(current.floor, running ? self().id : current.floor.targetPcId, {})
+          if (current && raw.expectedEngine !== undefined) requireRunningEngine(engineFor(current.agent), raw.expectedEngine as RuntimeEngine)
+          if (current && running) requireRunningEngine(engineFor(current.agent), running.engine)
+        } catch { return ended() }
         detach = chats.attach(sid, { send: m => void writeLine(stream, m) })
         if (detach) return
         const w = from && mode() === 'hub' ? whereAll()[sid] : undefined
@@ -4577,11 +4931,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!link) return ended()
         early = []
         const asked = sid
-        link.open({ op: 'terminal' }).then(
+        const expectedEngine = current ? engineFor(current.agent) : undefined
+        const support = current && isPcControl(current.floor) ? requirePcControlPeer(link) : expectedEngine ? requirePeerEngine(link, expectedEngine) : Promise.resolve()
+        support.then(() => link.open({ op: 'terminal' })).then(
           s => {
             if (stream.destroyed) return void s.destroy()
             relay = s
-            writeLine(s, { sessionId: asked })
+            writeLine(s, { sessionId: asked, ...(expectedEngine ? { expectedEngine } : {}) })
             for (const m of early!.splice(0)) writeLine(s, m)
             readLines(s, m => void writeLine(stream, m))
             s.on('close', () => stream.end())
@@ -4684,6 +5040,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           // F-118: what this person may see, from the first message on.
           for (const e of [
             { t: 'floors', floors: allFloors() },
+            { t: 'pc-control', answer: controlRawAnswer() },
             { t: 'live', live: chats.states() },
             { t: 'where', elsewhere: elsewhere(), last: lastAll(), team: teamInfo() },
           ] satisfies AgenticEvent[]) {
