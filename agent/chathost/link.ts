@@ -10,6 +10,8 @@ import { assertExecutionCAS, requireExecutionSnapshot } from '../../shared/chat-
 export interface ChatHostLink {
   /** Backend-only current host observations. A lost controller rejects, never proves exit. */
   inspect?(): Promise<{ hostPid: number; hostStartedAt: number; chats: HostChat[] }>
+  /** Synchronous authenticated controller fence; no cached disconnect is accepted as current. */
+  current?(): { generation: number; hostPid: number; hostStartedAt: number }
   readonly info: HostInfo
   /** For the chat pool: a terminal that lives in the host. */
   spawn: PtySpawn
@@ -67,6 +69,7 @@ export function adoptable(c: HostChat) {
 
 export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
   let client: HostClient = await connectChatHost({ port: o.port, token: o.token })
+  let generation = 1
   let pool: ChatPool | null = null
   let closed = false
   const lostCbs: Array<(why: string) => void> = []
@@ -86,6 +89,7 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
             const next = await connectChatHost({ port: where.port, token: where.token })
             if (closed) return void next.close()
             client = next
+            generation++
             watch(next)
             o.log.info('chat host: connected again')
             if (pool) await takeOver(next, pool)
@@ -129,6 +133,10 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
   return {
     get info() {
       return client.info
+    },
+    current() {
+      if (closed || !client.connected) throw new Error('Chat host ownership is unknown')
+      return { generation, hostPid: client.info.pid, hostStartedAt: client.info.startedAt }
     },
     async inspect() {
       if (!client.connected) throw new Error('Chat host ownership is unknown')

@@ -3,7 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
 import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
-import { ExecutionCoordinator, type ExecutionSourceFence, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
+import { ExecutionCoordinator, type ExecutionSourceFence, type ExecutionTargetObservation, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
 import { ExecutionIntentLedger, scopeDigest, type ExecutionIntentScope } from './execution-intents.ts'
 import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
 import { sourceHash } from './switch-fence.ts'
@@ -26,6 +26,7 @@ interface FenceState {
 }
 export function createExecutionService(o: ExecutionServiceOptions) {
   const runtime = createBridgeRuntime(o), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
+  const committing = new Map<string, ExecutionSourceFence>()
   let coordinator: ExecutionCoordinator | null = null, ledger: ExecutionIntentLedger | null = null
   let initialization: Promise<void> | null = null
   const key = (scope: ExecutionIntentScope) => `${scope.floorId}:${scope.agentId}`
@@ -41,6 +42,9 @@ export function createExecutionService(o: ExecutionServiceOptions) {
     assertCurrent(request) {
       const context = active.get(`${request.floorId}:${request.agentId}`)
       if (!context || !context.next) throw executionHttpError('execution-capability-required', 'selection')
+      const fence = committing.get(key(context.scope))
+      if (!fence) throw executionHttpError('execution-capability-required', 'selection')
+      fence.assertCurrent()
       assertExecutionCAS(request.expected, context.expected); assertExecutionCAS(request.next, context.next)
       assertCurrent(context)
       if (request.target.profile === CODEX_IN_CLAUDE_PROFILE) runtime.cachedCapability()
@@ -49,9 +53,18 @@ export function createExecutionService(o: ExecutionServiceOptions) {
     persist(file, text) {
       const contexts = [...active.values()].filter(context => context.floorFile === file && context.next !== null)
       if (contexts.length !== 1) throw executionHttpError('execution-intent-uncertain', 'selection')
-      const context = contexts[0]; assertCurrent(context)
-      writePrivateAtomic(file, text); context.floorHash = sourceHash(file)
+      const context = contexts[0], fence = committing.get(key(context.scope))
+      if (!fence) throw executionHttpError('execution-capability-required', 'selection')
+      assertCurrent(context); fence.assertCurrent()
+      writePrivateAtomic(file, text, () => { assertCurrent(context); fence.assertCurrent() }); context.floorHash = sourceHash(file)
     },
+  }
+  const currentTarget = (scope: ExecutionIntentScope, execution: ExecutionIdentity): ExecutionTargetObservation => {
+    actor(scope)
+    if (scope.targetPcId !== o.self().id || execution.profile !== CODEX_IN_CLAUDE_PROFILE || !o.host?.current) throw executionHttpError('execution-capability-required', 'capability')
+    const { capability, pins } = runtime.cachedCapability(), host = o.host.current(), now = Date.now()
+    return { targetPcId: o.self().id, execution, linkGeneration: `local_${runtimeEpoch}_${host.generation}`, observedAtMs: now, validUntilMs: now + 30_000,
+      nativeVerified: false, pins, bridgeCapability: capability }
   }
   async function ensure() {
     return initialization ??= (async () => {
@@ -62,13 +75,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       coordinator = new ExecutionCoordinator({ ledger, broker: runtime.broker!, assertAuthorized: actor,
         assertExecutionCurrent: (scope, expected) => { actor(scope); assertExecutionCAS(expected, o.state(scope).binding) },
         readFloor: async scope => o.state(scope), resolveTarget: (scope, profile) => o.target(scope, profile),
-        readTarget: async (scope, execution) => {
-          actor(scope)
-          if (scope.targetPcId !== o.self().id || execution.profile !== CODEX_IN_CLAUDE_PROFILE) throw executionHttpError('execution-capability-required', 'capability')
-          const { capability, pins } = runtime.cachedCapability(), now = Date.now()
-          return { targetPcId: o.self().id, execution, linkGeneration: `local_${runtimeEpoch}`, observedAtMs: now, validUntilMs: now + 30_000,
-            nativeVerified: false, pins, bridgeCapability: capability }
-        },
+        readTarget: async (scope, execution) => currentTarget(scope, execution), currentTarget,
         withSourceFence: async (scope, expected, action) => {
           actor(scope)
           if (active.size) throw executionHttpError('execution-intent-conflict', 'selection')
@@ -89,11 +96,14 @@ export function createExecutionService(o: ExecutionServiceOptions) {
           }
         },
         prepare: (scope, expected, target) => o.prepare(scope, expected, target),
-        commitFloor: async (scope, expected, next, prepared, stamp) => {
+        commitFloor: async (scope, expected, next, prepared, stamp, fence) => {
           const context = active.get(key(scope)); if (!context) throw executionHttpError('execution-intent-uncertain', 'selection')
           assertCurrent(context); context.next = next
-          o.commit({ floorId: scope.floorId, agentId: scope.agentId, expected, next, target: next.execution,
-            lineage: prepared?.lineage ?? null, homePcName: o.self().name, stamp })
+          committing.set(key(scope), fence)
+          try {
+            o.commit({ floorId: scope.floorId, agentId: scope.agentId, expected, next, target: next.execution,
+              lineage: prepared?.lineage ?? null, homePcName: o.self().name, stamp })
+          } finally { committing.delete(key(scope)) }
         },
         start: (request: ExecutionStartRequest) => runtime.start(request),
         observeRun: async (_scope, intent) => {

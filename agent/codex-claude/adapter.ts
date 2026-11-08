@@ -41,7 +41,7 @@ export function toResponses(value: unknown): Record<string, unknown> {
   const input: Array<Record<string, unknown>> = []
   for (const entry of array(request.messages)) {
     const message = record(entry)
-    if (message.role !== 'user' && message.role !== 'assistant') return refused()
+    if (!['user', 'assistant', 'system', 'developer'].includes(String(message.role))) return refused()
     let content: Array<Record<string, unknown>> = []
     const flush = () => { if (content.length) { input.push({ role: message.role, content }); content = [] } }
     for (const block of contentBlocks(message.content)) {

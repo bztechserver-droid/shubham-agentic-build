@@ -75,11 +75,16 @@ export function syncExecutionDirectory(directory: string): void {
   const fd = fs.openSync(directory, 'r')
   try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
 }
-export function writePrivateAtomic(file: string, data: string): void {
+export function writePrivateAtomic(file: string, data: string, beforeCommit?: () => void): void {
   if (!path.isAbsolute(file)) return refuse()
   const temporary = `${file}.${randomUUID()}.next`, directory = path.dirname(file)
   const fd = fs.openSync(temporary, 'wx', 0o600)
   try { protectPath(temporary); fs.writeFileSync(fd, data, 'utf8'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+  try { beforeCommit?.() } catch (error) {
+    // No rename was dispatched; remove only this freshly created, same-directory staging file.
+    try { fs.unlinkSync(temporary) } catch { /* The authoritative file stays untouched. */ }
+    throw error
+  }
   if (process.platform === 'win32') windowsSecurity().replace(temporary, file)
   else fs.renameSync(temporary, file)
   // The floor document's parent may contain legacy app files. Protect the new file, not unrelated paths.

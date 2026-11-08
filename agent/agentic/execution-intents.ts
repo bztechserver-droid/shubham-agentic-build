@@ -1,7 +1,7 @@
 // Durable, bounded write-ahead journal. An app-owned exclusive writer/storage admission is required.
 // No floor write, process launch, provider call or credential read occurs in this module.
 import { createHash } from 'node:crypto'
-import { lstat, open, readFile, rename } from 'node:fs/promises'
+import { lstat, open, readFile, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { assertExecutionCAS, assertPreparedExecution, contractRecord, requireExecutionSnapshot, sameExecution,
   type ExecutionSnapshot } from '../../shared/chat-execution.ts'
@@ -141,7 +141,48 @@ export class ExecutionIntentLedger {
     const bytes = await readFile(ledger.journalPath)
     ledger.check()
     ledger.replay(bytes)
+    await ledger.recoverStaging(bytes)
+    ledger.check()
     return ledger
+  }
+  /** Only a complete, checksummed checkpoint of this exact authoritative state is known staging.
+   * Unknown, partial, oversized or linked evidence is retained and refused under the exclusive writer. */
+  private async recoverStaging(authoritative: Buffer): Promise<void> {
+    const temporary = this.journalPath + '.next'
+    let before
+    try { before = await lstat(temporary) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { this.check(); return }
+      throw error
+    }
+    this.check()
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size === 0 || before.size > this.options.maxBytes) return uncertain()
+    await this.options.assertPrivateStorage(this.options.directory); this.check()
+    const bytes = await readFile(temporary); this.check()
+    const staged = new ExecutionIntentLedger(this.options)
+    staged.replay(bytes)
+    if (staged.sequence !== 1) return uncertain()
+    let frame: JournalFrame
+    try { frame = JSON.parse(bytes.toString('utf8')) } catch { return uncertain() }
+    if (!frame.checkpoint) return uncertain()
+    for (const [key, entry] of staged.entries) {
+      const current = this.entries.get(key)
+      if (!current || executionDigest(current) !== executionDigest(entry)) return uncertain()
+    }
+    const now = this.options.now()
+    for (const [key, entry] of this.entries) {
+      const child = entry.kind === 'selection' && entry.plan ? this.entries.get(journalKey(entry.scope, entry.plan.stamp.openIntentId)) : null
+      const discardable = entry.retainUntilMs <= now && (terminal(entry)
+        || (entry.kind === 'selection' && entry.state === 'committed' && child && terminal(child) && child.retainUntilMs <= now))
+      if (!staged.entries.has(key) && !discardable) return uncertain()
+    }
+    const main = await readFile(this.journalPath); this.check()
+    if (!main.equals(authoritative)) return uncertain()
+    const after = await lstat(temporary); this.check()
+    if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1 || after.dev !== before.dev || after.ino !== before.ino
+      || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return uncertain()
+    await this.options.assertPrivateStorage(this.options.directory); this.check()
+    await unlink(temporary); this.check()
+    await this.options.syncDirectory(this.options.directory); this.check()
   }
   private check(): void {
     if (this.closed || this.poisoned) return uncertain()

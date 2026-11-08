@@ -1133,7 +1133,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     onChange: () => poolOptions.onChange?.(), onEnded: e => poolOptions.onEnded?.(e),
   })
   const nativeChats = combinePools(createChatPool(poolOptions), openCode.pool)
-  if (o.codex && o.chatHost?.inspect && !o.spawn) {
+  if (o.codex && o.chatHost?.inspect && o.chatHost.current && !o.spawn) {
     executionService = createExecutionService({ directory: path.join(o.dir, 'codex-claude'), manager: o.codex, host: o.chatHost, self,
       pool: () => nativeChats, memorySettings: poolOptions.settings,
       current: request => {

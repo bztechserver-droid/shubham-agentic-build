@@ -34,11 +34,13 @@ export async function runBridgeChild(configFile: string, args: string[]): Promis
   const initial = readChildConfig(configFile)
   const { createHash } = await import('node:crypto')
   if (createHash('sha256').update(fs.readFileSync(initial.claude)).digest('hex') !== initial.claudeSha256) throw new Error('The pinned Claude Code executable changed')
+  let paused = false
   const server = http.createServer((req, res) => {
     const fail = (status: number) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json', 'x-should-retry': 'false' }); res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Codex in Claude Code is paused. Review the execution in the app; no fallback or automatic retry was used.' } })) }
     if (req.headers.origin !== undefined || req.method !== 'POST'
       || !['/v1/messages', '/v1/messages/count_tokens'].includes((req.url ?? '').split('?')[0])
       || !(equalKey(req.headers.authorization, `Bearer ${initial.loopbackKey}`) || equalKey(req.headers['x-api-key'], initial.loopbackKey))) return fail(403)
+    if (paused) return fail(400)
     let size = 0; const chunks: Buffer[] = [], abort = new AbortController()
     req.on('data', data => { size += data.length; if (size > 16 * 1024 * 1024) { fail(413); req.destroy() } else chunks.push(data) })
     req.on('aborted', () => abort.abort())
@@ -51,13 +53,13 @@ export async function runBridgeChild(configFile: string, args: string[]): Promis
         const response = await fetch(`http://127.0.0.1:${config.controllerPort}/bridge/${config.runId}${req.url!.split('?')[0]}`, {
           method: 'POST', signal: abort.signal, redirect: 'error', headers: { authorization: `Bearer ${config.controllerKey}`, 'content-type': 'application/json' }, body: Buffer.concat(chunks),
         })
-        if (!response.ok || !response.body) { await response.body?.cancel(); return fail(400) }
+        if (!response.ok || !response.body) { paused = true; await response.body?.cancel(); return fail(400) }
         res.writeHead(200, { 'content-type': response.headers.get('content-type') ?? 'application/json', 'cache-control': 'no-store' })
         for await (const data of response.body) {
           if (!res.write(data)) await new Promise<void>(resolve => res.once('drain', resolve))
         }
         res.end()
-      } catch { fail(400) }
+      } catch { paused = true; fail(400) }
     })() })
   })
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()) })
@@ -78,7 +80,7 @@ export async function runBridgeChild(configFile: string, args: string[]): Promis
     ANTHROPIC_DEFAULT_OPUS_MODEL: BRIDGE_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL: BRIDGE_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL: BRIDGE_MODEL,
     CLAUDE_CODE_SUBAGENT_MODEL: BRIDGE_MODEL, CLAUDE_CODE_EFFORT_LEVEL: BRIDGE_EFFORT },
     permissions: { defaultMode: 'bypassPermissions' } }) + '\n')
-  const child = spawn(initial.claude, [...args, '--settings', initial.settingsFile], { cwd: process.cwd(), env, windowsHide: true, stdio: 'inherit' })
+  const child = spawn(initial.claude, ['--settings', initial.settingsFile, ...args], { cwd: process.cwd(), env, windowsHide: true, stdio: 'inherit' })
   try {
     if (!child.pid) throw new Error('Claude Code did not start')
     writePrivateAtomic(initial.readyFile, JSON.stringify({ version: 1, runId: initial.runId, leaseId: initial.leaseId,

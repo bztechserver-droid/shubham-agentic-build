@@ -63,6 +63,8 @@ export interface ExecutionCoordinatorPorts {
   resolveTarget(scope: ExecutionIntentScope, profile: ExecutionProfile, current: ExecutionSnapshot): ExecutionIdentity
   /** Read cached authenticated target evidence only. No native/provider probe, lease or install. */
   readTarget(scope: ExecutionIntentScope, execution: ExecutionIdentity): Promise<ExecutionTargetObservation>
+  /** Synchronous cached authority at the actual floor CAS; no await or native/provider call. */
+  currentTarget(scope: ExecutionIntentScope, execution: ExecutionIdentity): ExecutionTargetObservation
   withSourceFence<T>(scope: ExecutionIntentScope, expected: ExecutionSnapshot, use: (fence: ExecutionSourceFence) => Promise<T>): Promise<T>
   prepare(scope: ExecutionIntentScope, expected: ExecutionSnapshot, target: ExecutionIdentity, fence: ExecutionSourceFence): Promise<PreparedExecutionSelection>
   /** One authoritative floor-document CAS includes profile, binding, lineage AND stamp. Must recheck seal/fence/source bytes.
@@ -94,6 +96,7 @@ export class ExecutionCoordinator {
   private readonly newId: () => string
   private readonly receipts = new Map<string, Receipt>()
   private readonly active = new Set<string>()
+  private readonly reconciliations = new Map<string, Promise<ExecutionIntentStatusReply>>()
   constructor(ports: ExecutionCoordinatorPorts) {
     this.ports = ports; this.now = ports.now ?? Date.now; this.newId = ports.newId ?? randomUUID
     if (!Number.isSafeInteger(ports.maxReceipts ?? 256) || (ports.maxReceipts ?? 256) < 1
@@ -140,7 +143,15 @@ export class ExecutionCoordinator {
     return this.reply('open', this.requestId(request, 'openIntentId'), () => this.openOnce(scope, request, signal))
   }
   status(scope: ExecutionIntentScope, id: string): Promise<ExecutionIntentStatusReply> {
-    return this.reply('status', id, () => this.statusOnce(scope, id))
+    return this.reply('status', id, () => {
+      this.guard(scope)
+      if (!executionIntentId(id)) throw executionHttpError('execution-invalid', 'status')
+      const key = this.operationKey(scope, id), pending = this.reconciliations.get(key)
+      if (pending) return pending
+      const operation = this.statusOnce(scope, id).finally(() => this.reconciliations.delete(key))
+      this.reconciliations.set(key, operation)
+      return operation
+    })
   }
   private async floor(scope: ExecutionIntentScope, signal?: AbortSignal, fence?: ExecutionSourceFence): Promise<ExecutionFloorState> {
     const state = await this.awaited(scope, () => this.ports.readFloor(scope), signal, fence)
@@ -150,6 +161,9 @@ export class ExecutionCoordinator {
   }
   private async target(scope: ExecutionIntentScope, execution: ExecutionIdentity, signal?: AbortSignal, fence?: ExecutionSourceFence): Promise<ExecutionTargetObservation> {
     const observation = await this.awaited(scope, () => this.ports.readTarget(scope, execution), signal, fence)
+    return this.validateTarget(scope, execution, observation)
+  }
+  private validateTarget(scope: ExecutionIntentScope, execution: ExecutionIdentity, observation: ExecutionTargetObservation): ExecutionTargetObservation {
     const now = this.now()
     if (observation.targetPcId !== scope.targetPcId || !executionId(observation.linkGeneration)
       || !sameExecution(observation.execution, execution) || !executionTime(observation.observedAtMs)
@@ -234,7 +248,14 @@ export class ExecutionCoordinator {
         // WAL includes the exact next binding/stamp and one planned open BEFORE authoritative floor CAS.
         record = await this.awaited(scope, () => this.ports.ledger.stageSelection(record, next, this.newId(), this.newId()), signal, fence)
         const plan = record.plan!
-        await this.awaited(scope, () => this.ports.commitFloor(scope, request.expected, next, prepared, plan.stamp, fence), signal, fence)
+        const commitFence: ExecutionSourceFence = { assertCurrent: () => {
+          this.guard(scope, signal, fence)
+          if (receipt.expiresAtMs <= this.now()) throw executionHttpError('execution-capability-required', 'selection')
+          const current = this.validateTarget(scope, request.target, this.ports.currentTarget(scope, request.target))
+          if (this.evidenceDigest(current) !== receipt.evidenceDigest) throw executionHttpError('execution-capability-required', 'selection')
+          if (receipt.expiresAtMs <= this.now()) throw executionHttpError('execution-capability-required', 'selection')
+        } }
+        await this.awaited(scope, () => this.ports.commitFloor(scope, request.expected, next, prepared, plan.stamp, commitFence), signal, commitFence)
         const authoritative = await this.floor(scope, signal, fence)
         assertExecutionCAS(next, authoritative.binding)
         if (!stampEqual(authoritative.selection, plan.stamp)) throw executionHttpError('execution-intent-uncertain', 'selection')
@@ -289,8 +310,13 @@ export class ExecutionCoordinator {
     const operation = this.operationKey(scope, record.id)
     if (this.active.has(operation)) throw executionHttpError('execution-intent-uncertain', 'open', record.id)
     this.active.add(operation)
+    let claimed = false
     try {
-      record = await this.awaited(scope, () => this.ports.ledger.claimOpen(record as OpenIntent, request.cols, request.rows), signal)
+      record = await this.awaited(scope, async () => {
+        const result = await this.ports.ledger.claimOpen(record as OpenIntent, request.cols, request.rows)
+        claimed = true; record = result
+        return result
+      }, signal)
       const owned = record as OpenIntent
       let startRequest: ExecutionStartRequest
       const startSignal = signal ?? new AbortController().signal
@@ -326,7 +352,7 @@ export class ExecutionCoordinator {
       return Object.freeze({ executionVersion: 1, openIntentId: record.id, state: 'running', committed: (record as OpenIntent).binding, actual })
     } catch (error) {
       const current = this.ports.ledger.get(scope, request.openIntentId)
-      if (current?.kind === 'open' && !['stopped', 'refused'].includes(current.state)) await this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'open'))
+      if (claimed && current?.kind === 'open' && !['stopped', 'refused'].includes(current.state)) await this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'open'))
       // Retain the run/lease on ambiguous failure. Lifecycle owner confirms end/adopts before sweep; no fallback/restart.
       throw executionHttpError(codeOf(error, 'open'), 'open', request.openIntentId)
     } finally { this.active.delete(operation) }
@@ -371,7 +397,8 @@ export class ExecutionCoordinator {
       } catch (error) {
         this.guard(scope)
         const current = this.ports.ledger.get(scope, id)
-        if (current?.kind === 'open' && !['stopped', 'refused'].includes(current.state)) record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'runtime')))
+        if (current && current.revision !== record.revision) record = current
+        else if (current?.kind === 'open' && !['stopped', 'refused'].includes(current.state)) record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'runtime')))
       }
     }
     this.guard(scope)

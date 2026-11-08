@@ -29,7 +29,7 @@ export async function probeClaudeHarness(o: { directory: string; claude: string;
     const started = Date.now()
     const child = spawn(process.execPath, [path.join(import.meta.dirname, 'child.ts'), configFile, '--print', '--output-format', 'json',
       resume ? '--resume' : '--session-id', sid, '--model', BRIDGE_MODEL, '--effort', BRIDGE_EFFORT, '--permission-mode', 'bypassPermissions',
-      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', prompt], {
+      '--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--', prompt], {
       cwd: directory, windowsHide: true, env: { ...process.env, CLAUDE_CONFIG_DIR: home, CLAUDE_CODE_MAX_RETRIES: '0', ANTHROPIC_MAX_RETRIES: '0' }, stdio: ['ignore', 'pipe', 'pipe'],
     })
     if (child.pid) active.set(child.pid, started)
