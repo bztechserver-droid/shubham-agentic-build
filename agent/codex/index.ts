@@ -138,7 +138,10 @@ export function createCodex(o: CodexOptions): CodexManager {
   let bridgeValidated = false
   let bridgeFailure: BridgeCredentialCode = 'bridge-credential-unavailable'
   let bridgeTimer: NodeJS.Timeout | null = null
-  type Validation = { active: boolean; controller: AbortController; timer: NodeJS.Timeout; done: Promise<void>; finish: () => void }
+  // Receipt order is distinct from immutable credential identity: even a same-identity
+  // native renewal supersedes an older maintenance result (including failure/timeout).
+  let bridgeAuthority = 0
+  type Validation = { active: boolean; authority: number; binding: string; controller: AbortController; timer: NodeJS.Timeout; done: Promise<void>; finish: () => void }
   let validation: Validation | null = null
   let validationNotBefore = 0
   const sessionEpoch = (s: CrmSession | null) => s ? createHash('sha256').update(JSON.stringify([s.url, s.user.id, s.signedInAt, s.cookie])).digest('hex') : null
@@ -146,6 +149,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     bridgeValidated = false
     bridgeFailure = reason
     if (forget) bridgeReceipt = null
+    advanceBridgeAuthority()
     for (const flights of bridgeFlights.values()) for (const flight of flights) flight.abort()
   }
   function authorization(text: string, revision: number): BridgeRequestAuthorization | null {
@@ -178,6 +182,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     try { requireBridgeContext(candidate, s.user.id, now()) }
     catch { invalidateBridge('bridge-refresh-required'); return }
     bridgeReceipt = Object.freeze(candidate); bridgeValidated = true
+    advanceBridgeAuthority()
   }
   function currentBridge(expected?: ManagerBridgeContext): ManagerBridgeContext | null {
     const receipt = bridgeReceipt
@@ -203,6 +208,11 @@ export function createCodex(o: CodexOptions): CodexManager {
     validation.active = false; clearTimeout(validation.timer); validation.controller.abort(); validation.finish()
     // Keep the single-flight slot until the physical promise settles, even if fetch ignores abort.
   }
+  function advanceBridgeAuthority() { bridgeAuthority++; cancelValidation() }
+  function ownsValidation(flight: Validation): boolean {
+    return !closed && validation === flight && flight.active && !flight.controller.signal.aborted && bridgeConsumers.size > 0
+      && flight.authority === bridgeAuthority && flight.binding === validationBinding()
+  }
   function stopBridgeTimer() { if (bridgeTimer) clearInterval(bridgeTimer); bridgeTimer = null; cancelValidation() }
   function protectBridge(id: string) {
     if (closed || !/^bridge-[a-f0-9-]{36}$/.test(id)) throw bridgeCredentialError('bridge-lease-invalid')
@@ -220,27 +230,31 @@ export function createCodex(o: CodexOptions): CodexManager {
       if (at < validationNotBefore) return { done: Promise.resolve() }
       if (!s || changed()) { invalidateBridge('bridge-credential-unavailable'); return { done: Promise.resolve() } }
       validationNotBefore = at + BRIDGE_VALIDATION_CADENCE_MS
-      const captured = validationBinding(), controller = new AbortController()
+      const binding = validationBinding(), authority = bridgeAuthority, controller = new AbortController()
       let finish!: () => void
       const done = new Promise<void>(resolve => { finish = resolve })
-      const flight: Validation = { active: true, controller, done, finish, timer: setTimeout(() => {
+      const flight: Validation = { active: true, authority, binding, controller, done, finish, timer: setTimeout(() => {
         if (validation !== flight || !flight.active) return
-        flight.active = false; controller.abort(); invalidateBridge('bridge-validation-stale'); finish()
+        const owns = ownsValidation(flight)
+        flight.active = false; controller.abort()
+        if (owns) invalidateBridge('bridge-validation-stale')
+        finish()
       }, BRIDGE_VALIDATION_TIMEOUT_MS) }
       flight.timer.unref(); validation = flight
       // Initiate the EXISTING CRM read here; network completion does not hold this queue.
       let response: Promise<CodexCredential>
       try { response = Promise.resolve(crm.credential(s, build, controller.signal)) } catch { response = Promise.reject(new Error('validation unavailable')) }
       void response.then(r => serial(async () => {
-        if (closed || validation !== flight || !flight.active || controller.signal.aborted || bridgeConsumers.size === 0) return
-        if (captured !== validationBinding()) return // An older response cannot replace/revoke a newer manager context.
+        if (!ownsValidation(flight)) return
         if (now() < at || now() - at >= BRIDGE_VALIDATION_TIMEOUT_MS) {
           invalidateBridge('bridge-validation-stale'); return
         }
         if (r.kind !== 'ok' || r.login.kind !== 'chatgpt') { invalidateBridge('bridge-credential-unavailable', true); return }
         // Normal manager ordering owns replacement. Never apply a stale response over a pending native refresh.
         await pull({ session: s, at, result: r })
-      })).catch(() => { if (validation === flight && flight.active) invalidateBridge('bridge-credential-unavailable') }).finally(() => {
+      })).catch(() => serial(async () => {
+        if (ownsValidation(flight)) invalidateBridge('bridge-credential-unavailable')
+      })).finally(() => {
         clearTimeout(flight.timer); flight.active = false; finish()
         if (validation === flight) validation = null
       })

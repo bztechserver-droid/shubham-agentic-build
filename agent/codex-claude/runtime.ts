@@ -17,13 +17,14 @@ import { fromResponses, messagesEvents, providerFailureSummary, sendResponses, t
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
+import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
-  state: 'starting' | 'running' | 'ended'; proof?: BridgeActualRuntimeProof;
+  state: 'starting' | 'running' | 'ended' | 'released'; proof?: BridgeActualRuntimeProof;
   dispatchPaused?: boolean;
 }
 export interface BridgeRuntimeOptions {
@@ -38,47 +39,72 @@ export interface BridgeRuntimeOptions {
 /** One controller-side provider transport. Persistent children hold loopback keys only. */
 export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   const runs = new Map<string, RunRecord>(), dispatch = new Map<string, Extract<ExecutionStartRequest, { kind: 'bridge' }>['dispatchProvider']>()
-  const retired = new Set<string>(), lifetime = new AbortController()
+  const lifetime = new AbortController(), knownBrokerLeases = new Set<string>(), retirementWork = new BridgeRetirementWork()
+  let hostLifetime = new AbortController()
   const probes = new Map<string, { key: string; consumerId: string; ownerId: string; sawRead: boolean; paused: boolean }>()
   let closed = false, storage: Awaited<ReturnType<typeof openExecutionStorage>> | null = null
   let server: http.Server | null = null, port = 0, capability: BridgeTargetCapability | null = null
   let pins: BridgeRuntimePins | null = null, claude: string | null = null, claudeHash: string | null = null
   let initialization: Promise<void> | null = null
+  const ownership = new BridgeOwnership(() => {
+    if (closed || !o.host?.current) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+    return o.host.current()
+  })
+  o.host?.onLost(() => { ownership.invalidate(); hostLifetime.abort() })
+  o.host?.onBack(() => { if (!closed) hostLifetime = new AbortController() })
+  const cleanupTimer = setInterval(() => { void retirementWork.reconcile() }, 1000)
+  cleanupTimer.unref()
   const recordFile = (id: string) => { if (!safeId(id)) throw executionHttpError('execution-invalid', 'runtime'); return path.join(o.directory, `${id}.run.json`) }
   const save = (record: RunRecord) => writePrivateAtomic(recordFile(record.runId), JSON.stringify(record) + '\n')
   const pause = (record: RunRecord) => {
     record.dispatchPaused = true
     try { save(record) } catch { closed = true; lifetime.abort() }
   }
-  const current = (request: BridgeLeaseRequest) => !closed && request.targetPcId === o.self().id && o.current(request)
+  const current = (request: BridgeLeaseRequest) => {
+    try { ownership.capture(); return !closed && request.targetPcId === o.self().id && o.current(request) } catch { return false }
+  }
   // Protect saved unique consumers BEFORE index's native sweep/adoption can run. No authorization is inferred.
   if (fs.existsSync(o.directory)) {
     assertPrivatePath(o.directory)
     for (const name of fs.readdirSync(o.directory).filter(name => name.endsWith('.run.json'))) {
       const file = path.join(o.directory, name); assertPrivatePath(file)
       const record = JSON.parse(fs.readFileSync(file, 'utf8')) as RunRecord
-      if (record.version !== 1 || !safeId(record.runId) || name !== `${record.runId}.run.json` || !record.lease?.leaseId?.startsWith('bridge-')) throw executionHttpError('execution-intent-uncertain', 'runtime')
-      if (record.state !== 'ended') { o.manager?.bridgeCredentials.protect(record.lease.leaseId); runs.set(record.runId, record) }
+      if (record.version !== 1 || !safeId(record.runId) || name !== `${record.runId}.run.json` || !record.lease?.leaseId?.startsWith('bridge-')
+        || !['starting', 'running', 'ended', 'released'].includes(record.state)
+        || path.resolve(record.configFile) !== path.join(path.resolve(o.directory), `${record.runId}.child.json`)) throw executionHttpError('execution-intent-uncertain', 'runtime')
+      if (record.state !== 'released') { o.manager?.bridgeCredentials.protect(record.lease.leaseId); runs.set(record.runId, record) }
     }
   }
   const broker = o.manager ? createCodexBridgeCredentialBroker({ source: o.manager.bridgeCredentials, currentBinding: current,
     observeRuntime: observe,
-    canRetire: (lease, observation) => observation.state !== 'running' && observation.state !== 'unknown' && retired.has(lease.leaseId),
+    canRetire: (lease, observation) => {
+      const record = runs.get(lease.request.runId)
+      return !!record?.proof && ownership.canRetire(lease, record.proof, observation)
+    },
   }) : null
 
   async function physical(record: RunRecord): Promise<BridgeOwnerObservation> {
     if (!o.host?.inspect || !pins || !capability || closed) return { state: 'unknown' }
     cachedCapability()
+    const epoch = ownership.capture()
+    if (record.state === 'ended' && record.proof) {
+      const retired = ownership.retirement(record.lease, record.proof)
+      if (retired) return retired
+    }
     const host = await o.host.inspect()
+    ownership.fence(epoch)
+    if (host.hostPid !== epoch.hostPid || host.hostStartedAt !== epoch.hostStartedAt) throw executionHttpError('execution-runtime-mismatch', 'runtime')
     const ch = host.chats.find(chat => chat.id === record.lease.request.binding.sessionId)
     if (!ch || ch.meta.bridgeRunId !== record.runId || !isDeepStrictEqual(ch.meta.execution, record.lease.request.binding)) return { state: 'unknown' }
     if (ch.exited) {
       if (!record.proof) return { state: 'unknown' }
       const table = await processes(record.proof.proxy.pid, record.proof.claude.pid, host.hostPid, record.proof.listener.port)
+      ownership.fence(epoch)
       if (table.rows.some(p => (p.pid === record.proof!.proxy.pid && p.created === record.proof!.proxy.createdAtMs)
         || (p.pid === record.proof!.claude.pid && p.created === record.proof!.claude.createdAtMs)) || table.listener) return { state: 'unknown' }
-      record.state = 'ended'; save(record); retired.add(record.lease.leaseId)
-      return { state: 'ended' }
+      const retired = ownership.ended(record.lease, record.proof, epoch)
+      record.state = 'ended'; save(record); queueRetirement(record)
+      return retired
     }
     const config = readChildConfig(record.configFile)
     assertPrivatePath(config.readyFile); assertPrivatePath(config.settingsFile)
@@ -86,6 +112,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (ready.version !== 1 || ready.runId !== record.runId || ready.leaseId !== record.lease.leaseId || ready.proxyPid !== ch.pid
       || !Number.isSafeInteger(ready.claudePid) || !Number.isSafeInteger(ready.port) || ready.port < 1 || ready.port > 65535) return { state: 'unknown' }
     const observed = await processes(ch.pid, ready.claudePid, host.hostPid, ready.port)
+    ownership.fence(epoch)
     const proxy = observed.rows.find(p => p.pid === ch.pid), child = observed.rows.find(p => p.pid === ready.claudePid), hostProc = observed.rows.find(p => p.pid === host.hostPid)
     if (!proxy || !child || !hostProc || !observed.listener || child.ppid !== proxy.pid || child.created < proxy.created
       || Math.abs(proxy.created - Date.parse(String(ch.meta.startedAt))) > 10_000 || Math.abs(hostProc.created - host.hostStartedAt) > 10_000
@@ -102,13 +129,18 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       settings: { ownerId: record.lease.request.ownerId, access: 'owner-only', scope: 'child-only' } }
     if (record.proof && (!isDeepStrictEqual(record.proof.proxy, proof.proxy) || !isDeepStrictEqual(record.proof.claude, proof.claude))) return { state: 'unknown' }
     requireBridgeRuntimeProof(proof, record.lease, record.lease.request, capability, pins, Date.now())
+    ownership.admit(record.lease, proof, epoch)
     if (!record.proof) { record.proof = proof; record.state = 'running'; save(record) }
     return { state: 'running', runtime: proof }
   }
   async function observe(request: BridgeLeaseRequest): Promise<BridgeOwnerObservation> {
     const record = runs.get(request.runId)
     if (!record || !isDeepStrictEqual(record.lease.request, request)) return { state: 'unknown' }
-    try { return await physical(record) } catch { return { state: 'unknown' } }
+    try {
+      const observed = await physical(record)
+      if (observed.state === 'unknown') ownership.invalidate(record.runId)
+      return observed
+    } catch { ownership.invalidate(record.runId); return { state: 'unknown' } }
   }
   async function initialize() {
     if (closed || !o.host?.inspect || !o.host.current || !o.manager || process.platform !== 'win32' || process.arch !== 'x64') throw executionHttpError('execution-capability-required', 'runtime')
@@ -122,7 +154,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     await o.host.inspect()
     o.host.current()
     pins = { platform: 'win32', arch: 'x64', nodeVersion: process.versions.node, claudeVersion: '2.1.319', codexVersion: codex.version,
-      adapterSha256: createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
+      adapterSha256: createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
     const capFile = path.join(o.directory, 'capability.json')
     if (fs.existsSync(capFile)) { try { assertPrivatePath(capFile); capability = requireBridgeCapability(JSON.parse(fs.readFileSync(capFile, 'utf8')), o.self().id, pins, Date.now()) } catch { capability = null } }
     server = http.createServer((req, res) => { void handleProvider(req, res) })
@@ -130,9 +162,11 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const address = server.address(); if (!address || typeof address === 'string') throw executionHttpError('execution-capability-required', 'runtime'); port = address.port
     for (const record of runs.values()) {
       const observed = await observe(record.lease.request)
+      if (observed.state === 'ended') { queueRetirement(record); continue }
       if (observed.state !== 'running') continue
       try {
         await broker!.adopt(record.lease, observed.runtime)
+        knownBrokerLeases.add(record.lease.leaseId)
         const config = readChildConfig(record.configFile)
         writePrivateAtomic(record.configFile, JSON.stringify({ ...config, controllerPort: port, controllerKey: randomBytes(32).toString('hex') }) + '\n')
       } catch { /* Hold survives; dispatch remains paused until the owner context can be proved. */ }
@@ -173,13 +207,14 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (request.kind !== 'bridge' || !broker) throw executionHttpError('execution-capability-required', 'open')
     await ensure(); cachedCapability()
     if (!current(request.lease.request) || runs.has(request.runId)) throw executionHttpError('execution-stale', 'open')
-    for (const old of runs.values()) if (old.lease.request.binding.sessionId === request.binding.sessionId && old.state !== 'ended') {
+    for (const old of runs.values()) if (old.lease.request.binding.sessionId === request.binding.sessionId && old.state !== 'released') {
       const observed = await observe(old.lease.request)
       if (observed.state === 'unknown') throw executionHttpError('execution-intent-uncertain', 'open')
       if (observed.state === 'running') { o.pool().kill(request.binding.sessionId!, 'bridge-resume'); await o.pool().waitStopped?.(request.binding.sessionId!) }
       const ended = await observe(old.lease.request)
       if (ended.state !== 'ended') throw executionHttpError('execution-intent-uncertain', 'open')
-      await broker.release(old.lease)
+      queueRetirement(old); await retirementWork.reconcile()
+      if (runs.get(old.runId)?.state !== 'released') throw executionHttpError('execution-intent-uncertain', 'open')
     }
     const configFile = path.join(o.directory, `${request.runId}.child.json`)
     const config: BridgeChildConfig = { version: 1, runId: request.runId, ownerId: request.scope.ownerId, leaseId: request.lease.leaseId,
@@ -188,6 +223,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     writePrivateAtomic(configFile, JSON.stringify(config) + '\n')
     const record: RunRecord = { version: 1, runId: request.runId, lease: request.lease, pins: pins!, configFile, state: 'starting' }
     save(record); runs.set(record.runId, record); dispatch.set(record.runId, request.dispatchProvider)
+    knownBrokerLeases.add(record.lease.leaseId)
     o.pool().start({ ...o.launch(request), engine: 'claude', model: BRIDGE_MODEL, effort: BRIDGE_EFFORT,
       bridge: { descriptorFile: configFile, runId: record.runId, binding: request.binding, wrapperPath: path.join(import.meta.dirname, 'child.ts') } })
     const deadline = Date.now() + 30_000
@@ -199,7 +235,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   }
   function cachedCapability() {
     if (!capability || !pins || !o.host?.inspect || !o.host.current || closed || Date.now() - Date.parse(capability.endpointProof.verifiedAt) > 86_400_000) throw executionHttpError('execution-capability-required', 'capability')
-    const currentHash = createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex')
+    const currentHash = createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex')
     if (currentHash !== pins.adapterSha256 || !claude || hash(claude) !== claudeHash) throw executionHttpError('execution-capability-required', 'capability')
     storage!.assertExclusiveWriter()
     o.host.current()
@@ -214,7 +250,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const expected = `Bearer ${probe.key}`, provided = req.headers.authorization
       if (typeof provided !== 'string' || provided.length !== expected.length || !timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) return fail()
       if (probe.paused) return fail()
-      const controller = new AbortController(), signal = AbortSignal.any([controller.signal, lifetime.signal, AbortSignal.timeout(180_000)])
+      const controller = new AbortController(), signal = AbortSignal.any([controller.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(180_000)])
       req.on('aborted', () => controller.abort()); res.on('close', () => { if (!res.writableEnded) controller.abort() })
       try {
         const chunks: Buffer[] = []; let bytes = 0
@@ -243,7 +279,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const key = req.headers.authorization, expected = `Bearer ${config.controllerKey}`
     if (typeof key !== 'string' || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) return fail()
     if (record.dispatchPaused) return fail()
-    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, AbortSignal.timeout(180_000)])
+    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(180_000)])
     req.on('aborted', () => abort.abort()); res.on('close', () => { if (!res.writableEnded) abort.abort() })
     try {
       const chunks: Buffer[] = []; let size = 0
@@ -257,6 +293,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const sender = dispatch.get(record.runId) ?? (<T>(send: Parameters<NonNullable<typeof broker>['dispatch']>[1], abort?: AbortSignal) => broker.dispatch(record.lease, send, abort) as Promise<T>)
       const response = await sender((authorization, abort) => {
         if (record.dispatchPaused) throw executionHttpError('execution-intent-uncertain', 'runtime')
+        if (!record.proof || !current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        ownership.assertRunning(record.lease, record.proof)
         return sendResponses(body, authorization, abort).catch(error => {
           pause(record)
           writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
@@ -269,25 +307,41 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   }
   function matches(binding: ExecutionSnapshot, runId?: string): boolean {
     for (const record of runs.values()) if ((!runId || record.runId === runId) && record.state === 'running' && record.proof) {
-      try { assertExecutionCAS(binding, record.lease.request.binding); return current(record.lease.request) } catch { /* A different generation. */ }
+      try {
+        assertExecutionCAS(binding, record.lease.request.binding)
+        ownership.assertRunning(record.lease, record.proof)
+        return current(record.lease.request)
+      } catch { /* A different or unproved controller/process generation cannot admit native input. */ }
     }
     return false
   }
-  async function ended(sid: string) {
-    for (const record of runs.values()) if (record.lease.request.binding.sessionId === sid && record.state !== 'ended') {
-      for (let i = 0; i < 20 && !closed; i++) {
-        const observed = await observe(record.lease.request)
-        if (observed.state === 'ended') {
-          try {
-            await broker!.release(record.lease)
-            const config = readChildConfig(record.configFile)
-            for (const file of [config.settingsFile, config.readyFile, record.configFile]) { try { fs.unlinkSync(file) } catch { /* Already gone. */ } }
-            dispatch.delete(record.runId); break
-          } catch { /* A provider promise is still physically draining; retain its hold. */ }
-        }
-        await wait(250)
+  function queueRetirement(record: RunRecord) {
+    retirementWork.add(record.runId, async () => {
+      if (closed) return false
+      if (record.state === 'released') return true
+      const observed = await observe(record.lease.request)
+      if (observed.state !== 'ended' || !record.proof || !ownership.canRetire(record.lease, record.proof, observed)) return false
+      const config = readChildConfig(record.configFile)
+      if (knownBrokerLeases.has(record.lease.leaseId)) await broker!.release(record.lease)
+      else {
+        // Recovery of a saved, already-ended unique consumer: no acquire, refresh or provider adoption.
+        // The manager still owns draining, settlement and any native auth writeback.
+        await o.manager!.bridgeCredentials.release(record.lease.leaseId, () => {
+          if (!record.proof || !ownership.canRetire(record.lease, record.proof, observed)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        })
       }
+      record.state = 'released'; save(record)
+      for (const file of [config.settingsFile, config.readyFile, record.configFile]) { try { fs.unlinkSync(file) } catch { /* Only this run's exact private artifacts. */ } }
+      ownership.invalidate(record.runId); dispatch.delete(record.runId)
+      return true
+    })
+  }
+  async function ended(sid: string) {
+    for (const record of runs.values()) if (record.lease.request.binding.sessionId === sid && record.state !== 'released') {
+      if (record.state !== 'ended') ownership.invalidate(record.runId)
+      queueRetirement(record)
     }
+    await retirementWork.reconcile()
   }
   async function adopt(binding: ExecutionSnapshot, runId: string) {
     await ensure()
@@ -297,12 +351,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const observed = await observe(record.lease.request)
     if (observed.state !== 'running') throw executionHttpError('execution-runtime-mismatch', 'runtime')
     await broker!.adopt(record.lease, observed.runtime)
+    knownBrokerLeases.add(record.lease.leaseId)
     const config = readChildConfig(record.configFile)
     writePrivateAtomic(record.configFile, JSON.stringify({ ...config, controllerPort: port, controllerKey: randomBytes(32).toString('hex') }) + '\n')
   }
   return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt,
     get storage() { return storage },
-    close() { closed = true; lifetime.abort(); server?.closeAllConnections(); server?.close(); storage?.close() } }
+    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); storage?.close() } }
 }
 
 interface ObservedProcess { pid: number; ppid: number; created: number; file: string; command: string }
