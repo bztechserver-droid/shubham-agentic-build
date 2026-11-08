@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, sameExecution, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
 import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
 import { ExecutionCoordinator, type ExecutionSourceFence, type ExecutionTargetObservation, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
@@ -48,7 +49,32 @@ export function confirmedPreparedToolSelection(intent: ExecutionToolIntent, pare
     committed: child.binding, openIntentId: child.id }
 }
 export function createExecutionService(o: ExecutionServiceOptions) {
-  const runtime = createBridgeRuntime(o), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
+  // Observe through the existing authenticated controller. Diagnostics contain only predicates;
+  // a failed observation still refuses admission and never creates a runtime proof.
+  const host = o.host
+  const observedHost = host?.inspect ? { ...host, inspect: async () => {
+    const before = host.current?.()
+    const observation = await host.inspect!()
+    try {
+      const after = host.current?.()
+      const managed = observation.chats.filter(chat => typeof chat.meta.bridgeRunId === 'string'
+        && /^[A-Za-z0-9_-]{16,128}$/.test(chat.meta.bridgeRunId)).map(chat => {
+        try {
+          const record = JSON.parse(fs.readFileSync(path.join(o.directory, `${chat.meta.bridgeRunId}.run.json`), 'utf8'))
+          const config = JSON.parse(fs.readFileSync(record.configFile, 'utf8'))
+          const ready = JSON.parse(fs.readFileSync(config.readyFile, 'utf8'))
+          return { runId: chat.meta.bridgeRunId, bindingMatches: isDeepStrictEqual(chat.meta.execution, record.lease.request.binding),
+            pidMatches: chat.pid === ready.proxyPid, readyMatches: ready.runId === record.runId && ready.leaseId === record.lease.leaseId,
+            hasStartedAt: Number.isFinite(Date.parse(String(chat.meta.startedAt))), exited: !!chat.exited }
+        } catch { return { runId: chat.meta.bridgeRunId, privateRecordReadable: false } }
+      })
+      writePrivateAtomic(path.join(o.directory, 'host-observation-diagnostic.json'), JSON.stringify({ version: 1, at: new Date().toISOString(),
+        controllerUnchanged: isDeepStrictEqual(before, after), hostMatches: observation.hostPid === before?.hostPid && observation.hostStartedAt === before?.hostStartedAt,
+        managed }) + '\n')
+    } catch { /* Diagnostics never replace the physical admission checks. */ }
+    return observation
+  } } : host
+  const runtime = createBridgeRuntime({ ...o, host: observedHost }), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
   const committing = new Map<string, ExecutionSourceFence>()
   let coordinator: ExecutionCoordinator | null = null, ledger: ExecutionIntentLedger | null = null
   let initialization: Promise<void> | null = null
