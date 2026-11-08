@@ -248,7 +248,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const probe = probes.get(match[1])
     if (probe) {
       const expected = `Bearer ${probe.key}`, provided = req.headers.authorization
-      if (typeof provided !== 'string' || provided.length !== expected.length || !timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) return fail()
+      if (typeof provided !== 'string' || Buffer.byteLength(provided) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) return fail()
       if (probe.paused) return fail()
       const controller = new AbortController(), signal = AbortSignal.any([controller.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(180_000)])
       req.on('aborted', () => controller.abort()); res.on('close', () => { if (!res.writableEnded) controller.abort() })
