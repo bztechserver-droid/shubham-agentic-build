@@ -394,7 +394,8 @@ export class ExecutionIntentLedger {
     return this.serial(async () => {
       const current = this.current(expected)
       if ((current.kind === 'selection' && (state === 'stopped' || current.state === 'committed'))
-        || terminal(current) || (state === 'refused' && !['reserved', 'ready'].includes(current.state))) throw executionHttpError('execution-intent-conflict', 'status', current.id)
+        || terminal(current) || (state === 'refused' && !['reserved', 'ready'].includes(current.state)
+          && !(current.kind === 'selection' && current.state === 'uncertain' && !current.plan))) throw executionHttpError('execution-intent-conflict', 'status', current.id)
       const updated = { ...current, state, reason, revision: current.revision + 1, updatedAtMs: this.options.now() } as T
       delete (updated as { actual?: ExecutionRuntimeSummary }).actual
       await this.persist([updated]); return this.get(current.scope, current.id) as T

@@ -375,7 +375,15 @@ export class ExecutionCoordinator {
     let record = this.ports.ledger.get(scope, id)
     if (!record) return Object.freeze({ version: 1, intentId: id, kind: 'unknown', state: 'unknown', canFallback: false })
     if (this.active.has(this.operationKey(scope, id))) return this.statusReply(record)
-    if (record.kind === 'selection' && record.plan && ['prepared', 'uncertain'].includes(record.state)) {
+    if (record.kind === 'selection' && !record.plan && record.state === 'uncertain') {
+      const current = await this.floor(scope)
+      assertExecutionCAS(record.request.expected, current.binding)
+      // Floor CAS is always preceded by a durable plan. A finished failed operation
+      // with no such plan cannot have dispatched that CAS or an open. Do not prepare
+      // again or clear any source fence; a fresh explicit selection must pass those guards.
+      if (current.selection?.selectionIntentId === record.id) throw executionHttpError('execution-intent-uncertain', 'status', id)
+      record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(record!, 'refused', record!.reason ?? 'execution-intent-uncertain'))
+    } else if (record.kind === 'selection' && record.plan && ['prepared', 'uncertain'].includes(record.state)) {
       const current = await this.floor(scope)
       if (stampEqual(current.selection, record.plan.stamp)) {
         assertExecutionCAS(record.plan.binding, current.binding)

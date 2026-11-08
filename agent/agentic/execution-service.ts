@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { execFile } from 'node:child_process'
 import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, sameExecution, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
-import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
+import { EXECUTION_ERROR_CODES, executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
 import { ExecutionCoordinator, type ExecutionSourceFence, type ExecutionTargetObservation, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
 import { ExecutionIntentLedger, scopeDigest, selectionFingerprint, type ExecutionIntentScope, type ExecutionIntent } from './execution-intents.ts'
 import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
@@ -101,6 +101,18 @@ export function createExecutionService(o: ExecutionServiceOptions) {
     return observation
   } } : host
   const runtime = createBridgeRuntime({ ...o, host: observedHost }), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
+  const noteSelectionFailure = (error: unknown, stage: 'seal' | 'selection' | 'finish') => {
+    try {
+      const value = error as { code?: unknown; name?: unknown; stack?: unknown }, code = value?.code
+      const frames = typeof value?.stack === 'string' ? value.stack.split('\n').slice(1, 10).flatMap(line => {
+        const match = /\b([A-Za-z0-9_-]+\.ts):(\d+):(\d+)/.exec(line)
+        return match ? [`${match[1]}:${match[2]}:${match[3]}`] : []
+      }) : []
+      writePrivateAtomic(path.join(o.directory, 'last-selection-failure.json'), JSON.stringify({ version: 1, at: new Date().toISOString(), stage,
+        kind: ['TypeError', 'ReferenceError', 'RangeError', 'SyntaxError'].includes(String(value?.name)) ? value.name : 'Error',
+        code: typeof code === 'string' && ((EXECUTION_ERROR_CODES as readonly string[]).includes(code) || ['EACCES', 'EPERM', 'EBUSY', 'EIO', 'ENOENT', 'ENOSPC'].includes(code)) ? code : null, frames }) + '\n')
+    } catch { /* Never expose a cause or let diagnostics alter the selection outcome. */ }
+  }
   const committing = new Map<string, ExecutionSourceFence>()
   let coordinator: ExecutionCoordinator | null = null, ledger: ExecutionIntentLedger | null = null
   let initialization: Promise<void> | null = null
@@ -154,19 +166,23 @@ export function createExecutionService(o: ExecutionServiceOptions) {
         withSourceFence: async (scope, expected, action) => {
           actor(scope)
           if (active.size) throw executionHttpError('execution-intent-conflict', 'selection')
-          const source = await o.seal(scope, expected)
+          let source: Awaited<ReturnType<typeof o.seal>>
+          try { source = await o.seal(scope, expected) } catch (error) { noteSelectionFailure(error, 'seal'); throw error }
           const file = o.floorFile(scope), context: FenceState = { scope, expected, next: null, source, floorFile: file, floorHash: sourceHash(file) }
           active.set(key(scope), context)
+          const finishSource = (committed: boolean, changed: boolean) => {
+            try { source.finish(committed, changed) } catch (error) { noteSelectionFailure(error, 'finish'); throw error }
+          }
           let committed = false
           try {
             const fence: ExecutionSourceFence = { assertCurrent: () => assertCurrent(context) }
             const result = await action(fence)
             committed = true
             return result
-          } finally {
+          } catch (error) { noteSelectionFailure(error, 'selection'); throw error } finally {
             // A lost acknowledgment after a stamped file CAS still counts as a committed source retirement.
             if (context.next) { try { assertExecutionCAS(context.next, o.state(scope).binding); committed = true } catch { /* Retain source fence on uncertainty. */ } }
-            try { if (committed || !context.next) source.finish(committed, context.next?.sessionId !== expected.sessionId) }
+            try { if (committed || !context.next) finishSource(committed, context.next?.sessionId !== expected.sessionId) }
             finally { active.delete(key(scope)) }
           }
         },
