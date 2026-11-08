@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { execFile } from 'node:child_process'
 import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, sameExecution, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
 import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
 import { ExecutionCoordinator, type ExecutionSourceFence, type ExecutionTargetObservation, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
@@ -9,7 +10,9 @@ import { ExecutionIntentLedger, scopeDigest, selectionFingerprint, type Executio
 import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
 import { sourceHash } from './switch-fence.ts'
 import { createBridgeRuntime, type BridgeRuntimeOptions } from '../codex-claude/runtime.ts'
-import { writePrivateAtomic } from '../codex-claude/storage.ts'
+import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.ts'
+import { readChildConfig } from '../codex-claude/child.ts'
+import { recoverUnreportedHostPids } from './execution-host-observation.ts'
 
 export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
   actor(scope: ExecutionIntentScope): void
@@ -54,7 +57,30 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   const host = o.host
   const observedHost = host?.inspect ? { ...host, inspect: async () => {
     const before = host.current?.()
-    const observation = await host.inspect!()
+    let observation = await host.inspect!()
+    if (host.current) observation = await recoverUnreportedHostPids(observation, { current: host.current, node: process.execPath,
+      ready(chat) {
+        const runId = String(chat.meta.bridgeRunId), recordFile = path.join(o.directory, `${runId}.run.json`)
+        assertPrivatePath(recordFile)
+        const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'))
+        if (record.runId !== runId || record.configFile !== path.join(o.directory, `${runId}.child.json`)
+          || !isDeepStrictEqual(record.lease?.request?.binding, chat.meta.execution) || record.lease?.request?.binding?.sessionId !== chat.id) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        const config = readChildConfig(record.configFile)
+        if (config.readyFile !== path.join(o.directory, `${runId}.ready.json`)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        assertPrivatePath(config.readyFile)
+        const ready = JSON.parse(fs.readFileSync(config.readyFile, 'utf8'))
+        if (ready.version !== 1 || ready.runId !== runId || ready.leaseId !== record.lease.leaseId) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        return ready.proxyPid
+      },
+      process(pid) {
+        const script = `Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath}} | ConvertTo-Json -Compress`
+        return new Promise(resolve => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+          { encoding: 'utf8', timeout: 8000, windowsHide: true, maxBuffer: 65536 }, (error, stdout) => {
+            if (error) return resolve(null)
+            try { resolve(JSON.parse(stdout)) } catch { resolve(null) }
+          }))
+      },
+    })
     try {
       const after = host.current?.()
       const managed = observation.chats.filter(chat => typeof chat.meta.bridgeRunId === 'string'
