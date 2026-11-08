@@ -5,7 +5,7 @@ import type { BridgeRequestAuthorization } from './contract.ts'
 
 export const CODEX_RESPONSES_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 const refused = (): never => { throw Object.assign(new Error('This Claude Code request is unsupported by the Codex adapter.'), { status: 400, code: 'bridge-policy-refused' }) }
-export interface ProviderFailureSummary { stage: 'http' | 'transport' | 'stream' | 'policy'; status?: number; category?: string; parameter?: string; model?: string; effort?: string }
+export interface ProviderFailureSummary { stage: 'http' | 'transport' | 'stream' | 'policy'; status?: number; category?: string; parameter?: string; model?: string; effort?: string; mediaType?: 'event-stream' | 'json' | 'html' | 'text' | 'other' | 'missing' }
 const failures = new WeakMap<Error, ProviderFailureSummary>()
 export const providerFailureSummary = (error: unknown): ProviderFailureSummary => error instanceof Error && failures.has(error) ? failures.get(error)! : { stage: 'stream' }
 const unavailable = (summary: ProviderFailureSummary = { stage: 'stream' }): never => {
@@ -111,6 +111,8 @@ export function fromResponses(value: unknown): AdapterReply {
 }
 
 export async function readCompletedResponse(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
+  const type = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase()
+  const mediaType: ProviderFailureSummary['mediaType'] = !type ? 'missing' : type === 'text/event-stream' ? 'event-stream' : type === 'application/json' ? 'json' : type === 'text/html' ? 'html' : type === 'text/plain' ? 'text' : 'other'
   if (!response.ok) {
     let raw = ''
     if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await reader.read(); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } finally { await reader.cancel().catch(() => {}); reader.releaseLock() } }
@@ -123,9 +125,9 @@ export async function readCompletedResponse(response: Response, signal: AbortSig
     } catch { /* Never retain arbitrary upstream body or message. */ }
     return unavailable({ stage: 'http', status: response.status, category, ...(parameter ? { parameter } : {}) })
   }
-  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) return unavailable({ stage: 'http', status: response.status, category: 'non-stream-response' })
+  if (!response.body) return unavailable({ stage: 'http', status: response.status, category: 'empty-response', mediaType })
   const reader = response.body.getReader(), decoder = new TextDecoder()
-  let pending = '', bytes = 0, completed: Record<string, unknown> | null = null
+  let pending = '', sample = '', bytes = 0, completed: Record<string, unknown> | null = null
   try {
     for (;;) {
       if (signal.aborted) return unavailable()
@@ -133,7 +135,9 @@ export async function readCompletedResponse(response: Response, signal: AbortSig
       if (chunk.done) break
       bytes += chunk.value.byteLength
       if (bytes > 64 * 1024 * 1024) return unavailable()
-      pending = (pending + decoder.decode(chunk.value, { stream: true })).replaceAll('\r\n', '\n')
+      const decoded = decoder.decode(chunk.value, { stream: true })
+      sample = (sample + decoded).slice(0, 8192)
+      pending = (pending + decoded).replaceAll('\r\n', '\n')
       let at: number
       while ((at = pending.indexOf('\n\n')) !== -1) {
         const frame = pending.slice(0, at); pending = pending.slice(at + 2)
@@ -141,11 +145,16 @@ export async function readCompletedResponse(response: Response, signal: AbortSig
         if (!data || data === '[DONE]') continue
         let event: Record<string, unknown>
         try { event = record(JSON.parse(data)) } catch { return unavailable() }
-        if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') return unavailable()
+        if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') return unavailable({ stage: 'stream', category: event.type, mediaType })
         if (event.type === 'response.completed') completed = record(event.response)
       }
     }
-    if (!completed || signal.aborted) return unavailable()
+    if (!completed || signal.aborted) {
+      let category = signal.aborted ? 'aborted' : 'missing-completed-event'
+      if (!signal.aborted && /^\s*(?:<!doctype html|<html)/i.test(sample)) category = /cf-chl|just a moment|cloudflare/i.test(sample) ? 'html-challenge' : 'html-response'
+      else if (!signal.aborted && /^\s*[{[]/.test(sample)) category = 'json-response'
+      return unavailable({ stage: 'stream', status: response.status, category, mediaType })
+    }
     return completed
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
 }
