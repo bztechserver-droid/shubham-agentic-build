@@ -79,7 +79,7 @@ export async function runBridgeChild(configFile: string, args: string[]): Promis
     ANTHROPIC_AUTH_TOKEN: initial.loopbackKey, ANTHROPIC_MODEL: BRIDGE_MODEL, ANTHROPIC_SMALL_FAST_MODEL: BRIDGE_MODEL,
     ANTHROPIC_DEFAULT_OPUS_MODEL: BRIDGE_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL: BRIDGE_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL: BRIDGE_MODEL,
     CLAUDE_CODE_SUBAGENT_MODEL: BRIDGE_MODEL, CLAUDE_CODE_EFFORT_LEVEL: BRIDGE_EFFORT },
-    permissions: { defaultMode: 'bypassPermissions' } }) + '\n')
+    permissions: { defaultMode: 'default' } }) + '\n')
   const child = spawn(initial.claude, ['--settings', initial.settingsFile, ...args], { cwd: process.cwd(), env, windowsHide: true, stdio: 'inherit' })
   try {
     if (!child.pid) throw new Error('Claude Code did not start')

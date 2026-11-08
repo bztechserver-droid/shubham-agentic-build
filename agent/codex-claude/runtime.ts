@@ -72,7 +72,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       if (record.version !== 1 || !safeId(record.runId) || name !== `${record.runId}.run.json` || !record.lease?.leaseId?.startsWith('bridge-')
         || !['starting', 'running', 'ended', 'released'].includes(record.state)
         || path.resolve(record.configFile) !== path.join(path.resolve(o.directory), `${record.runId}.child.json`)) throw executionHttpError('execution-intent-uncertain', 'runtime')
-      if (record.state !== 'released') { o.manager?.bridgeCredentials.protect(record.lease.leaseId); runs.set(record.runId, record) }
+      if (record.state === 'released') {
+        if (!record.proof) throw executionHttpError('execution-intent-uncertain', 'runtime')
+        ownership.released(record.lease, record.proof)
+      } else o.manager?.bridgeCredentials.protect(record.lease.leaseId)
+      // Keep completed tombstones across restart, without re-protecting or adopting their consumers.
+      runs.set(record.runId, record)
     }
   }
   const broker = o.manager ? createCodexBridgeCredentialBroker({ source: o.manager.bridgeCredentials, currentBinding: current,
@@ -137,6 +142,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const record = runs.get(request.runId)
     if (!record || !isDeepStrictEqual(record.lease.request, request)) return { state: 'unknown' }
     try {
+      if (record.state === 'released') return record.proof ? ownership.released(record.lease, record.proof) : { state: 'unknown' }
       const observed = await physical(record)
       if (observed.state === 'unknown') ownership.invalidate(record.runId)
       return observed
@@ -161,6 +167,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(0, '127.0.0.1', () => resolve()) })
     const address = server.address(); if (!address || typeof address === 'string') throw executionHttpError('execution-capability-required', 'runtime'); port = address.port
     for (const record of runs.values()) {
+      if (record.state === 'released') continue
       const observed = await observe(record.lease.request)
       if (observed.state === 'ended') { queueRetirement(record); continue }
       if (observed.state !== 'running') continue

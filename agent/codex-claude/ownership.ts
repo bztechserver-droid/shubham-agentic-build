@@ -60,6 +60,17 @@ export class BridgeOwnership {
     const receipt = this.retirements.get(lease.leaseId)
     return receipt && this.canRetire(lease, proof, receipt.observation) ? receipt.observation : null
   }
+  /** Called only for an owner-only durable record saved AFTER confirmed process end
+   * and manager release. This is a stopped-status tombstone, never a new retirement
+   * token or permission to run, dispatch, acquire, adopt or release anything. */
+  released(lease: CodexBridgeLease, proof: BridgeActualRuntimeProof): BridgeOwnerObservation {
+    this.validate(lease, proof)
+    if (proof.version !== 1 || proof.policy?.model !== 'gpt-6.1-sol' || proof.policy.effort !== 'max' || proof.policy.allRequestPurposes !== true
+      || ![proof.proxy?.pid, proof.proxy?.createdAtMs, proof.claude?.pid, proof.claude?.createdAtMs].every(value => Number.isSafeInteger(value) && value > 0)
+      || proof.proxy.pid === proof.claude.pid) return mismatch()
+    this.invalidate(lease.request.runId)
+    return Object.freeze({ state: 'ended' as const })
+  }
   canRetire(lease: CodexBridgeLease, proof: BridgeActualRuntimeProof, observed: BridgeOwnerObservation): boolean {
     try {
       const receipt = this.retirements.get(lease.leaseId)
