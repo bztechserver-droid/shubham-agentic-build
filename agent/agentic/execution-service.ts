@@ -1,10 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
+import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, sameExecution, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
 import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
 import { ExecutionCoordinator, type ExecutionSourceFence, type ExecutionTargetObservation, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
-import { ExecutionIntentLedger, scopeDigest, type ExecutionIntentScope } from './execution-intents.ts'
+import { ExecutionIntentLedger, scopeDigest, selectionFingerprint, type ExecutionIntentScope, type ExecutionIntent } from './execution-intents.ts'
 import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
 import { sourceHash } from './switch-fence.ts'
 import { createBridgeRuntime, type BridgeRuntimeOptions } from '../codex-claude/runtime.ts'
@@ -23,6 +23,29 @@ export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
 interface FenceState {
   scope: ExecutionIntentScope; expected: ExecutionSnapshot; next: ExecutionSnapshot | null;
   floorFile: string; floorHash: string; source: { assertCurrent(): void; finish(committed: boolean, changed: boolean): void };
+}
+export interface ExecutionToolIntent {
+  version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest;
+  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply;
+}
+/** Recover only the FIRST unused open of an exact, authoritatively reconciled selection.
+ * This is called by the explicit open POST, never by GET or an ambiguous started operation. */
+export function confirmedPreparedToolSelection(intent: ExecutionToolIntent, parent: ExecutionIntent | null, child: ExecutionIntent | null): ExecutionSelectionReply {
+  const refuse = (): never => { throw executionHttpError('execution-intent-uncertain', 'open') }
+  if (intent.openIssued || intent.reply || !intent.request || parent?.kind !== 'selection' || child?.kind !== 'open'
+    || parent.state !== 'committed' || !parent.plan || child.state !== 'ready' || child.lease || child.actual || child.dimensions
+    || scopeDigest(parent.scope) !== scopeDigest(intent.scope) || scopeDigest(child.scope) !== scopeDigest(intent.scope)
+    || parent.id !== intent.request.selectionIntentId || parent.fingerprint !== selectionFingerprint(intent.scope, intent.request)
+    || parent.plan.stamp.selectionIntentId !== parent.id || parent.plan.stamp.openIntentId !== child.id
+    || child.selectionIntentId !== parent.id || child.runId !== parent.plan.runId) return refuse()
+  assertExecutionCAS(intent.expected, intent.request.expected)
+  assertExecutionCAS(parent.plan.binding, child.binding)
+  if (!sameExecution(intent.request.target, child.binding.execution)) return refuse()
+  if (intent.selected && (intent.selected.openIntentId !== child.id || intent.selected.selectionIntentId !== parent.id)) return refuse()
+  if (intent.selected) assertExecutionCAS(intent.selected.committed, child.binding)
+  return { version: 1, selectionIntentId: parent.id,
+    state: sameExecution(intent.expected.execution, child.binding.execution) ? 'unchanged' : 'committed',
+    committed: child.binding, openIntentId: child.id }
 }
 export function createExecutionService(o: ExecutionServiceOptions) {
   const runtime = createBridgeRuntime(o), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
@@ -137,16 +160,26 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       if (!executionIntentId(operationId)) throw executionHttpError('execution-invalid', 'open')
       await ensure()
       const file = path.join(o.directory, `${operationId}.tool.json`)
-      type ToolIntent = { version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest; selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply }
-      let intent: ToolIntent
+      let intent: ExecutionToolIntent
       if (fs.existsSync(file)) {
-        intent = JSON.parse(fs.readFileSync(file, 'utf8')) as ToolIntent
+        intent = JSON.parse(fs.readFileSync(file, 'utf8')) as ExecutionToolIntent
         if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope)) throw executionHttpError('execution-intent-conflict', 'open', operationId)
         const id = intent.selected?.openIntentId ?? intent.reply?.openIntentId ?? intent.request?.selectionIntentId
         if (!id) throw executionHttpError('execution-intent-uncertain', 'open', operationId)
         const status = await coordinator!.status(scope, id)
         if (status.kind === 'open' && status.state === 'running' && status.actual && status.committed) return {
           executionVersion: 1, openIntentId: id, state: 'already-running', committed: status.committed, actual: status.actual }
+        const selectionStatus = !intent.openIssued && intent.request
+          ? status.kind === 'selection' ? status : await coordinator!.status(scope, intent.request.selectionIntentId) : null
+        if (selectionStatus?.kind === 'selection' && selectionStatus.state === 'committed' && selectionStatus.openIntentId) {
+          const parent = ledger!.get(scope, selectionStatus.intentId), child = ledger!.get(scope, selectionStatus.openIntentId)
+          intent.selected = confirmedPreparedToolSelection(intent, parent, child)
+          assertExecutionCAS(intent.selected.committed, o.state(scope).binding)
+          actor(scope)
+          // Persist the no-replay fence BEFORE dispatching the one existing versioned open.
+          intent.openIssued = true; writePrivateAtomic(file, JSON.stringify(intent) + '\n')
+          return coordinator!.open(scope, { executionVersion: 1, openIntentId: intent.selected.openIntentId, expectedExecution: intent.selected.committed })
+        }
         throw executionHttpError('execution-intent-uncertain', 'open', id)
       }
       const state = o.state(scope)
