@@ -829,20 +829,13 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return
       const w = Math.max(20, Math.min(Math.floor(cols), 500))
       const h = Math.max(5, Math.min(Math.floor(rows), 200))
+      // A viewer joins with a replay and sends its size on every ChatUI -> TUI mount.
+      // Do not shrink/restore an unchanged PTY: Codex reflows its entire history, and
+      // a delayed restore could also overwrite a newer, genuine layout change.
+      if (w === c.size.cols && h === c.size.rows) return
       try {
-        if (w === c.size.cols && h === c.size.rows) {
-          // Same size: nudge it, so the TUI repaints the whole screen for a page that just joined.
-          c.pty.resize(w - 1, h)
-          c.screen.resize(w - 1, h)
-          setTimeout(() => {
-            if (c.exited) return
-            c.pty.resize(w, h)
-            c.screen.resize(w, h)
-          }, 60).unref()
-        } else {
-          c.pty.resize(w, h)
-          c.screen.resize(w, h)
-        }
+        c.pty.resize(w, h)
+        c.screen.resize(w, h)
         c.size = { cols: w, rows: h }
       } catch {
         // Exited meanwhile.
