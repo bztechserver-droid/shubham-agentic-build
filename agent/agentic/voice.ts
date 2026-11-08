@@ -495,8 +495,8 @@ export function createVoice(deps: VoiceDeps): Voice {
     async http(r) {
       const { method, rest } = r
       if (method === 'POST' && rest === '/pair-code') {
-        // Making a code takes his signed tap from a registered approval device: a paired phone can talk to the Assistant, and through it to everything.
-        if (!deps.proof) throw apiError(503, 'Pairing needs a registered approval device (Settings › Approval device)')
+        // A phone-app pair code requires the current CRM administrator session (proof supplied by index.ts).
+        if (!deps.proof) throw apiError(503, 'Pairing requires the CRM administrator session; sign in on the app page.')
         const who = deps.proof(r.body, r)
         deps.log?.info(`voice: a pair code was made (${who})`)
         return pairCode()

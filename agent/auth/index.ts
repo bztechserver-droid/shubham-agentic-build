@@ -71,8 +71,6 @@ interface FileShape {
   admins: string[]
   require: AuthRequire
   phoneExempt: boolean
-  /** F-124 (F-122's ownerCodes, generalised): "Sign-in is enough (no approval device)": sbskrrt, signed in, is accepted wherever a registered device's signature is asked for (default on). */
-  signInEnough: boolean
   trial: Trial | null
   sessions: SessionRow[]
   directory: AuthUser[]
@@ -82,7 +80,7 @@ interface FileShape {
 }
 
 function emptyFile(): FileShape {
-  return { version: 1, admins: [SBSKRRT_ID], require: 'off', phoneExempt: true, signInEnough: true, trial: null, sessions: [], directory: [], directoryAt: null, migrated: null }
+  return { version: 1, admins: [SBSKRRT_ID], require: 'off', phoneExempt: true, trial: null, sessions: [], directory: [], directoryAt: null, migrated: null }
 }
 
 const userOf = (v: unknown): AuthUser | null =>
@@ -98,8 +96,7 @@ export function parseFile(raw: unknown): FileShape {
   }
   if (isRequire(raw.require)) f.require = raw.require
   if (raw.phoneExempt === false) f.phoneExempt = false
-  // F-122 wrote it as ownerCodes: an old file that said off still says off.
-  if (raw.signInEnough === false || raw.ownerCodes === false) f.signInEnough = false
+  // Legacy ownerCodes/signInEnough flags are deliberately ignored (F158).
   const t = raw.trial
   if (isObject(t) && isRequire(t.previous) && typeof t.until === 'number' && str(t.sid)) f.trial = { previous: t.previous, until: t.until, sid: t.sid }
   if (Array.isArray(raw.sessions)) {
@@ -152,10 +149,6 @@ export interface Auth {
   admins(): readonly string[]
   /** The paired phone app keeps its device key instead of a sign-in. */
   phoneExempt(): boolean
-  /** F-124: whether a signed-in sbskrrt is accepted in place of an approval device's signature (the setting; the caller must also be the owner). */
-  signInEnough(): boolean
-  /** F-122's name for the same thing. */
-  ownerCodes(): boolean
   status(c: Caller): AuthStatus
   signIn(c: Caller, body: unknown, secure: boolean): Promise<SignedIn>
   /** Ends this session; the cookie to clear it. */
@@ -314,8 +307,8 @@ export function createAuth(o: AuthOptions): Auth {
       person: c.person,
       session: c.person ? sessionInfo(c.sid) : null,
       canPublish: c.person?.canSeeAll === true,
-      mayShowCode: c.person?.canSeeAll === true && f.signInEnough,
-      mayApprove: c.person?.canSeeAll === true && f.signInEnough,
+      mayShowCode: c.person?.canSeeAll === true && !!sessionInfo(c.sid),
+      mayApprove: !!c.person && !!sessionInfo(c.sid),
       needsSignIn: !c.person && !c.machine && needsSignIn(c.via),
     }
   }
@@ -414,7 +407,7 @@ export function createAuth(o: AuthOptions): Auth {
 
   function settingsOf(): AuthSettings {
     settleTrial()
-    return { require: require(), phoneExempt: f.phoneExempt, signInEnough: f.signInEnough, ownerCodes: f.signInEnough, trial: f.trial ? { previous: f.trial.previous, until: new Date(f.trial.until).toISOString() } : null }
+    return { require: require(), phoneExempt: f.phoneExempt, trial: f.trial ? { previous: f.trial.previous, until: new Date(f.trial.until).toISOString() } : null }
   }
 
   /** Only a signed-in admin: nobody at an open app, no one else, may change how people sign in. */
@@ -435,15 +428,8 @@ export function createAuth(o: AuthOptions): Auth {
     if (b.require !== undefined && !isRequire(b.require)) throw apiError(400, "require is off, remote or all")
     if (b.phoneExempt !== undefined && typeof b.phoneExempt !== 'boolean') throw apiError(400, 'phoneExempt is true or false')
     settleTrial()
-    if (b.ownerCodes !== undefined && typeof b.ownerCodes !== 'boolean') throw apiError(400, 'ownerCodes is true or false')
-    if (b.signInEnough !== undefined && typeof b.signInEnough !== 'boolean') throw apiError(400, 'signInEnough is true or false')
-    if (typeof b.ownerCodes === 'boolean' && typeof b.signInEnough === 'boolean' && b.ownerCodes !== b.signInEnough) throw apiError(400, 'ownerCodes is the old name of signInEnough: send one, or both the same')
-    const enough = typeof b.signInEnough === 'boolean' ? b.signInEnough : typeof b.ownerCodes === 'boolean' ? b.ownerCodes : undefined
+    if (b.ownerCodes !== undefined || b.signInEnough !== undefined) throw Object.assign(apiError(410, 'Approval-device settings were removed; CRM login is required.'), { code: 'approval-devices-retired' })
     if (typeof b.phoneExempt === 'boolean') f.phoneExempt = b.phoneExempt
-    if (enough !== undefined && enough !== f.signInEnough) {
-      f.signInEnough = enough
-      log?.warn(`${who.username} turned "Sign-in is enough (no approval device)" ${enough ? 'ON' : 'off (approval devices only)'}`)
-    }
     if (isRequire(b.require) && b.require !== f.require) {
       const raising = order(b.require) > order(f.require)
       if (raising) {
@@ -503,8 +489,6 @@ export function createAuth(o: AuthOptions): Auth {
     isAdmin: admin,
     admins: () => f.admins,
     phoneExempt: () => f.phoneExempt,
-    signInEnough: () => f.signInEnough,
-    ownerCodes: () => f.signInEnough,
     status,
     signIn,
     signOut,

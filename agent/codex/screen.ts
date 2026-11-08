@@ -69,6 +69,36 @@ export function composer(lines: readonly string[]): { text: string; collapsed: b
   return null
 }
 
+/** Only for a transaction that already observed an empty composer and owns all input.
+ * A narrow viewport can scroll the prompt glyph away while the end of a long paste remains.
+ * Never use this to decide that an unknown initial screen is empty or safe to paste into.
+ */
+export function ownedComposerTail(lines: readonly string[], pasted: string): { text: string; collapsed: false } | null {
+  if (menuOnScreen(lines)) return null
+  let footer = -1
+  for (let i = lines.length - 1; i >= 0; i--) if (COMPOSER_FOOTER.test(lines[i])) { footer = i; break }
+  if (footer < 3 || lines.slice(footer + 1).some(l => l.trim() && !COMPOSER_FOOTER.test(l) && !/\b(?:context left|tokens left|f2 to view)\b/i.test(l))) return null
+  const body = lines.slice(0, footer)
+  if (body.some(l => /^\s*(?:[\u2022\u25a0]|Working\b|Worked for\b)/.test(l))) return null
+  const first = body.findIndex(l => l.trim())
+  const prompt = INPUT_LINE.exec(body[first] ?? '')
+  // Native Codex repeats its prompt at the first visible row when scrolling a draft.
+  // Remove that ONE decoration, retaining literal glyphs in every continuation row.
+  const candidates = prompt ? [[prompt[1], ...body.slice(first + 1)].join('\n').trim()] : [body.join('\n').trim()]
+  // The clipped first row can retain a cell during a wide-character redraw. Only
+  // an intact multi-row continuation suffix may prove drain; never delete a
+  // character in the middle or search arbitrary output for a matching fragment.
+  const rest = body.slice(first + 1)
+  if (prompt && rest.filter(l => l.trim()).length >= 2) candidates.push(rest.join('\n').trim())
+  const expected = pasted.replace(/\s+/g, '')
+  for (const text of candidates) {
+    const visible = text.replace(/\s+/g, '')
+    // A repeated prefix must not masquerade as the fully drained end of a paste.
+    if (visible.length >= 32 && expected.length > visible.length && expected.indexOf(visible) === expected.length - visible.length) return { text, collapsed: false }
+  }
+  return null
+}
+
 /** Whether Codex is working on a turn: its "Working (12s • esc to interrupt)" line. */
 export function working(lines: readonly string[]): boolean {
   return bottom(lines, 14).some(l => WORKING_LINE.test(l))

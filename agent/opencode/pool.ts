@@ -43,6 +43,7 @@ interface Live {
   text: string
   draft: boolean
   delivering?: boolean
+  generation?: string
   lastActive: number
   refreshing: boolean
   refreshAgain: boolean
@@ -240,14 +241,24 @@ export function createOpenCodePool(o: OpenCodePoolOptions) {
       const c = live.get(sid)
       if (!c) return 'gone'
       if (c.delivering || c.info.state === 'running' || (opt?.refuseDraft && c.draft)) return 'blocked'
+      if (opt?.guard?.() === false) return 'blocked'
       c.failure = null
       c.delivering = true
-      change(sid, 'running')
-      const sending = c.backend.send(text).then(() => { void refresh(sid); return 'sent' as const }, error => { failure(sid, error); return 'unconfirmed' as const })
+      const sending = (async () => {
+        if (opt?.authorize && !(await opt.authorize('submit').catch(() => false))) return 'blocked' as const
+        if (opt?.guard?.() === false || live.get(sid) !== c) return 'blocked' as const
+        change(sid, 'running')
+        return c.backend.send(text).then(() => { void refresh(sid); return 'sent' as const }, error => { failure(sid, error); return 'unconfirmed' as const })
+      })()
         .finally(() => { c.delivering = false })
+      if (opt?.waitForOutcome) return sending
       let timer: ReturnType<typeof setTimeout> | undefined
       try { return await Promise.race([sending, new Promise<'unconfirmed'>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
       finally { clearTimeout(timer) }
+    },
+    generation(sid) {
+      const c = live.get(sid)
+      return c ? c.generation ??= randomBytes(16).toString('hex') : null
     },
     typeWhenReady(sid, text, opt) {
       const c = live.get(sid); if (!c) return
@@ -271,6 +282,7 @@ export function combinePools(base: ChatPool, extra: ChatPool): ChatPool {
     info: sid => owner(sid).info(sid), live: () => [...base.live(), ...extra.live()], states: () => ({ ...base.states(), ...extra.states() }), byKey: key => extra.byKey(key) ?? base.byKey(key),
     attach: (sid, v) => owner(sid).attach(sid, v), input: (sid, d) => owner(sid).input(sid, d), resize: (sid, c, r) => owner(sid).resize(sid, c, r), read: (sid, n) => owner(sid).read(sid, n), screen: sid => owner(sid).screen(sid), asking: sid => owner(sid).asking(sid), drafting: sid => owner(sid).drafting(sid),
     deliver: async (sid, t, opt) => owner(sid).deliver?.(sid, t, opt) ?? 'unconfirmed',
+    generation: sid => owner(sid).generation?.(sid) ?? null,
     type: (sid, t, opt) => owner(sid).type(sid, t, opt), typeWhenReady: (sid, t, opt) => owner(sid).typeWhenReady(sid, t, opt), kill: (sid, why) => owner(sid).kill(sid, why), waitStopped: sid => base.waitStopped?.(sid) ?? Promise.resolve(), adopt: (a, p, r) => base.adopt(a, p, r), activity: sid => owner(sid).activity(sid), press: (sid, d) => owner(sid).press(sid, d), closeAll() { extra.closeAll(); base.closeAll() },
   }
 }

@@ -150,10 +150,31 @@ export interface PreviewsAnswer {
 /** POST /floors/:f/agents/:a/say */
 export interface SayRequest {
   text: string
+  /** Stable across double taps, observation retries and reconnects. Never replace after uncertainty. */
+  messageId?: string
+  /** The binding shown when composing; null means the agent did not yet have a conversation. */
+  expectedSessionId?: string | null
 }
+
+export type DeliveryState = 'pending' | 'sent' | 'blocked' | 'unconfirmed' | 'gone'
+/** Sent means native submission/queue acknowledgement, not a completed model response. */
+export interface DeliveryReceipt {
+  id: string
+  state: DeliveryState
+  sessionId: string | null
+  /** Opaque runtime incarnation, never a native session pointer or credential. */
+  generation: string | null
+  started: boolean
+  updatedAt: string
+}
+/** GET /floors/:f/agents/:a/deliveries/:messageId, with the same typing ACL and original actor. */
+export interface DeliveryAnswer { receipt: DeliveryReceipt }
+/** GET /floors/:f/agents/:a/deliveries before sending to a possibly older hub. */
+export interface DeliveryCapabilities { version: 1; idempotent: true; expectedSessionId: true; receipts: true }
 
 export interface SayAnswer {
   ok: true
-  /** The chat wasn't running: it was started (or resumed) and the message is typed once it is ready. */
+  /** The chat wasn't running: it was started (or resumed) before accepting the message. */
   started: boolean
+  receipt?: DeliveryReceipt
 }

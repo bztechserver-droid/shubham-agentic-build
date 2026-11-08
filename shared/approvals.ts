@@ -1,4 +1,3 @@
-import type { Signed } from './approval-sign.ts'
 import type { ChatMenu } from './chat.ts'
 import type { ChatState } from './agentic.ts'
 
@@ -57,15 +56,12 @@ export interface AnswerRequest {
   sessionId: string
   id: string
   n: number
-  /** The registered approval device's signature (shared/approval-sign.ts). */
-  sig?: Signed
 }
 
-/** POST /agentic/approvals/cancel: Esc into the prompt `id` of that chat (only when its footer says "Esc to cancel"). Signed like an answer. */
+/** POST /agentic/approvals/cancel: Esc into the prompt `id` of that chat (only when its footer says "Esc to cancel"). Authorized by the current CRM session and target rights. */
 export interface CancelRequest {
   sessionId: string
   id: string
-  sig?: Signed
 }
 
 /** POST /agentic/send-as-me: his words, typed into the chat as plain input. */
@@ -75,8 +71,10 @@ export interface SendAsMeRequest {
   text: string
   /** The prepared card this came from (it is dropped once sent). */
   card?: string
-  /** The registered approval device's signature over the target and the words. */
-  sig?: Signed
+  /** F157: stable delivery correlation ID; never mint another after an uncertain result. */
+  messageId?: string
+  /** The conversation binding captured when composing. Null means no existing conversation. */
+  expectedSessionId?: string | null
 }
 
 /** F-081: "Apply new builds automatically when quiet" (auto-update.json on the hub; the guard applies, this agent keeps the switch). */

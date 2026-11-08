@@ -1,6 +1,15 @@
+import { requireCrmHuman, describeHuman, createPromptActions, APPROVAL_GRANT_MS, isNativeApprovalCommit, nativeApprovalSnapshot, type NativeApprovalProof, type NativeApprovalSnapshot, type NativeApprovalCommit } from './human-session.ts'
 import { createPcControlStore, isPcControl, immutablePcControl, pcControlError, pcControlRevision, assertPcControlExpected, checkedPcControlNamespace, type PcControlKnownDevice } from './pc-control.ts'
 import type { PcControlAnswer, PcControlWorkspace, PcControlCapability, PcControlSlot } from '../../shared/pc-control.ts'
-import { requireRunningEngine, engineUpdateRequired, type RuntimeEngine } from './runtime-engine.ts'
+import { executionIdentityOf, requireLegacyExecution, requireRunningEngine, engineUpdateRequired, type RuntimeEngine } from './runtime-engine.ts'
+import { assertExecutionCAS, normalizeExecution, snapshotAgentExecution, type ExecutionIdentity } from '../../shared/chat-execution.ts'
+import { createExecutionService } from './execution-service.ts'
+import type { ExecutionIntentScope } from './execution-intents.ts'
+import { loadSession } from '../claude/index.ts'
+import { sourceHash } from './switch-fence.ts'
+import { forkClaudeExecution } from '../codex-claude/fork.ts'
+import { executionHttpError, executionIntentId, requireExecutionCapabilityQuery, requireExecutionOpenRequest,
+  requireExecutionSelectionRequest, type ExecutionCapabilityReply } from '../../shared/chat-execution-http.ts'
 import { prepareConversation, type PreparedConversation } from '../opencode/switch.ts'
 import { interchange } from '../opencode/backend.ts'
 import { createOpenCodePool, combinePools, type OpenCodePoolOptions } from '../opencode/pool.ts'
@@ -48,7 +57,9 @@ import {
   type TuneAnswer,
   type TuneRequest,
 } from '../../shared/agentic.ts'
-import type { PreviewsAnswer, SayAnswer } from '../../shared/chat.ts'
+import type { PreviewsAnswer, SayAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
+import { createDeliveryReceipts } from './delivery-receipts.ts'
+import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
 import type { CrmAnswer, CrmCheck, CrmSessionInfo } from '../../shared/crm.ts'
 import type { MemoryKind } from '../../shared/memory.ts'
@@ -80,12 +91,11 @@ import { FAST_TOOLS } from './fast-tools-list.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
-import { cleanOrigin, createDeviceStore } from './approval-devices.ts'
-import { createRecovery as createDeviceRecovery, windowsElevation, type Elevation } from './approval-recovery.ts'
+import type { Elevation } from './approval-recovery.ts'
 import { createAutoUpdate } from './auto-update.ts'
 import type { WaTools } from '../whatsapp/index.ts'
 import { waTool } from '../whatsapp/tools.ts'
-import type { DevicesAnswer, PublicJwk, RecoveryFinished, RecoveryStarted, SignedKind } from '../../shared/approval-sign.ts'
+import type { SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
 import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
@@ -162,7 +172,6 @@ const BROADCAST_COOLDOWN_MS = 10_000
 const MAX_RELAY_TEXT = 10_000
 /** F-050: the longest message the chat view types into a chat, and how long a new chat is taken to be at its start questions. */
 const MAX_SAY_TEXT = 20_000
-const SAY_FRESH_MS = 20_000
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** F-021: the hub's state to its members at least this often (their catch-up runs off it). */
 const STATE_EVERY_MS = 30_000
@@ -297,9 +306,9 @@ export interface AgenticOptions {
   reapEveryMs?: number
   /** F-078: the newer build waiting for Update now, if there is one (main.ts reads it off the build). */
   newerBuild?: () => string | null
-  /** F-074: tests: what stands in for the registered device's signature on a pair code. */
+  /** @deprecated Inert compatibility input. Human actions always use the real CRM cookie session, never an injected proof. */
   voiceProof?: (body: unknown, r?: { caller?: Caller; headers: IncomingMessage['headers'] }) => string
-  /** F-076 recovery: the Windows administrator prompt that lets a person add an approval device from this PC when none can sign (tests: a fake). */
+  /** @deprecated Inert compatibility input: approval-device enrollment/recovery is retired; no elevation is run. */
   recoveryElevation?: Elevation
   /** F-080: the speech service's stream (Whisper on the hub), offered to the phone at /voice/speech with its device key. */
   speech?: (ws: WsSocket) => void
@@ -351,6 +360,8 @@ export interface Agentic {
   callTool(key: string, name: string, args: unknown): Promise<string>
   /** F-118, for the test that holds the access policy and the route table equal: each route as 'METHOD <regex source>'. */
   routeKeys(): string[]
+  /** Separately audited profile routes: explicit per-chat owner rules live in this module. */
+  executionRouteKeys(): string[]
   /** F-097: a member PC's request to the hub's Common Drive over the link (throws when there is no hub or it can't be reached). */
   driveRequest(body: unknown, timeoutMs?: number): Promise<unknown>
   /** F-021: an 'agentic' stream another of the hub's PCs opened (meta.from says which). */
@@ -375,8 +386,8 @@ export interface Agentic {
   /** F-075: the chat host changes with an update: the open chats are written down (so the new agent resumes them), then ended in the host. */
   retireChatHost(): Promise<void>
   /**
-   * F-079: that a request carries his approval device's signature over `kind` and `fields` (or the old way is switched
-   * on): who it was, for a log line; throws 401/403 otherwise. WhatsApp's sends use it (kind 'wa-send').
+   * F158: current CRM-session human for an audit line; admin-only for pairing/auto-update/WhatsApp.
+   * Legacy fields/signature arguments are ignored, never a second authorization path.
    */
   humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown, r?: ProofRequest): string
   close(): void
@@ -451,6 +462,7 @@ interface Replica {
 }
 
 export function createAgentic(o: AgenticOptions): Agentic {
+  const approvalNativeRuntimes = new Map<string, { fingerprint: string; generation: string }>()
   const log = o.log
   const team = o.team
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
@@ -539,22 +551,47 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  let executionService: ReturnType<typeof createExecutionService> | null = null
+  const executionAuthority = {
+    assertCurrent: (request: import('./floors.ts').FloorExecutionCommit) => {
+      if (!executionService) throw executionHttpError('execution-capability-required', 'selection')
+      executionService.authority.assertCurrent(request)
+    },
+    persist: (file: string, text: string) => {
+      if (!executionService) throw executionHttpError('execution-capability-required', 'selection')
+      executionService.authority.persist(file, text)
+    },
+  }
   const hubFloors = createFloorStore(path.join(o.dir, 'floors.json'), () => {
     if (mode() === 'member') return
     emit({ t: 'floors', floors: hubFloors.list() })
     pushState()
-  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
+  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   // F-127: a member's OWN floors, made while the Server could not be reached (floors-local.json). The same store, and 'alone' mode's code, run them. The facade
   // below is the one `floors` every handler already uses: a member's is the local one (it keeps no copy of the Server's floors in a store: that is the replica),
   // the hub's and a PC alone's is the usual one.
   const localFloors = createFloorStore(path.join(o.dir, 'floors-local.json'), () => {
     if (mode() === 'member') emitFloors()
-  }, { defaultEngine: () => defaultsNow().engine ?? '', switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
+  }, { executionAuthority, defaultEngine: () => defaultsNow().engine ?? '', executionDefaults: () => defaultsNow(), switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   const offlineSettings = createOfflineSettings(path.join(o.dir, 'offline.json'))
   const controlFloors = createPcControlStore(path.join(o.dir, 'pc-control.json'), () => { emitFloors(); if (mode() !== 'member') pushState() }, { switchConversation: carryConversation, validateCodexThread: (f, a, t) => assertCodexThreadAvailable(allFloors(), f, a, t) })
   const pickFloors = () => (mode() === 'member' ? localFloors : hubFloors)
   const storeFor = (id: string) => controlFloors.store.get(id) ? controlFloors.store : pickFloors()
+  const controlExecutionUnverified = () => {
+    const store = controlFloors.store
+    // An older store that cannot report profile-aware ownership cannot authorize credential cleanup.
+    return !('hasUnverifiedExecution' in store) || typeof store.hasUnverifiedExecution !== 'function' || store.hasUnverifiedExecution() !== false
+  }
   const floors: FloorStore = {
+    hasUnverifiedExecution: () => pickFloors().hasUnverifiedExecution() || controlExecutionUnverified(),
+    executionState: (f, a) => {
+      if (isPcControl(floorOf(f))) throw immutablePcControl()
+      return pickFloors().executionState(f, a)
+    },
+    commitExecution: request => {
+      if (isPcControl(floorOf(request.floorId))) throw immutablePcControl()
+      return pickFloors().commitExecution(request)
+    },
     list: () => mode() === 'member' ? allFloors() : checkedPcControlNamespace([...pickFloors().list(), ...controlFloors.store.list()]),
     get: id => storeFor(id).get(id) ?? (mode() === 'member' ? replica.floors.find(f => f.id === id && isPcControl(f)) ?? null : null),
     create: (name, as) => pickFloors().create(name, as),
@@ -576,9 +613,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-118: every floor and chat that has no owner is sbskrrt's (the one-time move; it is idempotent, so a chat some older path
   // made without an owner is covered at the next start too). A member keeps no floors of its own: this changes nothing there.
   if (o.auth) {
-    const moved = hubFloors.assignUnowned(SBSKRRT_OWNER)
-    if (moved) log?.info(`F-118: ${moved} floors and chats had no owner; they are sbskrrt's now`)
-    if (!o.auth.migrated()) o.auth.markMigrated()
+    try {
+      const moved = hubFloors.assignUnowned(SBSKRRT_OWNER)
+      if (moved) log?.info(`F-118: ${moved} floors and chats had no owner; they are sbskrrt's now`)
+      if (!o.auth.migrated()) o.auth.markMigrated()
+    } catch (error) {
+      if (!['execution-invalid', 'execution-intent-uncertain'].includes(String((error as { code?: unknown }).code))) throw error
+      log?.warn('Execution metadata is quarantined. Floor bytes and ownership migration remain unchanged.')
+    }
   }
   // F-067: what "Default" means for a chat's model, effort and ultracode, kept on the hub (a member gets a copy with the state).
   const chatDefaults = createDefaultsStore(path.join(o.dir, 'chat-defaults.json'), () => {
@@ -720,7 +762,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   function floorOf(id: string): Floor {
     const f = allFloors().find(x => x.id === id)
-    if (!f) throw apiError(404, 'No such floor')
+    if (!f) { pickFloors().get(id); throw apiError(404, 'No such floor') }
     return f
   }
 
@@ -731,6 +773,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function bySession(sid: string): { floor: Floor; agent: FloorAgent } | null {
+    // A quarantined persisted profile must not become an unbound legacy-Claude session.
+    pickFloors().bySession(sid)
     for (const floor of allFloors()) {
       const agent = floor.agents.find(a => a.sessionId === sid)
       if (agent) return { floor, agent }
@@ -753,6 +797,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Captured before I/O and rechecked by the writer after every async transfer boundary. */
   function controlTransferGuard(peer: LinkPeer, sid: string): () => void {
+    const execution = bySession(sid)
+    if (execution) requireLegacyExecution(execution.agent, defaultsNow())
     if (!validMirrorSid(sid)) throw apiError(400, 'Expected a canonical session id')
     const proof = () => {
       const pin = controlPinnedPc(sid)
@@ -784,6 +830,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function guardPcControlRoute(r: MountRequest, params: string[]) {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(r.method) || r.rest.startsWith('/pc-control')) return
     if (!/^\/floors(?:\/|$)/.test(r.rest)) return
+    // Sending is subject to the existing typing ACL and pinned launch guards, not workspace editing.
+    if (r.method === 'POST' && /^\/floors\/[^/]+\/agents\/[^/]+\/say$/.test(r.rest)) return
     const id = params[0], f = id ? allFloors().find(f => f.id === id) : null
     if (isPcControl(f)) throw immutablePcControl()
     if (isObject(r.body)) {
@@ -943,9 +991,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // ---------------------------------------------------------------------------------------
   // F-134: the engine of an agent, and where a Codex chat's conversation is
 
-  const defaultEngine = (): AgentEngine => defaultsNow().engine ?? ''
   /** The engine an agent really runs: its own setting, else Settings › Chats'. */
-  const engineFor = (agent: FloorAgent): 'claude' | 'codex' | 'opencode' => engineOf(agent.engine, defaultEngine())
+  const engineFor = (agent: FloorAgent): 'claude' | 'codex' | 'opencode' => executionIdentityOf(agent, defaultsNow()).engine
   const isCodexSession = (sid: string): boolean => {
     const at = bySession(sid)
     return !!at && engineFor(at.agent) === 'codex'
@@ -1028,6 +1075,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     idleReapMs: o.idleReapMs,
     reapEveryMs: o.reapEveryMs,
     onEnded: e => {
+      void executionService?.runtime.ended(e.sessionId)
+      approvalNativeRuntimes.delete(e.sessionId)
       // F-134: a Codex chat that ended lets the login go (the last one puts a changed login back to the CRM first, then takes the file out) and its profile.
       if (e.engine === 'codex' && o.codex) {
         removeProfile(o.codex.paths, e.sessionId)
@@ -1084,20 +1133,115 @@ export function createAgentic(o: AgenticOptions): Agentic {
     onChange: () => poolOptions.onChange?.(), onEnded: e => poolOptions.onEnded?.(e),
   })
   const nativeChats = combinePools(createChatPool(poolOptions), openCode.pool)
+  if (o.codex && o.chatHost?.inspect && !o.spawn) {
+    executionService = createExecutionService({ directory: path.join(o.dir, 'codex-claude'), manager: o.codex, host: o.chatHost, self,
+      pool: () => nativeChats, memorySettings: poolOptions.settings,
+      current: request => {
+        try {
+          const at = bySession(request.binding.sessionId!)
+          if (!at || isPcControl(at.floor) || request.targetPcId !== self().id) return false
+          assertExecutionCAS(request.binding, snapshotAgentExecution(at.agent, defaultsNow()))
+          return loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id === request.ownerId
+        } catch { return false }
+      },
+      actor: scope => {
+        const agent = workflowExecutionAgent(scope.floorId, scope.agentId)
+        if (agent.owner?.id !== scope.ownerId || scope.targetPcId !== self().id
+          || agent.homePc !== scope.targetPcId) throw executionHttpError('execution-forbidden', 'authorization')
+      },
+      state: scope => floors.executionState(scope.floorId, scope.agentId),
+      floorFile: () => path.join(o.dir, mode() === 'member' ? 'floors-local.json' : 'floors.json'),
+      commit: request => { floors.commitExecution(request) },
+      target: (scope, profile) => targetExecution(profile, workflowExecutionAgent(scope.floorId, scope.agentId)),
+      launch: request => {
+        const floor = floorOf(request.scope.floorId), agent = workflowExecutionAgent(floor.id, request.scope.agentId)
+        assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
+        const sid = request.binding.sessionId!, cwd = findTranscriptCwd(sid, projectsDir) || codeDirOf(floor)
+        prepareClaudeConfig(cwd, claudeJson)
+        const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief() : '', orderReplies())
+          + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
+        const built = strictConfigFor(o.dir, sid, appMcpServers, mcpRegistryFile, claudeJson, cwd, agent.mcpServers)
+        return { sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath: writeBrief(briefsDir, sid, brief),
+          mcpConfig: built.file, strictMcp: true, model: 'gpt-6.1-sol', effort: 'max', resume: !!findClaudeTranscript(sid, projectsDir), cols: request.cols, rows: request.rows }
+      },
+      seal: async (scope, expected) => {
+        assertExecutionCAS(expected, floors.executionState(scope.floorId, scope.agentId).binding)
+        if (!expected.sessionId || expected.execution.engine === 'opencode') throw executionHttpError('execution-lineage-invalid', 'selection')
+        const token = randomUUID(), file = expected.execution.engine === 'codex'
+          ? expected.codexThread && o.codex ? findRollout(o.codex.paths.home, expected.codexThread) : null
+          : findClaudeTranscript(expected.sessionId, projectsDir)
+        if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
+        switchFences.begin(expected.sessionId, token)
+        if (nativeChats.info(expected.sessionId)) { nativeChats.kill(expected.sessionId, 'execution-selection'); await nativeChats.waitStopped?.(expected.sessionId) }
+        await settled(file)
+        switchFences.snapshot(expected.sessionId, token, file); switchFences.seal(expected.sessionId, token)
+        const digest = sourceHash(file)
+        return { assertCurrent: () => { if (sourceHash(file) !== digest) throw executionHttpError('execution-stale', 'selection') },
+          finish: (committed, changed) => { if (committed && changed) switchFences.retire(expected.sessionId!, token); else switchFences.cancel(expected.sessionId!, token) } }
+      },
+      prepare: async (scope, expected, target) => {
+        const floor = floorOf(scope.floorId), file = expected.execution.engine === 'codex'
+          ? expected.codexThread && o.codex ? findRollout(o.codex.paths.home, expected.codexThread) : null
+          : findClaudeTranscript(expected.sessionId!, projectsDir)
+        if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
+        return forkClaudeExecution({ expected, target, file, cwd: conversationCwd(file) || codeDirOf(floor), projectsDir })
+      },
+    })
+  }
+  let blockedLegacyAdoption = false
+  const assertLegacySid = (sid: string) => {
+    const current = bySession(sid)
+    if (current) requireLegacyExecution(current.agent, defaultsNow())
+  }
+  const legacySidAllowed = (sid: string) => { try { assertLegacySid(sid); return true } catch { return false } }
+  const runtimeSidAllowed = (sid: string) => {
+    try {
+      const at = bySession(sid)
+      if (!at || executionIdentityOf(at.agent, defaultsNow()).profile !== 'codex-in-claude-v1') return legacySidAllowed(sid)
+      const binding = snapshotAgentExecution(at.agent, defaultsNow()), info = nativeChats.info(sid)
+      if (!info?.execution || !executionService?.runtime.matches(binding, info.bridgeRunId)) return false
+      assertExecutionCAS(binding, info.execution); return true
+    } catch { return false }
+  }
   const chats: ChatPool = { ...nativeChats,
-    start: options => { switchFences.assertWritable(options.sessionId); return nativeChats.start(options) },
-    input: (sid, data) => !switchFences.blocked(sid) && nativeChats.input(sid, data),
-    press: (sid, data) => !switchFences.blocked(sid) && nativeChats.press(sid, data),
-    type: (sid, text, options) => !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
-    deliver: async (sid, text, options) => switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed',
-    typeWhenReady: (sid, text, options) => { switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
-    adopt: (info, pty, replay) => { const result = nativeChats.adopt(info, pty, replay); if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery'); return result },
+    beforeAdopt: async info => {
+      const at = bySession(info.sessionId)
+      if (at && executionIdentityOf(at.agent, defaultsNow()).profile === 'codex-in-claude-v1') {
+        const expected = snapshotAgentExecution(at.agent, defaultsNow())
+        assertExecutionCAS(expected, info.execution)
+        if (!executionService || !info.bridgeRunId) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        await executionService.runtime.adopt(expected, info.bridgeRunId)
+      }
+    },
+    start: options => { assertLegacySid(options.sessionId); switchFences.assertWritable(options.sessionId); return nativeChats.start(options) },
+    input: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.input(sid, data),
+    press: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.press(sid, data),
+    type: (sid, text, options) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
+    deliver: async (sid, text, options) => !runtimeSidAllowed(sid) || switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed',
+    attach: (sid, viewer) => runtimeSidAllowed(sid) ? nativeChats.attach(sid, viewer) : null,
+    resize: (sid, cols, rows) => { if (runtimeSidAllowed(sid)) nativeChats.resize(sid, cols, rows) },
+    kill: (sid, why) => runtimeSidAllowed(sid) && nativeChats.kill(sid, why),
+    typeWhenReady: (sid, text, options) => { assertLegacySid(sid); switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
+    adopt: (info, pty, replay) => {
+      try {
+        const at = bySession(info.sessionId)
+        if (at && executionIdentityOf(at.agent, defaultsNow()).profile === 'codex-in-claude-v1') {
+          if (!executionService) throw executionHttpError('execution-capability-required', 'runtime')
+          const expected = snapshotAgentExecution(at.agent, defaultsNow())
+          assertExecutionCAS(expected, info.execution)
+          if (!executionService?.runtime.matches(expected, info.bridgeRunId)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+        } else assertLegacySid(info.sessionId)
+      } catch (error) { blockedLegacyAdoption = true; throw error }
+      const result = nativeChats.adopt(info, pty, replay)
+      if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery')
+      return result
+    },
   }
 
   // F-075: the chats the agent before this one left running in the chat host are taken over at once.
   const adopted: Promise<void> = o.chatHost
-    ? o.chatHost
-        .adopt(chats)
+    ? Promise.resolve(existsSync(path.join(o.dir, 'codex-claude', 'capability.json')) ? executionService?.runtime.ensure() : undefined)
+        .then(() => o.chatHost!.adopt(chats))
         .then(r => {
           // F-134: a Codex chat the host kept running holds the Codex login file: it counts as one of the chats that keep it.
           for (const c of chats.live()) if (c.engine === 'codex') o.codex?.adopt(c.sessionId)
@@ -1110,6 +1254,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   void adopted.then(async () => {
     const cx = o.codex
     if (!cx) return
+    if (blockedLegacyAdoption || floors.hasUnverifiedExecution()) {
+      log?.warn('Execution ownership is unverified; native credential cleanup is deferred until trusted provider adoption.')
+      return
+    }
     for (const floor of floors.list()) for (const agent of floor.agents) {
       if (engineFor(agent) !== 'codex' || !agent.sessionId || agent.codexThread) continue
       const sid = agent.sessionId
@@ -1313,6 +1461,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Starts the agent's chat on this PC (its lease already got). */
   async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+    requireLegacyExecution(agent, defaultsNow())
     assertPcControlTarget(floor, self().id, size)
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
@@ -1482,6 +1631,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * when it is elsewhere and `takeOver` wasn't asked. Answers where it was taken from.
    */
   async function lease(sid: string, who: { id: string; name: string }, takeOver: boolean, agentName: string): Promise<string | undefined> {
+    const bound = bySession(sid)
+    if (bound) requireLegacyExecution(bound.agent, defaultsNow())
     const pinned = bySession(sid)
     if (pinned) assertPcControlTarget(pinned.floor, who.id, { takeOver })
     switchFences.assertWritable(sid)
@@ -1708,10 +1859,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const link = needHub()
     const floor = floorOf(floorId)
     const agent = agentOf(floor, agentId)
+    requireLegacyExecution(agent, defaultsNow())
     let sid = agent.sessionId
     assertPcControlTarget(floor, self().id, req)
     if (sid) switchFences.assertWritable(sid)
-    await requirePeerEngine(link, engineFor(agent))
+    await requirePeerEngine(link, agent)
     if (sid && chats.info(sid)) {
       requireRunningEngine(engineFor(agent), chats.info(sid)!.engine)
       const proof = await request<{ engine?: RuntimeEngine }>(link, 'lease', { sessionId: sid, takeOver: false, expectedEngine: engineFor(agent) })
@@ -1946,7 +2098,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * as before (the caller's 409, or `takeOver`). When the home can't be reached the answer is 424,
    * naming it (the page offers here).
    */
-  async function requirePeerEngine(link: LinkPeer, expectedEngine: RuntimeEngine) {
+  async function requirePeerEngine(link: LinkPeer, agent: FloorAgent) {
+    // Hybrid Claude never reaches the historical Claude-only compatibility exception.
+    const expectedEngine = requireLegacyExecution(agent, defaultsNow())
     if (expectedEngine !== 'claude') {
       let proof: unknown
       try { proof = await request(link, 'engine-open-capabilities', {}, 5000) } catch { throw engineUpdateRequired(link.name) }
@@ -1955,9 +2109,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   async function openOnPeer(link: LinkPeer, floor: Floor, agent: FloorAgent, text?: string): Promise<ChatOpened> {
+    requireLegacyExecution(agent, defaultsNow())
     const expectedEngine = engineFor(agent)
     if (isPcControl(floor)) { assertPcControlTarget(floor, link.id, {}); await requirePcControlPeer(link) }
-    await requirePeerEngine(link, expectedEngine)
+    await requirePeerEngine(link, agent)
     const opened = await request<ChatOpened>(link, 'open', { floorId: floor.id, agentId: agent.id, expectedEngine, text }, 60_000)
     // Legacy Claude-only apps can still open Claude. They never prove support for a newer engine.
     if (opened.engine === undefined && expectedEngine !== 'claude') throw engineUpdateRequired(link.name)
@@ -1991,6 +2146,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
     const managed = floorOf(floorId)
     if (isPcControl(managed) && (req.here || req.takeOver)) throw immutablePcControl()
+    requireLegacyExecution(agentOf(managed, agentId), defaultsNow())
     const selected = agentOf(floorOf(floorId), agentId).sessionId
     if (selected) switchFences.assertWritable(selected)
     // F-127: a floor made on this PC while the Server was away is run here, as on a PC alone: no lease, this PC's own Claude sign-in.
@@ -2035,6 +2191,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function restartChat(sid: string): Promise<boolean> {
     if (mode() === 'member') return false
     const at = floors.bySession(sid)
+    if (at) requireLegacyExecution(at.agent, defaultsNow())
     if (!at || !chats.info(sid)) return false
     if (chats.info(sid)?.engine === 'opencode') {
       await openCode.abort(sid)
@@ -2140,8 +2297,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
   /** typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. */
-  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void) =>
-    typeInto(c, body, { confirmed: true }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
+  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void, actor?: Caller) =>
+    typeInto(c, body, { confirmed: true, caller: actor }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
       if (e?.code === 'delivery-unconfirmed') uncertain?.()
       else undo()
       throw e
@@ -2207,12 +2364,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * What the chat's screen shows right now, as lines of text (not its scroll-back: that still holds menus long gone). This PC's chat: its
    * screen model; another PC's: that PC's, over the link. Null when the screen can't be had (an older PC that has no such request).
    */
-  async function screenOf(c: { sessionId: string; id: string }): Promise<string | null> {
-    if (c.id === self().id) return chats.screen(c.sessionId)?.join('\n') ?? null
-    const link = team?.member(c.id)
-    if (!link) return null
-    return request<string>(link, 'screen', { sessionId: c.sessionId }).catch(() => null)
-  }
+
 
   // The one key a Cancel button presses (the member PC's 'keys' request takes it, and digits, nothing else).
   const ESC_KEY = String.fromCharCode(27)
@@ -2222,10 +2374,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * footer. Where the screen can't be had, the scroll-back gives the words around it but no buttons (nothing is pressed from stale text).
    */
   async function promptOfChat(c: { sessionId: string; id: string }) {
-    const screen = await screenOf(c)
-    if (screen !== null) return promptOf(screen)
-    const p = promptOf(await readChat(c, 60).catch(() => ''))
-    return { ...p, menu: null, cancellable: false }
+    let native: NativeApprovalSnapshot | null = null
+    const runtime = approvalRuntime(c.sessionId, c.id)
+    try {
+      if (c.id === self().id) native = localApprovalSnapshot(c.sessionId, null)
+      else {
+        const link = team?.member(c.id)
+        if (link) native = nativeApprovalSnapshot(await request(link, 'approval-snapshot-v1', { version: 1, pcId: c.id, sessionId: c.sessionId }), c.id, c.sessionId)
+      }
+      if (native && c.id !== self().id && (native.proof.hubId !== self().id || native.proof.hubEpoch === null)) native = null
+    } catch { /* Missing/malformed/old peers never get a legacy keys fallback. */ }
+    if (!native) return { menu: null, context: 'This PC needs a current app and a live native prompt before approvals can be used.', cancellable: false,
+      id: createHash('sha256').update(JSON.stringify([promptEpoch, c, 'unsupported'])).digest('hex'), native: null }
+    const p = native.proof
+    return { menu: native.menu, context: native.context, cancellable: native.cancellable,
+      id: createHash('sha256').update(JSON.stringify([promptEpoch, c.sessionId, c.id, runtime, p.targetEpoch, p.generation, p.hubId, p.hubEpoch, p.floorId, p.agentId, p.promptId])).digest('hex'), native }
   }
 
   /** M1: a chat waiting at a permission prompt or a menu is never typed into (Enter would pick the highlighted option). The words for a person or an agent. */
@@ -2244,17 +2407,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * his draft. Every other caller (an agent's message, a broadcast, a nudge, an order's reply) never does: on his unsent text nothing is
    * typed and it throws 409. A chat on a member PC reports its draft back, because only that PC knows its screen.
    */
-  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean } = {}): Promise<boolean> {
+  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller } = {}): Promise<boolean> {
+    const bound = bySession(c.sessionId)
+    if (bound) requireLegacyExecution(bound.agent, defaultsNow())
     const refuseDraft = opt.human !== true
     if (opt.confirmed) {
       let result: unknown
-      if (c.id === self().id) result = { delivery: await confirmedDelivery(c.sessionId, body, refuseDraft) }
+      if (c.id === self().id) {
+        const delivery = await confirmedDelivery(c.sessionId, body, refuseDraft, opt.caller)
+        result = delivery === 'blocked' && chats.drafting(c.sessionId) ? 'draft' : { delivery }
+      }
       else {
-        const link = team?.member(c.id)
-        if (!link) return false
-        // Old peers can return true after scheduling only; that is explicitly not confirmation.
-        result = await request(link, 'type', { sessionId: c.sessionId, text: body, refuseDraft, confirmDelivery: true }, 22_000)
-          .catch(() => ({ delivery: 'unconfirmed' }))
+        const at = bySession(c.sessionId)
+        if (!at) return false
+        const tracking = remoteNativeDelivery(c.id, c.sessionId, body, 'agent-message', randomUUID(), deliveryBinding(at.agent), opt.caller).catch(() => null)
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          const receipt = await Promise.race([tracking, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 18_000) })])
+          result = receipt?.blockedByDraft ? 'draft' : { delivery: receipt?.state === 'pending' ? 'unconfirmed' : receipt?.state ?? 'unconfirmed' }
+        } finally { clearTimeout(timer) }
       }
       if (result === 'draft') throw apiError(409, draftWords(c.sessionId))
       const delivery = isObject(result) ? result.delivery : undefined
@@ -2271,22 +2442,108 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return r === true
   }
 
-  /** Includes queue/backend time; a timeout never repeats or cancels a possibly accepted send. */
-  async function confirmedDelivery(sessionId: string, body: string, refuseDraft: boolean) {
-    let timer: ReturnType<typeof setTimeout> | undefined
+  const messageReceipts = createDeliveryReceipts(path.join(o.dir, 'message-receipts.json'))
+  const nativeReceipts = createDeliveryReceipts(path.join(o.dir, 'native-delivery-receipts.json'))
+  const humanInputGrants = createHumanInputGrants()
+  const deliveryActor = (r?: { caller?: Caller }) => r?.caller?.person ? `person:${r.caller.person.id}` : JSON.stringify(r?.caller ?? OPEN)
+  const deliveryBinding = (a: FloorAgent) => {
+    const execution = executionIdentityOf(a, defaultsNow())
+    return JSON.stringify([a.sessionId, execution.engine, a.codexThread ?? null, a.opencodeSession ?? null, a.homePc ?? null,
+      ...(a.executionProfile !== undefined || a.executionRevision !== undefined
+        ? [execution.profile, execution.provider, execution.harness, execution.transcript, a.executionRevision ?? 0] : [])])
+  }
+  function advanceDeliveryBinding(binding: string, a: FloorAgent): string | null {
+    const current = deliveryBinding(a)
+    if (binding === current) return binding
+    // Learning the first native ID on this same runtime is not a conversation switch.
     try {
-      return await Promise.race([
-        chats.deliver?.(sessionId, body, { refuseDraft }) ?? Promise.resolve('unconfirmed' as const),
-        new Promise<'unconfirmed'>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) }),
-      ])
+      const before: unknown = JSON.parse(binding), after: unknown[] = JSON.parse(current)
+      if (!Array.isArray(before) || before.length !== after.length) return null
+      const slot = engineFor(a) === 'codex' ? 2 : engineFor(a) === 'opencode' ? 3 : -1
+      if (slot < 0 || before[slot] !== null || typeof after[slot] !== 'string') return null
+      return before.every((v, i) => i === slot || v === after[i]) ? current : null
+    } catch { return null }
+  }
+  const deliveryAcl = (actor: Caller, sid: string) => {
+    try { const at = bySession(sid); return !!at && (access.needChat(actor, at.agent, 'type', 'message delivery'), true) } catch { return false }
+  }
+  function sayIntent(raw: unknown): Omit<SayRequest, 'text'> {
+    if (!isObject(raw)) return {}
+    if (raw.messageId !== undefined && (typeof raw.messageId !== 'string' || !UUID_RE.test(raw.messageId))) throw apiError(400, 'messageId must be a UUID')
+    if (raw.expectedSessionId !== undefined && raw.expectedSessionId !== null && (typeof raw.expectedSessionId !== 'string' || !validTransferSid(raw.expectedSessionId))) throw apiError(400, 'expectedSessionId must be the captured session ID or null')
+    return { ...(raw.messageId !== undefined ? { messageId: String(raw.messageId) } : {}), ...(raw.expectedSessionId !== undefined ? { expectedSessionId: raw.expectedSessionId as string | null } : {}) }
+  }
+
+  function beginNativeDelivery(sessionId: string, body: string, owner: string, messageId?: string, expectedBinding?: string, extraGuard?: () => boolean, authorize?: (phase: HumanInputPhase) => Promise<boolean>) {
+    assertLegacySid(sessionId)
+    const at = bySession(sessionId)
+    if (!at) throw apiError(409, 'The destination conversation changed. Nothing was submitted.')
+    const { floor, agent } = at
+    return nativeReceipts.begin({ id: messageId, owner, floorId: floor.id, agentId: agent.id, text: body, expectedSessionId: sessionId }, async bind => {
+      const generation = chats.generation?.(sessionId)
+      let binding = expectedBinding ?? deliveryBinding(agent)
+      const valid = () => {
+        const current = bySession(sessionId), runtime = chats.info(sessionId)
+        if (closing || !current || current.floor.id !== floor.id || current.agent.id !== agent.id || !runtime || chats.generation?.(sessionId) !== generation || runtime.engine !== engineFor(current.agent) || switchFences.blocked(sessionId)) return false
+        const advanced = advanceDeliveryBinding(binding, current.agent)
+        if (!advanced) return false
+        binding = advanced
+        try { assertPcControlTarget(current.floor, self().id, {}); return extraGuard?.() !== false } catch { return false }
+      }
+      if (!generation || !valid()) return 'blocked'
+      bind(sessionId, generation, false)
+      return chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize }) ?? 'unconfirmed'
+    })
+  }
+
+  /** Tool callers retain a bounded observation window; the one native transaction continues. */
+  async function confirmedDelivery(sessionId: string, body: string, _refuseDraft: boolean, actor?: Caller) {
+    try {
+      const at = bySession(sessionId)
+      if (!at) return 'gone' as const
+      const owner = 'agent-message', receipt = beginNativeDelivery(sessionId, body, owner, undefined, undefined, actor ? () => deliveryAcl(actor, sessionId) : undefined)
+      const final = await nativeReceipts.wait(receipt.id, owner, at.floor.id, at.agent.id)
+      return final?.state === 'pending' ? 'unconfirmed' as const : final?.state ?? 'unconfirmed' as const
     } catch { return 'unconfirmed' as const }
-    finally { clearTimeout(timer) }
+  }
+
+  function validReceipt(raw: unknown, id: string): raw is DeliveryReceipt {
+    return isObject(raw) && raw.id === id && ['pending','sent','blocked','unconfirmed','gone'].includes(String(raw.state)) && (raw.sessionId === null || typeof raw.sessionId === 'string') && (raw.generation === null || typeof raw.generation === 'string') && typeof raw.started === 'boolean' && typeof raw.updatedAt === 'string'
+  }
+
+  /** The initial request is sent once. A broken response changes the operation into status-only observation. */
+  async function remoteNativeDelivery(pcId: string, sid: string, body: string, owner: string, id: string, binding: string, actor?: Caller, humanAuthority?: () => boolean): Promise<(DeliveryReceipt & { blockedByDraft?: boolean }) | null> {
+    assertLegacySid(sid)
+    const peer = () => team?.member(pcId) ?? null
+    const first = peer()
+    if (!first) return null
+    const support = await request<unknown>(first, 'delivery-capabilities', {}, 3000).catch(() => null)
+    if (!isObject(support) || support.version !== 1 || support.idempotent !== true || (humanAuthority && support.humanInputAuthorization !== 1)) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    const target = bySession(sid)
+    if (!target) return null
+    const currentBinding = advanceDeliveryBinding(binding, target.agent)
+    if (!currentBinding || (actor && !deliveryAcl(actor, sid))) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    binding = currentBinding
+    const grant = humanAuthority ? humanInputGrants.register(pcId, first.token, id, sid, humanAuthority) : null
+    if (humanAuthority && !grant) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    try {
+    let raw: unknown = await request(first, 'type', { sessionId: sid, text: body, refuseDraft: true, confirmDelivery: true, messageId: id, owner, expectedBinding: binding, floorId: target.floor.id, agentId: target.agent.id, targetPcId: pcId, actor, ...(grant ? { humanAuthorization: grant.nonce } : {}) }, 16_000).catch(() => null)
+    const deadline = Date.now() + 300_000
+    for (;;) {
+      const r = isObject(raw) ? raw.receipt : null
+      if (validReceipt(r, id) && r.state !== 'pending') return { ...r, ...(r.state === 'blocked' && isObject(raw) && raw.blockedByDraft === true ? { blockedByDraft: true } : {}) }
+      if (raw !== null && !validReceipt(r, id)) return null
+      if (Date.now() >= deadline || closing) return validReceipt(r, id) ? { ...r, state: 'unconfirmed' } : null
+      await new Promise<void>(resolve => setTimeout(resolve, 500))
+      const link = peer()
+      raw = link ? await request(link, 'delivery-status', { messageId: id, owner, floorId: target.floor.id, agentId: target.agent.id, targetPcId: pcId }, 6000).catch(() => null) : null
+    }
+    } finally { grant?.close() }
   }
 
   // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
   const approvalLog = createApprovalLog(path.join(o.dir, 'approvals.jsonl'))
   // The phones (browsers) whose signature an approval or a send needs: registered once, here on the hub.
-  const approvalDevices = createDeviceStore(path.join(o.dir, 'approval-devices.json'))
   // F-081: the switch the guard's night-watch reads (auto-update.json in this folder).
   const autoUpdate = createAutoUpdate(path.join(o.dir, 'auto-update.json'))
   const prepared = new Map<string, PreparedCard>()
@@ -2579,22 +2836,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return assistantAt() ? { sessionId: sid, state: sid ? whereAll()[sid]?.state : undefined } : null
     },
     say: body => tellAssistant(body),
-    proof:
-      o.voiceProof ??
-      ((body, r) => {
-        // F-122: no signature, but a browser signed in as sbskrrt (unless Settings says approval devices only): given the code too.
-        const signed = isObject(body) && body.sig !== undefined && body.sig !== null
-        const by = signed ? null : ownerCodeBy(r)
-        if (by) {
-          deviceLog('A pair code for the phone app was made', by)
-          return by
-        }
-        // Strict, like Automatic updates ON: a registered approval device's signature over kind 'pair', never the unsigned old way.
-        if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
-        const name = approvalDevices.verify('pair', [], isObject(body) ? body.sig : undefined).name
-        deviceLog('A pair code for the phone app was made', `device "${name}"`)
-        return `device "${name}"`
-      }),
+    proof: (_body, r) => {
+      const by = humanProof('pair', [], undefined, r)
+      deviceLog('A pair code for the phone app was made', by)
+      return by
+    },
     feed: send => {
       const sid = assistantAt()?.a.sessionId
       return sid ? chatFeeds.attach(sid, send) : () => {}
@@ -2846,7 +3092,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, target.sessionId, body) }))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, target.sessionId, body) }, me))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
@@ -2854,6 +3100,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'app_open_chat': {
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
         access.needChat(me, a, 'owner', toolWhere)
+        const explicitProfile = args.executionProfile
+        if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1') throw executionHttpError('execution-invalid', 'open')
+        if (explicitProfile === 'codex-in-claude-v1' || executionIdentityOf(a, defaultsNow()).profile === 'codex-in-claude-v1') {
+          workflowExecutionAgent(f.id, a.id)
+          if (!executionService || !me.person || !a.owner || !a.homePc || a.homePc !== self().id
+            || (args.pc !== undefined && args.pc !== self().id && String(args.pc).toLowerCase() !== self().name.toLowerCase())) throw executionHttpError('execution-capability-required', 'open')
+          const scope = { actorId: me.person.id, ownerId: a.owner.id, floorId: f.id, agentId: a.id, targetPcId: a.homePc }
+          executionService.bindActor(scope, () => {
+            const source = floors.bySession(sid)
+            if (!source || access.asChat(source.agent).person?.id !== me.person!.id) throw executionHttpError('execution-forbidden', 'authorization')
+            access.needChat(me, workflowExecutionAgent(f.id, a.id), 'owner', toolWhere)
+          })
+          const operationId = typeof args.operationId === 'string' ? args.operationId : explicitProfile ? '' : randomUUID()
+          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1')
+          return json({ ...reply, sessionId: reply.committed.sessionId, agent: a.name, floor: f.name, pc: self().name })
+        }
         const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null
         const pc = pcName ? pcs().find(p => p.name.toLowerCase() === pcName || p.id === args.pc) : null
         if (pcName && !pc) throw apiError(404, `No PC called ${String(args.pc)} within reach; app_chats lists them`)
@@ -2933,7 +3195,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, c.sessionId, body) }))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, c.sessionId, body) }, me))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
@@ -2957,7 +3219,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const drafts = all.filter(c => !c.asking && c.drafting)
         // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
         const outcomes = await Promise.all(to.map(async c => {
-          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true }), unknown: false, draft: false } }
+          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true, caller: me }), unknown: false, draft: false } }
           catch (e) { return { c, sent: false, unknown: isObject(e) && e.code === 'delivery-unconfirmed', draft: e instanceof Error && /unsent text in its box/.test(e.message) } }
         }))
         const uncertain = outcomes.filter(r => r.unknown).map(r => r.c)
@@ -3163,12 +3425,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Conversions are prepared before the atomic chart commit; never substitute an empty binding. */
   function carryConversation(_floor: Floor, previous: FloorAgent, _to: 'claude' | 'codex' | 'opencode') {
+    requireLegacyExecution(previous, defaultsNow())
     const result = preparedSwitches.get(previous.id)
     if (!result) throw Object.assign(apiError(409, 'History was not prepared. The current conversation is unchanged.'), { code: 'engine-change-conversion-failed' })
     return { sessionId: result.sessionId, codexThread: result.codexThread, opencodeSession: result.opencodeSession, homePc: result.homePc, homePcName: result.homePcName }
   }
 
   function localSwitchSource(previous: FloorAgent): string | null {
+    requireLegacyExecution(previous, defaultsNow())
     const sid = previous.sessionId!
     const current = bySession(sid)
     if (current && isPcControl(current.floor) && chats.info(sid)) requireRunningEngine(engineFor(previous), chats.info(sid)!.engine)
@@ -3204,6 +3468,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   async function prepareLocalSwitch(floor: Floor, previous: FloorAgent, next: FloorAgent, switchId: string) {
     assertPcControlTarget(floor, self().id, {})
+    requireLegacyExecution(previous, defaultsNow())
+    requireLegacyExecution(next, defaultsNow())
     if (isPcControl(floor) && previous.sessionId && chats.info(previous.sessionId)) requireRunningEngine(engineFor(previous), chats.info(previous.sessionId)!.engine)
     const file = localSwitchSource(previous)
     const sid = previous.sessionId!, from = engineFor(previous), to = engineFor(next)
@@ -3259,6 +3525,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || !isObject(raw.expected) || !isObject(raw.next) ||
       !['claude', 'codex', 'opencode'].includes(String(raw.next.engine))) throw apiError(400, 'Expected an engine-switch preparation')
     const floor = floorOf(raw.floorId), previous = agentOf(floor, raw.agentId), expected = raw.expected
+    requireLegacyExecution(previous, defaultsNow())
+    const nextRaw = raw.next
+    if (['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(nextRaw, k))) throw executionHttpError('execution-capability-required', 'selection')
     const matches = () => {
       const current = agentOf(floorOf(floor.id), previous.id)
       return current.sessionId === expected.sessionId && engineFor(current) === expected.engine &&
@@ -3531,209 +3800,279 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-076: approvals and send-as-me. Human-only: these routes take the page's own request; a request that carries
   // a chat's key (what an agent's tools use) is refused here, and no MCP tool answers a prompt or sends as the person.
 
-  function humanOnly(r: MountRequest) {
-    if (r.headers['x-sad-chat-key'] !== undefined) throw apiError(403, "Only the person's own taps answer a prompt or send as them: this is not for a chat.")
-  }
+  function humanOnly(r: MountRequest) { r.caller = requireCrmHuman(o.auth, r) }
   const byOf = (r: MountRequest) => `the app (${String(r.headers['user-agent'] ?? 'a browser').replace(/\s+/g, ' ').slice(0, 90)})`
-
-  /**
-   * The proof an approval or a send carries: the signature of a registered approval device over exactly what was asked.
-   * Without one it is refused, unless the old way is switched on in Settings (off to start with). Says who it was, for the log.
-   */
-  function humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown, r?: ProofRequest): string {
-    if (signed !== undefined && signed !== null) return `device "${approvalDevices.verify(kind, fields, signed).name}"`
-    // F-124: "Sign-in is enough": a browser signed in as sbskrrt (a real F-118 session; the unsigned open app never counts) stands in for the device.
-    const signedIn = ownerCodeBy(r, false)
-    if (signedIn) return signedIn
-    if (approvalDevices.unsignedAllowed()) return 'an unsigned request (the old way, switched on in Settings)'
-    if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Open Settings › Approval device on your phone and register it.')
-    throw apiError(401, 'This needs a signature from a registered approval device (your phone). Open it there.')
+  const promptActions = createPromptActions()
+  const promptEpoch = randomUUID()
+  const approvalLinks = new WeakMap<object, string>()
+  const approvalRuntime = (sid: string, pc: string) => {
+    if (pc === self().id) return chats.info(sid)?.startedAt
+    const token = team?.member(pc)?.token
+    if (!token) return undefined
+    if (!approvalLinks.has(token)) approvalLinks.set(token, randomUUID())
+    return approvalLinks.get(token)
   }
-
-  /**
-   * F-081: Apply new builds automatically when quiet. Turning it ON needs the signature of a registered approval device
-   * (never the old unsigned way: this one is about his machine restarting by itself); turning it off needs nothing.
-   */
-  function setAutoUpdate(raw: unknown, by: string, r?: ProofRequest) {
-    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
-    let who = 'a tap (off needs no signature)'
-    if (raw.on) {
-      // F-124: a signed-in sbskrrt may switch it on without a device when Sign-in is enough; never the unsigned old way.
-      const signedIn = raw.sig !== undefined && raw.sig !== null ? null : ownerCodeBy(r, false)
-      if (signedIn) who = signedIn
-      else {
-        if (approvalDevices.count() === 0) throw apiError(403, 'No approval device is registered yet. Register your phone in Settings › Approval device first.')
-        who = `device "${approvalDevices.verify('autoupdate', [true], raw.sig).name}"`
-      }
+  const nativePromptActions = createPromptActions()
+  const approvalGrants = new Map<string, { proof: NativeApprovalProof; hubToken: object | null }>()
+  function approvalGeneration(sid: string): string {
+    const info = chats.info(sid)
+    if (!info) throw apiError(409, 'That native chat is no longer running.')
+    const pool = chats as ChatPool & { generation?: (sid: string) => string | null }
+    if (pool.generation) {
+      const value = pool.generation(sid)
+      if (!value) throw apiError(409, 'Native generation is unavailable; update this PC.')
+      return `pool:${value}`
     }
+    // Older pool API: onEnded deletes this record even for same-SID/same-timestamp restarts.
+    const fingerprint = JSON.stringify([info.startedAt, info.engine, info.floorId, info.agentId])
+    const previous = approvalNativeRuntimes.get(sid)
+    if (previous?.fingerprint !== fingerprint) approvalNativeRuntimes.set(sid, { fingerprint, generation: randomUUID() })
+    return approvalNativeRuntimes.get(sid)!.generation
+  }
+  function requireApprovalHub(token: object | null, expectedId = team?.hub()?.id) {
+    if (!token || mode() !== 'member' || team?.hub()?.id !== expectedId || team?.hub()?.link?.token !== token) throw apiError(409, 'The current pinned Server connection is required for approval.')
+  }
+  function sweepApprovalGrants() {
+    for (const [id, grant] of approvalGrants) if (grant.proof.expiresAt < Date.now()) approvalGrants.delete(id)
+  }
+  function localApprovalSnapshot(sid: string, hubToken: object | null): NativeApprovalSnapshot {
+    assertLegacySid(sid)
+    if (hubToken) requireApprovalHub(hubToken)
+    const info = chats.info(sid), at = floors.bySession(sid), screen = chats.screen(sid)
+    if (!info || !at || !screen || info.floorId !== at.floor.id || info.agentId !== at.agent.id || (at.agent.homePc && at.agent.homePc !== self().id) || (isPcControl(at.floor) && at.floor.targetPcId !== self().id)) throw apiError(409, 'The native approval target changed.')
+    sweepApprovalGrants()
+    if (approvalGrants.size >= 4096) throw apiError(429, 'Too many approval snapshots; wait one minute and refresh.')
+    const p = promptOf(screen.join('\n'))
+    if (hubToken && !approvalLinks.has(hubToken)) approvalLinks.set(hubToken, randomUUID())
+    const proof: NativeApprovalProof = { version: 1, grantId: randomUUID(), pcId: self().id, sessionId: sid, floorId: at.floor.id, agentId: at.agent.id,
+      generation: approvalGeneration(sid), targetEpoch: promptEpoch, hubEpoch: hubToken ? approvalLinks.get(hubToken)! : null, hubId: hubToken ? team!.hub()!.id : null, promptId: p.id, expiresAt: Date.now() + APPROVAL_GRANT_MS }
+    approvalGrants.set(proof.grantId, { proof, hubToken })
+    return { proof, menu: p.menu, context: p.context, cancellable: p.cancellable }
+  }
+  async function commitNativeApproval(raw: unknown, hubToken: object | null, validateLocal?: (agent: FloorAgent) => void): Promise<{ version: 1; committed: true }> {
+    if (!isNativeApprovalCommit(raw)) throw apiError(400, 'Expected a versioned, target-bound approval commit.')
+    if (hubToken) requireApprovalHub(hubToken, raw.proof.hubId ?? undefined)
+    else if (!validateLocal) throw authError(401, 'A current CRM session is required.', 'sign-in')
+    const proof = raw.proof, grant = approvalGrants.get(proof.grantId)
+    if (!grant || grant.hubToken !== hubToken || JSON.stringify(grant.proof) !== JSON.stringify(proof)) throw apiError(409, 'The native approval grant is not current.')
+    return nativePromptActions.run(JSON.stringify([proof.sessionId, proof.generation, proof.promptId]), JSON.stringify([raw.action, raw.n ?? null]), async markNativeAttempt => {
+      if (hubToken) requireApprovalHub(hubToken, proof.hubId ?? undefined)
+      const at = floors.bySession(proof.sessionId), info = chats.info(proof.sessionId), screen = chats.screen(proof.sessionId)
+      assertLegacySid(proof.sessionId)
+      if (proof.expiresAt < Date.now() || proof.targetEpoch !== promptEpoch || proof.pcId !== self().id || !at || !info || !screen ||
+          at.floor.id !== proof.floorId || at.agent.id !== proof.agentId || info.floorId !== proof.floorId || info.agentId !== proof.agentId || (at.agent.homePc && at.agent.homePc !== self().id) || (isPcControl(at.floor) && at.floor.targetPcId !== self().id) ||
+          info.state !== 'question' || approvalGeneration(proof.sessionId) !== proof.generation) throw apiError(409, 'The native approval target or grant changed before input.')
+      const p = promptOf(screen.join('\n'))
+      if (p.id !== proof.promptId || (raw.action === 'cancel' ? !p.cancellable : !answerable(p.menu) || !p.menu!.options.some(x => x.n === raw.n))) throw apiError(409, 'The native prompt changed before input.')
+      // No await between the final target/human check and the receiving native write.
+      validateLocal?.(at.agent)
+      markNativeAttempt()
+      if (!chats.input(proof.sessionId, raw.action === 'cancel' ? ESC_KEY : String(raw.n))) throw apiError(409, 'Native approval was not confirmed; do not retry automatically.')
+      return { version: 1, committed: true }
+    })
+  }
+  function humanProof(kind: SignedKind, _fields: (string | number | boolean)[], _legacySignature: unknown, r?: ProofRequest): string {
+    // F158: never inspect old device keys, settings, signatures or unsigned flags.
+    return describeHuman(requireCrmHuman(o.auth, r, ['autoupdate', 'pair', 'wa-send'].includes(kind)))
+  }
+  function humanTarget(r: ProofRequest | undefined, agent: FloorAgent, need: 'type' | 'owner' = 'type') {
+    const caller = requireCrmHuman(o.auth, r)
+    if (r) r.caller = caller
+    access.needChat(caller, agent, need, 'human approval/send')
+    const at = agent.sessionId ? whereAll()[agent.sessionId] : null
+    if (mode() === 'member' && (at?.id ?? agent.homePc) !== self().id) throw Object.assign(apiError(409, 'Sign in on the Server page to act on a chat running on another PC.'), { code: 'hub-sign-in-required', hubOrigin: null })
+    return caller
+  }
+  function setAutoUpdate(raw: unknown, by: string, r?: ProofRequest) {
+    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on}')
+    const who = humanProof('autoupdate', [raw.on], undefined, r)
     const st = autoUpdate.set(raw.on, `${who} via ${by}`)
     deviceLog(`Automatic updates when quiet switched ${raw.on ? 'ON' : 'off'}`, `${who} via ${by}`)
-    log?.info(`automatic updates when quiet: ${raw.on ? 'on' : 'off'}`)
     return st
   }
-
-  const devicesAnswer = (): DevicesAnswer => ({ devices: approvalDevices.list(), unsignedAllowed: approvalDevices.unsignedAllowed(), bootstrap: approvalDevices.count() === 0 })
-
   const deviceLog = (detail: string, by: string) => approvalLog.add({ kind: 'device', floor: '', agent: '', pc: self().name, sessionId: '', detail, by })
+  function retiredApprovalDevices(): never { throw Object.assign(apiError(410, 'Approval-device enrollment was removed. Sign in through CRM; no device registration is used.'), { code: 'approval-devices-retired' }) }
 
-  /**
-   * F-122: the other way to be given a code (to add an approval device, or to pair Chris): a browser SIGNED IN as the owner of the app
-   * (sbskrrt, F-118's session), on any device, unless Settings turned it off ("approval devices only"). A registered device's signature
-   * is tried first and works exactly as before. "Unsigned, acting as sbskrrt" at sign-in level off does NOT count (as with Publish): it must
-   * be a real session, since every tailnet device can open the Server's page. Says who and from where, for the log; null when it does not apply.
-   */
-  function ownerCodeBy(r: ProofRequest | undefined, browser = true): string | null {
-    const c = r?.caller
-    if (!r || !o.auth || !o.auth.signInEnough() || c?.person?.canSeeAll !== true) return null
-    const login = r.headers['x-sad-via-login']
-    const where = c.via === 'tailnet' ? `over the tailnet${typeof login === 'string' && login ? ` as ${login.slice(0, 80)}` : ''}` : 'on this PC'
-    return `${c.person.username} (${c.person.id.slice(0, 8)}) signed in, ${where}${browser ? `, ${byOf(r as MountRequest)}` : ''}`
-  }
-
-  /** A one-time code to add a device: the first one needs nothing (there is nobody to sign); after that, a registered device's signature, or (F-122) sbskrrt signed in. */
-  function deviceCode(raw: unknown, r?: MountRequest) {
-    const body = isObject(raw) ? raw : {}
-    let who = 'the first device (nobody to sign yet)'
-    if (approvalDevices.count() > 0) who = `${humanProof('code', [], body.sig, r)}${r ? ` via ${byOf(r)}` : ''}`
-    // The person and the device are logged, never the code.
-    deviceLog('A code to add an approval device was made', who)
-    recoveryCode = null
-    return approvalDevices.newCode()
-  }
-
-  // Recovery from this PC (order o4a52): when no registered device can sign, a Windows administrator prompt on this PC lets ONE new device register.
-  // agent/agentic/approval-recovery.ts has the why and the checks; these are its routes. Every step goes in the approvals log.
-  const deviceRecovery = createDeviceRecovery({ elevation: o.recoveryElevation ?? windowsElevation(), note: (detail, by) => deviceLog(detail, by) })
-  /** The code the last accepted recovery gave: a registration with it is logged as "after a Windows administrator prompt". */
-  let recoveryCode: string | null = null
-
-  const recoverStart = (by: string): RecoveryStarted => deviceRecovery.start(by)
-
-  async function recoverFinish(by: string, body: unknown): Promise<RecoveryFinished> {
-    await deviceRecovery.finish(by, isObject(body) ? body.ticket : undefined)
-    const c = approvalDevices.newCode()
-    recoveryCode = c.code
-    return { ...c, ...devicesAnswer() }
-  }
-
-  /** The page address from the Origin header, unless it is the remote gate's own loopback value (the gate rewrites the header, so it says nothing about the page). */
-  function headerOrigin(h: string | string[] | undefined): string | undefined {
-    const o1 = cleanOrigin(Array.isArray(h) ? h[0] : h)
-    if (!o1) return undefined
-    const u = new URL(o1)
-    return u.hostname === '127.0.0.1' && u.port === '4740' ? undefined : o1
-  }
-
-  function deviceRegister(raw: unknown, by: string, header?: string | string[]) {
-    if (!isObject(raw)) throw apiError(400, 'Expected {name, jwk, code}')
-    // The page says where it is (location.origin): the gate rewrites the Origin header, so the header is only a fallback. Information only.
-    const origin = cleanOrigin(raw.origin) ?? headerOrigin(header)
-    const viaRecovery = recoveryCode !== null && raw.code === recoveryCode
-    const d = approvalDevices.register(raw.name, raw.jwk as PublicJwk, raw.code, origin)
-    if (viaRecovery) recoveryCode = null
-    deviceLog(`Approval device registered: ${d.name} (${d.id})${d.origin ? ` from ${d.origin}` : ''}`, viaRecovery ? `${by} after a Windows administrator prompt` : by)
-    log?.info(`approval device registered: ${d.name}`)
-    return { device: d, ...devicesAnswer() }
-  }
-
-  function deviceRemove(raw: unknown, by: string, r?: ProofRequest) {
-    if (!isObject(raw) || typeof raw.device !== 'string') throw apiError(400, 'Expected {device, sig}')
-    const who = humanProof('remove', [raw.device], raw.sig, r)
-    if (!approvalDevices.remove(raw.device)) throw apiError(404, 'No such approval device')
-    deviceLog(`Approval device removed: ${raw.device}`, `${who} via ${by}`)
-    return devicesAnswer()
-  }
-
-  /** The old way (requests with no signature) on or off. Changing it needs a registered device's signature, once there is one. */
-  function deviceUnsigned(raw: unknown, by: string, r?: ProofRequest) {
-    if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on, sig}')
-    const who = approvalDevices.count() > 0 ? humanProof('unsigned', [raw.on], raw.sig, r) : 'nobody (no device is registered)'
-    approvalDevices.setUnsignedAllowed(raw.on)
-    deviceLog(`Unsigned approvals ${raw.on ? 'switched ON (the old way)' : 'switched off'}`, `${who} via ${by}`)
-    return devicesAnswer()
-  }
-
-  /** A message typed to the agent the way the terminal does it (a paste, then Enter); a chat that isn't running is started or picked back up first, and the message follows once it is ready. */
-  async function sayTo(id: string, agentId: string, body: string): Promise<SayAnswer> {
-    const agent = agentOf(floorOf(id), agentId)
-    const at = agent.sessionId ? whereAll()[agent.sessionId] : undefined
-    if (agent.sessionId && at) {
-      const fresh = at.id === self().id && Date.now() - Date.parse(chats.info(agent.sessionId)?.startedAt ?? '') < SAY_FRESH_MS
-      // Just started, it may still be at claude's own questions (trust this folder...): wait for the prompt.
-      if (fresh) chats.typeWhenReady(agent.sessionId, body)
-      else if (atPrompt(agent.sessionId)) throw apiError(409, promptWords(agent.sessionId))
-      else if (!(await typeInto({ sessionId: agent.sessionId, id: at.id }, body, { human: true }))) throw apiError(409, atPrompt(agent.sessionId) ? promptWords(agent.sessionId) : `${agent.name}'s chat on ${at.name} can't be typed into right now`)
-      return { ok: true, started: false }
-    }
-    // F-064: a chat that lives on another PC is started there, and that PC types the message once it is up.
-    const opened = await openChat(id, agentId, { say: body })
-    if (!opened.on) chats.typeWhenReady(opened.sessionId, body)
-    return { ok: true, started: true }
+  /** One durable intent; neither a timeout nor reopening the chat replays its paste. */
+  async function sayTo(id: string, agentId: string, body: string, intent: Omit<SayRequest, 'text'> = {}, actor: Caller = OPEN, onSent?: (sid: string) => void, humanAuthority?: () => boolean): Promise<SayAnswer> {
+    const owner = deliveryActor({ caller: actor })
+    const receipt = messageReceipts.begin({ id: intent.messageId, owner, floorId: id, agentId, text: body, expectedSessionId: intent.expectedSessionId }, async bind => {
+      let mayHaveSubmitted = false
+      try {
+      if (humanAuthority?.() === false) return 'blocked'
+      let agent = agentOf(floorOf(id), agentId)
+      if (intent.expectedSessionId !== undefined && agent.sessionId !== intent.expectedSessionId) return 'blocked'
+      try { access.needChat(actor, agent, 'type', 'message delivery') } catch { return 'blocked' }
+      let sid = agent.sessionId, pc = sid ? whereAll()[sid]?.id : undefined, started = false
+      if (!sid || !pc) {
+        if (access.rights(actor, agent)?.can !== 'owner') return 'blocked'
+        const requestedHome = agent.homePc
+        // Opening never carries text. Only the receipt-owned transaction can submit it afterwards.
+        const opened = await openChat(id, agentId, {})
+        sid = opened.sessionId; started = opened.started
+        pc = chats.info(sid) ? self().id : whereAll()[sid]?.id
+        // The authenticated open can precede the debounced live advertisement. Its home is
+        // usable only when the canonical binding still agrees with the requested home.
+        if (!pc && opened.on && requestedHome && agentOf(floorOf(id), agentId).homePc === requestedHome) pc = requestedHome
+      }
+      agent = agentOf(floorOf(id), agentId)
+      if (!sid || !pc || agent.sessionId !== sid) return 'blocked'
+      const targetSid = sid
+      let binding = deliveryBinding(agent)
+      const valid = () => {
+        try {
+          const current = agentOf(floorOf(id), agentId)
+          const advanced = advanceDeliveryBinding(binding, current)
+          if (!advanced) return false
+          binding = advanced
+          access.needChat(actor, current, 'type', 'message delivery')
+          return !switchFences.blocked(targetSid) && humanAuthority?.() !== false
+        } catch { return false }
+      }
+      if (!valid()) return 'blocked'
+      let final: DeliveryReceipt | null
+      if (pc === self().id) {
+        const generation = chats.generation?.(sid)
+        if (!generation) return 'gone'
+        bind(sid, generation, started)
+        mayHaveSubmitted = true
+        const native = beginNativeDelivery(sid, body, owner, receiptId(), binding, valid)
+        do { final = await nativeReceipts.wait(native.id, owner, id, agentId, 15_000) } while (final?.state === 'pending' && !closing)
+      } else {
+        mayHaveSubmitted = true
+        final = await remoteNativeDelivery(pc, sid, body, owner, receiptId(), binding, actor, humanAuthority ? valid : undefined)
+        if (final?.generation) bind(sid, final.generation, started)
+      }
+      if (final?.state === 'sent') onSent?.(sid)
+      return final?.state === 'pending' ? 'unconfirmed' : final?.state ?? 'unconfirmed'
+      } catch { return mayHaveSubmitted ? 'unconfirmed' : 'blocked' }
+    })
+    // The send callback is always a microtask, after this stable ID has been allocated.
+    function receiptId() { return receipt.id }
+    const final = await messageReceipts.wait(receipt.id, owner, id, agentId)
+    if (final?.state === 'sent') return { ok: true, started: final.started, receipt: final }
+    const state = final?.state ?? 'unconfirmed'
+    const description = state === 'pending'
+      ? 'The one message is still awaiting submission confirmation and may still complete. Observe its receipt; do not press Enter or resend.'
+      : state === 'blocked' || state === 'gone'
+        ? 'The message was not submitted: the chat, binding, draft or prompt is unavailable. Refresh the destination before trying a new message.'
+        : 'Delivery is not confirmed. The one message may already have been submitted or may remain in the composer. Inspect the destination; do not press Enter or resend.'
+    throw Object.assign(apiError(409, description), { code: `delivery-${state}` })
   }
 
   /** The keys of a numbered choice, into a chat anywhere (this PC's, or through the link). */
-  async function typeKeys(c: { sessionId: string; id: string }, data: string): Promise<boolean> {
-    if (c.id === self().id) return chats.input(c.sessionId, data)
+  async function typeKeys(c: { sessionId: string; id: string }, data: string, proof: NativeApprovalProof, validateLocal: (agent: FloorAgent) => void, markDispatch: () => void): Promise<boolean> {
+    const command: NativeApprovalCommit = { version: 1, proof, action: data === ESC_KEY ? 'cancel' : 'answer', ...(data === ESC_KEY ? {} : { n: Number(data) }) }
+    if (c.id === self().id) return (await commitNativeApproval(command, null, current => { validateLocal(current); markDispatch() })).committed
     const link = team?.member(c.id)
-    if (!link) return false
-    return request<boolean>(link, 'keys', { sessionId: c.sessionId, data }).catch(() => false)
+    if (!link) throw apiError(409, 'The pinned PC disconnected before approval dispatch.')
+    // Human authentication/ACL linearizes at authenticated dispatch. Never forward cookies or raw claimed people.
+    const at = floors.bySession(c.sessionId)
+    if (!at) throw apiError(409, 'The approval target changed before dispatch.')
+    validateLocal(at.agent)
+    const dispatchPeer: LinkPeer = { ...link, open: async meta => {
+      const stream = await link.open(meta), end = stream.end
+      stream.end = function (...args: unknown[]) {
+        try {
+          if (team?.member(c.id)?.token !== link.token) throw apiError(409, 'The pinned PC changed before dispatch.')
+          const latest = floors.bySession(c.sessionId)
+          if (!latest) throw apiError(409, 'The approval target changed before dispatch.')
+          validateLocal(latest.agent)
+          markDispatch()
+          return Reflect.apply(end, stream, args)
+        } catch (error) { stream.destroy(); throw error }
+      } as typeof stream.end
+      return stream
+    } }
+    const result = await request<{ version: number; committed: boolean }>(dispatchPeer, 'approval-commit-v1', command)
+    if (result?.version !== 1 || result.committed !== true) throw apiError(409, 'Approval commit was not confirmed; inspect the prompt and do not retry automatically.')
+    return true
   }
 
   /** Every chat waiting at a prompt, on every floor and PC, with what its screen says. */
-  async function listApprovals(): Promise<ApprovalsAnswer> {
+  async function listApprovals(r?: ProofRequest): Promise<ApprovalsAnswer> {
+    const caller = requireCrmHuman(o.auth, r)
     const where = whereAll()
-    const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (a.sessionId && where[a.sessionId]?.state === 'question' ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
+    const waiting = floors.list().flatMap(f => f.agents.flatMap(a => (access.rights(caller, a)?.can && access.rights(caller, a)?.can !== 'view' && a.sessionId && where[a.sessionId]?.state === 'question' ? [{ f, a, w: where[a.sessionId], sid: a.sessionId }] : [])))
     const items = await Promise.all(
       waiting.map(async ({ f, a, w, sid }): Promise<ApprovalItem> => {
         const p = await promptOfChat({ sessionId: sid, id: w.id })
         return { sessionId: sid, floorId: f.id, floorName: f.name, agentId: a.id, agentName: a.name, pc: w.name, state: w.state, menu: p.menu, context: p.context, id: p.id, answerable: answerable(p.menu), cancellable: p.cancellable }
       }),
     )
-    return { items, prepared: [...prepared.values()].sort((x, y) => y.at.localeCompare(x.at)) }
+    return { items, prepared: [...prepared.values()].filter(card => { const a = allFloors().find(f => f.id === card.floorId)?.agents.find(a => a.id === card.agentId); const rights = a ? access.rights(caller, a) : null; return rights && rights.can !== 'view' }).sort((x, y) => y.at.localeCompare(x.at)) }
   }
 
   /** His tap on option n of the prompt he was shown: typed into that chat exactly as pressing it there. Refused when the prompt has changed since. */
   async function answerApproval(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string' || typeof raw.n !== 'number') throw apiError(400, 'Expected {sessionId, id, n}')
     const req = raw as unknown as AnswerRequest
-    // A registered device signed exactly this prompt and option (or the old way is on): before anything is looked at or typed.
-    by = `${humanProof('answer', [req.sessionId, req.id, req.n], req.sig, r)} via ${by}`
+    // Only the current CRM session and current target rights authorize this action.
+    by = `${humanProof('answer', [req.sessionId, req.id, req.n], undefined, r)} via ${by}`
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
+    humanTarget(r, at.agent)
+    const runtime = w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
     const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+    if (!p.native) throw Object.assign(apiError(409, 'That PC needs an app update before native approval can be verified.'), { code: 'approval-peer-update-required' })
     if (!answerable(p.menu)) throw apiError(409, 'That prompt can only be answered in the chat itself.')
     if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
     const option = p.menu!.options.find(x => x.n === req.n)
     if (!option) throw apiError(400, `The prompt has no option ${req.n}`)
-    if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, String(req.n)))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be answered right now`)
-    const detail = `${p.menu!.question || 'A prompt'} → ${option.n}. ${option.label}${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
-    approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
-    log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}`)
-    return { ok: true, answered: `${option.n}. ${option.label}`, agent: at.agent.name, floor: at.floor.name }
+    const latest = floors.bySession(req.sessionId)
+    const current = whereAll()[req.sessionId]
+    if (!latest || latest.agent.id !== at.agent.id || current?.id !== w.id || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed; refresh the prompt.')
+    humanTarget(r, latest.agent)
+    return promptActions.run(JSON.stringify([req.sessionId, req.id]), JSON.stringify(['answer', req.n]), async markNativeAttempt => {
+      const now = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+      if (!now.native || now.id !== req.id || !answerable(now.menu) || !now.menu!.options.some(x => x.n === req.n)) throw apiError(409, 'That prompt changed before the answer could be committed; refresh it.')
+      const target = floors.bySession(req.sessionId), live = whereAll()[req.sessionId]
+      if (!target || target.agent.id !== at.agent.id || live?.id !== w.id || live.state !== 'question' || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed before the answer could be committed; refresh it.')
+      humanTarget(r, target.agent)
+      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, String(req.n), now.native.proof, current => humanTarget(r, current), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be answered right now`)
+      const detail = `${p.menu!.question || 'A prompt'} → ${option.n}. ${option.label}${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
+      approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
+      log?.info(`approved for ${at.agent.name} on ${at.floor.name}: option ${option.n}`)
+      return { ok: true, answered: `${option.n}. ${option.label}`, agent: at.agent.name, floor: at.floor.name }
+    })
   }
 
   /**
    * His tap on Cancel (Esc) for the prompt he was shown: one Escape key into that chat, only while its screen still shows the same prompt
-   * and its footer says "Esc to cancel". Signed like an answer. On a permission prompt Esc means No.
+   * and its footer says "Esc to cancel". CRM-authorized like an answer. On a permission prompt Esc means No.
    */
   async function cancelApproval(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.id !== 'string') throw apiError(400, 'Expected {sessionId, id}')
     const req = raw as unknown as CancelRequest
-    by = `${humanProof('cancel', [req.sessionId, req.id], req.sig, r)} via ${by}`
+    by = `${humanProof('cancel', [req.sessionId, req.id], undefined, r)} via ${by}`
     const at = floors.bySession(req.sessionId)
     const w = whereAll()[req.sessionId]
     if (!at || !w) throw apiError(404, "That chat isn't running any more")
+    humanTarget(r, at.agent)
+    const runtime = w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token
     if (w.state !== 'question') throw apiError(409, 'That chat is no longer waiting at a prompt; look again.')
     const p = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+    if (!p.native) throw Object.assign(apiError(409, 'That PC needs an app update before native approval can be verified.'), { code: 'approval-peer-update-required' })
     if (!p.cancellable) throw apiError(409, 'That prompt has no "Esc to cancel"; answer it in the chat itself.')
     if (p.id !== req.id) throw apiError(409, 'That prompt has changed since you looked at it; look again.')
-    if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, ESC_KEY))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be cancelled right now`)
-    const detail = `${p.menu?.question || 'A prompt'} → Esc (cancel)${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
-    approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
-    log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}`)
-    return { ok: true, agent: at.agent.name, floor: at.floor.name }
+    const latest = floors.bySession(req.sessionId)
+    const current = whereAll()[req.sessionId]
+    if (!latest || latest.agent.id !== at.agent.id || current?.id !== w.id || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed; refresh the prompt.')
+    humanTarget(r, latest.agent)
+    return promptActions.run(JSON.stringify([req.sessionId, req.id]), 'cancel', async markNativeAttempt => {
+      const now = await promptOfChat({ sessionId: req.sessionId, id: w.id })
+      if (!now.native || now.id !== req.id || !now.cancellable) throw apiError(409, 'That prompt changed before Cancel could be committed; refresh it.')
+      const target = floors.bySession(req.sessionId), live = whereAll()[req.sessionId]
+      if (!target || target.agent.id !== at.agent.id || live?.id !== w.id || live.state !== 'question' || (w.id === self().id ? chats.info(req.sessionId)?.startedAt : team?.member(w.id)?.token) !== runtime) throw apiError(409, 'The running target changed before Cancel could be committed; refresh it.')
+      humanTarget(r, target.agent)
+      if (!(await typeKeys({ sessionId: req.sessionId, id: w.id }, ESC_KEY, now.native.proof, current => humanTarget(r, current), markNativeAttempt))) throw apiError(409, `${at.agent.name}'s chat on ${w.name} can't be cancelled right now`)
+      const detail = `${p.menu?.question || 'A prompt'} → Esc (cancel)${p.context ? ` | ${p.context.split('\n').slice(-3).join(' / ')}` : ''}`
+      approvalLog.add({ kind: 'answer', floor: at.floor.name, agent: at.agent.name, pc: w.name, sessionId: req.sessionId, detail, by })
+      log?.info(`cancelled (Esc) for ${at.agent.name} on ${at.floor.name}`)
+      return { ok: true, agent: at.agent.name, floor: at.floor.name }
+    })
   }
 
   /** His own words, into a chosen agent's chat as plain input: no "[message from ...]", as if typed there. */
@@ -3741,15 +4080,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId, text}')
     const req = raw as unknown as SendAsMeRequest
     const body = text(req.text, 'text', MAX_SAY_TEXT)
-    // A registered device signed exactly this target and these words (or the old way is on).
-    by = `${humanProof('send', [req.floorId, req.agentId, createHash('sha256').update(body, 'utf8').digest('hex'), typeof req.card === 'string' ? req.card : ''], req.sig, rq)} via ${by}`
+    // Cached legacy signature fields are ignored, never an alternative to a CRM session.
+    by = `${humanProof('send', [req.floorId, req.agentId, createHash('sha256').update(body, 'utf8').digest('hex'), typeof req.card === 'string' ? req.card : ''], undefined, rq)} via ${by}`
     const at = agentOf(floorOf(req.floorId), req.agentId)
+    const person = humanTarget(rq, at, at.sessionId && whereAll()[at.sessionId] ? 'type' : 'owner')
+    const humanAuthority = () => {
+      try { const current = requireCrmHuman(o.auth, rq); return current.sid === person.sid && current.person?.id === person.person?.id }
+      catch { return false }
+    }
     const floor = floorOf(req.floorId)
-    const r = await sayTo(req.floorId, req.agentId, body)
-    const w = at.sessionId ? whereAll()[at.sessionId] : undefined
-    approvalLog.add({ kind: 'send', floor: floor.name, agent: at.name, pc: w?.name ?? self().name, sessionId: at.sessionId ?? '', detail: body, by })
-    if (typeof req.card === 'string') prepared.delete(req.card)
-    log?.info(`sent as the person to ${at.name} on ${floor.name}`)
+    const r = await sayTo(req.floorId, req.agentId, body, sayIntent(raw), rq?.caller ?? OPEN, sid => {
+      const w = whereAll()[sid]
+      approvalLog.add({ kind: 'send', floor: floor.name, agent: at.name, pc: w?.name ?? self().name, sessionId: sid, detail: body, by })
+      if (typeof req.card === 'string') prepared.delete(req.card)
+      log?.info(`sent as the person to ${at.name} on ${floor.name}`)
+    }, humanAuthority)
     return { ...r, agent: at.name, floor: floor.name }
   }
 
@@ -3783,6 +4128,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * them at its next start; the answer says which.
    */
   async function tuneAgent(floorId: string, agentId: string, raw: unknown): Promise<TuneAnswer> {
+    requireLegacyExecution(agentOf(floorOf(floorId), agentId), defaultsNow())
     if (!isObject(raw)) throw apiError(400, 'Expected {model?, effort?, ultracode?}')
     if (raw.codexModel !== undefined || raw.codexEffort !== undefined) return tuneCodex(floorId, agentId, raw)
     const req: TuneRequest = {}
@@ -3837,6 +4183,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   async function tuneCodex(floorId: string, agentId: string, raw: Row): Promise<TuneAnswer> {
     const before = floorOf(floorId)
     const a = agentOf(before, agentId)
+    requireLegacyExecution(a, defaultsNow())
     if (engineFor(a) !== 'codex') throw apiError(409, `${a.name} runs Claude: change its model and effort with model and effort, or change its engine first.`)
     if (raw.codexModel !== undefined && typeof raw.codexModel !== 'string') throw apiError(400, 'codexModel is a model name, or "" for the one Codex chooses')
     if (raw.codexEffort !== undefined && !(CODEX_EFFORTS as readonly unknown[]).includes(raw.codexEffort)) throw apiError(400, 'codexEffort is low, medium, high, xhigh, max, or "" for the one Codex chooses')
@@ -3977,10 +4324,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** A copy of a conversation becomes an agent's chat (transcripts.ts says why a copy): a new agent's, or the one named's. */
   async function importChat(floorId: string, body: unknown, as?: ChatOwner): Promise<ChatImported> {
     if (!isObject(body) || typeof body.sessionId !== 'string' || !UUID_RE.test(body.sessionId)) throw apiError(400, 'Expected {sessionId, agentId?, name?, role?}')
+    if (['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(body, k))) throw executionHttpError('execution-capability-required', 'selection')
     const from = body.sessionId
     if (isPcControl(floorOf(floorId)) || controlAlias(from)) throw immutablePcControl()
     const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
     const floor = floorOf(floorId)
+    if (intoId) requireLegacyExecution(agentOf(floor, intoId), defaultsNow())
+    const previousBinding = bySession(from)
+    if (previousBinding) requireLegacyExecution(previousBinding.agent, defaultsNow())
     if (intoId) agentOf(floor, intoId)
     const link = mode() === 'member' ? needHub() : null
     // F-022: from another PC: brought here first.
@@ -4135,20 +4486,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, ([id, agentId], r) => tuneAgent(id, agentId, r.body)],
     // F-076: human-only. Answer a waiting chat's prompt from one place; say something as the person. Never a chat's key (it has no route here).
-    ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals())],
-    ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r))],
-    ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r))],
-    ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r))],
+    ['GET', /^\/approvals$/, (_, r) => (humanOnly(r), listApprovals(r)), 'local'],
+    ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r)), 'local'],
+    ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r)), 'local'],
+    ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r)), 'local'],
     ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r), r))],
-    ['GET', /^\/approvals\/devices$/, (_, r) => (humanOnly(r), devicesAnswer())],
-    ['POST', /^\/approvals\/devices\/code$/, (_, r) => (humanOnly(r), deviceCode(r.body, r))],
-    ['POST', /^\/approvals\/devices\/register$/, (_, r) => (humanOnly(r), deviceRegister(r.body, byOf(r), r.headers.origin))],
-    ['GET', /^\/approvals\/devices\/recover$/, (_, r) => (humanOnly(r), deviceRecovery.status())],
-    ['POST', /^\/approvals\/devices\/recover\/start$/, (_, r) => (humanOnly(r), recoverStart(byOf(r)))],
-    ['POST', /^\/approvals\/devices\/recover\/finish$/, (_, r) => (humanOnly(r), recoverFinish(byOf(r), r.body))],
-    ['POST', /^\/approvals\/devices\/remove$/, (_, r) => (humanOnly(r), deviceRemove(r.body, byOf(r), r))],
-    ['POST', /^\/approvals\/devices\/unsigned$/, (_, r) => (humanOnly(r), deviceUnsigned(r.body, byOf(r), r))],
+    ['GET', /^\/approvals\/devices$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/code$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/register$/, () => retiredApprovalDevices()],
+    ['GET', /^\/approvals\/devices\/recover$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/recover\/start$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/recover\/finish$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/remove$/, () => retiredApprovalDevices()],
+    ['POST', /^\/approvals\/devices\/unsigned$/, () => retiredApprovalDevices()],
     ['GET', /^\/approvals\/log$/, (_, r) => (humanOnly(r), { entries: approvalLog.list(Math.min(500, Number(r.query.get('limit')) || 100)) })],
     [
       'DELETE',
@@ -4187,7 +4538,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ([id, agentId], r) => shareChat(id, agentId, r.body),
     ],
     ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body, access.ownerOf(callerOf(r))), 'local'],
-    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => openChat(id, agentId, openRequest(r.body)), 'local'],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => {
+      const body = r.body
+      if (isObject(body) && ['executionVersion', 'openIntentId', 'expectedExecution'].some(k => Object.hasOwn(body, k))) {
+        const request = requireExecutionOpenRequest(r.body), agent = workflowExecutionAgent(id, agentId)
+        assertExecutionCAS(request.expectedExecution, snapshotAgentExecution(agent, defaultsNow()))
+        if (!executionService) throw executionHttpError('execution-capability-required', 'open', request.openIntentId)
+        return executionService.open(executionScope(id, agentId, r), request)
+      }
+      return openChat(id, agentId, openRequest(r.body))
+    }, 'local'],
     [
       'POST',
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/run-on$/,
@@ -4383,10 +4743,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
           access.deny(callerOf(r), `POST say`, a.sessionId)
           throw authError(403, 'That chat is not running, and only its owner can start it.', 'not-yours')
         }
-        return sayTo(id, agentId, body)
+        return sayTo(id, agentId, body, sayIntent(r.body), callerOf(r))
       },
-      'local',
     ],
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries$/, () => ({ version: 1, idempotent: true, expectedSessionId: true, receipts: true })],
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries\/([^/]+)$/, ([id, agentId, messageId], r) => {
+      const receipt = messageReceipts.lookup(messageId, deliveryActor(r), id, agentId)
+      if (!receipt) throw apiError(404, 'No delivery receipt for this person and agent.')
+      return { receipt }
+    }],
     ['GET', /^\/floors\/([^/]+)\/memory$/, ([id], r) => ({ entries: memory.search(floorOf(id).id, r.query.get('q') ?? '', 100) })],
     [
       'POST',
@@ -4476,6 +4841,82 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   const callerOf = (r: MountRequest): Caller => r.caller ?? OPEN
 
+  function workflowExecutionAgent(id: string, agentId: string): FloorAgent {
+    const floor = floorOf(id), agent = agentOf(floor, agentId)
+    if (isPcControl(floor) || [agent.id, agent.sessionId, agent.codexThread, agent.opencodeSession].some(x => typeof x === 'string' && controlAlias(x))) throw immutablePcControl()
+    executionIdentityOf(agent, defaultsNow())
+    return agent
+  }
+  function targetExecution(profile: ReturnType<typeof requireExecutionCapabilityQuery>['profile'], agent: FloorAgent): ExecutionIdentity {
+    const engine = profile === 'codex-native-v1' ? 'codex' : profile === 'opencode-native-v1' ? 'opencode' : 'claude'
+    return normalizeExecution({ engine, executionProfile: profile, opencodeProvider: agent.opencodeProvider }, defaultsNow())
+  }
+  function executionScope(id: string, agentId: string, r: MountRequest): ExecutionIntentScope {
+    const agent = workflowExecutionAgent(id, agentId), caller = callerOf(r)
+    if (!executionService || !caller.person || !agent.homePc) throw executionHttpError('execution-forbidden', 'authorization')
+    const ownerId = agent.owner?.id
+    if (!ownerId) throw executionHttpError('execution-forbidden', 'authorization')
+    const scope = { actorId: caller.person.id, ownerId, floorId: id, agentId, targetPcId: agent.homePc }
+    executionService.bindActor(scope, () => {
+      const latest = o.auth ? o.auth.caller(r.headers) : caller
+      if (latest.person?.id !== caller.person!.id || latest.sid !== caller.sid) throw executionHttpError('execution-forbidden', 'authorization')
+      access.needChat(latest, workflowExecutionAgent(id, agentId), 'owner', 'execution')
+    })
+    return scope
+  }
+  async function executionCapability(id: string, agentId: string, r: MountRequest): Promise<ExecutionCapabilityReply> {
+    const agent = workflowExecutionAgent(id, agentId), query = requireExecutionCapabilityQuery(Object.fromEntries(r.query))
+    const current = snapshotAgentExecution(agent, defaultsNow()), target = targetExecution(query.profile, agent)
+    if (!current.homePc) throw executionHttpError('execution-capability-required', 'capability')
+    if (executionService && current.homePc === self().id) {
+      try { return await executionService.capability(executionScope(id, agentId, r), query) }
+      catch (error) { if ((error as { code?: string }).code !== 'execution-capability-required') throw error }
+    }
+    return { version: 1, current, target, targetPcId: current.homePc, available: false, unavailableCode: 'execution-capability-required' }
+  }
+  type ProfileRoute = [string, RegExp, Handler, 'local', Rule]
+  const profileOwner: Rule = { kind: 'chat', need: 'owner', floor: 0, agent: 1 }
+  // The separately-owned legacy access/POLICY file is outside this allocation. These explicit owner rules
+  // pass through the SAME PC Control/SID/ACL dispatcher; there is no unguarded raw/forwarding shortcut.
+  const executionRoutes: ProfileRoute[] = [
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-capability$/, ([id, agentId], r) => executionCapability(id, agentId, r), 'local', profileOwner],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-selection$/, ([id, agentId], r) => {
+      const agent = workflowExecutionAgent(id, agentId), request = requireExecutionSelectionRequest(r.body)
+      if ([request.expected.agentId, request.expected.sessionId, request.expected.codexThread, request.expected.opencodeSession].some(x => typeof x === 'string' && controlAlias(x))) throw immutablePcControl()
+      assertExecutionCAS(request.expected, snapshotAgentExecution(agent, defaultsNow()))
+      if (!executionService) throw executionHttpError('execution-capability-required', 'selection', request.selectionIntentId)
+      return executionService.select(executionScope(id, agentId, r), request)
+    }, 'local', profileOwner],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-verify$/, ([id, agentId], r) => {
+      const agent = workflowExecutionAgent(id, agentId)
+      if (!isObject(r.body) || r.body.version !== 1 || Object.keys(r.body).some(key => !['version', 'expected'].includes(key))) throw executionHttpError('execution-invalid', 'capability')
+      assertExecutionCAS(r.body.expected, snapshotAgentExecution(agent, defaultsNow()))
+      if (!executionService) throw executionHttpError('execution-capability-required', 'capability')
+      return executionService.verify(executionScope(id, agentId, r))
+    }, 'local', profileOwner],
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-intents\/([^/]+)$/, ([id, agentId, intent], r) => {
+      workflowExecutionAgent(id, agentId)
+      if (!executionIntentId(intent)) throw executionHttpError('execution-invalid', 'status')
+      if (!executionService) throw executionHttpError('execution-capability-required', 'status', intent)
+      return executionService.status(executionScope(id, agentId, r), intent)
+    }, 'local', profileOwner],
+  ]
+  function guardWorkflowExecution(r: MountRequest, params: string[], profile: boolean): void {
+    if (profile) { workflowExecutionAgent(params[0], params[1]); return }
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(r.method)) return
+    const body = r.body
+    if (isObject(body) && ['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(body, k))) throw executionHttpError('execution-capability-required', 'selection')
+    if (isObject(body) && typeof body.sessionId === 'string') {
+      const source = bySession(body.sessionId)
+      if (source) requireLegacyExecution(source.agent, defaultsNow())
+    }
+    if (/^\/floors\/[^/]+\/agents\/[^/]+\//.test(r.rest) && !r.rest.endsWith('/share')) {
+      const agent = agentOf(floorOf(params[0]), params[1])
+      if (!(r.rest.endsWith('/chat') && isObject(r.body) && Object.hasOwn(r.body, 'executionVersion'))) requireLegacyExecution(agent, defaultsNow())
+    }
+    if (r.method === 'DELETE' && /^\/floors\/[^/]+$/.test(r.rest)) for (const agent of floorOf(params[0]).agents) requireLegacyExecution(agent, defaultsNow())
+  }
+
   /** F-118: what a route's rule needs of its caller, checked before anything runs. A route with no rule is for the owner of the app. */
   function checkRule(rule: Rule | undefined, params: string[], r: MountRequest) {
     const c = callerOf(r)
@@ -4523,7 +4964,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** Runs the route `rest` names; `forward` (a member) passes a non-local one to its hub instead. */
   async function route(r: MountRequest, forward?: (r: MountRequest) => Promise<unknown>): Promise<unknown> {
     let methodMismatch = false
-    for (const [method, pattern, run, where] of routes) {
+    for (const [method, pattern, run, where, profileRule] of [...executionRoutes, ...routes]) {
       const m = pattern.exec(r.rest)
       if (!m) continue
       if (r.method !== method) {
@@ -4537,7 +4978,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         throw apiError(400, 'Malformed path')
       }
       guardPcControlRoute(r, params)
-      checkRule(ruleOf(method, pattern), params, r)
+      const versionedOpen = r.method === 'POST' && /^\/floors\/[^/]+\/agents\/[^/]+\/chat$/.test(r.rest)
+        && isObject(r.body) && ['executionVersion', 'openIntentId', 'expectedExecution'].some(k => Object.hasOwn(r.body as object, k))
+      if ((profileRule || versionedOpen) && !callerOf(r).person) throw authError(401, 'Sign in before using execution selection.', 'sign-in')
+      checkRule(profileRule ?? ruleOf(method, pattern), params, r)
+      guardWorkflowExecution(r, params, profileRule !== undefined)
       if (forward && where !== 'local' && !runsHere(method, pattern, params)) return await forward(r)
       return await run(params, r)
     }
@@ -4546,6 +4991,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** A member's change, passed to the hub; its own folder for a floor becomes `folderFor` (checked here, where it is). */
   async function toHub(r: MountRequest): Promise<unknown> {
+    if (/^\/(?:approvals|send-as-me|auto-update)(?:\/|$)/.test(r.rest)) { requireCrmHuman(o.auth, r); throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null }) }
     const link = needHub()
     let body = r.body
     if (r.method === 'PATCH' && /^\/floors\/[^/]+$/.test(r.rest) && isObject(body) && body.codeDir !== undefined) {
@@ -4589,6 +5035,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'hub') {
       switch (op) {
+        case 'delivery-capabilities':
+          return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
+        case 'delivery-authorize':
+          return answer(raw => humanInputGrants.authorize(from.id, team?.member(from.id)?.token, raw))
         case 'pc-control-capabilities':
           return answer(() => ({ version: 1, pinnedWorkspace: true, actualEngineProof: true, engines: ['claude', 'codex'] }))
         case 'pc-control-runtime':
@@ -4702,7 +5152,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return servePull(sid => validMirrorSid(sid) ? findTranscript(sid, projectsDir) : null)
       }
     } else if (m === 'member' && from.id === team!.hub()?.id) {
+      const approvalHubToken = team?.hub()?.link?.token ?? null
       switch (op) {
+        case 'delivery-capabilities':
+          return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
+        case 'delivery-status':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.messageId !== 'string' || typeof raw.owner !== 'string' || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || raw.targetPcId !== self().id) throw apiError(400, 'Expected a delivery receipt on this PC.')
+            const receipt = nativeReceipts.lookup(raw.messageId, raw.owner, raw.floorId, raw.agentId)
+            return { receipt, blockedByDraft: receipt?.state === 'blocked' && !!receipt.sessionId && chats.drafting(receipt.sessionId) }
+          })
+        case 'approval-snapshot-v1':
+          return answer(raw => {
+            requireApprovalHub(approvalHubToken, from.id)
+            if (!isObject(raw) || Object.keys(raw).some(k => !['version', 'pcId', 'sessionId'].includes(k)) || raw.version !== 1 || raw.pcId !== self().id || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected a versioned native approval target.')
+            return localApprovalSnapshot(raw.sessionId, approvalHubToken)
+          })
+        case 'approval-commit-v1':
+          return answer(raw => { requireApprovalHub(approvalHubToken, from.id); return commitNativeApproval(raw, approvalHubToken) })
         case 'pc-control-capabilities':
           return answer(() => ({ version: 1, pinnedWorkspace: true, actualEngineProof: true, engines: ['claude', 'codex'] }))
         case 'pc-control-runtime':
@@ -4740,6 +5207,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'type':
           return answer(raw => {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
+            if (raw.confirmDelivery === true && raw.messageId !== undefined) {
+              if (typeof raw.messageId !== 'string' || !UUID_RE.test(raw.messageId) || typeof raw.owner !== 'string' || raw.owner.length > 256 || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || typeof raw.expectedBinding !== 'string' || raw.targetPcId !== self().id) throw apiError(400, 'Expected one pinned delivery intent.')
+              const { messageId, owner, floorId, agentId, sessionId, text: body } = raw
+              const existing = nativeReceipts.lookup(messageId, owner, floorId, agentId)
+              if (existing) {
+                const receipt = nativeReceipts.begin({ id: messageId, owner, floorId, agentId, text: body, expectedSessionId: sessionId }, async () => 'blocked')
+                return { receipt, blockedByDraft: receipt.state === 'blocked' && chats.drafting(sessionId) }
+              }
+              const current = bySession(sessionId)
+              if (current?.floor.id !== floorId || current.agent.id !== agentId) throw apiError(409, 'The destination conversation changed. Nothing was submitted.')
+              assertPcControlTarget(current.floor, self().id, {})
+              const actor = isObject(raw.actor) ? raw.actor as unknown as Caller : undefined
+              if (raw.humanAuthorization !== undefined && (typeof raw.humanAuthorization !== 'string' || !UUID_RE.test(raw.humanAuthorization))) throw apiError(400, 'Expected one native input authorization.')
+              const hub = team!.hub()?.link, generation = chats.generation?.(sessionId)
+              const nonce = raw.humanAuthorization
+              let sequence = 0
+              const authorize = typeof nonce === 'string' ? async (phase: HumanInputPhase) => {
+                if (!hub || !generation || team!.hub()?.link?.token !== hub.token || chats.generation?.(sessionId) !== generation) return false
+                const next = sequence++
+                const proof = await request<unknown>(hub, 'delivery-authorize', { nonce, messageId, sessionId, generation, phase, sequence: next }, 3000).catch(() => null)
+                return isObject(proof) && proof.version === 1 && proof.allowed === true && proof.sequence === next && team!.hub()?.link?.token === hub.token && chats.generation?.(sessionId) === generation
+              } : undefined
+              const receipt = beginNativeDelivery(sessionId, body, owner, messageId, raw.expectedBinding, actor ? () => deliveryAcl(actor, sessionId) : undefined, authorize)
+              return nativeReceipts.wait(receipt.id, owner, floorId, agentId, 12_000).then(final => ({ receipt: final, blockedByDraft: final?.state === 'blocked' && chats.drafting(sessionId) }))
+            }
             // A caller that is not the person typing (an agent's message, a broadcast, a nudge) asks for the draft check: this PC knows its own screens.
             if (raw.refuseDraft === true && chats.drafting(raw.sessionId)) return 'draft'
             if (raw.confirmDelivery === true) return confirmedDelivery(raw.sessionId, raw.text, raw.refuseDraft === true).then(delivery => ({ delivery }))
@@ -4759,11 +5251,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         case 'attach-get':
           return answer(raw => attachGetPeer(raw))
         case 'keys':
-          // F-076: the hub answering a prompt in a chat that runs here: one or two digits (a numbered choice), or the one Esc key of a Cancel button; nothing else.
-          return answer(raw => {
-            if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.data !== 'string' || !(/^\d{1,2}$/.test(raw.data) || raw.data === ESC_KEY)) throw apiError(400, 'Expected {sessionId, data: a number or Esc}')
-            return chats.input(raw.sessionId, raw.data)
-          })
+          // Approval-only legacy RPC retired. Terminal sockets and ordinary MCP type remain unchanged.
+          return answer(() => { throw Object.assign(apiError(409, 'Update the Server and target PC for versioned approval commits.'), { code: 'approval-peer-update-required' }) })
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
           return answer(raw => {
@@ -4794,10 +5283,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // It is asked again at every key: a share changed to 'view' while the socket is open takes typing away at once.
     const typing = () => {
       const at = bySession(sid)
+      if (at && !runtimeSidAllowed(sid)) return false
       return !at || access.rights(caller, at.agent)?.can !== 'view'
     }
     return (ws: WsSocket) => {
       const current = bySession(sid), running = chats.info(sid)
+      if (current && !runtimeSidAllowed(sid)) return ws.close(1008, 'This execution has not proved a supported runtime.')
       if (current && isPcControl(current.floor) && running && current.floor.targetPcId !== self().id) return ws.close(1008, 'This runtime is on the wrong PC.')
       if (current && running) {
         try { requireRunningEngine(engineFor(current.agent), running.engine) }
@@ -4865,7 +5356,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       stream?.destroy()
     })
     const expected = bySession(sid)
-    const support = expected && isPcControl(expected.floor) ? requirePcControlPeer(link) : expected ? requirePeerEngine(link, engineFor(expected.agent)) : Promise.resolve()
+    const support = expected && isPcControl(expected.floor) ? requirePcControlPeer(link) : expected ? requirePeerEngine(link, expected.agent) : Promise.resolve()
     support.then(() => link.open({ op: 'terminal' })).then(
       s => {
         if (closed) return void s.destroy()
@@ -4920,6 +5411,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         sid = typeof raw.sessionId === 'string' ? raw.sessionId : ''
         const current = bySession(sid), running = chats.info(sid)
         try {
+          if (current) requireLegacyExecution(current.agent, defaultsNow())
           if (current && isPcControl(current.floor)) assertPcControlTarget(current.floor, running ? self().id : current.floor.targetPcId, {})
           if (current && raw.expectedEngine !== undefined) requireRunningEngine(engineFor(current.agent), raw.expectedEngine as RuntimeEngine)
           if (current && running) requireRunningEngine(engineFor(current.agent), running.engine)
@@ -4932,7 +5424,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         early = []
         const asked = sid
         const expectedEngine = current ? engineFor(current.agent) : undefined
-        const support = current && isPcControl(current.floor) ? requirePcControlPeer(link) : expectedEngine ? requirePeerEngine(link, expectedEngine) : Promise.resolve()
+        const support = current && isPcControl(current.floor) ? requirePcControlPeer(link) : current ? requirePeerEngine(link, current.agent) : Promise.resolve()
         support.then(() => link.open({ op: 'terminal' })).then(
           s => {
             if (stream.destroyed) return void s.destroy()
@@ -4949,6 +5441,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return
       }
       if (early !== null) {
+        if (!legacySidAllowed(sid)) return ended()
         if (relay) writeLine(relay, raw)
         else early.push(raw)
         return
@@ -4988,6 +5481,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return (req, res, caller) => {
           // F-118: a file into a chat is typing into it.
           access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])), 'type', 'POST attach')
+          requireLegacyExecution(agentOf(floorOf(decodeURIComponent(up[1])), decodeURIComponent(up[2])), defaultsNow())
           return attachUpload(req, res, decodeURIComponent(up[1]), decodeURIComponent(up[2]), url)
         }
       const down = /^\/floors\/([^/]+)\/agents\/([^/]+)\/attachment\/([^/]+)$/.exec(rest)
@@ -5064,6 +5558,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     memory,
     callTool,
     routeKeys: () => routes.map(([m, p]) => policyKey(m, p)),
+    executionRouteKeys: () => executionRoutes.map(([m, p]) => policyKey(m, p)),
     driveRequest: async (body, timeoutMs) => request<unknown>(needHub(), 'drive', body, timeoutMs ?? 30_000),
     serve,
     restartChat,
@@ -5079,6 +5574,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     close() {
       // The chats are about to be closed with the app: what is open now is what the next start reopens.
       closing = true
+      executionService?.close()
+      messageReceipts.close()
+      nativeReceipts.close()
+      humanInputGrants.close()
       for (const cancel of threadWatchers.values()) cancel()
       threadWatchers.clear()
       void crmFiles.close()

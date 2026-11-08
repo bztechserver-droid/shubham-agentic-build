@@ -39,6 +39,7 @@ import { ROUTES } from './config.ts'
 import { loopbackOrigin } from './local-host.ts'
 import type { Logger } from './log.ts'
 import { keepalive, pongFor, WS_DEAD_MS, WS_PING_MS } from './ws-live.ts'
+import { EXECUTION_ERROR_CODES, executionId, executionIntentId, publicExecutionFailure, type ExecutionPhase } from '../shared/chat-execution-http.ts'
 
 // The local API the app talks to (agent/SPEC.md › Local API): HTTP and a WebSocket on
 // 127.0.0.1 only, with shared/agent-api.ts as the contract. Every request but /health must
@@ -592,6 +593,24 @@ export function startApi(o: ApiOptions): Promise<Api> {
   /** F-018: the mount whose prefix this path is under. */
   const mountOf = (path: string) => o.mounts?.find(m => path.startsWith(`${AGENT_API_PREFIX}${m.prefix}/`))
 
+  // F-159: private request-derived context; never serialize a thrown object's arbitrary body.
+  const executionFailures = new WeakMap<IncomingMessage, { phase: ExecutionPhase; intentId?: string }>()
+  function noteExecutionRequest(m: ApiMount, req: IncomingMessage, rest: string, body: unknown): void {
+    if (m.prefix !== '/agentic') return
+    const match = /^\/floors\/([^/]+)\/agents\/([^/]+)\/(execution-capability|execution-verify|execution-selection|execution-intents\/([^/]+)|chat)$/.exec(rest)
+    if (!match) return
+    try { if (!executionId(decodeURIComponent(match[1])) || !executionId(decodeURIComponent(match[2]))) return } catch { return }
+    const method = req.method ?? 'GET', leaf = match[3]
+    const data = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null
+    let phase: ExecutionPhase, intent: unknown
+    if ((method === 'GET' && leaf === 'execution-capability') || (method === 'POST' && leaf === 'execution-verify')) phase = 'capability'
+    else if (method === 'POST' && leaf === 'execution-selection') { phase = 'selection'; intent = data?.selectionIntentId }
+    else if (method === 'POST' && leaf === 'chat' && data?.executionVersion === 1) { phase = 'open'; intent = data.openIntentId }
+    else if (method === 'GET' && match[4]) { phase = 'status'; try { intent = decodeURIComponent(match[4]) } catch { return } }
+    else return
+    executionFailures.set(req, { phase, ...(executionIntentId(intent) ? { intentId: intent } : {}) })
+  }
+
   async function answerMount(m: ApiMount, req: IncomingMessage, url: URL): Promise<unknown> {
     const rest = url.pathname.slice(`${AGENT_API_PREFIX}${m.prefix}`.length)
     let caller: Caller = OPEN
@@ -606,6 +625,7 @@ export function startApi(o: ApiOptions): Promise<Api> {
     }
     const method = req.method ?? 'GET'
     const body = method === 'POST' || method === 'PATCH' || method === 'PUT' ? await readJson(req, m.maxBody?.(rest)) : undefined
+    noteExecutionRequest(m, req, rest, body)
     return m.http({ method, rest, query: url.searchParams, body, headers: req.headers, caller })
   }
 
@@ -747,7 +767,11 @@ export function startApi(o: ApiOptions): Promise<Api> {
       const code = typeof status === 'number' && status >= 400 && status < 600 ? status : 500
       if (code === 500) log?.error(`${req.method} ${req.url}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
       const why = (e as { code?: unknown }).code
-      if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}), ...hubSignInHint(code, why, (e as { hubOrigin?: unknown }).hubOrigin) })
+      const execution = executionFailures.get(req)
+      if (!res.headersSent && code === 409 && execution && typeof why === 'string' && (EXECUTION_ERROR_CODES as readonly string[]).includes(why)) {
+        const safe = publicExecutionFailure(e, execution.phase, execution.intentId)
+        send(res, 409, { error: safe.message, ...safe })
+      } else if (!res.headersSent) send(res, code, { error: e instanceof Error ? e.message : String(e), ...(typeof why === 'string' && code !== 500 ? { code: why } : {}), ...hubSignInHint(code, why, (e as { hubOrigin?: unknown }).hubOrigin) })
       else res.destroy()
     })
   })

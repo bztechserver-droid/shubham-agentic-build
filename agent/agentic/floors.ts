@@ -21,6 +21,12 @@ import { SHARE_LEVELS, type ChatOwner, type ChatShare, type ShareLevel } from '.
 import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 import { conversationHistory, rememberConversation } from './conversation-history.ts'
+import { assertExecutionCAS, assertPreparedExecution, contractRecord, requireExecutionIdentity, requireExecutionSnapshot,
+  sameExecution, snapshotAgentExecution, type ExecutionIdentity, type ExecutionLineage, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
+import { executionHttpError, executionIntentId, requireHttpExecutionSnapshot } from '../../shared/chat-execution-http.ts'
+import { executionIdentityOf, requireLegacyExecution } from './runtime-engine.ts'
+import { validatePreparedConversation } from './prepared-conversation.ts'
+import type { ExecutionCommitStamp } from './execution-intents.ts'
 
 // F-018: floors and their agents (agentic-claude-manager server/lib/floors.js), kept in
 // <state>/agent/agentic/floors.json. A floor starts with its boss seated; the page owns the
@@ -66,8 +72,9 @@ const LEAD_MD =
 
 function hydrateAgent(raw: unknown, index: number): FloorAgent {
   const a = isObject(raw) ? raw : {}
+  if (['executionProfile', 'executionRevision', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(a, k))) executionIdentityOf(a)
   const name = str(a.name, NAME_MAX).trim()
-  return {
+  const hydrated: FloorAgent = {
     id: typeof a.id === 'string' && a.id ? a.id.slice(0, 64) : randomUUID(),
     ...(a.pcControlSlot === 1 || a.pcControlSlot === 2 ? { pcControlSlot: a.pcControlSlot } : {}),
     name: name || 'Untitled',
@@ -85,6 +92,8 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     ultracode: isUltracode(a.ultracode) ? a.ultracode : '',
     // F-134: the engine and the Codex model and effort are the page's to set; the Codex conversation id is the agent's (patch() puts the old one back).
     engine: isEngine(a.engine) ? a.engine : '',
+    ...(Object.hasOwn(a, 'executionProfile') ? { executionProfile: a.executionProfile as FloorAgent['executionProfile'] } : {}),
+    ...(Object.hasOwn(a, 'executionRevision') ? { executionRevision: a.executionRevision as number } : {}),
     opencodeProvider: (OPENCODE_PROVIDERS as readonly unknown[]).includes(a.opencodeProvider) ? a.opencodeProvider as FloorAgent['opencodeProvider'] : '',
     opencodeModel: openCodeModel(a.opencodeModel),
     opencodeSession: typeof a.opencodeSession === 'string' && OPENCODE_SESSION_RE.test(a.opencodeSession) ? a.opencodeSession : null,
@@ -100,6 +109,11 @@ function hydrateAgent(raw: unknown, index: number): FloorAgent {
     owner: ownerOf(a.owner),
     sharedWith: shareList(a.sharedWith),
   }
+  if (Object.hasOwn(a, 'executionProfile')) {
+    // New explicit identities are never repaired into another native binding during hydration.
+    assertExecutionCAS(snapshotAgentExecution(a), snapshotAgentExecution(hydrated))
+  }
+  return hydrated
 }
 
 /**
@@ -138,6 +152,12 @@ function repairAgents(agents: FloorAgent[]): FloorAgent[] {
 
 function hydrateFloor(raw: unknown): Floor | null {
   if (!isObject(raw) || typeof raw.id !== 'string' || !raw.id) return null
+  // A future/unsupported execution cannot hide beyond the legacy chart-size trimming boundary.
+  if (Array.isArray(raw.agents)) for (const agent of raw.agents) if (isObject(agent)) {
+    if (['executionProfile', 'executionRevision', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(agent, k))) executionIdentityOf(agent)
+    if (Array.isArray(agent.conversationHistory)) for (const history of agent.conversationHistory) if (isObject(history)
+      && ['executionProfile', 'executionRevision', 'execution'].some(k => Object.hasOwn(history, k))) conversationHistory([history])
+  }
   const created = typeof raw.createdAt === 'string' ? raw.createdAt : now()
   const agents = (Array.isArray(raw.agents) ? raw.agents : []).slice(0, MAX_AGENTS_PER_FLOOR).map(hydrateAgent)
   return {
@@ -175,6 +195,11 @@ function shareList(v: unknown): ChatShare[] {
 }
 
 export interface FloorStore {
+  /** Backend only: unknown provider/runtime ownership must fence native credential cleanup. */
+  hasUnverifiedExecution(): boolean
+  /** Backend only: private selection stamp is never a member of public Floor or event payloads. */
+  executionState(floorId: string, agentId: string): { binding: ExecutionSnapshot; selection: ExecutionCommitStamp | null }
+  commitExecution(request: FloorExecutionCommit): Floor
   validatePatch(id: string, patch: FloorPatch, as?: ChatOwner): Floor
   list(): Floor[]
   get(id: string): Floor | null
@@ -242,6 +267,8 @@ export function ensureDuty(floors: Floor[]): boolean {
 
 /** Reads `file` (a corrupt one is set aside as .corrupt-<time>, never overwritten) and keeps it written. */
 export interface FloorStoreOptions {
+  /** Absent in production in this phase: real storage, ACL/source fences and target proof are not wired. */
+  executionAuthority?: FloorExecutionAuthority
   /** Check the other canonical stores before persisting a discovered native binding. */
   validateCodexThread?: (floorId: string, agentId: string, thread: string | null) => void
   /** Internal PC Control store: only exact engine-only chart changes are accepted. */
@@ -250,8 +277,39 @@ export interface FloorStoreOptions {
   readOnly?: boolean
   /** F-134: the engine an agent set to "Default" runs, so changing it is judged by what really runs. */
   defaultEngine?: () => AgentEngine
+  /** Full inherited provider identity for execution CAS; independent of legacy native-engine inference. */
+  executionDefaults?: () => { engine?: AgentEngine; opencodeProvider?: FloorAgent['opencodeProvider'] }
   /** F-142: after validation, carry a confirmed engine change into a fresh server-owned binding. */
   switchConversation?: (floor: Floor, previous: FloorAgent, to: 'claude' | 'codex' | 'opencode') => Pick<FloorAgent, 'sessionId' | 'codexThread' | 'opencodeSession' | 'homePc' | 'homePcName'> | null
+}
+
+export interface FloorExecutionAuthority {
+  /** Current actor/owner, full target/pin/link proof, sealed native source hashes and exclusive writer fence. */
+  assertCurrent(request: FloorExecutionCommit): void
+  /** Durable same-directory atomic document replacement AND file/directory sync under owner-only storage. */
+  persist(file: string, text: string): void
+}
+export interface FloorExecutionCommit {
+  readonly floorId: string
+  readonly agentId: string
+  readonly expected: ExecutionSnapshot
+  readonly next: ExecutionSnapshot
+  readonly target: ExecutionIdentity
+  readonly lineage: ExecutionLineage | null
+  readonly homePcName: string
+  readonly stamp: ExecutionCommitStamp
+}
+interface PrivateExecutionCommit {
+  floorId: string
+  agentId: string
+  binding: ExecutionSnapshot
+  stamp: ExecutionCommitStamp
+}
+function validExecutionStamp(value: unknown): value is ExecutionCommitStamp {
+  return contractRecord(value) && Object.keys(value).sort().join(',') === 'fingerprint,openIntentId,scopeDigest,selectionIntentId'
+    && executionIntentId(value.selectionIntentId) && executionIntentId(value.openIntentId)
+    && typeof value.scopeDigest === 'string' && /^[a-f0-9]{64}$/.test(value.scopeDigest)
+    && typeof value.fingerprint === 'string' && /^[a-f0-9]{64}$/.test(value.fingerprint)
 }
 
 /** Only the already-selected native binding is idempotent; an app SID or older native ID is never a new thread. */
@@ -276,11 +334,14 @@ export function assertCodexThreadAvailable(rows: Floor[], floorId: string, agent
 
 export function createFloorStore(file: string, onChange: () => void = () => {}, opts: FloorStoreOptions = {}): FloorStore {
   const defaultEngine = () => opts.defaultEngine?.() ?? ''
+  const executionDefaults = () => opts.executionDefaults?.() ?? { engine: defaultEngine() }
+  const quarantined = new Set<string>(), quarantinedSessions = new Set<string>()
+  let privateCommits: PrivateExecutionCommit[] = [], metadataUnsupported = false, writeUncertain = false
   let floors: Floor[] = opts.seed ? clone(opts.seed) : load()
   // F-086: the migration runs at the start; what it changed is written with the next change at the latest (and at once if it can be).
-  if (ensureDuty(floors) && !opts.readOnly) {
+  if (!quarantined.size && !metadataUnsupported && ensureDuty(floors) && !opts.readOnly) {
     try {
-      writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`)
+      writeAtomic(file, document())
     } catch {
       // Written with the next save.
     }
@@ -294,22 +355,60 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       if ((e as NodeJS.ErrnoException).code === 'ENOENT') return []
       throw e
     }
-    try {
-      const data: unknown = JSON.parse(text)
-      const list = isObject(data) && Array.isArray(data.floors) ? data.floors : []
-      return list.map(hydrateFloor).filter((f): f is Floor => f !== null)
-    } catch {
+    let data: unknown
+    try { data = JSON.parse(text) } catch {
       renameSync(file, `${file}.corrupt-${Date.now()}`)
       return []
     }
+    // Unsupported schema/profile is not corrupt JSON. Preserve every original byte; never erase/default it.
+    const list = isObject(data) && Array.isArray(data.floors) ? data.floors : []
+    const loaded: Floor[] = []
+    for (const raw of list) {
+      try { const floor = hydrateFloor(raw); if (floor) loaded.push(floor) } catch (error) {
+        if (!['execution-invalid', 'execution-stale'].includes(String((error as { code?: unknown }).code)) || !isObject(raw) || typeof raw.id !== 'string') throw error
+        quarantined.add(raw.id)
+        if (Array.isArray(raw.agents)) for (const agent of raw.agents) if (isObject(agent)) {
+          for (const id of [agent.sessionId, agent.codexThread, agent.opencodeSession]) if (typeof id === 'string') quarantinedSessions.add(id)
+          if (Array.isArray(agent.conversationHistory)) for (const history of agent.conversationHistory) if (isObject(history)) {
+            for (const id of [history.sessionId, history.codexThread, history.opencodeSession, history.sourceSessionId]) if (typeof id === 'string') quarantinedSessions.add(id)
+          }
+        }
+      }
+    }
+    if (isObject(data) && Object.hasOwn(data, 'executionPrivate')) {
+      const metadata = data.executionPrivate
+      if (!isObject(metadata) || Object.keys(metadata).sort().join(',') !== 'commits,version' || metadata.version !== 1 || !Array.isArray(metadata.commits) || metadata.commits.length > 4096) metadataUnsupported = true
+      else for (const raw of metadata.commits) {
+        try {
+          if (!isObject(raw) || Object.keys(raw).sort().join(',') !== 'agentId,binding,floorId,stamp' || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string' || !validExecutionStamp(raw.stamp)) throw executionHttpError('execution-invalid', 'selection')
+          const agent = loaded.find(f => f.id === raw.floorId)?.agents.find(a => a.id === raw.agentId)
+          if (!agent || privateCommits.some(c => c.floorId === raw.floorId && c.agentId === raw.agentId)) throw executionHttpError('execution-invalid', 'selection')
+          const binding = requireHttpExecutionSnapshot(raw.binding)
+          assertExecutionCAS(binding, snapshotAgentExecution(agent))
+          privateCommits.push({ floorId: raw.floorId, agentId: raw.agentId, binding, stamp: raw.stamp })
+        } catch { metadataUnsupported = true }
+      }
+    }
+    return loaded
+  }
+
+  function assertWritable(): void {
+    if (writeUncertain) throw executionHttpError('execution-intent-uncertain', 'selection')
+    if (quarantined.size || metadataUnsupported) throw executionHttpError('execution-invalid', 'selection')
+  }
+  function document(): string {
+    // Legacy envelope is byte-for-byte the existing serializer when no execution commits exist.
+    return `${JSON.stringify({ floors, ...(privateCommits.length ? { executionPrivate: { version: 1, commits: privateCommits } } : {}) }, null, 2)}\n`
   }
 
   function save() {
+    assertWritable()
     ensureDuty(floors)
-    if (!opts.readOnly) { writeAtomic(file, `${JSON.stringify({ floors }, null, 2)}\n`); onChange() }
+    if (!opts.readOnly) { writeAtomic(file, document()); onChange() }
   }
 
   function find(id: string): Floor {
+    if (quarantined.has(id)) throw executionHttpError('execution-invalid', 'selection')
     const f = floors.find(x => x.id === id)
     if (!f) throw apiError(404, 'No such floor')
     return f
@@ -327,14 +426,76 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
   }
 
   return {
-    validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine, pcControl: opts.pcControl }).patch(id, patch, as) },
+    hasUnverifiedExecution: () => writeUncertain || metadataUnsupported || quarantined.size > 0 || floors.some(f => f.agents.some(a => a.executionProfile === 'codex-in-claude-v1')),
+    executionState(floorId, agentId) {
+      if (writeUncertain) throw executionHttpError('execution-intent-uncertain', 'status')
+      if (metadataUnsupported) throw executionHttpError('execution-invalid', 'status')
+      const agent = agentOf(find(floorId), agentId)
+      const binding = snapshotAgentExecution(agent, executionDefaults())
+      const commit = privateCommits.find(c => c.floorId === floorId && c.agentId === agentId)
+      if (commit) assertExecutionCAS(binding, commit.binding)
+      return { binding, selection: commit ? clone(commit.stamp) : null }
+    },
+    commitExecution(request) {
+      assertWritable()
+      if (!opts.executionAuthority || opts.readOnly) throw executionHttpError('execution-capability-required', 'selection')
+      const floor = clone(find(request.floorId)), source = agentOf(floor, request.agentId)
+      if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control cannot use workflow execution selection.'), { code: 'pc-control-immutable' })
+      const expected = requireExecutionSnapshot(request.expected), next = requireExecutionSnapshot(request.next), target = requireExecutionIdentity(request.target)
+      assertExecutionCAS(expected, snapshotAgentExecution(source, executionDefaults()))
+      if (expected.agentId !== request.agentId || !expected.homePc || next.homePc !== expected.homePc || !validExecutionStamp(request.stamp)
+        || !sameExecution(next.execution, target)) throw executionHttpError('execution-lineage-invalid', 'selection')
+      if (sameExecution(expected.execution, target)) {
+        assertExecutionCAS(expected, next)
+        if (request.lineage !== null) throw executionHttpError('execution-lineage-invalid', 'selection')
+      } else {
+        assertExecutionCAS(next, assertPreparedExecution(expected, request.lineage, expected.homePc, target).binding)
+        validatePreparedConversation({ ...next, homePcName: request.homePcName }, target.engine, source, expected.homePc,
+          floors.flatMap(f => f.agents), [], { expected, target, lineage: request.lineage!, defaults: executionDefaults() })
+      }
+      opts.executionAuthority.assertCurrent(request)
+      const archived = clone(source)
+      Object.assign(archived, { engine: expected.execution.engine, executionProfile: expected.execution.profile, executionRevision: expected.executionRevision })
+      if (expected.execution.engine === 'opencode') archived.opencodeProvider = expected.execution.provider as FloorAgent['opencodeProvider']
+      rememberConversation(archived, expected.execution.engine)
+      const agent = agentOf(floor, request.agentId)
+      Object.assign(agent, { engine: target.engine, executionProfile: target.profile, executionRevision: next.executionRevision,
+        sessionId: next.sessionId, codexThread: next.codexThread, opencodeSession: next.opencodeSession, homePc: next.homePc,
+        homePcName: request.homePcName, conversationHistory: archived.conversationHistory })
+      if (target.engine === 'opencode') agent.opencodeProvider = target.provider as FloorAgent['opencodeProvider']
+      rememberConversation(agent, target.engine, next.sessionId !== expected.sessionId ? expected.sessionId ?? undefined : undefined)
+      floor.updatedAt = now()
+      const beforeFloors = floors, beforeCommits = privateCommits
+      const beforeBytes = existsSync(file) ? readFileSync(file, 'utf8') : null
+      floors = floors.map(f => f.id === floor.id ? floor : f)
+      privateCommits = [...privateCommits.filter(c => c.floorId !== floor.id || c.agentId !== agent.id),
+        { floorId: floor.id, agentId: agent.id, binding: next, stamp: clone(request.stamp) }]
+      const intended = document()
+      try {
+        opts.executionAuthority.assertCurrent(request)
+        opts.executionAuthority.persist(file, intended)
+      } catch (error) {
+        // A lost acknowledgement after atomic replacement is not proof of no commit. Never overwrite/rollback bytes.
+        let observed: string | null = null
+        try { observed = readFileSync(file, 'utf8') } catch { /* Retain fenced uncertainty. */ }
+        if (observed === beforeBytes) { floors = beforeFloors; privateCommits = beforeCommits }
+        else if (observed !== intended) writeUncertain = true
+        throw error
+      }
+      // Publication uses only public Floor; the stamp never enters it or an event.
+      onChange()
+      return clone(floor)
+    },
+    validatePatch(id, patch, as) { return createFloorStore('', () => {}, { seed: floors, readOnly: true, defaultEngine, executionDefaults, pcControl: opts.pcControl }).patch(id, patch, as) },
     list: () => clone(floors),
     get: id => {
+      if (quarantined.has(id)) throw executionHttpError('execution-invalid', 'selection')
       const f = floors.find(x => x.id === id)
       return f ? clone(f) : null
     },
 
     create(name, as) {
+      assertWritable()
       const t = now()
       const floor: Floor = {
         id: randomUUID(),
@@ -353,6 +514,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     patch(id, p, as) {
+      assertWritable()
+      if (['executionPrivate', 'stamp', 'fingerprint', 'scopeDigest'].some(k => Object.hasOwn(p, k))) throw executionHttpError('execution-invalid', 'selection')
       // Stage the entire chart: a failure in any conversion must not mutate another binding or field.
       const floor = clone(find(id))
       if (floor.workspace === 'pc-control') {
@@ -363,6 +526,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         })) throw Object.assign(apiError(409, 'PC Control slots are immutable except for their engine.'), { code: 'pc-control-immutable' })
       }
       const expected = p.expectedConversation
+      if (p.expectedExecution) assertExecutionCAS(p.expectedExecution, snapshotAgentExecution(agentOf(floor, p.expectedExecution.agentId), executionDefaults()))
       if (expected) {
         const a = floor.agents.find(a => a.id === expected.agentId)
         if (!a || engineOf(a.engine, defaultEngine()) !== expected.engine || a.sessionId !== expected.sessionId ||
@@ -400,6 +564,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
         // it the first agent), and taking the last agent off leaves an empty floor.
         const next = p.agents.map((raw, i) => {
           if (isObject(raw)) {
+            if (['execution', 'provider', 'harness', 'transcript', 'executionPrivate', 'stamp', 'fingerprint'].some(k => Object.hasOwn(raw, k))) throw executionHttpError('execution-invalid', 'selection')
             if (raw.opencodeProvider !== undefined && !['', ...OPENCODE_PROVIDERS].includes(String(raw.opencodeProvider))) throw apiError(400, 'OpenCode provider is openai, anthropic or opencode')
             if (raw.opencodeModel !== undefined && !validOpenCodeModel(raw.opencodeModel)) throw apiError(400, 'Invalid OpenCode model')
           }
@@ -418,6 +583,17 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
           a.duty = before.get(a.id)?.duty ?? null
           // The conversation binding is server-owned. F-142 carries it across engines after validation below.
           const had = before.get(a.id)
+          if (had) {
+            if (isObject(raw) && ((Object.hasOwn(raw, 'executionProfile') && raw.executionProfile !== had.executionProfile)
+              || (Object.hasOwn(raw, 'executionRevision') && raw.executionRevision !== had.executionRevision))) throw executionHttpError('execution-capability-required', 'selection')
+            if (had.executionProfile !== undefined) a.executionProfile = had.executionProfile
+            else delete a.executionProfile
+            if (had.executionRevision !== undefined) a.executionRevision = had.executionRevision
+            else delete a.executionRevision
+            if (had.executionProfile !== undefined && (a.engine !== had.engine || a.opencodeProvider !== had.opencodeProvider)) throw executionHttpError('execution-capability-required', 'selection')
+            if (executionIdentityOf(had, { engine: defaultEngine() }).profile === 'codex-in-claude-v1'
+              && ['model', 'effort', 'ultracode', 'codexModel', 'codexEffort', 'opencodeModel'].some(k => a[k as keyof FloorAgent] !== had[k as keyof FloorAgent])) throw executionHttpError('bridge-policy-refused', 'selection')
+          } else if (a.executionProfile !== undefined || a.executionRevision !== undefined) throw executionHttpError('execution-capability-required', 'selection')
           a.conversationHistory = clone(had?.conversationHistory ?? [])
           a.opencodeSession = had?.opencodeSession ?? null
           a.codexThread = had?.codexThread ?? null
@@ -471,12 +647,14 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
               archived.homePcName = carried.homePcName ?? archived.homePcName
               rememberConversation(archived, engineOf(had.engine, defaultEngine()))
               a.conversationHistory = archived.conversationHistory
-              Object.assign(a, carried)
+              Object.assign(a, { sessionId: carried.sessionId, codexThread: carried.codexThread, opencodeSession: carried.opencodeSession,
+                homePc: carried.homePc, homePcName: carried.homePcName })
               rememberConversation(a, engineOf(a.engine, defaultEngine()), had.sessionId)
             }
           }
         }
         floor.agents = floor.workspace === 'pc-control' ? next : repairAgents(next)
+        if ([...before.values()].some(a => a.executionProfile === 'codex-in-claude-v1' && !floor.agents.some(n => n.id === a.id))) throw executionHttpError('execution-capability-required', 'selection')
       }
       floor.updatedAt = now()
       const previousFloors = floors
@@ -486,15 +664,18 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     remove(id) {
+      assertWritable()
       const f = floors.find(x => x.id === id)
       if (!f) return null
       if (f.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control cannot be removed.'), { code: 'pc-control-immutable' })
+      if (f.agents.some(a => a.executionProfile === 'codex-in-claude-v1')) throw executionHttpError('execution-capability-required', 'selection')
       floors = floors.filter(x => x !== f)
       save()
       return clone(f)
     },
 
     reorder(order) {
+      assertWritable()
       if (floors.some(f => f.workspace === 'pc-control')) throw Object.assign(apiError(409, 'PC Control cannot be reordered.'), { code: 'pc-control-immutable' })
       const rank = new Map(order.map((id, i) => [id, i]))
       floors = [...floors].sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity))
@@ -503,10 +684,12 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     moveAgent(fromFloorId, agentId, toFloorId, before) {
+      assertWritable()
       const from = find(fromFloorId)
       const to = find(toFloorId)
       if (from.workspace === 'pc-control' || to.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control slots cannot move.'), { code: 'pc-control-immutable' })
       const agent = agentOf(from, agentId)
+      if (agent.executionProfile === 'codex-in-claude-v1' && from !== to) throw executionHttpError('execution-capability-required', 'selection')
       if (to !== from) {
         if (to.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `${to.name} already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
         if (!uniqueName(to, agent.name)) throw apiError(409, `There is already an agent called "${agent.name}" on ${to.name}; rename one first`)
@@ -534,6 +717,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     addAgent(floorId, req, as) {
+      assertWritable()
+      if (['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(req, k))) throw executionHttpError('execution-capability-required', 'selection')
       const floor = find(floorId)
       if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control has exactly two persistent slots.'), { code: 'pc-control-immutable' })
       if (floor.agents.length >= MAX_AGENTS_PER_FLOOR) throw apiError(409, `This floor already has ${MAX_AGENTS_PER_FLOOR} agents, the most it can`)
@@ -586,6 +771,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     setShare(floorId, agentId, list) {
+      assertWritable()
       const floor = find(floorId)
       if (floor.workspace === 'pc-control') throw Object.assign(apiError(409, 'PC Control sharing is managed by the server.'), { code: 'pc-control-immutable' })
       const agent = agentOf(floor, agentId)
@@ -596,8 +782,10 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     adopt(raw, from) {
+      assertWritable()
       const f = hydrateFloor(raw)
       if (!f) throw apiError(400, 'Not a floor')
+      if (f.agents.some(a => a.executionProfile === 'codex-in-claude-v1')) throw executionHttpError('execution-capability-required', 'selection')
       if (f.workspace === 'pc-control' || floors.some(x => x.id === f.id && x.workspace === 'pc-control')) throw Object.assign(apiError(409, 'PC Control cannot be adopted.'), { code: 'pc-control-immutable' })
       const have = floors.find(x => x.id === f.id)
       if (have) return { floor: clone(have), created: false, renamedFrom: null }
@@ -622,6 +810,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     assignUnowned(owner) {
+      assertWritable()
       let n = 0
       for (const f of floors) {
         if (!f.createdBy) {
@@ -640,8 +829,11 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     bindSession(floorId, agentId, sessionId) {
+      assertWritable()
       const floor = find(floorId)
       const agent = agentOf(floor, agentId)
+      requireLegacyExecution(agent, { engine: defaultEngine() })
+      if (sessionId) for (const f of floors) for (const a of f.agents) if (a.sessionId === sessionId) requireLegacyExecution(a, { engine: defaultEngine() })
       if (sessionId && floors.some(f => f.agents.some(a => a.id !== agentId && a.pcControlSlot && (a.sessionId === sessionId || a.conversationHistory?.some(h => h.sessionId === sessionId || h.codexThread === sessionId || h.opencodeSession === sessionId))))) throw Object.assign(apiError(409, 'A PC Control conversation cannot be reassigned.'), { code: 'pc-control-immutable' })
       if (sessionId !== null && !SESSION_ID_RE.test(sessionId)) throw apiError(400, 'Not a chat id')
       if (sessionId !== null) {
@@ -664,16 +856,20 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     setOpenCodeSession(floorId, agentId, native) {
+      assertWritable()
       if (native !== null && !OPENCODE_SESSION_RE.test(native)) throw apiError(400, 'Invalid OpenCode session id')
       const floor = find(floorId), agent = agentOf(floor, agentId)
+      requireLegacyExecution(agent, { engine: defaultEngine() })
       agent.opencodeSession = native
       rememberConversation(agent, engineOf(agent.engine, defaultEngine()))
       floor.updatedAt = now(); save(); return clone(floor)
     },
 
     setCodexThread(floorId, agentId, thread) {
+      assertWritable()
       const current = find(floorId)
       const previous = agentOf(current, agentId)
+      requireLegacyExecution(previous, { engine: defaultEngine() })
       if (thread !== null && !THREAD_ID_RE.test(thread)) throw apiError(400, 'Not a Codex conversation id')
       const next = thread === null ? null : thread.toLowerCase()
       assertCodexThreadAvailable(floors, floorId, agentId, next)
@@ -701,9 +897,11 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     setHome(floorId, agentId, home) {
+      assertWritable()
       const floor = find(floorId)
       if (floor.workspace === 'pc-control' && home?.id !== floor.targetPcId) throw Object.assign(apiError(409, 'This chat is pinned to its PC.'), { code: 'pc-control-wrong-device' })
       const agent = agentOf(floor, agentId)
+      requireLegacyExecution(agent, { engine: defaultEngine() })
       const id = home?.id.trim().slice(0, 64) || null
       const name = id ? home!.name.trim().slice(0, NAME_MAX) || id : null
       if (agent.homePc === id && agent.homePcName === name) return clone(floor)
@@ -716,6 +914,7 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
     },
 
     bySession(sessionId) {
+      if (quarantinedSessions.has(sessionId)) throw executionHttpError('execution-invalid', 'runtime')
       for (const floor of floors) {
         const agent = floor.agents.find(a => a.sessionId === sessionId)
         if (agent) return { floor: clone(floor), agent: clone(agent) }

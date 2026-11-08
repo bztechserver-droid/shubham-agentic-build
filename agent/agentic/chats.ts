@@ -115,6 +115,8 @@ const PASTE_START = '\u001b[200~'
 const PASTE_END = '\u001b[201~'
 
 export interface StartChat {
+  /** Backend-owned managed launch; never accepted directly from an HTTP body. */
+  bridge?: { descriptorFile: string; runId: string; binding: import('../../shared/chat-execution.ts').ExecutionSnapshot; wrapperPath: string }
   sessionId: string
   floorId: string
   agentId: string
@@ -124,7 +126,7 @@ export interface StartChat {
   mcpConfig?: string
   /** claude --strict-mcp-config: only the servers of mcpConfig, none from the user's own config (the F-078 scope fix). */
   strictMcp?: boolean
-  model: AgentModel
+  model: AgentModel | 'gpt-6.1-sol'
   /** F-049: claude --effort (low ... max); none: the CLI's own. */
   effort?: string
   /** claude --resume <id> rather than --session-id <id>: the conversation exists. */
@@ -157,6 +159,8 @@ export interface Viewer {
 }
 
 export interface ChatInfo {
+  execution?: import('../../shared/chat-execution.ts').ExecutionSnapshot
+  bridgeRunId?: string
   sessionId: string
   floorId: string
   agentId: string
@@ -169,6 +173,8 @@ export interface ChatInfo {
 }
 
 export interface ChatPool {
+  /** Managed profiles validate physical host ownership and adopt provider leases before PTY adoption. */
+  beforeAdopt?(info: AdoptChat): Promise<void>
   start(o: StartChat): ChatInfo
   info(sessionId: string): ChatInfo | null
   live(): ChatInfo[]
@@ -195,7 +201,9 @@ export interface ChatPool {
    */
   type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
   /** Await actual input acceptance; legacy type() only reports scheduling. */
-  deliver?(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): Promise<SendResult>
+  deliver?(sessionId: string, text: string, opt?: DeliveryOptions): Promise<SendResult>
+  /** Opaque incarnation: a restarted process must not inherit a pending send. */
+  generation?(sessionId: string): string | null
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
   typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
   kill(sessionId: string, why?: string): boolean
@@ -213,6 +221,17 @@ export interface ChatPool {
   closeAll(): void
 }
 
+export interface DeliveryOptions {
+  refuseDraft?: boolean
+  /** The HTTP/RPC caller still bounds its observation wait independently. */
+  waitForOutcome?: boolean
+  waitUntilReady?: boolean
+  /** Rechecked before every owned input action; false cancels without retrying on a new binding. */
+  guard?: () => boolean
+  /** Optional current coordinator authorization immediately before new native input. */
+  authorize?: (phase: 'paste' | 'submit') => Promise<boolean>
+}
+
 export interface ChatActivity {
   state: ChatState
   startedAt: string
@@ -224,6 +243,8 @@ export interface ChatActivity {
 
 /** What the chat host keeps of a chat for the agent that finds it again. */
 export interface AdoptChat {
+  execution?: import('../../shared/chat-execution.ts').ExecutionSnapshot
+  bridgeRunId?: string
   sessionId: string
   floorId: string
   agentId: string
@@ -335,6 +356,8 @@ interface Chat {
   questionAt?: number
   /** Keep pastes and their delayed Enters from separate messages together. */
   codexSending?: Promise<SendResult>
+  delivering?: Promise<SendResult>
+  generation?: string
   inputEpoch?: number
 }
 
@@ -377,11 +400,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
    * those cells blanked (Screen.typedLines); what is left is what a person typed. Anything pasted now would join a draft,
    * and the Enter would send both as one message.
    */
-  function boxText(lines: string[], typed: string[] = lines): string {
+  function boxComposer(lines: string[], typed: string[] = lines): string | null {
     for (let j = lines.length - 1; j >= 1; j--) {
       if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
       let end = -1
-      for (let k = j + 1; k < Math.min(lines.length, j + 9); k++) {
+      for (let k = j + 1; k < lines.length; k++) {
         if (RULE_LINE_RE.test(lines[k])) {
           end = k
           break
@@ -391,8 +414,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const text = [typed[j].replace(/^\s*❯/, ''), ...typed.slice(j + 1, end)].join(' ').replace(/\s+/g, ' ').trim()
       return /^Try "/.test(text) ? '' : text
     }
-    return ''
+    return null
   }
+  const boxText = (lines: string[], typed = lines) => boxComposer(lines, typed) ?? ''
   function draftOnScreen(c: Chat): boolean {
     try {
       if (c.engine === 'codex') return !menuOnScreen(c) && cxs.draftText(c.screen.lines()) !== ''
@@ -592,15 +616,24 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     return strip(c.buffer.join('')).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   }
 
-  function sendCodex(c: Chat, text: string): Promise<SendResult> {
+  function sendCodex(c: Chat, text: string, opt?: DeliveryOptions): Promise<SendResult> {
     const epoch = c.inputEpoch ?? 0
     const deadline = Date.now() + Math.min(300_000, o.codexSend?.timeoutMs ?? Math.max(96_000, Buffer.byteLength(text) * 50 + 6000))
-    const send = () => c.exited ? Promise.resolve('gone' as const) : sendToCodex({
-      write: d => write(c, d), lines: () => { if (c.exited) throw Error('gone'); return c.screen.lines() },
+    const send = async (): Promise<SendResult> => {
+      while (opt?.waitUntilReady && !c.exited && !cxs.composer(c.screen.lines()) && !menuOnScreen(c) && Date.now() < deadline) {
+        if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) return 'unconfirmed'
+        await new Promise<void>(resolve => setTimeout(resolve, 100))
+      }
+      if (c.exited) return 'gone'
+      if (opt?.guard?.() === false) return 'blocked'
+      return sendToCodex({
+      write: d => d !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, d), lines: () => { if (c.exited) throw Error('gone'); return c.screen.lines() },
       sleep: ms => new Promise<void>(r => setTimeout(r, ms)),
-      interrupted: () => (c.inputEpoch ?? 0) !== epoch,
+      interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
       gone: () => c.exited,
+      beforeInput: opt?.authorize,
     }, text, { ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
+    }
     const sending = (c.codexSending ? c.codexSending.then(r => r === 'sent' ? send() : 'blocked' as const) : send())
       .catch(() => 'unconfirmed' as const)
     c.codexSending = sending
@@ -617,6 +650,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     // This one guard covers every way in (the tools, the chat view, the heartbeat, a member PC's 'type', the chat host).
     // Approvals answer a question on purpose with input(), not with this.
     if (blocked(c)) return false
+    if (c.delivering) return false
     if (c.engine === 'codex') {
       // F-134: Codex takes a message its own way (codex/sender.ts: paste, wait, Enter, look, Enter again). The caller is told it is on its way; a message that
       // could not be taken is said in the log (and a question that appeared in the meantime stops it before any Enter).
@@ -712,10 +746,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
   return {
     start(s) {
+      if (s.bridge && (s.engine !== 'claude' || s.bridge.binding.execution.profile !== 'codex-in-claude-v1'
+        || s.bridge.binding.sessionId !== s.sessionId || s.bridge.binding.agentId !== s.agentId
+        || s.model !== 'gpt-6.1-sol' || s.effort !== 'max')) throw Object.assign(new Error('Invalid managed execution launch.'), { status: 409, code: 'execution-runtime-mismatch' })
       if (s.engine && s.engine !== 'claude' && s.engine !== 'codex') throw Object.assign(new Error('This native terminal pool does not support the requested engine.'), { status: 503, code: 'engine-not-supported' })
       const existing = chats.get(s.sessionId)
       if (existing && !existing.exited) {
         if (existing.engine !== (s.engine ?? 'claude')) throw engineMismatch(s.engine ?? 'claude', existing.engine)
+        if (JSON.stringify(existing.info.execution ?? null) !== JSON.stringify(s.bridge?.binding ?? null) || (existing.info.bridgeRunId ?? null) !== (s.bridge?.runId ?? null)) throw Object.assign(new Error('The existing runtime belongs to another execution.'), { status: 409, code: 'execution-runtime-mismatch' })
         return infoOf(existing)
       }
       if (!spawnPty) {
@@ -752,8 +790,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         if (s.resume && s.codex!.thread) args.push('resume', s.codex!.thread)
       } else {
         if ((o.env ?? process.env).SAD_CLAUDE_FULLSCREEN !== '1') Object.assign(env, { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1', CLAUDE_CODE_DISABLE_MOUSE: '1' })
-        const cred = o.credential?.() ?? null
-        if (cred) {
+        const cred = s.bridge ? null : o.credential?.() ?? null
+        if (s.bridge) {
+          for (const k of Object.keys(env)) if (/^(?:ANTHROPIC_|OPENAI_|CODEX_|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_)/.test(k)) delete env[k]
+        } else if (cred) {
           for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
           env[cred.name] = cred.value
         } else {
@@ -767,16 +807,16 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
         if (s.model) args.push('--model', s.model)
         if (s.effort) args.push('--effort', s.effort)
-        if (o.settings) args.push('--settings', o.settings)
+        if (o.settings && !s.bridge) args.push('--settings', o.settings)
       }
-      const file = /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
-      const argv = /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
+      const file = s.bridge ? process.execPath : /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
+      const argv = s.bridge ? [s.bridge.wrapperPath, s.bridge.descriptorFile, ...args] : /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
       const size = { cols: s.cols ?? 120, rows: s.rows ?? 32 }
       const startedAt = new Date().toISOString()
-      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt, engine } satisfies Record<string, unknown> })
+      const pty = spawnPty(file, argv, { cwd: s.cwd, env, cols: size.cols, rows: size.rows, id: s.sessionId, meta: { key, floorId: s.floorId, agentId: s.agentId, cwd: s.cwd, startedAt, engine, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}) } satisfies Record<string, unknown> })
 
       const c: Chat = {
-        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, engine, cwd: s.cwd, startedAt },
+        info: { sessionId: s.sessionId, floorId: s.floorId, agentId: s.agentId, engine, cwd: s.cwd, startedAt, ...(s.bridge ? { execution: s.bridge.binding, bridgeRunId: s.bridge.runId } : {}) },
         engine,
         pty,
         key,
@@ -900,20 +940,48 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (c.engine === 'codex') {
         // Never repaste after an uncertain receipt. The one owned transaction may still drain.
         if (c.codexSending) return 'blocked'
-        const sending = sendCodex(c, text)
+        const sending = sendCodex(c, text, opt)
+        if (opt?.waitForOutcome) return sending
         let timer: ReturnType<typeof setTimeout> | undefined
         try { return await Promise.race([sending, new Promise<SendResult>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
         finally { clearTimeout(timer) }
       }
-      if (opt?.refuseDraft && draftOnScreen(c)) return 'blocked'
+      if (c.delivering || draftOnScreen(c)) return 'blocked'
       const epoch = c.inputEpoch ?? 0
-      if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return 'gone'
-      c.lastActive = Date.now()
-      await new Promise<void>(r => setTimeout(r, 300))
-      if (c.exited) return 'gone'
-      if ((c.inputEpoch ?? 0) !== epoch) return 'unconfirmed'
-      if (blocked(c)) return 'blocked'
-      return write(c, '\r') ? 'sent' : 'gone'
+      const sending = (async (): Promise<SendResult> => {
+        const deadline = Date.now() + (o.codexSend?.timeoutMs ?? 96_000)
+        while (opt?.waitUntilReady && boxComposer(c.screen.lines(), c.screen.typedLines()) === null && !blocked(c) && Date.now() < deadline) {
+          if (c.exited) return 'gone'
+          if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) return 'unconfirmed'
+          await new Promise<void>(resolve => setTimeout(resolve, 100))
+        }
+        if (opt?.guard?.() === false) return 'blocked'
+        return sendToCodex({
+          write: data => data !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, data),
+          lines: () => {
+            if (c.exited) throw Error('gone')
+            if (blocked(c)) return ['\u203a 1. Permission', 'Enter to confirm']
+            const box = boxComposer(c.screen.lines(), c.screen.typedLines())
+            return box === null ? [] : ['\u203a ' + box, ' GPT-CLAUDE']
+          },
+          sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
+          interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
+          gone: () => c.exited,
+          beforeInput: opt?.authorize,
+        }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
+      })().catch(() => 'unconfirmed' as const)
+      c.delivering = sending
+      void sending.finally(() => { if (c.delivering === sending) c.delivering = undefined })
+      if (opt?.waitForOutcome) return sending
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try { return await Promise.race([sending, new Promise<SendResult>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
+      finally { clearTimeout(timer) }
+    },
+
+    generation(id) {
+      const c = chats.get(id)
+      if (!c || c.exited) return null
+      return c.generation ??= randomBytes(16).toString('hex')
     },
 
     typeWhenReady,
@@ -940,7 +1008,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (existing && !existing.exited) return infoOf(existing)
       const size = { cols: a.cols, rows: a.rows }
       const c: Chat = {
-        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, engine: a.engine === 'codex' ? 'codex' : 'claude', cwd: a.cwd, startedAt: a.startedAt },
+        info: { sessionId: a.sessionId, floorId: a.floorId, agentId: a.agentId, engine: a.engine === 'codex' ? 'codex' : 'claude', cwd: a.cwd, startedAt: a.startedAt, ...(a.execution ? { execution: a.execution, bridgeRunId: a.bridgeRunId } : {}) },
         engine: a.engine === 'codex' ? 'codex' : 'claude',
         pty,
         key: a.key,

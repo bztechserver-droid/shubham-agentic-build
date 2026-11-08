@@ -2,11 +2,14 @@ import type { Logger } from '../log.ts'
 import type { ChatPool, PtySpawn } from '../agentic/chats.ts'
 import { connectChatHost, type HostClient, type HostInfo } from './client.ts'
 import type { HostChat } from './protocol.ts'
+import { assertExecutionCAS, requireExecutionSnapshot } from '../../shared/chat-execution.ts'
 
 // F-075: what the chat pool sees of the chat host: where its terminals come from (`spawn`), and, once, at the
 // start of this agent, the chats the agent before it left running (`adopt`).
 
 export interface ChatHostLink {
+  /** Backend-only current host observations. A lost controller rejects, never proves exit. */
+  inspect?(): Promise<{ hostPid: number; hostStartedAt: number; chats: HostChat[] }>
   readonly info: HostInfo
   /** For the chat pool: a terminal that lives in the host. */
   spawn: PtySpawn
@@ -48,7 +51,18 @@ export function adoptable(c: HostChat) {
   const cwd = str(c.meta.cwd)
   const startedAt = str(c.meta.startedAt)
   if (!key || !floorId || !agentId || !cwd || !startedAt) return null
-  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows, engine: c.meta.engine === 'codex' ? ('codex' as const) : ('claude' as const) }
+  let managed: { execution: ReturnType<typeof requireExecutionSnapshot>; bridgeRunId: string } | null = null
+  if (Object.hasOwn(c.meta, 'execution') || Object.hasOwn(c.meta, 'bridgeRunId')) {
+    try {
+      const execution = requireExecutionSnapshot(c.meta.execution)
+      if (execution.execution.profile !== 'codex-in-claude-v1' || execution.execution.engine !== c.meta.engine
+        || execution.sessionId !== c.id || execution.agentId !== agentId || typeof c.meta.bridgeRunId !== 'string'
+        || !/^[A-Za-z0-9_-]{16,128}$/.test(c.meta.bridgeRunId)) return null
+      assertExecutionCAS(execution, c.meta.execution)
+      managed = { execution, bridgeRunId: c.meta.bridgeRunId }
+    } catch { return null }
+  }
+  return { sessionId: c.id, floorId, agentId, cwd, startedAt, key, cols: c.cols, rows: c.rows, engine: c.meta.engine === 'codex' ? ('codex' as const) : ('claude' as const), ...(managed ?? {}) }
 }
 
 export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
@@ -100,6 +114,8 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
         continue
       }
       try {
+        await p.beforeAdopt?.(a)
+        if (c !== client || !c.connected) throw new Error('The chat host controller changed during adoption')
         const { pty, replay } = await c.attach(ch.id)
         p.adopt(a, pty, replay)
         out.adopted.push(ch.id)
@@ -113,6 +129,13 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
   return {
     get info() {
       return client.info
+    },
+    async inspect() {
+      if (!client.connected) throw new Error('Chat host ownership is unknown')
+      const current = client
+      const chats = await current.list()
+      if (current !== client || !current.connected) throw new Error('Chat host ownership changed')
+      return { hostPid: current.info.pid, hostStartedAt: current.info.startedAt, chats }
     },
     spawn: (file, args, so) => {
       if (!so.id) throw new Error('a chat in the host needs its id')

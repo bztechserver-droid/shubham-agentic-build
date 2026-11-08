@@ -1,10 +1,15 @@
 import type { CodexState, CodexStatus } from '../../shared/codex.ts'
+import { createHash, randomUUID } from 'node:crypto'
 import { apiError } from '../api.ts'
 import { CrmError, type CrmSession } from '../claude/crm.ts'
 import type { Logger } from '../log.ts'
 import * as crmApi from './crm.ts'
 import type { CodexCredential, WriteBack } from './crm.ts'
 import { codexPaths, hasLogin, placeLogin, readLogin, readSidecar, removeLogin, writeBase, writeSidecar, type CodexPaths } from './home.ts'
+import { BRIDGE_VALIDATION_CADENCE_MS, BRIDGE_VALIDATION_TIMEOUT_MS, BRIDGE_VALIDATION_MAX_AGE_MS,
+  bridgeCredentialError, requireBridgeContext, sameBridgeCredential, type BridgeCredentialCode,
+  type ManagedBridgeSource, type ManagerBridgeContext } from './bridge-credentials.ts'
+import type { BridgeRequestAuthorization } from '../codex-claude/contract.ts'
 
 // F-134: Codex on this PC runs on the Codex subscription the CRM gives the person signed in here, exactly as Claude does (F-007): the agent asks the CRM for
 // THAT PERSON'S login with their CRM session, so there is no Codex sign-in on any PC and no key typed into the app. This file keeps the login's whole life on
@@ -37,7 +42,7 @@ export const WATCH_EVERY_MS = 20_000
 
 /** The CRM calls this manager makes; tests give a stand-in. */
 export interface CodexCrm {
-  credential(s: Pick<CrmSession, 'url' | 'cookie'>, build: string): Promise<CodexCredential>
+  credential(s: Pick<CrmSession, 'url' | 'cookie'>, build: string, signal?: AbortSignal): Promise<CodexCredential>
   writeBack(s: Pick<CrmSession, 'url' | 'cookie'>, build: string, body: { baseRevision: number; authJson: string }): Promise<WriteBack>
 }
 
@@ -68,6 +73,8 @@ export interface CodexOptions {
 
 export interface CodexManager {
   readonly paths: CodexPaths
+  /** Backend-only provider consumers. No raw credential getter and no independent refresher. */
+  readonly bridgeCredentials: ManagedBridgeSource
   /** The codex executable of this PC, or null. */
   bin(): string | null
   status(): CodexStatus
@@ -124,8 +131,187 @@ export function createCodex(o: CodexOptions): CodexManager {
     return run
   }
 
+  // F159: these holds share native cleanup accounting, but never a SID or native engine filter.
+  const bridgeConsumers = new Set<string>()
+  const bridgeFlights = new Map<string, Set<AbortController>>()
+  let bridgeReceipt: ManagerBridgeContext | null = null
+  let bridgeValidated = false
+  let bridgeFailure: BridgeCredentialCode = 'bridge-credential-unavailable'
+  let bridgeTimer: NodeJS.Timeout | null = null
+  type Validation = { active: boolean; controller: AbortController; timer: NodeJS.Timeout; done: Promise<void>; finish: () => void }
+  let validation: Validation | null = null
+  let validationNotBefore = 0
+  const sessionEpoch = (s: CrmSession | null) => s ? createHash('sha256').update(JSON.stringify([s.url, s.user.id, s.signedInAt, s.cookie])).digest('hex') : null
+  function invalidateBridge(reason: BridgeCredentialCode, forget = false) {
+    bridgeValidated = false
+    bridgeFailure = reason
+    if (forget) bridgeReceipt = null
+    for (const flights of bridgeFlights.values()) for (const flight of flights) flight.abort()
+  }
+  function authorization(text: string, revision: number): BridgeRequestAuthorization | null {
+    try {
+      const raw = JSON.parse(text), tokens = raw?.tokens
+      if (raw?.auth_mode !== 'chatgpt' || typeof tokens?.access_token !== 'string' || tokens.access_token.length > 65_536 ||
+          typeof tokens.account_id !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(tokens.account_id)) return null
+      const parts = tokens.access_token.split('.')
+      if (parts.length !== 3 || parts.some((p: string) => !p || !/^[A-Za-z0-9_-]+$/.test(p))) return null
+      const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+      const expiresAtMs = claims?.exp * 1000, account = claims?.['https://api.openai.com/auth']
+      if (!Number.isSafeInteger(claims?.exp) || !Number.isSafeInteger(expiresAtMs) || expiresAtMs <= 0 ||
+          (account !== undefined && account?.chatgpt_account_id !== tokens.account_id)) return null
+      // The CRM response + current hash/sidecar is authority, not locally decoded JWT claims/signature.
+      return { accessToken: tokens.access_token, accountId: tokens.account_id, expiresAtMs, credentialRevision: revision }
+    } catch { return null }
+  }
+  function recordBridge(s: CrmSession, subscriptionId: string, revision: number, contentHash: string, at: number) {
+    const login = readLogin(paths), side = readSidecar(paths), token = login ? authorization(login.text, revision) : null
+    if (closed || !token || sessionEpoch(o.session()) !== sessionEpoch(s) || login?.sha256 !== contentHash || side?.sha256 !== contentHash ||
+        side.userId !== s.user.id || side.subscriptionId !== subscriptionId || side.baseRevision !== revision || key || waiting) {
+      invalidateBridge('bridge-credential-unavailable', true); return
+    }
+    let candidate: ManagerBridgeContext = { ownerId: s.user.id, sessionEpoch: sessionEpoch(s)!, subscriptionId, revision, contentHash,
+      credentialEpoch: bridgeReceipt?.credentialEpoch ?? randomUUID(), expiresAtMs: token.expiresAtMs,
+      validatedAtMs: at, validationExpiresAtMs: at + BRIDGE_VALIDATION_MAX_AGE_MS }
+    if (bridgeReceipt && !sameBridgeCredential(bridgeReceipt, candidate)) {
+      invalidateBridge('bridge-context-changed', true); candidate = { ...candidate, credentialEpoch: randomUUID() }
+    }
+    try { requireBridgeContext(candidate, s.user.id, now()) }
+    catch { invalidateBridge('bridge-refresh-required'); return }
+    bridgeReceipt = Object.freeze(candidate); bridgeValidated = true
+  }
+  function currentBridge(expected?: ManagerBridgeContext): ManagerBridgeContext | null {
+    const receipt = bridgeReceipt
+    if (closed || !receipt) return null
+    const s = o.session(), login = readLogin(paths), side = readSidecar(paths)
+    if (!s || sessionEpoch(s) !== receipt.sessionEpoch || s.user.id !== receipt.ownerId || key || waiting ||
+        !login || login.sha256 !== receipt.contentHash || !side || side.sha256 !== receipt.contentHash || side.userId !== receipt.ownerId ||
+        side.subscriptionId !== receipt.subscriptionId || side.baseRevision !== receipt.revision) {
+      invalidateBridge('bridge-context-changed', true); return null
+    }
+    if (expected && !sameBridgeCredential(receipt, expected)) return null
+    if (!bridgeValidated) return null
+    try { requireBridgeContext(receipt, receipt.ownerId, now()); return receipt }
+    catch { invalidateBridge(now() >= receipt.validationExpiresAtMs ? 'bridge-validation-stale' : 'bridge-refresh-required'); return null }
+  }
+  function validationBinding(): string {
+    const login = readLogin(paths), side = readSidecar(paths)
+    return JSON.stringify([sessionEpoch(o.session()), login?.sha256 ?? null, side?.userId ?? null, side?.subscriptionId ?? null,
+      side?.baseRevision ?? null, side?.sha256 ?? null, bridgeReceipt?.credentialEpoch ?? null])
+  }
+  function cancelValidation() {
+    if (!validation) return
+    validation.active = false; clearTimeout(validation.timer); validation.controller.abort(); validation.finish()
+    // Keep the single-flight slot until the physical promise settles, even if fetch ignores abort.
+  }
+  function stopBridgeTimer() { if (bridgeTimer) clearInterval(bridgeTimer); bridgeTimer = null; cancelValidation() }
+  function protectBridge(id: string) {
+    if (closed || !/^bridge-[a-f0-9-]{36}$/.test(id)) throw bridgeCredentialError('bridge-lease-invalid')
+    bridgeConsumers.add(id); leases.add(id)
+    if (!bridgeTimer && o.timers !== false) {
+      bridgeTimer = setInterval(() => { void validateBridge() }, BRIDGE_VALIDATION_CADENCE_MS)
+      bridgeTimer.unref()
+    }
+  }
+  async function validateBridge(): Promise<void> {
+    const envelope = await serial(async () => {
+      if (closed || bridgeConsumers.size === 0) return { done: Promise.resolve() }
+      if (validation) return { done: validation.done }
+      const s = o.session(), at = now()
+      if (at < validationNotBefore) return { done: Promise.resolve() }
+      if (!s || changed()) { invalidateBridge('bridge-credential-unavailable'); return { done: Promise.resolve() } }
+      validationNotBefore = at + BRIDGE_VALIDATION_CADENCE_MS
+      const captured = validationBinding(), controller = new AbortController()
+      let finish!: () => void
+      const done = new Promise<void>(resolve => { finish = resolve })
+      const flight: Validation = { active: true, controller, done, finish, timer: setTimeout(() => {
+        if (validation !== flight || !flight.active) return
+        flight.active = false; controller.abort(); invalidateBridge('bridge-validation-stale'); finish()
+      }, BRIDGE_VALIDATION_TIMEOUT_MS) }
+      flight.timer.unref(); validation = flight
+      // Initiate the EXISTING CRM read here; network completion does not hold this queue.
+      let response: Promise<CodexCredential>
+      try { response = Promise.resolve(crm.credential(s, build, controller.signal)) } catch { response = Promise.reject(new Error('validation unavailable')) }
+      void response.then(r => serial(async () => {
+        if (closed || validation !== flight || !flight.active || controller.signal.aborted || bridgeConsumers.size === 0) return
+        if (captured !== validationBinding()) return // An older response cannot replace/revoke a newer manager context.
+        if (now() < at || now() - at >= BRIDGE_VALIDATION_TIMEOUT_MS) {
+          invalidateBridge('bridge-validation-stale'); return
+        }
+        if (r.kind !== 'ok' || r.login.kind !== 'chatgpt') { invalidateBridge('bridge-credential-unavailable', true); return }
+        // Normal manager ordering owns replacement. Never apply a stale response over a pending native refresh.
+        await pull({ session: s, at, result: r })
+      })).catch(() => { if (validation === flight && flight.active) invalidateBridge('bridge-credential-unavailable') }).finally(() => {
+        clearTimeout(flight.timer); flight.active = false; finish()
+        if (validation === flight) validation = null
+      })
+      return { done }
+    })
+    await envelope.done
+  }
+
+  const bridgeCredentials: ManagedBridgeSource = {
+    protect: protectBridge,
+    async retain(id, ownerId) {
+      const found = await serial(async () => {
+        protectBridge(id)
+        if (o.session()?.user.id !== ownerId) throw bridgeCredentialError('bridge-context-changed')
+        return { context: currentBridge() }
+      })
+      if (!found.context) await validateBridge()
+      return serial(async () => {
+        if (!bridgeConsumers.has(id)) throw bridgeCredentialError('bridge-lease-invalid')
+        const context = currentBridge()
+        if (!context) throw bridgeCredentialError(bridgeFailure)
+        if (context.ownerId !== ownerId) throw bridgeCredentialError('bridge-context-changed')
+        return context
+      })
+    },
+    current: (id, expected) => bridgeConsumers.has(id) ? currentBridge(expected) : null,
+    async use(id, expected, send, signal) {
+      const controller = new AbortController(), combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+      let invoked = false
+      try {
+        const envelope = await serial(async () => {
+          if (combined.aborted) throw bridgeCredentialError('bridge-cancelled')
+          const context = bridgeConsumers.has(id) ? currentBridge(expected) : null
+          if (!context) throw bridgeCredentialError('bridge-context-changed')
+          const login = readLogin(paths), auth = login ? authorization(login.text, context.revision) : null
+          if (!auth || login!.sha256 !== context.contentHash || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed')
+          const flights = bridgeFlights.get(id) ?? new Set<AbortController>(); flights.add(controller); bridgeFlights.set(id, flights)
+          const guarded: BridgeRequestAuthorization = Object.freeze({
+            get accessToken() { if (combined.aborted || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed'); return auth.accessToken },
+            get accountId() { if (combined.aborted || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed'); return auth.accountId },
+            get expiresAtMs() { if (combined.aborted || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed'); return auth.expiresAtMs },
+            get credentialRevision() { if (combined.aborted || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed'); return auth.credentialRevision },
+          })
+          invoked = true
+          return { result: send(guarded, combined) }
+        })
+        const result = await envelope.result
+        if (combined.aborted || !bridgeConsumers.has(id) || !currentBridge(expected)) throw bridgeCredentialError('bridge-dispatch-unknown')
+        return result
+      } catch (error) {
+        if (invoked) throw bridgeCredentialError('bridge-dispatch-unknown')
+        throw error
+      } finally {
+        const flights = bridgeFlights.get(id); flights?.delete(controller); if (flights?.size === 0) bridgeFlights.delete(id)
+      }
+    },
+    release: (id, guard) => serial(async () => {
+      guard?.()
+      if (bridgeFlights.get(id)?.size) throw bridgeCredentialError('bridge-owner-busy')
+      if (!bridgeConsumers.delete(id)) return
+      leases.delete(id)
+      if (bridgeConsumers.size === 0) stopBridgeTimer()
+      if (leases.size === 0) { await settleNow(); tidy() }
+      o.onChange()
+    }),
+    validate: validateBridge,
+  }
+
   const iso = () => new Date(now()).toISOString()
   const set = (outcome: Outcome | 'ok', hint: string | null = null) => {
+    if (outcome !== 'ok') invalidateBridge('bridge-credential-unavailable')
     if (lastOutcome === outcome && outcomeHint === hint) return
     lastOutcome = outcome
     outcomeHint = hint
@@ -170,15 +356,15 @@ export function createCodex(o: CodexOptions): CodexManager {
   // ── fetching ───────────────────────────────────────────────────────────────────────────────
 
   /** Asks the CRM for the person's login. Never overwrites a changed file (settle first). */
-  async function pull(): Promise<{ kind: 'ok'; revision: number; replaced: boolean } | { kind: 'none' | 'expired' | 'offline' | 'error' }> {
-    const s = o.session()
+  async function pull(checked?: { session: CrmSession; at: number; result: CodexCredential }): Promise<{ kind: 'ok'; revision: number; replaced: boolean } | { kind: 'none' | 'expired' | 'offline' | 'error' }> {
+    const s = checked?.session ?? o.session(), at = checked?.at ?? now()
     if (!s) {
       set('sign-in-needed', 'Sign in to the CRM first: Codex uses the Codex subscription the CRM gives you.')
       return { kind: 'expired' }
     }
     let r: CodexCredential
     try {
-      r = await crm.credential(s, build)
+      r = checked ? checked.result : await crm.credential(s, build)
     } catch (e) {
       if (e instanceof CrmError && e.status === null) {
         set('crm-offline', "The CRM can't be reached right now.")
@@ -189,10 +375,12 @@ export function createCodex(o: CodexOptions): CodexManager {
       return { kind: 'error' }
     }
     if (r.kind === 'expired') {
+      invalidateBridge('bridge-credential-unavailable', true)
       set('sign-in-needed', 'The CRM ended your session: sign in to it again.')
       return { kind: 'expired' }
     }
     if (r.kind === 'none') {
+      invalidateBridge('bridge-credential-unavailable', true)
       assigned = null
       key = null
       set(r.state, r.message)
@@ -208,13 +396,17 @@ export function createCodex(o: CodexOptions): CodexManager {
     lastFetchedAt = iso()
     assigned = { name: login.subscription.name, kind: login.kind, revision: login.revision }
     set('ok')
-    if (changed()) return { kind: 'ok', revision: login.revision, replaced: false }
+    if (changed()) { invalidateBridge('bridge-credential-unavailable', true); return { kind: 'ok', revision: login.revision, replaced: false } }
     const side = readSidecar(paths)
     const there = hasLogin(paths)
     const same = there && side && side.subscriptionId === login.subscription.id && side.userId === s.user.id && side.baseRevision === login.revision
-    if (same) return { kind: 'ok', revision: login.revision, replaced: false }
+    if (same) {
+      recordBridge(s, login.subscription.id, login.revision, createHash('sha256').update(login.authJson).digest('hex'), at)
+      return { kind: 'ok', revision: login.revision, replaced: false }
+    }
     const hadOlder = there && !!side
     placeLogin(paths, login.authJson, { subscriptionId: login.subscription.id, userId: s.user.id, revision: login.revision }, new Date(now()))
+    recordBridge(s, login.subscription.id, login.revision, createHash('sha256').update(login.authJson).digest('hex'), at)
     log.info(`F-134: Codex login for subscription "${login.subscription.name}" in place (revision ${login.revision})`)
     if ((hadOlder || hadKey) && leases.size > 0) o.onNewerLogin()
     return { kind: 'ok', revision: login.revision, replaced: true }
@@ -225,6 +417,7 @@ export function createCodex(o: CodexOptions): CodexManager {
    * back to a subscription that is a key now) is taken out so Codex has one credential only. Chats that hold an older key (or the file) are restarted. True when it changed.
    */
   function takeKey(login: Extract<crmApi.CodexLogin, { kind: 'api_key' }>, userId: string): boolean {
+    invalidateBridge('bridge-credential-unavailable', true)
     const before = key
     const hadFile = hasLogin(paths) || readSidecar(paths) !== null
     if (hadFile && changed()) log.warn("F-138: a login Codex refreshed for an earlier subscription can't go back (this person's subscription is an API key now); it is taken out")
@@ -245,6 +438,7 @@ export function createCodex(o: CodexOptions): CodexManager {
   async function settleNow(): Promise<SettleResult> {
     const login = readLogin(paths)
     if (!login) {
+      invalidateBridge('bridge-credential-unavailable', true)
       waiting = false
       return 'none'
     }
@@ -253,6 +447,7 @@ export function createCodex(o: CodexOptions): CodexManager {
       waiting = false
       return 'none'
     }
+    invalidateBridge('bridge-credential-unavailable', true)
     if (!side) {
       // A login file with no sidecar: its origin is unknown, so it can't be put back safely. The CRM's copy replaces it when there is one.
       const got = await pull0()
@@ -265,6 +460,7 @@ export function createCodex(o: CodexOptions): CodexManager {
       return 'waiting'
     }
     let r: WriteBack
+    const at = now()
     try {
       r = await crm.writeBack(s, build, { baseRevision: side.baseRevision, authJson: login.text })
     } catch (e) {
@@ -279,6 +475,7 @@ export function createCodex(o: CodexOptions): CodexManager {
         waiting = false
         lastWrittenBackAt = iso()
         if (assigned) assigned = { ...assigned, revision: r.revision }
+        recordBridge(s, side.subscriptionId, r.revision, login.sha256, at)
         log.info(`F-134: the refreshed Codex login is with the CRM (revision ${side.baseRevision} -> ${r.revision})`)
         o.onChange()
         return 'accepted'
@@ -320,6 +517,7 @@ export function createCodex(o: CodexOptions): CodexManager {
   /** Replaces the local login with the CRM's copy; true when that worked (so the older file may go). A changed file is overwritten here ON PURPOSE (its refresh token is dead). */
   async function pull0(): Promise<boolean> {
     const s = o.session()
+    const at = now()
     if (!s) return false
     let r: CodexCredential
     try {
@@ -337,12 +535,13 @@ export function createCodex(o: CodexOptions): CodexManager {
     lastFetchedAt = iso()
     assigned = { name: r.login.subscription.name, kind: r.login.kind, revision: r.login.revision }
     placeLogin(paths, r.login.authJson, { subscriptionId: r.login.subscription.id, userId: s.user.id, revision: r.login.revision }, new Date(now()))
+    recordBridge(s, r.login.subscription.id, r.login.revision, createHash('sha256').update(r.login.authJson).digest('hex'), at)
     return true
   }
 
   /** Takes the file out when nothing runs and nothing waits. */
   function tidy() {
-    if (leases.size === 0 && hasLogin(paths) && !changed()) removeLogin(paths)
+    if (leases.size === 0 && hasLogin(paths) && !changed()) { removeLogin(paths); invalidateBridge('bridge-credential-unavailable', true) }
   }
 
   // ── what the rest of the app calls ──────────────────────────────────────────────────────
@@ -365,6 +564,7 @@ export function createCodex(o: CodexOptions): CodexManager {
 
   const api: CodexManager = {
     paths,
+    bridgeCredentials,
     bin: () => o.find()?.path ?? null,
     status,
     credentialEnv: () => (key ? { name: API_KEY_VAR, value: key.value } : null),
@@ -438,6 +638,8 @@ export function createCodex(o: CodexOptions): CodexManager {
 
     close() {
       closed = true
+      stopBridgeTimer()
+      invalidateBridge('bridge-credential-unavailable', true)
       key = null
       for (const t of timers) clearInterval(t)
     },

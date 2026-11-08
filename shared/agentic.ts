@@ -7,6 +7,7 @@
 import type { AuthEnded, ChatAccess, ChatCan, ChatOwner, ChatShare } from './auth.ts'
 import type { OpenCodeProvider } from './opencode.ts'
 import type { AgentEngine, CodexEffort } from './codex.ts'
+import type { ExecutionIdentity, ExecutionProfile, ExecutionSnapshot } from './chat-execution.ts'
 
 export const AGENTIC_PREFIX = '/agentic'
 
@@ -66,6 +67,10 @@ export const isOrchestratorAgent = (floorName: string, agent: { name: string; du
 /** Server-owned native bindings. Artifacts stay on their recorded PC; switching never deletes them. */
 export interface ConversationRecord {
   engine: 'claude' | 'codex' | 'opencode'
+  /** Explicit execution identity/generation; absent on unchanged legacy native records. */
+  executionProfile?: ExecutionProfile
+  executionRevision?: number
+  execution?: ExecutionIdentity
   sessionId: string
   codexThread: string | null
   opencodeSession: string | null
@@ -116,6 +121,9 @@ export interface FloorAgent {
    * With the engine 'codex' its model and effort are these two (the Claude ones above are not used).
    */
   engine?: AgentEngine
+  /** Server-owned execution profile. A Claude harness can use the Codex provider; engine alone is insufficient. */
+  executionProfile?: ExecutionProfile
+  executionRevision?: number
   opencodeProvider?: OpenCodeProvider | ''
   opencodeModel?: string
   codexModel?: string
@@ -265,6 +273,8 @@ export interface FloorPatch {
   confirmNewConversation?: boolean
   /** Compare-and-swap for a confirmation captured before another switch or session change. */
   expectedConversation?: { agentId: string; engine: 'claude' | 'codex' | 'opencode'; sessionId: string | null; codexThread?: string | null; opencodeSession?: string | null }
+  /** Complete execution CAS for profile-aware metadata edits. Selection uses its separate versioned contract. */
+  expectedExecution?: ExecutionSnapshot
 }
 
 /** POST /agentic/floors/:id/agents (the sidebar's Add agent, and agent_hire). */

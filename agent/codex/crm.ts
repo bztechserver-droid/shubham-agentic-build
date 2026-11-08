@@ -29,9 +29,10 @@ export type CodexCredential =
   | { kind: 'expired' }
 
 /** GET mine/credential. `build` goes in x-christopher-build (the CRM records it as which copy asked). Throws CrmError when the CRM can't be reached or answers something unexpected. */
-export async function credential(s: Auth, build: string): Promise<CodexCredential> {
+export async function credential(s: Auth, build: string, signal?: AbortSignal): Promise<CodexCredential> {
   const r = await call(`${s.url}/v1/org/codex-subscriptions/mine/credential`, {
     headers: { cookie: s.cookie, accept: 'application/json', 'x-christopher-build': build },
+    ...(signal ? { signal } : {}),
   })
   if (r.status === 200) {
     const sub = r.body.subscription

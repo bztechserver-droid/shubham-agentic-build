@@ -71,7 +71,8 @@ export const trimUrl = (url: string) => url.replace(/\/+$/, '')
 export async function call(url: string, init: RequestInit): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> {
   let res: Response
   try {
-    res = await fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS) })
+    const limit = AbortSignal.timeout(TIMEOUT_MS)
+    res = await fetch(url, { ...init, redirect: 'error', signal: init.signal ? AbortSignal.any([init.signal, limit]) : limit })
   } catch (e) {
     const err = e as { name?: string; message?: string; cause?: { code?: string; message?: string } }
     const why = err.name === 'TimeoutError' ? `no answer in ${TIMEOUT_MS / 1000} s` : (err.cause?.code ?? err.cause?.message ?? err.message ?? String(e))

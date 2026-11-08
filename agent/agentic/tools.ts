@@ -50,7 +50,9 @@ export const TOOLS: ToolDef[] = [
       "Start an agent's chat, or pick its conversation back up, on any floor: on this PC, or on the PC named (\"pc\": a name from app_chats, e.g. the laptop). Refused when it runs on another PC already, unless takeOver is true (it then stops there first).",
     inputSchema: {
       type: 'object',
-      properties: { ...agentRef, pc: { type: 'string', description: 'Which PC runs it (a name); this PC when left out.' }, takeOver: { type: 'boolean' } },
+      properties: { ...agentRef, pc: { type: 'string', description: 'Which PC runs it (a name); this PC when left out.' }, takeOver: { type: 'boolean' },
+        executionProfile: { type: 'string', enum: ['codex-in-claude-v1'], description: 'Explicitly select Codex provider in the Claude Code harness on its proved home PC. Only at the human\'s request; may run the isolated setup proof.' },
+        operationId: { type: 'string', minLength: 16, maxLength: 128, description: 'Required for explicit profile selection. Generate once and retain after any uncertain result; the same operation is only observed on retry.' } },
       required: ['floor', 'agent'],
       additionalProperties: false,
     },

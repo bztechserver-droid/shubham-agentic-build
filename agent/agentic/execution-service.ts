@@ -1,0 +1,169 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { assertExecutionCAS, CODEX_IN_CLAUDE_PROFILE, type ExecutionIdentity, type ExecutionSnapshot } from '../../shared/chat-execution.ts'
+import { executionHttpError, executionIntentId, type ExecutionOpenReply, type ExecutionSelectionReply, type ExecutionSelectionRequest } from '../../shared/chat-execution-http.ts'
+import { ExecutionCoordinator, type ExecutionSourceFence, type PreparedExecutionSelection, type ExecutionStartRequest } from './execution-coordinator.ts'
+import { ExecutionIntentLedger, scopeDigest, type ExecutionIntentScope } from './execution-intents.ts'
+import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
+import { sourceHash } from './switch-fence.ts'
+import { createBridgeRuntime, type BridgeRuntimeOptions } from '../codex-claude/runtime.ts'
+import { writePrivateAtomic } from '../codex-claude/storage.ts'
+
+export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
+  actor(scope: ExecutionIntentScope): void
+  state(scope: ExecutionIntentScope): { binding: ExecutionSnapshot; selection: import('./execution-intents.ts').ExecutionCommitStamp | null }
+  floorFile(scope: ExecutionIntentScope): string
+  commit(request: FloorExecutionCommit): void
+  target(scope: ExecutionIntentScope, profile: ExecutionIdentity['profile']): ExecutionIdentity
+  /** Stop/ack and durably seal the actual native source; no floor/profile change here. */
+  seal(scope: ExecutionIntentScope, expected: ExecutionSnapshot): Promise<{ assertCurrent(): void; finish(committed: boolean, changed: boolean): void }>
+  prepare(scope: ExecutionIntentScope, expected: ExecutionSnapshot, target: ExecutionIdentity): Promise<PreparedExecutionSelection>
+}
+interface FenceState {
+  scope: ExecutionIntentScope; expected: ExecutionSnapshot; next: ExecutionSnapshot | null;
+  floorFile: string; floorHash: string; source: { assertCurrent(): void; finish(committed: boolean, changed: boolean): void };
+}
+export function createExecutionService(o: ExecutionServiceOptions) {
+  const runtime = createBridgeRuntime(o), actors = new Map<string, () => void>(), active = new Map<string, FenceState>()
+  let coordinator: ExecutionCoordinator | null = null, ledger: ExecutionIntentLedger | null = null
+  let initialization: Promise<void> | null = null
+  const key = (scope: ExecutionIntentScope) => `${scope.floorId}:${scope.agentId}`
+  const actor = (scope: ExecutionIntentScope) => { o.actor(scope); const check = actors.get(scopeDigest(scope)); if (!check) throw executionHttpError('execution-forbidden', 'authorization'); check() }
+  const assertCurrent = (context: FenceState) => {
+    actor(context.scope); runtime.storage!.assertExclusiveWriter(); context.source.assertCurrent()
+    if (sourceHash(context.floorFile) !== context.floorHash) throw executionHttpError('execution-stale', 'selection')
+    const binding = o.state(context.scope).binding
+    try { assertExecutionCAS(context.expected, binding) }
+    catch (error) { if (!context.next) throw error; assertExecutionCAS(context.next, binding) }
+  }
+  const authority: FloorExecutionAuthority = {
+    assertCurrent(request) {
+      const context = active.get(`${request.floorId}:${request.agentId}`)
+      if (!context || !context.next) throw executionHttpError('execution-capability-required', 'selection')
+      assertExecutionCAS(request.expected, context.expected); assertExecutionCAS(request.next, context.next)
+      assertCurrent(context)
+      if (request.target.profile === CODEX_IN_CLAUDE_PROFILE) runtime.cachedCapability()
+      else throw executionHttpError('execution-capability-required', 'selection')
+    },
+    persist(file, text) {
+      const contexts = [...active.values()].filter(context => context.floorFile === file && context.next !== null)
+      if (contexts.length !== 1) throw executionHttpError('execution-intent-uncertain', 'selection')
+      const context = contexts[0]; assertCurrent(context)
+      writePrivateAtomic(file, text); context.floorHash = sourceHash(file)
+    },
+  }
+  async function ensure() {
+    return initialization ??= (async () => {
+      await runtime.ensure()
+      const storage = runtime.storage!
+      ledger = await ExecutionIntentLedger.open({ directory: storage.directory, assertPrivateStorage: storage.assertPrivateStorage,
+        assertExclusiveWriter: storage.assertExclusiveWriter, syncDirectory: storage.syncDirectory })
+      coordinator = new ExecutionCoordinator({ ledger, broker: runtime.broker!, assertAuthorized: actor,
+        assertExecutionCurrent: (scope, expected) => { actor(scope); assertExecutionCAS(expected, o.state(scope).binding) },
+        readFloor: async scope => o.state(scope), resolveTarget: (scope, profile) => o.target(scope, profile),
+        readTarget: async (scope, execution) => {
+          actor(scope)
+          if (scope.targetPcId !== o.self().id || execution.profile !== CODEX_IN_CLAUDE_PROFILE) throw executionHttpError('execution-capability-required', 'capability')
+          const { capability, pins } = runtime.cachedCapability(), now = Date.now()
+          return { targetPcId: o.self().id, execution, linkGeneration: `local_${runtimeEpoch}`, observedAtMs: now, validUntilMs: now + 30_000,
+            nativeVerified: false, pins, bridgeCapability: capability }
+        },
+        withSourceFence: async (scope, expected, action) => {
+          actor(scope)
+          if (active.size) throw executionHttpError('execution-intent-conflict', 'selection')
+          const source = await o.seal(scope, expected)
+          const file = o.floorFile(scope), context: FenceState = { scope, expected, next: null, source, floorFile: file, floorHash: sourceHash(file) }
+          active.set(key(scope), context)
+          let committed = false
+          try {
+            const fence: ExecutionSourceFence = { assertCurrent: () => assertCurrent(context) }
+            const result = await action(fence)
+            committed = true
+            return result
+          } finally {
+            // A lost acknowledgment after a stamped file CAS still counts as a committed source retirement.
+            if (context.next) { try { assertExecutionCAS(context.next, o.state(scope).binding); committed = true } catch { /* Retain source fence on uncertainty. */ } }
+            try { if (committed || !context.next) source.finish(committed, context.next?.sessionId !== expected.sessionId) }
+            finally { active.delete(key(scope)) }
+          }
+        },
+        prepare: (scope, expected, target) => o.prepare(scope, expected, target),
+        commitFloor: async (scope, expected, next, prepared, stamp) => {
+          const context = active.get(key(scope)); if (!context) throw executionHttpError('execution-intent-uncertain', 'selection')
+          assertCurrent(context); context.next = next
+          o.commit({ floorId: scope.floorId, agentId: scope.agentId, expected, next, target: next.execution,
+            lineage: prepared?.lineage ?? null, homePcName: o.self().name, stamp })
+        },
+        start: (request: ExecutionStartRequest) => runtime.start(request),
+        observeRun: async (_scope, intent) => {
+          if (!intent.lease) return { state: 'unknown' }
+          const observed = await runtime.observe(intent.lease.request)
+          return observed.state === 'running' ? { state: 'running', proof: observed.runtime }
+            : observed.state === 'ended' ? { state: 'ended', dispatchFenced: true } : { state: 'unknown' }
+        },
+      })
+    })()
+  }
+  const runtimeEpoch = randomUUID()
+  if (fs.existsSync(path.join(o.directory, 'capability.json'))) void ensure().catch(() => {})
+  return { authority, runtime,
+    bindActor(scope: ExecutionIntentScope, check: () => void) { actors.set(scopeDigest(scope), check) },
+    async verify(scope: ExecutionIntentScope) { actor(scope); await runtime.verify(scope.ownerId); actor(scope); await ensure(); return { version: 1, verified: true } },
+    async capability(scope: ExecutionIntentScope, query: unknown) {
+      // A GET never runs native/provider setup. Existing cached storage may be admitted without a provider call.
+      if (!fs.existsSync(path.join(o.directory, 'capability.json'))) throw executionHttpError('execution-capability-required', 'capability')
+      if (!initialization) throw executionHttpError('execution-capability-required', 'capability')
+      await initialization; return coordinator!.capability(scope, query)
+    },
+    async select(scope: ExecutionIntentScope, request: unknown) { await ensure(); return coordinator!.select(scope, request) },
+    async open(scope: ExecutionIntentScope, request: unknown) { await ensure(); return coordinator!.open(scope, request) },
+    async status(scope: ExecutionIntentScope, id: string) {
+      if (!initialization) throw executionHttpError('execution-capability-required', 'status', id)
+      await initialization; return coordinator!.status(scope, id)
+    },
+    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean): Promise<ExecutionOpenReply> {
+      actor(scope)
+      if (!executionIntentId(operationId)) throw executionHttpError('execution-invalid', 'open')
+      await ensure()
+      const file = path.join(o.directory, `${operationId}.tool.json`)
+      type ToolIntent = { version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest; selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply }
+      let intent: ToolIntent
+      if (fs.existsSync(file)) {
+        intent = JSON.parse(fs.readFileSync(file, 'utf8')) as ToolIntent
+        if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope)) throw executionHttpError('execution-intent-conflict', 'open', operationId)
+        const id = intent.selected?.openIntentId ?? intent.reply?.openIntentId ?? intent.request?.selectionIntentId
+        if (!id) throw executionHttpError('execution-intent-uncertain', 'open', operationId)
+        const status = await coordinator!.status(scope, id)
+        if (status.kind === 'open' && status.state === 'running' && status.actual && status.committed) return {
+          executionVersion: 1, openIntentId: id, state: 'already-running', committed: status.committed, actual: status.actual }
+        throw executionHttpError('execution-intent-uncertain', 'open', id)
+      }
+      const state = o.state(scope)
+      if (fs.readdirSync(o.directory).filter(name => name.endsWith('.tool.json')).length >= 512) throw executionHttpError('execution-ledger-full', 'open')
+      // Consume the original tool ID BEFORE native/provider verification; a lost setup response is not permission to repeat it.
+      intent = { version: 1, scope, expected: state.binding, openIssued: false }
+      writePrivateAtomic(file, JSON.stringify(intent) + '\n')
+      if (verify) { try { runtime.cachedCapability() } catch { await runtime.verify(scope.ownerId) } }
+      actor(scope); assertExecutionCAS(intent.expected, o.state(scope).binding)
+      if (state.binding.execution.profile === CODEX_IN_CLAUDE_PROFILE && state.selection) {
+        const status = await coordinator!.status(scope, state.selection.openIntentId)
+        if (status.state === 'running' && status.actual && status.committed) {
+          intent.reply = { executionVersion: 1, openIntentId: status.intentId, state: 'already-running', committed: status.committed, actual: status.actual }
+          writePrivateAtomic(file, JSON.stringify(intent) + '\n'); return intent.reply
+        }
+        if (status.state !== 'stopped' && status.state !== 'refused') throw executionHttpError('execution-intent-uncertain', 'open', status.intentId)
+      }
+      const capability = await coordinator!.capability(scope, { profile: CODEX_IN_CLAUDE_PROFILE })
+      if (!capability.available) throw executionHttpError(capability.unavailableCode, 'capability')
+      intent.request = { version: 1, selectionIntentId: capability.selectionIntentId,
+        expected: capability.current, target: capability.target, capabilityReceiptId: capability.capabilityReceiptId, confirmCarryOver: true }
+      writePrivateAtomic(file, JSON.stringify(intent) + '\n')
+      intent.selected = await coordinator!.select(scope, intent.request)
+      writePrivateAtomic(file, JSON.stringify(intent) + '\n')
+      intent.openIssued = true; writePrivateAtomic(file, JSON.stringify(intent) + '\n')
+      return coordinator!.open(scope, { executionVersion: 1, openIntentId: intent.selected.openIntentId, expectedExecution: intent.selected.committed })
+    },
+    close() { runtime.close() },
+  }
+}
