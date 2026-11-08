@@ -5,7 +5,13 @@ import type { BridgeRequestAuthorization } from './contract.ts'
 
 export const CODEX_RESPONSES_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 const refused = (): never => { throw Object.assign(new Error('This Claude Code request is unsupported by the Codex adapter.'), { status: 400, code: 'bridge-policy-refused' }) }
-const unavailable = (): never => { throw Object.assign(new Error('The Codex endpoint did not complete the requested Sol/max operation. No retry was made.'), { status: 502, code: 'bridge-policy-refused' }) }
+export interface ProviderFailureSummary { stage: 'http' | 'transport' | 'stream' | 'policy'; status?: number; category?: string; parameter?: string; model?: string; effort?: string }
+const failures = new WeakMap<Error, ProviderFailureSummary>()
+export const providerFailureSummary = (error: unknown): ProviderFailureSummary => error instanceof Error && failures.has(error) ? failures.get(error)! : { stage: 'stream' }
+const unavailable = (summary: ProviderFailureSummary = { stage: 'stream' }): never => {
+  const error = Object.assign(new Error('The Codex endpoint did not complete the requested Sol/max operation. No retry was made.'), { status: 502, code: 'bridge-policy-refused' })
+  failures.set(error, Object.freeze(summary)); throw error
+}
 const record = (value: unknown): Record<string, unknown> => contractRecord(value) ? value : refused()
 const array = (value: unknown): unknown[] => Array.isArray(value) ? value : refused()
 const text = (value: unknown): string => typeof value === 'string' ? value : refused()
@@ -47,6 +53,7 @@ export function toResponses(value: unknown): Record<string, unknown> {
         flush()
         const result = typeof block.content === 'string' ? block.content : contentBlocks(block.content ?? []).map(part => {
           if (part.type === 'text') return text(part.text)
+          if (part.type === 'tool_reference' && typeof part.tool_name === 'string') return `Available tool: ${part.tool_name}`
           // File/image tool results remain explicit, and are not turned into fabricated text.
           return refused()
         }).join('\n')
@@ -70,13 +77,18 @@ export function toResponses(value: unknown): Record<string, unknown> {
     else return refused()
   }
   if (request.stop_sequences !== undefined && array(request.stop_sequences).length) return refused()
+  const output = contractRecord(request.output_config) && contractRecord(request.output_config.format) ? request.output_config.format : null
+  if (output && output.type !== 'json_schema') return refused()
   return { model: BRIDGE_MODEL, instructions: system || 'You are a coding assistant running through Claude Code.', input,
+    ...(output ? { text: { format: { type: 'json_schema', name: 'claude_code_output', strict: true, schema: record(output.schema) } } } : {}),
     tools, tool_choice: toolChoice, parallel_tool_calls: true, reasoning: { effort: BRIDGE_EFFORT }, stream: true, store: false }
 }
 
 export function fromResponses(value: unknown): AdapterReply {
   const response = record(value)
-  if (response.status !== 'completed' || response.model !== BRIDGE_MODEL || record(response.reasoning).effort !== BRIDGE_EFFORT) return unavailable()
+  if (response.status !== 'completed' || response.model !== BRIDGE_MODEL || !contractRecord(response.reasoning) || response.reasoning.effort !== BRIDGE_EFFORT) return unavailable({ stage: 'policy',
+    ...(typeof response.model === 'string' && /^gpt-[a-z0-9.-]{1,64}$/.test(response.model) ? { model: response.model } : {}),
+    ...(contractRecord(response.reasoning) && ['low','medium','high','xhigh','max'].includes(String(response.reasoning.effort)) ? { effort: String(response.reasoning.effort) } : {}) })
   const content: Array<Record<string, unknown>> = []
   for (const value of array(response.output)) {
     const item = record(value)
@@ -99,7 +111,19 @@ export function fromResponses(value: unknown): AdapterReply {
 }
 
 export async function readCompletedResponse(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
-  if (!response.ok || !response.body || !response.headers.get('content-type')?.includes('text/event-stream')) return unavailable()
+  if (!response.ok) {
+    let raw = ''
+    if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await reader.read(); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } finally { await reader.cancel().catch(() => {}); reader.releaseLock() } }
+    let parameter: string | undefined, category = response.status === 401 || response.status === 403 ? 'authorization' : response.status === 429 ? 'rate-limit' : 'refused'
+    try {
+      const data = JSON.parse(raw), detail = typeof data.detail === 'string' ? data.detail : ''
+      const param = data.error?.param ?? /Unsupported parameter: ([a-zA-Z0-9_.[\]]+)/.exec(detail)?.[1]
+      if (typeof param === 'string' && ['model','instructions','input','tools','tool_choice','stream','store','reasoning','reasoning.effort','include','parallel_tool_calls'].includes(param)) parameter = param
+      if (detail.includes('requires a newer version of Codex') || String(data.error?.message ?? '').includes('requires a newer version of Codex')) category = 'client-version-required'
+    } catch { /* Never retain arbitrary upstream body or message. */ }
+    return unavailable({ stage: 'http', status: response.status, category, ...(parameter ? { parameter } : {}) })
+  }
+  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) return unavailable({ stage: 'http', status: response.status, category: 'non-stream-response' })
   const reader = response.body.getReader(), decoder = new TextDecoder()
   let pending = '', bytes = 0, completed: Record<string, unknown> | null = null
   try {
@@ -131,9 +155,14 @@ export function sendResponses(body: Record<string, unknown>, authorization: Brid
   if (body.model !== BRIDGE_MODEL || record(body.reasoning).effort !== BRIDGE_EFFORT || signal.aborted) return unavailable()
   const request = fetch(CODEX_RESPONSES_ENDPOINT, { method: 'POST', redirect: 'error', signal,
     headers: { authorization: `Bearer ${authorization.accessToken}`, 'chatgpt-account-id': authorization.accountId,
-      'content-type': 'application/json', accept: 'text/event-stream', 'originator': 'codex_cli_rs', 'user-agent': 'shubham-agentic-codex-claude/1' },
+      'content-type': 'application/json', accept: 'text/event-stream', originator: 'codex_cli_rs', version: '0.163.0',
+      'user-agent': 'shubham-agentic-codex-claude/1 (Codex protocol 0.163.0; Claude Code 2.1.319)' },
     body: JSON.stringify(body) })
-  return request.then(response => readCompletedResponse(response, signal))
+  return request.then(response => readCompletedResponse(response, signal)).catch(error => {
+    if (error instanceof Error && failures.has(error)) throw error
+    const code = (error as { cause?: { code?: string } })?.cause?.code
+    return unavailable({ stage: 'transport', category: typeof code === 'string' && ['ECONNRESET','ENOTFOUND','ECONNREFUSED','UND_ERR_CONNECT_TIMEOUT','UNABLE_TO_VERIFY_LEAF_SIGNATURE','CERT_HAS_EXPIRED'].includes(code) ? code : 'unavailable' })
+  })
 }
 
 /** Completed output is translated to Messages events; provider errors cannot turn into partial tool execution. */

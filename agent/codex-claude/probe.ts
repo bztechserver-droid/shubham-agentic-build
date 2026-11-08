@@ -40,7 +40,12 @@ export async function probeClaudeHarness(o: { directory: string; claude: string;
     child.once('error', () => { clearTimeout(timer); reject(new Error('Claude Code setup process could not start')) })
     child.once('close', code => {
       clearTimeout(timer); if (child.pid) active.delete(child.pid)
-      if (code !== 0) return reject(new Error('Claude Code setup process refused the gateway or model policy'))
+      if (code !== 0) {
+        const detail = stdout + stderr
+        const category = /effort.*max|max.*effort/i.test(detail) ? 'cli-effort-refused' : /unknown option|invalid.*option/i.test(detail) ? 'cli-option-refused' : 'cli-or-gateway-refused'
+        writePrivateAtomic(path.join(o.directory, 'last-harness-failure.json'), JSON.stringify({ at: new Date().toISOString(), exitCode: code, category, resumed: resume }) + '\n')
+        return reject(new Error('Claude Code setup process refused the gateway or model policy'))
+      }
       try {
         const result = stdout.trim().split(/\r?\n/).map(line => { try { return JSON.parse(line) } catch { return null } }).find(row => row?.type === 'result')
         if (result?.is_error || typeof result?.result !== 'string') return reject(new Error('Claude Code setup result was not confirmed'))

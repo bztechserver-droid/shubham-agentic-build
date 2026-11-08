@@ -13,7 +13,7 @@ import { findClaude, type ChatPool, type StartChat } from '../agentic/chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
-import { fromResponses, messagesEvents, sendResponses, toResponses } from './adapter.ts'
+import { fromResponses, messagesEvents, providerFailureSummary, sendResponses, toResponses } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
@@ -140,8 +140,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const context = await source.retain(id, ownerId)
       const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(120_000)])
       const response = await source.use(id, context, (authorization, abort) => sendResponses(toResponses({ model: BRIDGE_MODEL,
-        messages: [{ role: 'user', content: 'Reply with the single word READY.' }] }), authorization, abort), signal)
-      fromResponses(response) // Enforces actual completed model and explicit returned max effort.
+        messages: [{ role: 'user', content: `Verification ${randomUUID()}: reply with the single word READY.` }] }), authorization, abort).catch(error => {
+          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+        }), signal)
+      try { fromResponses(response) } catch (error) {
+        writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+      }
       let harnessRead = false
       const harness = await probeClaudeHarness({ directory: o.directory, claude: claude!, claudeSha256: claudeHash!, controllerPort: port,
         ownerId, consumerId: id, register: (runId, key) => {
@@ -210,8 +214,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input)
         if (match[2]) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ input_tokens: Buffer.byteLength(JSON.stringify(body)) })); return }
         const source = o.manager!.bridgeCredentials, context = await source.retain(probe.consumerId, probe.ownerId)
-        const response = await source.use(probe.consumerId, context, (authorization, abort) => sendResponses(body, authorization, abort), signal)
-        const reply = fromResponses(response)
+        const response = await source.use(probe.consumerId, context, (authorization, abort) => sendResponses(body, authorization, abort).catch(error => {
+          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+        }), signal)
+        let reply: ReturnType<typeof fromResponses>
+        try { reply = fromResponses(response) } catch (error) {
+          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+        }
         if (reply.content.some(block => block.type === 'tool_use' && block.name === 'Read')) probe.sawRead = true
         res.writeHead(200, { 'content-type': input.stream ? 'text/event-stream' : 'application/json', 'x-should-retry': 'false' })
         res.end(input.stream ? messagesEvents(reply) : JSON.stringify(reply)); return
