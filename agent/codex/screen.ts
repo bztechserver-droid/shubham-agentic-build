@@ -22,13 +22,14 @@ export const CODEX_DONE_RE = /Workedfor<?\d/i
 /** A question is up: a menu footer, a numbered option, or a sign-in screen (Codex without a login asks how to sign in). */
 export const CODEX_QUESTION_RE = /pressentertoconfirm|pressentertoselect|pressentertocontinue|entertoconfirm|entertoselect|escapetogoback|esctogoback|signinwithchatgpt|provideyourownapikey|doyouwant/i
 /** The prompt line is drawn (the chat can be typed into). */
-export const CODEX_PROMPT_READY_RE = /›|\?forshortcuts/
+export const CODEX_PROMPT_READY_RE = /[›❯»]|\?forshortcuts/
 
 // The cursor of a menu is "›" in some of Codex's menus and ">" in the sign-in one (seen on 0.163.0 when the login on disk was not accepted).
-const OPTION_UNDER_CURSOR = /^\s*[›>]\s*\d{1,2}\.\s+\S/
+const OPTION_UNDER_CURSOR = /^\s*[›❯»>]\s*\d{1,2}\.\s+\S/
 const MENU_FOOTER = /(?:press\s+)?enter\s+to\s+(?:confirm|select|continue)|esc(?:ape)?\s+to\s+(?:cancel|go\s+back)/i
-const INPUT_LINE = /^\s*›(?!\s*\d{1,2}\.\s)\s?(.*)$/
+const INPUT_LINE = /^\s*[›❯»](?!\s*\d{1,2}\.\s)\s?(.*)$/
 const PLACEHOLDER = /^Ask Codex to do anything$/i
+const COMPOSER_FOOTER = /^\s*(?:GPT-[\w.-]+|\?\s*for shortcuts|tab\s+to\s+queue\s+message\b)/i
 const WORKING_LINE = /Working\s*\(\d+s?[^)]*esc to interrupt/i
 const BACKGROUND = /(\d+)\s+background\s+terminals?\s+running/i
 
@@ -46,15 +47,26 @@ export function menuOnScreen(lines: readonly string[]): boolean {
 
 /** What is typed in the input box and not sent yet ('' when it is empty or shows the placeholder, or when a menu is up). */
 export function draftText(lines: readonly string[]): string {
-  if (menuOnScreen(lines)) return ''
-  const rows = bottom(lines, 8)
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const m = INPUT_LINE.exec(rows[i])
+  return composer(lines)?.text ?? ''
+}
+
+/** Current composer only: a historical prompt above a reply is never an empty input. */
+export function composer(lines: readonly string[]): { text: string; collapsed: boolean } | null {
+  if (menuOnScreen(lines)) return null
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = INPUT_LINE.exec(lines[i])
     if (!m) continue
-    const text = m[1].replace(/\s+/g, ' ').trim()
-    return PLACEHOLDER.test(text) ? '' : text
+    // Find the footer AFTER this prompt, never a stale footer above the current draft.
+    const footer = lines.findIndex((l, n) => n > i && COMPOSER_FOOTER.test(l))
+    const end = footer < 0 ? lines.length : footer
+    if (footer >= 0 && lines.slice(footer + 1).some(l => l.trim() && !COMPOSER_FOOTER.test(l) && !/^\s*.*\b(?:context left|tokens left|f2 to view)\b/i.test(l))) return null
+    const after = lines.slice(i + 1, end)
+    // A blank paragraph is fine; native response/activity rows are not composer continuations.
+    if (after.some(l => /^\s*(?:[•■]|Working\b|Worked for\b)/.test(l))) return null
+    const text = [m[1], ...after].join('\n').trim()
+    return { text: PLACEHOLDER.test(text) ? '' : text, collapsed: /\[Pasted (?:Content|text)\b/i.test(text) }
   }
-  return ''
+  return null
 }
 
 /** Whether Codex is working on a turn: its "Working (12s • esc to interrupt)" line. */

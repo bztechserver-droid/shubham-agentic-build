@@ -882,6 +882,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     input: (sid, data) => !switchFences.blocked(sid) && nativeChats.input(sid, data),
     press: (sid, data) => !switchFences.blocked(sid) && nativeChats.press(sid, data),
     type: (sid, text, options) => !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
+    deliver: async (sid, text, options) => switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed',
     typeWhenReady: (sid, text, options) => { switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
     adopt: (info, pty, replay) => { const result = nativeChats.adopt(info, pty, replay); if (switchFences.blocked(info.sessionId)) nativeChats.kill(info.sessionId, 'engine-switch-recovery'); return result },
   }
@@ -1863,9 +1864,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
   /** typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. */
-  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string) =>
-    typeInto(c, body).catch(e => {
-      undo()
+  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void) =>
+    typeInto(c, body, { confirmed: true }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
+      if (e?.code === 'delivery-unconfirmed') uncertain?.()
+      else undo()
       throw e
     })
 
@@ -1966,14 +1968,43 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * his draft. Every other caller (an agent's message, a broadcast, a nudge, an order's reply) never does: on his unsent text nothing is
    * typed and it throws 409. A chat on a member PC reports its draft back, because only that PC knows its screen.
    */
-  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean } = {}): Promise<boolean> {
+  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean } = {}): Promise<boolean> {
     const refuseDraft = opt.human !== true
+    if (opt.confirmed) {
+      let result: unknown
+      if (c.id === self().id) result = { delivery: await confirmedDelivery(c.sessionId, body, refuseDraft) }
+      else {
+        const link = team?.member(c.id)
+        if (!link) return false
+        // Old peers can return true after scheduling only; that is explicitly not confirmation.
+        result = await request(link, 'type', { sessionId: c.sessionId, text: body, refuseDraft, confirmDelivery: true }, 22_000)
+          .catch(() => ({ delivery: 'unconfirmed' }))
+      }
+      if (result === 'draft') throw apiError(409, draftWords(c.sessionId))
+      const delivery = isObject(result) ? result.delivery : undefined
+      if (delivery === 'sent') return true
+      if (delivery === 'blocked') throw Object.assign(apiError(409, 'The message was not submitted: a draft, menu, or earlier unresolved send blocked it.'), { code: 'delivery-blocked' })
+      if (delivery === 'gone') return false
+      throw Object.assign(apiError(409, 'Delivery is not confirmed; the one pending message may already have been submitted, may still complete, or may remain in the composer. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
+    }
     if (c.id === self().id) return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
     const link = team?.member(c.id)
     if (!link) return false
     const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(() => false)
     if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
     return r === true
+  }
+
+  /** Includes queue/backend time; a timeout never repeats or cancels a possibly accepted send. */
+  async function confirmedDelivery(sessionId: string, body: string, refuseDraft: boolean) {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        chats.deliver?.(sessionId, body, { refuseDraft }) ?? Promise.resolve('unconfirmed' as const),
+        new Promise<'unconfirmed'>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) }),
+      ])
+    } catch { return 'unconfirmed' as const }
+    finally { clearTimeout(timer) }
   }
 
   // F-076: what was answered and sent as the person (viewable), and the cards the assistant prepared (never sent by it).
@@ -2459,7 +2490,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
-    if (mode() === 'member' && !isLocalSession(me.sessionId)) return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs })
+    if (mode() === 'member' && !isLocalSession(me.sessionId)) return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
+      if (['send_to_chat', 'app_send_to_chat', 'broadcast_to_chats'].includes(name) && [502, 504].includes(error?.status)) throw Object.assign(apiError(409, 'Delivery is not confirmed after the connection failed; pending messages may already be submitted or may still complete. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
+      throw error
+    })
     return toolFor(me.sessionId, name, rawArgs)
   }
 
@@ -2536,7 +2570,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, target.sessionId, body) }))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
@@ -2623,7 +2657,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
+        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, c.sessionId, body) }))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
@@ -2646,13 +2680,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const skipped = all.filter(c => c.asking)
         const drafts = all.filter(c => !c.asking && c.drafting)
         // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
-        const refused = (await Promise.all(to.map(c => typeInto(c, `[broadcast from ${tag}] ${body}`).then(() => null, () => c)))).filter((c): c is NonNullable<typeof c> => c !== null)
-        if (refused.length) {
-          drafts.push(...refused)
-          to.splice(0, to.length, ...to.filter(c => !refused.includes(c)))
+        const outcomes = await Promise.all(to.map(async c => {
+          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true }), unknown: false, draft: false } }
+          catch (e) { return { c, sent: false, unknown: isObject(e) && e.code === 'delivery-unconfirmed', draft: e instanceof Error && /unsent text in its box/.test(e.message) } }
+        }))
+        const uncertain = outcomes.filter(r => r.unknown).map(r => r.c)
+        const refused = outcomes.filter(r => !r.sent && !r.unknown).map(r => r.c)
+        const failed = outcomes.filter(r => !r.sent && !r.unknown && !r.draft).map(r => r.c)
+        if (refused.length || uncertain.length) {
+          drafts.push(...outcomes.filter(r => r.draft).map(r => r.c))
+          to.splice(0, to.length, ...to.filter(c => !refused.includes(c) && !uncertain.includes(c)))
         }
         const nameOf = (c: { sessionId: string }) => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)
-        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}`
+        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}${failed.length ? ` Not submitted to ${failed.map(nameOf).join(', ')}: blocked or unavailable.` : ''}${uncertain.length ? ` Delivery not confirmed for ${uncertain.map(nameOf).join(', ')}; the pending messages may already be submitted or may still complete. Inspect those chats; do not automatically press Enter or resend.` : ''}`
       }
       case 'memory_save': {
         const entry = memory.save(floor.id, {
@@ -4367,6 +4407,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             if (!isObject(raw) || typeof raw.sessionId !== 'string' || typeof raw.text !== 'string') throw apiError(400, 'Expected {sessionId, text}')
             // A caller that is not the person typing (an agent's message, a broadcast, a nudge) asks for the draft check: this PC knows its own screens.
             if (raw.refuseDraft === true && chats.drafting(raw.sessionId)) return 'draft'
+            if (raw.confirmDelivery === true) return confirmedDelivery(raw.sessionId, raw.text, raw.refuseDraft === true).then(delivery => ({ delivery }))
             return chats.type(raw.sessionId, raw.text, raw.refuseDraft === true ? { refuseDraft: true } : undefined)
           })
         case 'sessions':

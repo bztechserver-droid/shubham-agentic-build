@@ -193,6 +193,8 @@ export interface ChatPool {
    * suggestion is not a draft.
    */
   type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
+  /** Await actual input acceptance; legacy type() only reports scheduling. */
+  deliver?(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): Promise<SendResult>
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
   typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
   kill(sessionId: string, why?: string): boolean
@@ -332,6 +334,7 @@ interface Chat {
   questionAt?: number
   /** Keep pastes and their delayed Enters from separate messages together. */
   codexSending?: Promise<SendResult>
+  inputEpoch?: number
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
@@ -588,6 +591,23 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     return strip(c.buffer.join('')).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   }
 
+  function sendCodex(c: Chat, text: string): Promise<SendResult> {
+    const epoch = c.inputEpoch ?? 0
+    const deadline = Date.now() + Math.min(300_000, o.codexSend?.timeoutMs ?? Math.max(96_000, Buffer.byteLength(text) * 50 + 6000))
+    const send = () => c.exited ? Promise.resolve('gone' as const) : sendToCodex({
+      write: d => write(c, d), lines: () => { if (c.exited) throw Error('gone'); return c.screen.lines() },
+      sleep: ms => new Promise<void>(r => setTimeout(r, ms)),
+      interrupted: () => (c.inputEpoch ?? 0) !== epoch,
+      gone: () => c.exited,
+    }, text, { ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
+    const sending = (c.codexSending ? c.codexSending.then(r => r === 'sent' ? send() : 'blocked' as const) : send())
+      .catch(() => 'unconfirmed' as const)
+    c.codexSending = sending
+    void sending.then(r => { if (r !== 'sent') log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: message delivery ${r}`) })
+      .finally(() => { if (c.codexSending === sending) c.codexSending = undefined })
+    return sending
+  }
+
   function paste(c: Chat, text: string) {
     // A paste, not keystrokes: the TUI takes it whole, newlines in it are text, and Enter
     // follows separately (in the same chunk it would be a newline in the paste).
@@ -600,15 +620,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       // F-134: Codex takes a message its own way (codex/sender.ts: paste, wait, Enter, look, Enter again). The caller is told it is on its way; a message that
       // could not be taken is said in the log (and a question that appeared in the meantime stops it before any Enter).
       c.lastActive = Date.now()
-      const send = () => sendToCodex({ write: d => write(c, d), lines: () => c.screen.lines(), sleep: ms => new Promise<void>(r => setTimeout(r, ms).unref()) }, text, o.codexSend)
-      const sending = (c.codexSending ? c.codexSending.then(result => result === 'sent' ? send() : result) : send())
-        .catch(() => 'unconfirmed' as const)
-      c.codexSending = sending
-      void sending.then(
-        r => {
-          if (r !== 'sent') log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: a message for this Codex chat was not taken (${r})`)
-        },
-      ).finally(() => { if (c.codexSending === sending) c.codexSending = undefined })
+      void sendCodex(c, text)
       return true
     }
     if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false
@@ -821,6 +833,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const c = chats.get(id)
       if (!c) return false
       c.lastSeen = Date.now()
+      c.inputEpoch = (c.inputEpoch ?? 0) + 1
       return write(c, data)
     },
 
@@ -873,6 +886,29 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return false
       if (opt?.refuseDraft && draftOnScreen(c)) return false
       return paste(c, text)
+    },
+
+    async deliver(id, text, opt) {
+      const c = chats.get(id)
+      if (!c || c.exited) return 'gone'
+      if (blocked(c)) return 'blocked'
+      if (c.engine === 'codex') {
+        // Never repaste after an uncertain receipt. The one owned transaction may still drain.
+        if (c.codexSending) return 'blocked'
+        const sending = sendCodex(c, text)
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try { return await Promise.race([sending, new Promise<SendResult>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
+        finally { clearTimeout(timer) }
+      }
+      if (opt?.refuseDraft && draftOnScreen(c)) return 'blocked'
+      const epoch = c.inputEpoch ?? 0
+      if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return 'gone'
+      c.lastActive = Date.now()
+      await new Promise<void>(r => setTimeout(r, 300))
+      if (c.exited) return 'gone'
+      if ((c.inputEpoch ?? 0) !== epoch) return 'unconfirmed'
+      if (blocked(c)) return 'blocked'
+      return write(c, '\r') ? 'sent' : 'gone'
     },
 
     typeWhenReady,
@@ -938,7 +974,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
     press(id, data) {
       const c = chats.get(id)
-      return !!c && !c.exited && write(c, data)
+      if (!c || c.exited) return false
+      c.inputEpoch = (c.inputEpoch ?? 0) + 1
+      return write(c, data)
     },
 
     closeAll() {
