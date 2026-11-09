@@ -12,6 +12,8 @@ export interface ChatHostLink {
   inspect?(): Promise<{ hostPid: number; hostStartedAt: number; chats: HostChat[] }>
   /** Synchronous authenticated controller fence; no cached disconnect is accepted as current. */
   current?(): { generation: number; hostPid: number; hostStartedAt: number }
+  /** Cancel only an exact app-owned managed start, including an unproved start. No input/admission grant. */
+  cancelManaged?(binding:ReturnType<typeof requireExecutionSnapshot>,runId:string,guard:()=>void):Promise<void>
   readonly info: HostInfo
   /** For the chat pool: a terminal that lives in the host. */
   spawn: PtySpawn
@@ -144,6 +146,17 @@ export async function connectLink(o: LinkOptions): Promise<ChatHostLink> {
       const chats = await current.list()
       if (current !== client || !current.connected) throw new Error('Chat host ownership changed')
       return { hostPid: current.info.pid, hostStartedAt: current.info.startedAt, chats }
+    },
+    async cancelManaged(binding,runId,guard) {
+      guard()
+      if(closed||!client.connected)throw new Error('Chat host ownership is unknown')
+      const controller=client, chats=await controller.list()
+      guard()
+      if(closed||client!==controller||!controller.connected)throw new Error('Chat host ownership changed')
+      const chat=chats.find(chat=>chat.id===binding.sessionId)
+      if(!chat||chat.meta.bridgeRunId!==runId||chat.meta.agentId!==binding.agentId||chat.meta.engine!=='claude')throw new Error('Managed start ownership is unknown')
+      assertExecutionCAS(binding,chat.meta.execution)
+      if(!chat.exited)controller.kill(chat.id)
     },
     spawn: (file, args, so) => {
       if (!so.id) throw new Error('a chat in the host needs its id')

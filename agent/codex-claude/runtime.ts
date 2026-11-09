@@ -21,15 +21,17 @@ import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
+import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, type UnstartedBridgeEnd, type UnstartedProcess } from './unstarted.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
-const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts']
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
   state: 'starting' | 'running' | 'ended' | 'released'; proof?: BridgeActualRuntimeProof;
   dispatchPaused?: boolean;
+  unstartedEnd?: UnstartedBridgeEnd;
 }
 export interface BridgeRuntimeOptions {
   directory: string; manager: CodexManager | null; host: ChatHostLink | null;
@@ -56,7 +58,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (closed || !o.host?.current) throw executionHttpError('execution-runtime-mismatch', 'runtime')
     return o.host.current()
   })
-  o.host?.onLost(() => { ownership.invalidate(); hostLifetime.abort() })
+  const unstarted = new UnstartedBridgeRetirements(epoch=>ownership.fence(epoch))
+  o.host?.onLost(() => { ownership.invalidate(); unstarted.invalidate(); hostLifetime.abort() })
   o.host?.onBack(() => { if (!closed) hostLifetime = new AbortController() })
   const cleanupTimer = setInterval(() => { void retirementWork.reconcile() }, 1000)
   cleanupTimer.unref()
@@ -79,8 +82,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         || !['starting', 'running', 'ended', 'released'].includes(record.state)
         || path.resolve(record.configFile) !== path.join(path.resolve(o.directory), `${record.runId}.child.json`)) throw executionHttpError('execution-intent-uncertain', 'runtime')
       if (record.state === 'released') {
-        if (!record.proof) throw executionHttpError('execution-intent-uncertain', 'runtime')
-        ownership.released(record.lease, record.proof)
+        if (record.proof) ownership.released(record.lease, record.proof)
+        else if (!record.unstartedEnd || !validUnstartedEnd(record.unstartedEnd,record.lease)) throw executionHttpError('execution-intent-uncertain', 'runtime')
       } else o.manager?.bridgeCredentials.protect(record.lease.leaseId)
       // Keep completed tombstones across restart, without re-protecting or adopting their consumers.
       runs.set(record.runId, record)
@@ -90,7 +93,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     observeRuntime: observe,
     canRetire: (lease, observation) => {
       const record = runs.get(lease.request.runId)
-      return !!record?.proof && ownership.canRetire(lease, record.proof, observation)
+      return !!record && (record.proof ? ownership.canRetire(lease, record.proof, observation) : unstarted.canRetire(lease,record.unstartedEnd,observation))
     },
   }) : null
   const previousFor = (record: RunRecord) => pins ? previousCapabilities.find(cap => compatibleControllerUpgrade(cap, record.pins,
@@ -109,6 +112,14 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     ownership.fence(epoch)
     if (host.hostPid !== epoch.hostPid || host.hostStartedAt !== epoch.hostStartedAt) throw executionHttpError('execution-runtime-mismatch', 'runtime')
     const ch = host.chats.find(chat => chat.id === record.lease.request.binding.sessionId)
+    if (!record.proof && (ch?.exited || record.unstartedEnd)) {
+      const rows=await unstartedProcesses([path.basename(process.execPath),path.basename(claude!)])
+      ownership.fence(epoch)
+      const end=confirmedUnstartedEnd(record.lease,epoch,ch,rows,record.configFile,record.unstartedEnd)
+      if(!end)return {state:'unknown'}
+      if(!record.unstartedEnd){record.unstartedEnd=end;record.state='ended';save(record)}
+      const observed=unstarted.ended(end,epoch);queueRetirement(record);return observed
+    }
     if (!ch || ch.meta.bridgeRunId !== record.runId || !isDeepStrictEqual(ch.meta.execution, record.lease.request.binding)) return { state: 'unknown' }
     if (ch.exited) {
       if (!record.proof) return { state: 'unknown' }
@@ -161,11 +172,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const record = runs.get(request.runId)
     if (!record || !isDeepStrictEqual(record.lease.request, request)) return { state: 'unknown' }
     try {
-      if (record.state === 'released') return record.proof ? ownership.released(record.lease, record.proof) : { state: 'unknown' }
+      if (record.state === 'released') return record.proof ? ownership.released(record.lease, record.proof)
+        : record.unstartedEnd&&validUnstartedEnd(record.unstartedEnd,record.lease)?{state:'ended'}:{state:'unknown'}
       const observed = await physical(record)
-      if (observed.state === 'unknown') ownership.invalidate(record.runId)
+      if (observed.state === 'unknown') {ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId)}
       return observed
-    } catch { ownership.invalidate(record.runId); return { state: 'unknown' } }
+    } catch { ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); return { state: 'unknown' } }
   }
   async function initialize() {
     if (closed || !o.host?.inspect || !o.host.current || !o.manager || process.platform !== 'win32' || process.arch !== 'x64') throw executionHttpError('execution-capability-required', 'runtime')
@@ -385,19 +397,20 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       if (closed) return false
       if (record.state === 'released') return true
       const observed = await observe(record.lease.request)
-      if (observed.state !== 'ended' || !record.proof || !ownership.canRetire(record.lease, record.proof, observed)) return false
+      const canRetire=()=>record.proof?ownership.canRetire(record.lease,record.proof,observed):unstarted.canRetire(record.lease,record.unstartedEnd,observed)
+      if (observed.state !== 'ended' || !canRetire()) return false
       const config = readChildConfig(record.configFile)
       if (knownBrokerLeases.has(record.lease.leaseId)) await broker!.release(record.lease)
       else {
         // Recovery of a saved, already-ended unique consumer: no acquire, refresh or provider adoption.
         // The manager still owns draining, settlement and any native auth writeback.
         await o.manager!.bridgeCredentials.release(record.lease.leaseId, () => {
-          if (!record.proof || !ownership.canRetire(record.lease, record.proof, observed)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+          if (!canRetire()) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         })
       }
       record.state = 'released'; save(record)
       for (const file of [config.settingsFile, config.readyFile, record.configFile]) { try { fs.unlinkSync(file) } catch { /* Only this run's exact private artifacts. */ } }
-      ownership.invalidate(record.runId); dispatch.delete(record.runId)
+      ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); dispatch.delete(record.runId)
       return true
     })
   }
@@ -420,9 +433,33 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const config = readChildConfig(record.configFile)
     writePrivateAtomic(record.configFile, JSON.stringify({ ...config, controllerPort: port, controllerKey: randomBytes(32).toString('hex') }) + '\n')
   }
-  return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt,
+  async function cancelUnstarted(binding:ExecutionSnapshot,authorize:()=>void) {
+    authorize();await ensure();authorize();cachedCapability()
+    const record=[...runs.values()].find(record=>!record.proof&&record.state==='starting'&&isDeepStrictEqual(record.lease.request.binding,binding))
+    if(!record||!current(record.lease.request)||!o.host?.cancelManaged)throw executionHttpError('execution-runtime-mismatch','runtime')
+    await o.host.cancelManaged(binding,record.runId,()=>{authorize();if(!current(record.lease.request))throw executionHttpError('execution-stale','runtime')})
+    const deadline=Date.now()+15000
+    while(Date.now()<deadline){
+      const observed=await observe(record.lease.request)
+      if(observed.state==='ended'){await retirementWork.reconcile();return}
+      await wait(250)
+    }
+    throw executionHttpError('execution-intent-uncertain','runtime')
+  }
+  return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt, cancelUnstarted,
     get storage() { return storage },
-    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close() } }
+    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close();unstarted.invalidate(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close() } }
+}
+
+function unstartedProcesses(names:readonly string[]):Promise<UnstartedProcess[]> {
+  if(names.some(name=>!/^[-A-Za-z0-9._]+\.exe$/i.test(name)))return Promise.reject(Error('Managed process identity is unavailable'))
+  const filter=[...new Set(names)].map(name=>`Name='${name}'`).join(' OR ')
+  const script=`@(Get-CimInstance Win32_Process -Filter "${filter}" -ErrorAction Stop | ForEach-Object {@{pid=[int]$_.ProcessId;command=$_.CommandLine}}) | ConvertTo-Json -Compress`
+  return new Promise((resolve,reject)=>execFile('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],
+    {encoding:'utf8',timeout:8000,windowsHide:true,maxBuffer:1024*1024},(error,stdout)=>{
+      if(error)return reject(Error('Managed start end is unconfirmed'))
+      try{const value=JSON.parse(stdout||'[]');const rows=Array.isArray(value)?value:[value];if(rows.some(row=>!row||typeof row!=='object'))throw Error();resolve(rows)}catch{reject(Error('Managed start end is unconfirmed'))}
+    }))
 }
 
 interface ObservedProcess { pid: number; ppid: number; created: number; file: string; command: string }

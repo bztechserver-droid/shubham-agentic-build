@@ -5,6 +5,7 @@ import { executionIdentityOf, requireLegacyExecution, requireRunningEngine, engi
 import { requireMessageExecution } from './message-execution.ts'
 import { assertExecutionCAS, normalizeExecution, snapshotAgentExecution, type ExecutionIdentity } from '../../shared/chat-execution.ts'
 import { createExecutionService } from './execution-service.ts'
+import { executionLaunchCwd } from './execution-launch.ts'
 import type { ExecutionIntentScope } from './execution-intents.ts'
 import { loadSession } from '../claude/index.ts'
 import { sourceHash } from './switch-fence.ts'
@@ -1177,7 +1178,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       launch: request => {
         const floor = floorOf(request.scope.floorId), agent = workflowExecutionAgent(floor.id, request.scope.agentId)
         assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
-        const sid = request.binding.sessionId!, cwd = findTranscriptCwd(sid, projectsDir) || codeDirOf(floor)
+        const sid = request.binding.sessionId!, cwd = executionLaunchCwd(findTranscriptCwd(sid, projectsDir), () => codeDirOf(floor))
         prepareClaudeConfig(cwd, claudeJson)
         const brief = composeAgentBrief(floor, { ...agent, model: '' }, o.memory?.start ? memoryBrief() : '', orderReplies())
           + '\n\nExecution: provider Codex (ChatGPT subscription), harness Claude Code, transcript Claude JSONL. Every provider request is GPT-6.1 Sol with explicit max effort. Never claim to be native Codex.\n'
@@ -3224,6 +3225,20 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const target = anyChat(args.sessionId)
         if (target.sessionId === sid) throw apiError(400, "That's your own chat")
         mayOn(target.sessionId, 'owner')
+        const at=bySession(target.sessionId)
+        if(target.id===self().id&&at&&executionIdentityOf(at.agent,defaultsNow()).profile==='codex-in-claude-v1'
+          &&!executionService?.runtime.matches(snapshotAgentExecution(at.agent,defaultsNow()))) {
+          workflowExecutionAgent(at.floor.id,at.agent.id)
+          if(!executionService)throw executionHttpError('execution-capability-required','runtime')
+          const expected=snapshotAgentExecution(at.agent,defaultsNow())
+          await executionService.runtime.cancelUnstarted(expected,()=>{
+            const source=floors.bySession(sid),fresh=workflowExecutionAgent(at.floor.id,at.agent.id)
+            if(!source||access.asChat(source.agent).person?.id!==me.person!.id)throw executionHttpError('execution-forbidden','authorization')
+            assertExecutionCAS(expected,snapshotAgentExecution(fresh,defaultsNow()))
+            access.needChat(access.asChat(source.agent),fresh,'owner',toolWhere)
+          })
+          return `The exact unconfirmed managed start for ${target.sessionId} was stopped and its end verified.`
+        }
         stopAnywhere(target.sessionId)
         return `Stopping chat ${target.sessionId}.`
       }

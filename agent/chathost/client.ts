@@ -44,6 +44,8 @@ export interface HostClient {
   attach(id: string): Promise<{ pty: RemotePty; replay: string }>
   /** An ended chat has been noted: the host forgets it. */
   forget(id: string): void
+  /** Backend cancellation through this existing authenticated controller. */
+  kill(id: string): void
   /** Stops the host (refused while chats run unless `killChats`). Resolves with the host's answer. */
   shutdown(killChats: boolean): Promise<{ ok: boolean; error?: string }>
   /** Calls back once if the connection goes away without close() (the host died or restarted, or another controller took over). */
@@ -235,6 +237,7 @@ export function connectChatHost(o: ConnectOptions): Promise<HostClient> {
       forget(id) {
         out({ t: 'forget', id })
       },
+      kill(id) { out({t:'kill',id}) },
       async shutdown(killChats) {
         const m = await expect('shutdown', { t: 'shutdown', killChats }).catch(() => ({ t: 'bye', why: 'no answer' }) as HostMsg)
         return m.t === 'bye' ? { ok: true } : { ok: false, error: m.t === 'error' ? m.error : 'unexpected answer' }
