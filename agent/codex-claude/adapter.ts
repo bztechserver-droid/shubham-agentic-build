@@ -1,11 +1,16 @@
 // App-owned implementation from the published Messages/Responses schemas. No third-party proxy code.
 import { randomUUID } from 'node:crypto'
+import type { ReadableStreamReadResult } from 'node:stream/web'
 import { BRIDGE_MODEL, BRIDGE_EFFORT, contractRecord, resolveBridgeModelAlias } from '../../shared/chat-execution.ts'
 import type { BridgeRequestAuthorization } from './contract.ts'
 
 export const CODEX_RESPONSES_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 const refused = (): never => { throw Object.assign(new Error('This Claude Code request is unsupported by the Codex adapter.'), { status: 400, code: 'bridge-policy-refused' }) }
 export interface ProviderFailureSummary { stage: 'http' | 'transport' | 'stream' | 'policy'; status?: number; category?: string; parameter?: string; model?: string; effort?: string; mediaType?: 'event-stream' | 'json' | 'html' | 'text' | 'other' | 'missing' }
+export interface ProviderProgress { phase: 'connecting' | 'headers' | 'reading' | 'completed'; status?: number; bytes: number; events: number }
+type ProgressObserver = (progress: ProviderProgress) => void
+const note = (observer: ProgressObserver | undefined, value: ProviderProgress) => { try { observer?.(value) } catch { /* Diagnostics cannot alter a provider operation. */ } }
+const cancellation = (signal: AbortSignal) => signal.reason?.name === 'TimeoutError' ? 'timeout' : 'aborted'
 const failures = new WeakMap<Error, ProviderFailureSummary>()
 export const providerFailureSummary = (error: unknown): ProviderFailureSummary => error instanceof Error && failures.has(error) ? failures.get(error)! : { stage: 'stream' }
 const unavailable = (summary: ProviderFailureSummary = { stage: 'stream' }): never => {
@@ -110,12 +115,22 @@ export function fromResponses(value: unknown): AdapterReply {
     usage: { input_tokens: tokens(usage.input_tokens), output_tokens: tokens(usage.output_tokens) } }
 }
 
-export async function readCompletedResponse(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
+export async function readCompletedResponse(response: Response, signal: AbortSignal, observer?: ProgressObserver): Promise<Record<string, unknown>> {
+  note(observer, { phase: 'headers', status: response.status, bytes: 0, events: 0 })
+  const read = (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
+    const aborted = () => {
+      void reader.cancel().catch(() => {})
+      try { unavailable({ stage: 'transport', category: cancellation(signal) }) } catch (error) { reject(error) }
+    }
+    if (signal.aborted) return aborted()
+    signal.addEventListener('abort', aborted, { once: true })
+    reader.read().then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted))
+  })
   const type = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase()
   const mediaType: ProviderFailureSummary['mediaType'] = !type ? 'missing' : type === 'text/event-stream' ? 'event-stream' : type === 'application/json' ? 'json' : type === 'text/html' ? 'html' : type === 'text/plain' ? 'text' : 'other'
   if (!response.ok) {
     let raw = ''
-    if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await reader.read(); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } finally { await reader.cancel().catch(() => {}); reader.releaseLock() } }
+    if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await read(reader); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } finally { void reader.cancel().catch(() => {}); reader.releaseLock() } }
     let parameter: string | undefined, category = response.status === 401 || response.status === 403 ? 'authorization' : response.status === 429 ? 'rate-limit' : 'refused'
     try {
       const data = JSON.parse(raw), detail = typeof data.detail === 'string' ? data.detail : ''
@@ -127,50 +142,59 @@ export async function readCompletedResponse(response: Response, signal: AbortSig
   }
   if (!response.body) return unavailable({ stage: 'http', status: response.status, category: 'empty-response', mediaType })
   const reader = response.body.getReader(), decoder = new TextDecoder()
-  let pending = '', sample = '', bytes = 0, completed: Record<string, unknown> | null = null
+  let pending = '', sample = '', bytes = 0, events = 0
   try {
     for (;;) {
-      if (signal.aborted) return unavailable()
-      const chunk = await reader.read()
+      if (signal.aborted) return unavailable({ stage: 'transport', category: cancellation(signal) })
+      const chunk = await read(reader)
       if (chunk.done) break
       bytes += chunk.value.byteLength
       if (bytes > 64 * 1024 * 1024) return unavailable()
       const decoded = decoder.decode(chunk.value, { stream: true })
+      note(observer, { phase: 'reading', status: response.status, bytes, events })
       sample = (sample + decoded).slice(0, 8192)
       pending = (pending + decoded).replaceAll('\r\n', '\n')
       let at: number
       while ((at = pending.indexOf('\n\n')) !== -1) {
         const frame = pending.slice(0, at); pending = pending.slice(at + 2)
         const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
-        if (!data || data === '[DONE]') continue
+        if (!data) continue
+        if (data === '[DONE]') return unavailable({ stage: 'stream', category: 'missing-completed-event', mediaType })
         let event: Record<string, unknown>
         try { event = record(JSON.parse(data)) } catch { return unavailable() }
+        events++
         if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') return unavailable({ stage: 'stream', category: event.type, mediaType })
-        if (event.type === 'response.completed') completed = record(event.response)
+        if (event.type === 'response.completed') {
+          const completed = record(event.response)
+          fromResponses(completed)
+          note(observer, { phase: 'completed', status: response.status, bytes, events })
+          return completed
+        }
       }
     }
-    if (!completed || signal.aborted) {
-      let category = signal.aborted ? 'aborted' : 'missing-completed-event'
+    {
+      let category = signal.aborted ? cancellation(signal) : 'missing-completed-event'
       if (!signal.aborted && /^\s*(?:<!doctype html|<html)/i.test(sample)) category = /cf-chl|just a moment|cloudflare/i.test(sample) ? 'html-challenge' : 'html-response'
       else if (!signal.aborted && /^\s*[{[]/.test(sample)) category = 'json-response'
       return unavailable({ stage: 'stream', status: response.status, category, mediaType })
     }
-    return completed
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
+  } finally { void reader.cancel().catch(() => {}); reader.releaseLock() }
 }
 
 /** Initiates the fixed-destination operation synchronously, before returning a Promise to the manager. */
-export function sendResponses(body: Record<string, unknown>, authorization: BridgeRequestAuthorization, signal: AbortSignal): Promise<Record<string, unknown>> {
-  if (body.model !== BRIDGE_MODEL || record(body.reasoning).effort !== BRIDGE_EFFORT || signal.aborted) return unavailable()
+export function sendResponses(body: Record<string, unknown>, authorization: BridgeRequestAuthorization, signal: AbortSignal, observer?: ProgressObserver): Promise<Record<string, unknown>> {
+  if (signal.aborted) return unavailable({ stage: 'transport', category: cancellation(signal) })
+  if (body.model !== BRIDGE_MODEL || record(body.reasoning).effort !== BRIDGE_EFFORT) return unavailable()
+  note(observer, { phase: 'connecting', bytes: 0, events: 0 })
   const request = fetch(CODEX_RESPONSES_ENDPOINT, { method: 'POST', redirect: 'error', signal,
     headers: { authorization: `Bearer ${authorization.accessToken}`, 'chatgpt-account-id': authorization.accountId,
       'content-type': 'application/json', accept: 'text/event-stream', originator: 'codex_cli_rs', version: '0.163.0',
       'user-agent': 'shubham-agentic-codex-claude/1 (Codex protocol 0.163.0; Claude Code 2.1.319)' },
     body: JSON.stringify(body) })
-  return request.then(response => readCompletedResponse(response, signal)).catch(error => {
+  return request.then(response => readCompletedResponse(response, signal, observer)).catch(error => {
     if (error instanceof Error && failures.has(error)) throw error
     const code = (error as { cause?: { code?: string } })?.cause?.code
-    return unavailable({ stage: 'transport', category: typeof code === 'string' && ['ECONNRESET','ENOTFOUND','ECONNREFUSED','UND_ERR_CONNECT_TIMEOUT','UNABLE_TO_VERIFY_LEAF_SIGNATURE','CERT_HAS_EXPIRED'].includes(code) ? code : 'unavailable' })
+    return unavailable({ stage: 'transport', category: signal.aborted ? cancellation(signal) : typeof code === 'string' && ['ECONNRESET','ENOTFOUND','ECONNREFUSED','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','ETIMEDOUT','UNABLE_TO_VERIFY_LEAF_SIGNATURE','CERT_HAS_EXPIRED'].includes(code) ? code : 'unavailable' })
   })
 }
 

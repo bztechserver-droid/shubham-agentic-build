@@ -13,15 +13,18 @@ import { findClaude, type ChatPool, type StartChat } from '../agentic/chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
-import { fromResponses, messagesEvents, providerFailureSummary, sendResponses, toResponses } from './adapter.ts'
+import { fromResponses, providerFailureSummary, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
+import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
+import { compatibleControllerUpgrade, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
   state: 'starting' | 'running' | 'ended' | 'released'; proof?: BridgeActualRuntimeProof;
@@ -45,6 +48,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   let closed = false, storage: Awaited<ReturnType<typeof openExecutionStorage>> | null = null
   let server: http.Server | null = null, port = 0, capability: BridgeTargetCapability | null = null
   let pins: BridgeRuntimePins | null = null, claude: string | null = null, claudeHash: string | null = null
+  let previousCapability: unknown = null
   let initialization: Promise<void> | null = null
   const ownership = new BridgeOwnership(() => {
     if (closed || !o.host?.current) throw executionHttpError('execution-runtime-mismatch', 'runtime')
@@ -87,6 +91,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       return !!record?.proof && ownership.canRetire(lease, record.proof, observation)
     },
   }) : null
+  const compatiblePrevious = (record: RunRecord) => !!pins && compatibleControllerUpgrade(previousCapability, record.pins,
+    record.proof, record.lease, pins, Object.fromEntries(Object.keys(UNCHANGED_CHILD_FILES).map(file => [file, hash(path.join(import.meta.dirname,file))])), Date.now())
 
   async function physical(record: RunRecord): Promise<BridgeOwnerObservation> {
     if (!o.host?.inspect || !pins || !capability || closed) return { state: 'unknown' }
@@ -119,12 +125,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const observed = await processes(ch.pid, ready.claudePid, host.hostPid, ready.port)
     ownership.fence(epoch)
     const proxy = observed.rows.find(p => p.pid === ch.pid), child = observed.rows.find(p => p.pid === ready.claudePid), hostProc = observed.rows.find(p => p.pid === host.hostPid)
+    const upgrade = !isDeepStrictEqual(record.pins, pins)
     if (!proxy || !child || !hostProc || !observed.listener || child.ppid !== proxy.pid || child.created < proxy.created
       || Math.abs(proxy.created - Date.parse(String(ch.meta.startedAt))) > 10_000 || Math.abs(hostProc.created - host.hostStartedAt) > 10_000
       || path.resolve(proxy.file).toLowerCase() !== path.resolve(process.execPath).toLowerCase()
       || path.resolve(child.file).toLowerCase() !== path.resolve(config.claude).toLowerCase()
       || !proxy.command.includes(record.configFile) || !proxy.command.includes(path.join(import.meta.dirname, 'child.ts'))
-      || config.claudeSha256 !== hash(config.claude) || !isDeepStrictEqual(record.pins, pins)) return { state: 'unknown' }
+      || config.claudeSha256 !== hash(config.claude) || upgrade && !compatiblePrevious(record)) return { state: 'unknown' }
     const execution = normalizeExecution({ engine: 'claude', executionProfile: CODEX_IN_CLAUDE_PROFILE })
     const proof: BridgeActualRuntimeProof = { version: 1, runId: record.runId, ownerId: record.lease.request.ownerId,
       targetPcId: o.self().id, leaseId: record.lease.leaseId, binding: record.lease.request.binding, execution: execution as BridgeActualRuntimeProof['execution'], pins,
@@ -134,6 +141,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       settings: { ownerId: record.lease.request.ownerId, access: 'owner-only', scope: 'child-only' } }
     if (record.proof && (!isDeepStrictEqual(record.proof.proxy, proof.proxy) || !isDeepStrictEqual(record.proof.claude, proof.claude))) return { state: 'unknown' }
     requireBridgeRuntimeProof(proof, record.lease, record.lease.request, capability, pins, Date.now())
+    if (upgrade) {
+      const file=path.join(o.directory,`${record.runId}.controller-upgrade.json`)
+      const receipt={version:1,runId:record.runId,fromPins:record.pins,toPins:pins,previousProof:record.proof,proof}
+      if (fs.existsSync(file)) { assertPrivatePath(file); if (!isDeepStrictEqual(JSON.parse(fs.readFileSync(file,'utf8')),receipt)) return {state:'unknown'} }
+      else writePrivateAtomic(file,JSON.stringify(receipt)+'\n')
+      record.pins=pins;record.proof=proof;save(record)
+    }
     ownership.admit(record.lease, proof, epoch)
     if (!record.proof) { record.proof = proof; record.state = 'running'; save(record) }
     return { state: 'running', runtime: proof }
@@ -160,12 +174,28 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     await o.host.inspect()
     o.host.current()
     pins = { platform: 'win32', arch: 'x64', nodeVersion: process.versions.node, claudeVersion: '2.1.319', codexVersion: codex.version,
-      adapterSha256: createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
+      adapterSha256: createHash('sha256').update(PIN_FILES.map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
     const capFile = path.join(o.directory, 'capability.json')
-    if (fs.existsSync(capFile)) { try { assertPrivatePath(capFile); capability = requireBridgeCapability(JSON.parse(fs.readFileSync(capFile, 'utf8')), o.self().id, pins, Date.now()) } catch { capability = null } }
+    const priorFile=path.join(o.directory,'previous-controller-capability.json')
+    if (fs.existsSync(priorFile)) { assertPrivatePath(priorFile); previousCapability=JSON.parse(fs.readFileSync(priorFile,'utf8')) }
+    if (fs.existsSync(capFile)) {
+      assertPrivatePath(capFile)
+      const raw=JSON.parse(fs.readFileSync(capFile,'utf8'))
+      try { capability = requireBridgeCapability(raw, o.self().id, pins, Date.now()) }
+      catch { capability = null; if (!previousCapability) previousCapability=raw }
+    }
     server = http.createServer((req, res) => { void handleProvider(req, res) })
     await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(0, '127.0.0.1', () => resolve()) })
     const address = server.address(); if (!address || typeof address === 'string') throw executionHttpError('execution-capability-required', 'runtime'); port = address.port
+    if (!capability && previousCapability) {
+      const survivor=[...runs.values()].find(record=>record.state==='running'&&current(record.lease.request)&&compatiblePrevious(record))
+      if (survivor) {
+        // One fresh manager/harness proof before adopting identical surviving children.
+        // Keep the old capability as migration provenance if startup is interrupted.
+        if (!fs.existsSync(priorFile)) writePrivateAtomic(priorFile,JSON.stringify(previousCapability)+'\n')
+        await verifyPinned(survivor.lease.request.ownerId)
+      }
+    }
     for (const record of runs.values()) {
       if (record.state === 'released') continue
       const observed = await observe(record.lease.request)
@@ -182,6 +212,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   function ensure(): Promise<void> { return initialization ??= initialize().catch(error => { server?.close(); storage?.close(); throw error }) }
   async function verify(ownerId: string): Promise<BridgeTargetCapability> {
     await ensure()
+    return verifyPinned(ownerId)
+  }
+  async function verifyPinned(ownerId: string): Promise<BridgeTargetCapability> {
     const id = `bridge-${randomUUID()}`, source = o.manager!.bridgeCredentials
     try {
       const context = await source.retain(id, ownerId)
@@ -242,7 +275,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   }
   function cachedCapability() {
     if (!capability || !pins || !o.host?.inspect || !o.host.current || closed || Date.now() - Date.parse(capability.endpointProof.verifiedAt) > 86_400_000) throw executionHttpError('execution-capability-required', 'capability')
-    const currentHash = createHash('sha256').update(['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts'].map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex')
+    const currentHash = createHash('sha256').update(PIN_FILES.map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex')
     if (currentHash !== pins.adapterSha256 || !claude || hash(claude) !== claudeHash) throw executionHttpError('execution-capability-required', 'capability')
     storage!.assertExclusiveWriter()
     o.host.current()
@@ -257,28 +290,30 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const expected = `Bearer ${probe.key}`, provided = req.headers.authorization
       if (typeof provided !== 'string' || Buffer.byteLength(provided) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) return fail()
       if (probe.paused) return fail()
-      const controller = new AbortController(), signal = AbortSignal.any([controller.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(180_000)])
+      const controller = new AbortController(), signal = AbortSignal.any([controller.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
       req.on('aborted', () => controller.abort()); res.on('close', () => { if (!res.writableEnded) controller.abort() })
+      let pending:ReturnType<typeof pendingMessages>|null=null, failure:ProviderFailureSummary|undefined
       try {
         const chunks: Buffer[] = []; let bytes = 0
         for await (const chunk of req) { bytes += chunk.length; if (bytes > 16 * 1024 * 1024) return fail(); chunks.push(chunk) }
         const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input)
         if (match[2]) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ input_tokens: Buffer.byteLength(JSON.stringify(body)) })); return }
+        pending=pendingMessages(res,input.stream===true)
         const source = o.manager!.bridgeCredentials, context = await source.retain(probe.consumerId, probe.ownerId)
         const response = await source.use(probe.consumerId, context, (authorization, abort) => {
           if (probe.paused) throw executionHttpError('execution-intent-uncertain', 'runtime')
           return sendResponses(body, authorization, abort).catch(error => {
+          failure=signal.aborted?{stage:'transport',category:signal.reason?.name==='TimeoutError'?'timeout':'aborted'}:providerFailureSummary(error)
           probe.paused = true
-          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...failure }) + '\n'); throw error
         }) }, signal)
         let reply: ReturnType<typeof fromResponses>
         try { reply = fromResponses(response) } catch (error) {
           writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
         }
         if (reply.content.some(block => block.type === 'tool_use' && block.name === 'Read')) probe.sawRead = true
-        res.writeHead(200, { 'content-type': input.stream ? 'text/event-stream' : 'application/json', 'x-should-retry': 'false' })
-        res.end(input.stream ? messagesEvents(reply) : JSON.stringify(reply)); return
-      } catch { probe.paused = true; return fail() }
+        pending.complete(reply); return
+      } catch { probe.paused = true; if(pending)pending.fail(failure);else fail();return }
     }
     const record = runs.get(match[1]); if (!record) return fail()
     let config: BridgeChildConfig
@@ -286,8 +321,18 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const key = req.headers.authorization, expected = `Bearer ${config.controllerKey}`
     if (typeof key !== 'string' || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) return fail()
     if (record.dispatchPaused) return fail()
-    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(180_000)])
+    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
     req.on('aborted', () => abort.abort()); res.on('close', () => { if (!res.writableEnded) abort.abort() })
+    let pending:ReturnType<typeof pendingMessages>|null=null, failure:ProviderFailureSummary|undefined
+    const started=Date.now();let lastSaved=0,lastPhase=''
+    let progress:ProviderProgress={phase:'connecting',bytes:0,events:0}
+    const noteProgress=(value:ProviderProgress)=>{
+      progress=value
+      if(value.phase!==lastPhase||Date.now()-lastSaved>=15_000){
+        lastPhase=value.phase;lastSaved=Date.now()
+        writePrivateAtomic(path.join(o.directory,`${record.runId}.request.json`),JSON.stringify({version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,...value})+'\n')
+      }
+    }
     try {
       const chunks: Buffer[] = []; let size = 0
       for await (const data of req) { size += data.length; if (size > 16 * 1024 * 1024) return fail(); chunks.push(data) }
@@ -297,20 +342,21 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         // Conservative local byte bound, never a generation or a request to a smaller model.
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ input_tokens: Buffer.byteLength(JSON.stringify(body)) })); return
       }
+      pending=pendingMessages(res,input.stream===true)
       const sender = dispatch.get(record.runId) ?? (<T>(send: Parameters<NonNullable<typeof broker>['dispatch']>[1], abort?: AbortSignal) => broker.dispatch(record.lease, send, abort) as Promise<T>)
       const response = await sender((authorization, abort) => {
         if (record.dispatchPaused) throw executionHttpError('execution-intent-uncertain', 'runtime')
         if (!record.proof || !current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         ownership.assertRunning(record.lease, record.proof)
-        return sendResponses(body, authorization, abort).catch(error => {
+        return sendResponses(body, authorization, abort,noteProgress).catch(error => {
           pause(record)
-          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), ...providerFailureSummary(error) }) + '\n'); throw error
+          failure=signal.aborted?{stage:'transport',category:signal.reason?.name==='TimeoutError'?'timeout':'aborted'}:providerFailureSummary(error)
+          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), runId:record.runId, elapsedMs:Date.now()-started,progress,...failure }) + '\n'); throw error
         })
       }, signal)
       const reply = fromResponses(response)
-      if (input.stream === true) { res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' }); res.end(messagesEvents(reply)) }
-      else { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(reply)) }
-    } catch { pause(record); fail() }
+      pending.complete(reply)
+    } catch { pause(record);if(pending)pending.fail(failure);else fail() }
   }
   function matches(binding: ExecutionSnapshot, runId?: string): boolean {
     for (const record of runs.values()) if ((!runId || record.runId === runId) && record.state === 'running' && record.proof) {
