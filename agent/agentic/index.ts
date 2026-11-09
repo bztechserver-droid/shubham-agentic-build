@@ -5058,7 +5058,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         &&typeof body.expectedSessionId==='string'&&body.expectedSessionId===agent.sessionId){
         assertMessageRuntime(body.expectedSessionId,self().id,true);return
       }
-      if (!(r.rest.endsWith('/chat') && isObject(r.body) && Object.hasOwn(r.body, 'executionVersion'))) requireLegacyExecution(agent, defaultsNow())
+      // Stop only ends the chat's process: its binding, profile and history stay as they are, and the bridge retires the
+      // run once its exact processes are gone (as app_stop_chat's stop of a proved chat does). It is the owner's (POLICY).
+      // Refusing it left a Codex in Claude Code chat unstoppable from the page ("has not proved this execution capability").
+      const stopOnly = r.method === 'POST' && /^\/floors\/[^/]+\/agents\/[^/]+\/terminate$/.test(r.rest)
+      if (!stopOnly && !(r.rest.endsWith('/chat') && isObject(r.body) && Object.hasOwn(r.body, 'executionVersion'))) requireLegacyExecution(agent, defaultsNow())
     }
     if (r.method === 'DELETE' && /^\/floors\/[^/]+$/.test(r.rest)) for (const agent of floorOf(params[0]).agents) requireLegacyExecution(agent, defaultsNow())
   }
