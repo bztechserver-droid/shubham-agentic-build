@@ -6,6 +6,7 @@ import { requireMessageExecution } from './message-execution.ts'
 import { assertExecutionCAS, normalizeExecution, snapshotAgentExecution, type ExecutionIdentity } from '../../shared/chat-execution.ts'
 import { createExecutionService } from './execution-service.ts'
 import { executionLaunchCwd } from './execution-launch.ts'
+import { chatExecutionActor } from './execution-chat-actor.ts'
 import type { ExecutionIntentScope } from './execution-intents.ts'
 import { loadSession } from '../claude/index.ts'
 import { sourceHash } from './switch-fence.ts'
@@ -3186,11 +3187,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
           if (!executionService || !me.person || !a.owner || !a.homePc || a.homePc !== self().id
             || (args.pc !== undefined && args.pc !== self().id && String(args.pc).toLowerCase() !== self().name.toLowerCase())) throw executionHttpError('execution-capability-required', 'open')
           const scope = { actorId: me.person.id, ownerId: a.owner.id, floorId: f.id, agentId: a.id, targetPcId: a.homePc }
-          executionService.bindActor(scope, () => {
-            const source = floors.bySession(sid)
-            if (!source || access.asChat(source.agent).person?.id !== me.person!.id) throw executionHttpError('execution-forbidden', 'authorization')
-            access.needChat(me, workflowExecutionAgent(f.id, a.id), 'owner', toolWhere)
-          })
+          executionService.bindActor(scope, chatExecutionActor({ floorId: floor.id, agentId: agent.id }, scope,
+            { floors, access, target: workflowExecutionAgent }))
           const operationId = typeof args.operationId === 'string' ? args.operationId : explicitProfile ? '' : randomUUID()
           const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1', explicitProfile === 'codex-native-v1' ? explicitProfile : 'codex-in-claude-v1', args.restoreHistory === true)
           return json({ ...reply, sessionId: reply.committed.sessionId, agent: a.name, floor: f.name, pc: self().name })

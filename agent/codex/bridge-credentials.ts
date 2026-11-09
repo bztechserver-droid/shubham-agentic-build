@@ -21,12 +21,16 @@ const messages: Record<BridgeCredentialCode, string> = {
   'bridge-dispatch-unknown': 'The provider operation did not complete with a confirmed result. Do not retry automatically.',
   'bridge-cancelled': 'The provider operation was cancelled. Do not retry automatically.',
 }
-const knownErrors = new WeakSet<Error>()
+const knownErrors = new WeakMap<Error, BridgeCredentialCode>()
 export const bridgeCredentialError = (code: BridgeCredentialCode) => {
   const error = Object.assign(new Error(messages[code]), { code, status: code === 'bridge-dispatch-unknown' ? 502 : 409 })
-  knownErrors.add(error)
+  knownErrors.set(error, code)
   return error
 }
+/** Only errors created here may contribute a credential interruption reason. Never inspect
+ * arbitrary error messages, causes or lookalike code fields for these diagnostics. */
+export const bridgeCredentialFailureCode = (error: unknown): BridgeCredentialCode | null =>
+  error instanceof Error ? knownErrors.get(error) ?? null : null
 const safeError = (error: unknown, fallback: BridgeCredentialCode) => error instanceof Error && knownErrors.has(error) ? error : bridgeCredentialError(fallback)
 
 /** Backend-only metadata. Neither this context nor the transient callback belongs in shared/UI state. */
@@ -123,7 +127,7 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
     requireBridgeContext(fresh, e.lease.request.ownerId, now(), margin)
     e.context = Object.freeze({ ...fresh })
   }
-  function pause(e: Entry) { e.blocked = true; for (const c of e.flights) c.abort() }
+  function pause(e: Entry) { e.blocked = true; for (const c of e.flights) c.abort(bridgeCredentialError('bridge-lease-invalid')) }
   const runtimeMatches = (e: Entry, runtime: BridgeActualRuntimeProof) => runtime.ownerId === e.lease.request.ownerId && runtime.runId === e.lease.request.runId &&
     runtime.targetPcId === e.lease.request.targetPcId && runtime.leaseId === e.lease.leaseId && isDeepStrictEqual(runtime.binding, e.lease.request.binding)
   async function refreshContext(e: Entry, signal?: AbortSignal) {
@@ -165,10 +169,11 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
     async dispatch(lease, send, signal) {
       const e = keyOf(lease)
       if (e.closed || e.blocked) throw bridgeCredentialError('bridge-lease-invalid')
-      const controller = new AbortController(), abort = () => controller.abort()
+      const controller = new AbortController(), abort = () => controller.abort(signal?.reason)
       let initiated = false, managerSignal: AbortSignal | undefined
+      const managerAbort = () => controller.abort(managerSignal?.reason)
       e.flights.add(controller); signal?.addEventListener('abort', abort, { once: true })
-      if (signal?.aborted) controller.abort()
+      if (signal?.aborted) abort()
       try {
         await refreshContext(e, controller.signal); fence(e, controller.signal)
         const observed = await o.observeRuntime(e.lease.request)
@@ -176,8 +181,8 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
         if (observed.state !== 'running' || !runtimeMatches(e, observed.runtime)) { pause(e); throw bridgeCredentialError('bridge-owner-ambiguous') }
         const result = await o.source.use(e.consumerId, e.context!, (auth, sourceSignal) => {
           managerSignal = sourceSignal
-          sourceSignal.addEventListener('abort', abort, { once: true })
-          if (sourceSignal.aborted) controller.abort()
+          sourceSignal.addEventListener('abort', managerAbort, { once: true })
+          if (sourceSignal.aborted) managerAbort()
           fence(e, controller.signal)
           const guarded: BridgeRequestAuthorization = Object.freeze({
             get accessToken() { fence(e, controller.signal); return auth.accessToken },
@@ -196,7 +201,7 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
         throw safeError(error, controller.signal.aborted ? 'bridge-cancelled' : 'bridge-credential-unavailable')
       } finally {
         e.flights.delete(controller); signal?.removeEventListener('abort', abort)
-        managerSignal?.removeEventListener('abort', abort)
+        managerSignal?.removeEventListener('abort', managerAbort)
       }
     },
     withAuthorization(lease, use, signal) { return broker.dispatch(lease, auth => use(auth), signal) },

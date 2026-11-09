@@ -19,6 +19,8 @@ import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
+import { requestFailureSummary, type RequestPhase } from './request-failure.ts'
+import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
 import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, settleUndispatchedLease, validUndispatchedRelease,
@@ -27,10 +29,10 @@ import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, s
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
-const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts']
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
-  state: 'starting' | 'running' | 'ended' | 'released'; proof?: BridgeActualRuntimeProof;
+  state: RunState; proof?: BridgeActualRuntimeProof;
   dispatchPaused?: boolean;
   unstartedEnd?: UnstartedBridgeEnd;
 }
@@ -101,6 +103,10 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     record.proof, record.lease, pins!, Object.fromEntries(Object.keys(UNCHANGED_CHILD_FILES).map(file => [file, hash(path.join(import.meta.dirname,file))])), Date.now())) : undefined
   const compatiblePrevious = (record: RunRecord) => previousFor(record) !== undefined
 
+  function tombstone(record: RunRecord): BridgeOwnerObservation {
+    return record.proof ? ownership.released(record.lease, record.proof)
+      : record.unstartedEnd && validUnstartedEnd(record.unstartedEnd, record.lease) ? { state: 'ended' } : { state: 'unknown' }
+  }
   async function physical(record: RunRecord): Promise<BridgeOwnerObservation> {
     if (!o.host?.inspect || !pins || !capability || closed) return { state: 'unknown' }
     cachedCapability()
@@ -112,24 +118,29 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const host = await o.host.inspect()
     ownership.fence(epoch)
     if (host.hostPid !== epoch.hostPid || host.hostStartedAt !== epoch.hostStartedAt) throw executionHttpError('execution-runtime-mismatch', 'runtime')
+    // Retired by a concurrent observation while this one awaited: report the tombstone, never rewrite it.
+    if (stateNow(record) === 'released') return tombstone(record)
     const ch = host.chats.find(chat => chat.id === record.lease.request.binding.sessionId)
     if (!record.proof && (ch?.exited || record.unstartedEnd)) {
       const rows=await unstartedProcesses([path.basename(process.execPath),path.basename(claude!)])
       ownership.fence(epoch)
       const end=confirmedUnstartedEnd(record.lease,epoch,ch,rows,record.configFile,record.unstartedEnd)
       if(!end)return {state:'unknown'}
-      if(!record.unstartedEnd){record.unstartedEnd=end;record.state='ended';save(record)}
+      if(!record.unstartedEnd){record.unstartedEnd=end;advanceRunState(record,'ended');save(record)}
       const observed=unstarted.ended(end,epoch);queueRetirement(record);return observed
     }
-    if (!ch || ch.meta.bridgeRunId !== record.runId || !isDeepStrictEqual(ch.meta.execution, record.lease.request.binding)) return { state: 'unknown' }
-    if (ch.exited) {
+    if (ch && (ch.meta.bridgeRunId !== record.runId || !isDeepStrictEqual(ch.meta.execution, record.lease.request.binding))) return { state: 'unknown' }
+    // Exited, or no longer listed by the current authenticated host (it forgets chats that ended while
+    // no agent was there): only the run's own recorded processes being gone proves the end.
+    if (!ch || ch.exited) {
       if (!record.proof) return { state: 'unknown' }
       const table = await processes(record.proof.proxy.pid, record.proof.claude.pid, host.hostPid, record.proof.listener.port)
       ownership.fence(epoch)
-      if (table.rows.some(p => (p.pid === record.proof!.proxy.pid && p.created === record.proof!.proxy.createdAtMs)
-        || (p.pid === record.proof!.claude.pid && p.created === record.proof!.claude.createdAtMs)) || table.listener) return { state: 'unknown' }
+      if (stateNow(record) === 'released') return tombstone(record)
+      if (!proofProcessesGone(record.proof, table)) return { state: 'unknown' }
       const retired = ownership.ended(record.lease, record.proof, epoch)
-      record.state = 'ended'; save(record); queueRetirement(record)
+      if (advanceRunState(record, 'ended')) save(record)
+      queueRetirement(record)
       return retired
     }
     const config = readChildConfig(record.configFile)
@@ -139,6 +150,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       || !Number.isSafeInteger(ready.claudePid) || !Number.isSafeInteger(ready.port) || ready.port < 1 || ready.port > 65535) return { state: 'unknown' }
     const observed = await processes(ch.pid, ready.claudePid, host.hostPid, ready.port)
     ownership.fence(epoch)
+    // Ended or retired by a concurrent observation while this one awaited: never report or admit it as running.
+    if (stateNow(record) === 'released') return tombstone(record)
+    if (stateNow(record) === 'ended') return { state: 'unknown' }
     const proxy = observed.rows.find(p => p.pid === ch.pid), child = observed.rows.find(p => p.pid === ready.claudePid), hostProc = observed.rows.find(p => p.pid === host.hostPid)
     const upgrade = !isDeepStrictEqual(record.pins, pins)
     if (!proxy || !child || !hostProc || !observed.listener || child.ppid !== proxy.pid || child.created < proxy.created
@@ -166,7 +180,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       record.pins=pins;record.proof=proof;save(record)
     }
     ownership.admit(record.lease, proof, epoch)
-    if (!record.proof) { record.proof = proof; record.state = 'running'; save(record) }
+    if (!record.proof) { record.proof = proof; advanceRunState(record, 'running'); save(record) }
     return { state: 'running', runtime: proof }
   }
   async function observe(request: BridgeLeaseRequest, undispatched?:{lease:CodexBridgeLease;fence():void}): Promise<BridgeOwnerObservation> {
@@ -194,8 +208,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     }
     if(!isDeepStrictEqual(record.lease.request,request))return{state:'unknown'}
     try {
-      if (record.state === 'released') return record.proof ? ownership.released(record.lease, record.proof)
-        : record.unstartedEnd&&validUnstartedEnd(record.unstartedEnd,record.lease)?{state:'ended'}:{state:'unknown'}
+      if (record.state === 'released') return tombstone(record)
       const observed = await physical(record)
       if (observed.state === 'unknown') {ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId)}
       return observed
@@ -301,10 +314,10 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       queueRetirement(old); await retirementWork.reconcile()
       if (runs.get(old.runId)?.state !== 'released') throw executionHttpError('execution-intent-uncertain', 'open')
     }
-    const configFile = path.join(o.directory, `${request.runId}.child.json`)
+    const files = runArtifacts(o.directory, request.runId), configFile = files.child
     const config: BridgeChildConfig = { version: 1, runId: request.runId, ownerId: request.scope.ownerId, leaseId: request.lease.leaseId,
       binding: request.binding, claude: claude!, claudeSha256: claudeHash!, controllerPort: port, controllerKey: randomBytes(32).toString('hex'), loopbackKey: randomBytes(32).toString('hex'),
-      settingsFile: path.join(o.directory, `${request.runId}.settings.json`), readyFile: path.join(o.directory, `${request.runId}.ready.json`), memorySettings: o.memorySettings }
+      settingsFile: files.settings, readyFile: files.ready, memorySettings: o.memorySettings }
     writePrivateAtomic(configFile, JSON.stringify(config) + '\n')
     const record: RunRecord = { version: 1, runId: request.runId, lease: request.lease, pins: pins!, configFile, state: 'starting' }
     save(record); runs.set(record.runId, record); dispatch.set(record.runId, request.dispatchProvider)
@@ -369,7 +382,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (record.dispatchPaused) return fail()
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
     req.on('aborted', () => abort.abort()); res.on('close', () => { if (!res.writableEnded) abort.abort() })
-    let pending:ReturnType<typeof pendingMessages>|null=null, failure:ProviderFailureSummary|undefined
+    let pending:ReturnType<typeof pendingMessages>|null=null
+    let phase:RequestPhase='request',providerDispatched=false
+    let providerFailure:ReturnType<typeof requestFailureSummary>|undefined
     const started=Date.now();let lastSaved=0,lastPhase=''
     let progress:ProviderProgress={phase:'connecting',bytes:0,events:0}
     const noteProgress=(value:ProviderProgress)=>{
@@ -383,7 +398,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const chunks: Buffer[] = []; let size = 0
       for await (const data of req) { size += data.length; if (size > 16 * 1024 * 1024) return fail(); chunks.push(data) }
       const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input)
-      if (!current(record.lease.request)) return fail()
+      phase='authorization'
+      if (!current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch','runtime')
       if (match[2]) {
         // Conservative local byte bound, never a generation or a request to a smaller model.
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ input_tokens: Buffer.byteLength(JSON.stringify(body)) })); return
@@ -394,15 +410,28 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         if (record.dispatchPaused) throw executionHttpError('execution-intent-uncertain', 'runtime')
         if (!record.proof || !current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         ownership.assertRunning(record.lease, record.proof)
+        phase='provider';providerDispatched=true
+        // The manager and broker deliberately replace initiated failures with UNKNOWN.
+        // Capture only the adapter's safe metadata at this boundary, never its raw error.
         return sendResponses(body, authorization, abort,noteProgress).catch(error => {
-          pause(record)
-          failure=signal.aborted?{stage:'transport',category:signal.reason?.name==='TimeoutError'?'timeout':'aborted'}:providerFailureSummary(error)
-          writePrivateAtomic(path.join(o.directory, 'last-provider-failure.json'), JSON.stringify({ at: new Date().toISOString(), runId:record.runId, elapsedMs:Date.now()-started,progress,...failure }) + '\n'); throw error
+          providerFailure=requestFailureSummary(error,'provider',abort);throw error
         })
       }, signal)
+      phase='response'
       const reply = fromResponses(response)
       pending.complete(reply)
-    } catch { pause(record);if(pending)pending.fail(failure);else fail() }
+    } catch (error) {
+      pause(record)
+      const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
+      const diagnostic={version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,
+        phase,...(providerDispatched?{progress}:{}),...failure}
+      try {
+        const bytes=JSON.stringify(diagnostic)+'\n'
+        writePrivateAtomic(path.join(o.directory,`${record.runId}.failure.json`),bytes)
+        writePrivateAtomic(path.join(o.directory,'last-provider-failure.json'),bytes)
+      } catch { /* Pause remains latched even when diagnostics cannot be saved. */ }
+      if(pending)pending.fail(failure);else fail()
+    }
   }
   function matches(binding: ExecutionSnapshot, runId?: string): boolean {
     for (const record of runs.values()) if ((!runId || record.runId === runId) && record.state === 'running' && record.proof) {
@@ -421,7 +450,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       const observed = await observe(record.lease.request)
       const canRetire=()=>record.proof?ownership.canRetire(record.lease,record.proof,observed):unstarted.canRetire(record.lease,record.unstartedEnd,observed)
       if (observed.state !== 'ended' || !canRetire()) return false
-      const config = readChildConfig(record.configFile)
+      // Derived names, not the child config: a lost config must not make retirement impossible.
+      const files = runArtifacts(o.directory, record.runId)
       if (knownBrokerLeases.has(record.lease.leaseId)) await broker!.release(record.lease)
       else {
         // Recovery of a saved, already-ended unique consumer: no acquire, refresh or provider adoption.
@@ -430,8 +460,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
           if (!canRetire()) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         })
       }
-      record.state = 'released'; save(record)
-      for (const file of [config.settingsFile, config.readyFile, record.configFile]) { try { fs.unlinkSync(file) } catch { /* Only this run's exact private artifacts. */ } }
+      if (advanceRunState(record, 'released')) save(record)
+      for (const file of [files.settings, files.ready, files.child]) { try { fs.unlinkSync(file) } catch { /* Only this run's exact private artifacts. */ } }
       ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); dispatch.delete(record.runId)
       return true
     })

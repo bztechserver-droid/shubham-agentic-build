@@ -2445,7 +2445,34 @@
     "said": "now one importnat feasutre if someone doesn't login in the app then nothing should be shown at all please",
     "added": "2026-11-08",
     "notes": [
-      "Lead scope: enforce signed-in human app access on local/remote/phone/deep links, server-side API/WebSocket/raw guards and fail-closed frontend. Only sign-in or neutral verification UI before current CRM session; no legacy/off/local/phone-exemption switch. Preserve explicitly authenticated machine/MCP/pinned internal transports without granting browser authority. Existing ownership/history/CRM/native accounts unchanged. Private backend/frontend/security review assigned; no Dev integration/publication/live auth setting changes yet. Evidence C:/saw/mandatory-login-f162-20261108/lead-scope.json."
+      "Lead scope: enforce signed-in human app access on local/remote/phone/deep links, server-side API/WebSocket/raw guards and fail-closed frontend. Only sign-in or neutral verification UI before current CRM session; no legacy/off/local/phone-exemption switch. Preserve explicitly authenticated machine/MCP/pinned internal transports without granting browser authority. Existing ownership/history/CRM/native accounts unchanged. Private backend/frontend/security review assigned; no Dev integration/publication/live auth setting changes yet. Evidence C:/saw/mandatory-login-f162-20261108/lead-scope.json.",
+      "2026-11-09 Shubham via Assistant order o08e9: Direct request from Shubham: start fixing login/privacy now and record these requirements. He can still see chats after logout. Login must be compulsory: while unauthenticated show only the login screen/blank protected shell, no chats/history, route navigation or overlay contents; protected deep links must require login too. Enforce this on backend APIs and live streams/terminal access as well as UI, not just hide routes. On logout or account switch, immediately remove previous user's rendered/cached data and subscriptions; handle stale in-flight responses so they cannot repopulate it. Preserve saved history, but only expose it to its authorized owner. Overlay Assistant must be unique per authenticated user, with that user's own independently owned session/history; no shared/global assistant conversation or reuse across accounts. Coordinate the Dev slot, audit the existing behavior and implement with tests for signed-out refresh/deep links, logout/back/multiple tabs, and AB switching including late responses and overlay isolation. Keep authorized shared-floor access working, but no access when signed out. Report actual changes and verified results, not diagnosis alone. Do not publish or press Update now; Shubham has authorized development, not publication.",
+      "2026-11-09 Lead: Connection backend handoff-v1 and Memory frontend handoff-v2 are private frozen candidates, not Dev changes or release approval. Owner-reported focused results46/46 backend and184/184 frontend; independent candidate review, managed offline browser checks, legacy test adaptation and per-user Assistant isolation remain. Integrations assigned the narrow Assistant scope proposal; existing saved history/bindings must not be deleted or arbitrarily reassigned. API400 integration has a separate guarded slot request; F162 held out, no publication/Update."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-163",
+    "title": "Fix repeated paused-execution API 400 across chats",
+    "said": "check the error in the lead chat there is an api error 400 again please check as to why it is there",
+    "added": "2026-11-09",
+    "notes": [
+      "2026-11-09 Shubham: its in many chats",
+      "2026-11-09 Shubham: fix the whole thing in a new build please",
+      "2026-11-09 Fix other PCS: investigating shared pre-dispatch and transport failure paths with saved request metadata; Lead/Web/Special are paused. Preserve histories, owners, execution profiles, Sol/max policy and no automatic replay/fallback. Isolated evidence C:/saw/api400-20261109; not fixed or released yet."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-164",
+    "title": "Codex in Claude chats always open (no \"operation outcome is uncertain\")",
+    "said": "Please fix the lead chat to open. It is giving some error, \"PC operational,\" something like that, for Claude in Codex. That should not come in the future. Claude in Codex should open smoothly.",
+    "added": "2026-11-09",
+    "notes": [
+      "2026-11-09 Agent 8: the error was \"The operation outcome is uncertain. Observe this same operation.\" Lead's last bridge run 1bf505fb had been released (lease freed, child files deleted) but a concurrent check in runtime.ts physical() then wrote it back to \"ended\"; every later open saw an uncertain old run and refused. Lead unstuck by hand at 22:17 (record restored to released, hub restarted). Code fix for the race: in progress, scratch only, not merged.",
+      "2026-11-09 Agent 8: the permanent fix is Fix other PCS's F-163 v3, merged into Dev at 22:21 (agent/codex-claude/run-state.ts: run states only move forward, the state is re-read after every await, retirement no longer needs the child config); publish started 22:22. Agent 8's parallel scratch fix (C:/saw/f164-bridge-race) is dropped, not merged. Tick once the published build is installed (Update) and a Codex in Claude chat reopens cleanly."
     ],
     "done": null,
     "doneNote": ""

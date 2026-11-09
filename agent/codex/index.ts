@@ -145,12 +145,20 @@ export function createCodex(o: CodexOptions): CodexManager {
   let validation: Validation | null = null
   let validationNotBefore = 0
   const sessionEpoch = (s: CrmSession | null) => s ? createHash('sha256').update(JSON.stringify([s.url, s.user.id, s.signedInAt, s.cookie])).digest('hex') : null
-  function invalidateBridge(reason: BridgeCredentialCode, forget = false) {
+  type BridgeInvalidationSource = 'manager-operation' | 'credential-integrity' | 'credential-validity' |
+    'validation-timeout' | 'validation-rejected' | 'validation-unavailable' | 'manager-closed'
+  function invalidateBridge(reason: BridgeCredentialCode, forget = false, source: BridgeInvalidationSource = 'manager-operation') {
+    const active = [...bridgeFlights.values()].reduce((count, flights) => count + flights.size, 0)
+    const report = bridgeValidated || active > 0
     bridgeValidated = false
     bridgeFailure = reason
     if (forget) bridgeReceipt = null
     advanceBridgeAuthority()
-    for (const flights of bridgeFlights.values()) for (const flight of flights) flight.abort()
+    for (const flights of bridgeFlights.values()) for (const flight of flights) flight.abort(bridgeCredentialError(reason))
+    if (report) {
+      try { log.warn(`bridge: credential authority interrupted (${reason}; ${source}; active requests ${active})`) }
+      catch { /* Diagnostics cannot change cancellation or credential authority. */ }
+    }
   }
   function authorization(text: string, revision: number): BridgeRequestAuthorization | null {
     try {
@@ -191,12 +199,12 @@ export function createCodex(o: CodexOptions): CodexManager {
     if (!s || sessionEpoch(s) !== receipt.sessionEpoch || s.user.id !== receipt.ownerId || key || waiting ||
         !login || login.sha256 !== receipt.contentHash || !side || side.sha256 !== receipt.contentHash || side.userId !== receipt.ownerId ||
         side.subscriptionId !== receipt.subscriptionId || side.baseRevision !== receipt.revision) {
-      invalidateBridge('bridge-context-changed', true); return null
+      invalidateBridge('bridge-context-changed', true, 'credential-integrity'); return null
     }
     if (expected && !sameBridgeCredential(receipt, expected)) return null
     if (!bridgeValidated) return null
     try { requireBridgeContext(receipt, receipt.ownerId, now()); return receipt }
-    catch { invalidateBridge(now() >= receipt.validationExpiresAtMs ? 'bridge-validation-stale' : 'bridge-refresh-required'); return null }
+    catch { invalidateBridge(now() >= receipt.validationExpiresAtMs ? 'bridge-validation-stale' : 'bridge-refresh-required', false, 'credential-validity'); return null }
   }
   function validationBinding(): string {
     const login = readLogin(paths), side = readSidecar(paths)
@@ -237,7 +245,7 @@ export function createCodex(o: CodexOptions): CodexManager {
         if (validation !== flight || !flight.active) return
         const owns = ownsValidation(flight)
         flight.active = false; controller.abort()
-        if (owns) invalidateBridge('bridge-validation-stale')
+        if (owns) invalidateBridge('bridge-validation-stale', false, 'validation-timeout')
         finish()
       }, BRIDGE_VALIDATION_TIMEOUT_MS) }
       flight.timer.unref(); validation = flight
@@ -247,13 +255,13 @@ export function createCodex(o: CodexOptions): CodexManager {
       void response.then(r => serial(async () => {
         if (!ownsValidation(flight)) return
         if (now() < at || now() - at >= BRIDGE_VALIDATION_TIMEOUT_MS) {
-          invalidateBridge('bridge-validation-stale'); return
+          invalidateBridge('bridge-validation-stale', false, 'validation-timeout'); return
         }
-        if (r.kind !== 'ok' || r.login.kind !== 'chatgpt') { invalidateBridge('bridge-credential-unavailable', true); return }
+        if (r.kind !== 'ok' || r.login.kind !== 'chatgpt') { invalidateBridge('bridge-credential-unavailable', true, 'validation-rejected'); return }
         // Normal manager ordering owns replacement. Never apply a stale response over a pending native refresh.
         await pull({ session: s, at, result: r })
       })).catch(() => serial(async () => {
-        if (ownsValidation(flight)) invalidateBridge('bridge-credential-unavailable')
+        if (ownsValidation(flight)) invalidateBridge('bridge-credential-unavailable', false, 'validation-unavailable')
       })).finally(() => {
         clearTimeout(flight.timer); flight.active = false; finish()
         if (validation === flight) validation = null
@@ -653,7 +661,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     close() {
       closed = true
       stopBridgeTimer()
-      invalidateBridge('bridge-credential-unavailable', true)
+      invalidateBridge('bridge-credential-unavailable', true, 'manager-closed')
       key = null
       for (const t of timers) clearInterval(t)
     },
