@@ -72,6 +72,7 @@ import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
 import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type PtySpawn } from './chats.ts'
+import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
@@ -1261,6 +1262,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       assertExecutionCAS(binding, info.execution); return true
     } catch { return false }
   }
+  // F-163: this agent's own bridge chat in the pool, admitted or not, can be stopped and shown (never typed into): bridge-stop.ts.
+  const ownBridgeSid = (sid: string) => ownBridgeChat(bySession(sid)?.agent, nativeChats.info(sid))
   function assertMessageRuntime(sid: string, targetPcId: string, confirmed: boolean) {
     const at=bySession(sid)
     if(!at)return
@@ -1284,9 +1287,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     press: (sid, data) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.press(sid, data),
     type: (sid, text, options) => runtimeSidAllowed(sid) && !switchFences.blocked(sid) && nativeChats.type(sid, text, options),
     deliver: async (sid, text, options) => !runtimeSidAllowed(sid) || switchFences.blocked(sid) ? 'blocked' : nativeChats.deliver?.(sid, text, options) ?? 'unconfirmed',
-    attach: (sid, viewer) => runtimeSidAllowed(sid) ? nativeChats.attach(sid, viewer) : null,
+    attach: (sid, viewer) => runtimeSidAllowed(sid) || ownBridgeSid(sid) ? nativeChats.attach(sid, viewer) : null,
     resize: (sid, cols, rows) => { if (runtimeSidAllowed(sid)) nativeChats.resize(sid, cols, rows) },
-    kill: (sid, why) => runtimeSidAllowed(sid) && nativeChats.kill(sid, why),
+    kill: (sid, why) => (runtimeSidAllowed(sid) || ownBridgeSid(sid)) && nativeChats.kill(sid, why),
     typeWhenReady: (sid, text, options) => { assertLegacySid(sid); switchFences.assertWritable(sid); nativeChats.typeWhenReady(sid, text, options) },
     adopt: (info, pty, replay) => {
       try {
@@ -5445,7 +5448,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     return (ws: WsSocket) => {
       const current = bySession(sid), running = chats.info(sid)
-      if (current && !runtimeSidAllowed(sid)) return ws.close(1008, 'This execution has not proved a supported runtime.')
+      // F-163: a paused bridge chat whose run lost its admission is still shown (typing() above keeps its keys out).
+      if (current && !runtimeSidAllowed(sid) && !ownBridgeSid(sid)) return ws.close(1008, 'This execution has not proved a supported runtime.')
       if (current && isPcControl(current.floor) && running && current.floor.targetPcId !== self().id) return ws.close(1008, 'This runtime is on the wrong PC.')
       if (current && running) {
         try { requireRunningEngine(engineFor(current.agent), running.engine) }
