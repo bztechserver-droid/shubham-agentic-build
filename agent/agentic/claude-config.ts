@@ -13,7 +13,9 @@ import { writeAtomic } from '../config.ts'
 //   - "Do you trust this folder?" for the floor's folder, which the person picked for the floor
 //     in the app: projects["C:/the/folder"].hasTrustDialogAccepted, as claude writes on "Yes".
 //     (In claude 2.1 that menu starts on "No, exit", so answering it with Enter would quit.)
-// Only ABSENT keys are filled: a theme someone chose, and everything else in the file, stays.
+// Shubham explicitly chose bypass permissions for all existing and new chats. Record that
+// native consent too, so a managed bypass launch opens without another startup question.
+// Other preferences are only filled when absent; credentials and unrelated settings stay.
 // The sign-in is not touched: it comes from CLAUDE_CODE_OAUTH_TOKEN (F-007).
 
 export const claudeJsonPath = (home = os.homedir()) => path.join(home, '.claude.json')
@@ -23,7 +25,7 @@ export const projectKey = (cwd: string) => cwd.replace(/\\/g, '/')
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
-/** Marks setup done and `cwd` trusted when they aren't; returns what it changed (empty: nothing written). */
+/** Marks setup done, records the requested bypass consent and trusts `cwd`; returns the changed preferences. */
 export function prepareClaudeConfig(cwd: string, file = claudeJsonPath()): string[] {
   let data: Record<string, unknown> = {}
   if (existsSync(file)) {
@@ -38,6 +40,10 @@ export function prepareClaudeConfig(cwd: string, file = claudeJsonPath()): strin
     data = parsed
   }
   const changed: string[] = []
+  if (data.bypassPermissionsModeAccepted !== true) {
+    data.bypassPermissionsModeAccepted = true
+    changed.push('bypass permissions consent')
+  }
   if (data.hasCompletedOnboarding === undefined) {
     data.hasCompletedOnboarding = true
     changed.push('first-run setup')

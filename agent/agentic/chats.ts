@@ -808,8 +808,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         for (const dir of o.addDirs ?? []) args.push('--add-dir', dir)
         if (s.model) args.push('--model', s.model)
         if (s.effort) args.push('--effort', s.effort)
-        // Managed bridges use ordinary native tool approvals; no bypass-mode startup consent.
-        if (s.bridge) args.push('--permission-mode', 'default')
+        // Shubham chose bypass for all existing/new chats: resumes get the same launch default.
+        // The native startup consent is recorded by prepareClaudeConfig, not answered with keys.
+        args.push('--permission-mode', 'bypassPermissions')
         if (o.settings && !s.bridge) args.push('--settings', o.settings)
       }
       const file = s.bridge ? process.execPath : /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
