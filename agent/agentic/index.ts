@@ -2,6 +2,7 @@ import { requireCrmHuman, describeHuman, createPromptActions, APPROVAL_GRANT_MS,
 import { createPcControlStore, isPcControl, immutablePcControl, pcControlError, pcControlRevision, assertPcControlExpected, checkedPcControlNamespace, type PcControlKnownDevice } from './pc-control.ts'
 import type { PcControlAnswer, PcControlWorkspace, PcControlCapability, PcControlSlot } from '../../shared/pc-control.ts'
 import { executionIdentityOf, requireLegacyExecution, requireRunningEngine, engineUpdateRequired, type RuntimeEngine } from './runtime-engine.ts'
+import { requireMessageExecution } from './message-execution.ts'
 import { assertExecutionCAS, normalizeExecution, snapshotAgentExecution, type ExecutionIdentity } from '../../shared/chat-execution.ts'
 import { createExecutionService } from './execution-service.ts'
 import type { ExecutionIntentScope } from './execution-intents.ts'
@@ -1255,6 +1256,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
       assertExecutionCAS(binding, info.execution); return true
     } catch { return false }
   }
+  function assertMessageRuntime(sid: string, targetPcId: string, confirmed: boolean) {
+    const at=bySession(sid)
+    if(!at)return
+    const runtime=nativeChats.info(sid)
+    requireMessageExecution(at.agent,defaultsNow(),{selfPcId:self().id,targetPcId,confirmed,
+      runtimeBinding:runtime?.execution,runId:runtime?.bridgeRunId,
+      admitted:(expected,runId)=>executionService?.runtime.matches(expected,runId)===true})
+  }
   const chats: ChatPool = { ...nativeChats,
     beforeAdopt: async info => {
       const at = bySession(info.sessionId)
@@ -2467,8 +2476,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * typed and it throws 409. A chat on a member PC reports its draft back, because only that PC knows its screen.
    */
   async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller } = {}): Promise<boolean> {
-    const bound = bySession(c.sessionId)
-    if (bound) requireLegacyExecution(bound.agent, defaultsNow())
+    assertMessageRuntime(c.sessionId,c.id,opt.confirmed===true)
     const refuseDraft = opt.human !== true
     if (opt.confirmed) {
       let result: unknown
@@ -2534,7 +2542,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   function beginNativeDelivery(sessionId: string, body: string, owner: string, messageId?: string, expectedBinding?: string, extraGuard?: () => boolean, authorize?: (phase: HumanInputPhase) => Promise<boolean>) {
-    assertLegacySid(sessionId)
+    assertMessageRuntime(sessionId,self().id,true)
     const at = bySession(sessionId)
     if (!at) throw apiError(409, 'The destination conversation changed. Nothing was submitted.')
     const { floor, agent } = at
@@ -2547,7 +2555,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const advanced = advanceDeliveryBinding(binding, current.agent)
         if (!advanced) return false
         binding = advanced
-        try { assertPcControlTarget(current.floor, self().id, {}); return extraGuard?.() !== false } catch { return false }
+        try { assertMessageRuntime(sessionId,self().id,true);assertPcControlTarget(current.floor, self().id, {}); return extraGuard?.() !== false } catch { return false }
       }
       if (!generation || !valid()) return 'blocked'
       bind(sessionId, generation, false)
@@ -4981,6 +4989,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     if (/^\/floors\/[^/]+\/agents\/[^/]+\//.test(r.rest) && !r.rest.endsWith('/share')) {
       const agent = agentOf(floorOf(params[0]), params[1])
+      if(r.method==='POST'&&r.rest.endsWith('/say')&&isObject(body)&&typeof body.messageId==='string'&&UUID_RE.test(body.messageId)
+        &&typeof body.expectedSessionId==='string'&&body.expectedSessionId===agent.sessionId){
+        assertMessageRuntime(body.expectedSessionId,self().id,true);return
+      }
       if (!(r.rest.endsWith('/chat') && isObject(r.body) && Object.hasOwn(r.body, 'executionVersion'))) requireLegacyExecution(agent, defaultsNow())
     }
     if (r.method === 'DELETE' && /^\/floors\/[^/]+$/.test(r.rest)) for (const agent of floorOf(params[0]).agents) requireLegacyExecution(agent, defaultsNow())
