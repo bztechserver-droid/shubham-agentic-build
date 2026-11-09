@@ -794,6 +794,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         const cred = s.bridge ? null : o.credential?.() ?? null
         if (s.bridge) {
           for (const k of Object.keys(env)) if (/^(?:ANTHROPIC_|OPENAI_|CODEX_|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_USE_)/.test(k)) delete env[k]
+          // Codex in Claude Code runs the bridge's own copy of the one proved Claude Code version: it never updates itself.
+          env.DISABLE_AUTOUPDATER = '1'
         } else if (cred) {
           for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[k]
           env[cred.name] = cred.value

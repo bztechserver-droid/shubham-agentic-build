@@ -23,6 +23,7 @@ import { requestFailureSummary, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
+import { claudeBinDir, installedClaudeSources, provedClaudeBinary } from './claude-binary.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
 import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, settleUndispatchedLease, validUndispatchedRelease,
@@ -31,7 +32,7 @@ import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, s
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
-const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts', 'capability-renewal.ts', 'requirements.ts']
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts', 'capability-renewal.ts', 'requirements.ts', 'claude-binary.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
   state: RunState; proof?: BridgeActualRuntimeProof;
@@ -52,6 +53,8 @@ export interface BridgeRuntimeOptions {
   launch(request: ExecutionStartRequest): Omit<StartChat, 'bridge'>;
   pool(): ChatPool;
   memorySettings?: string;
+  /** Where the bridge keeps its copy of the proved Claude Code program (default: claudeBinDir(directory)). */
+  claudeBinDir?: string;
 }
 
 /** One controller-side provider transport. Persistent children hold loopback keys only. */
@@ -228,7 +231,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     // A retried start-up begins from the saved files again, never from a half-read earlier attempt.
     capability = null; previousCapabilities.length = 0
     storage = await openExecutionStorage(o.directory)
-    claude = findClaude()
+    // The bridge's own copy of the proved version, never the PATH program that Claude Code updates in place.
+    claude = provedClaudeBinary({ binDir: o.claudeBinDir ?? claudeBinDir(o.directory), version: REQUIRED.claude,
+      sources: installedClaudeSources(REQUIRED.claude, findClaude()) })
     const codex = findCodex()
     if (!claude || !/\.exe$/i.test(claude) || !codex || codex.version !== REQUIRED.codex || process.versions.node !== REQUIRED.node) throw executionHttpError('execution-capability-required', 'runtime')
     const version = spawnSync(claude, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
