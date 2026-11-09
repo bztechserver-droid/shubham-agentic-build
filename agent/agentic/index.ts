@@ -7,7 +7,7 @@ import { createExecutionService } from './execution-service.ts'
 import type { ExecutionIntentScope } from './execution-intents.ts'
 import { loadSession } from '../claude/index.ts'
 import { sourceHash } from './switch-fence.ts'
-import { forkClaudeExecution } from '../codex-claude/fork.ts'
+import { forkClaudeExecution, forkNativeCodexExecution } from '../codex-claude/fork.ts'
 import { executionHttpError, executionIntentId, requireExecutionCapabilityQuery, requireExecutionOpenRequest,
   requireExecutionSelectionRequest, type ExecutionCapabilityReply } from '../../shared/chat-execution-http.ts'
 import { prepareConversation, type PreparedConversation } from '../opencode/switch.ts'
@@ -1153,6 +1153,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
       floorFile: () => path.join(o.dir, mode() === 'member' ? 'floors-local.json' : 'floors.json'),
       commit: request => { floors.commitExecution(request) },
       target: (scope, profile) => targetExecution(profile, workflowExecutionAgent(scope.floorId, scope.agentId)),
+      nativeOpen: async (request, assertCurrent) => {
+        const guard = () => {
+          assertCurrent()
+          const agent = workflowExecutionAgent(request.scope.floorId, request.scope.agentId)
+          assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
+          if (request.signal.aborted || request.kind !== 'native' || request.binding.execution.profile !== 'codex-native-v1'
+            || agent.owner?.id !== request.scope.ownerId || request.scope.targetPcId !== self().id
+            || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
+        }
+        guard()
+        await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard)
+        guard()
+      },
       launch: request => {
         const floor = floorOf(request.scope.floorId), agent = workflowExecutionAgent(floor.id, request.scope.agentId)
         assertExecutionCAS(request.binding, snapshotAgentExecution(agent, defaultsNow()))
@@ -1173,6 +1186,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
         switchFences.begin(expected.sessionId, token, 'execution-profile-v1')
         if (nativeChats.info(expected.sessionId)) { nativeChats.kill(expected.sessionId, 'execution-selection'); await nativeChats.waitStopped?.(expected.sessionId) }
+        if (expected.execution.profile === 'codex-in-claude-v1') await executionService?.runtime.ended(expected.sessionId)
         await settled(file)
         switchFences.snapshot(expected.sessionId, token, file, 'execution-profile-v1'); switchFences.seal(expected.sessionId, token, 'execution-profile-v1')
         const digest = sourceHash(file)
@@ -1184,6 +1198,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
           ? expected.codexThread && o.codex ? findRollout(o.codex.paths.home, expected.codexThread) : null
           : findClaudeTranscript(expected.sessionId!, projectsDir)
         if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
+        if (target.profile === 'codex-native-v1' && o.codex) return forkNativeCodexExecution({ expected, target, file,
+          cwd: conversationCwd(file) || codeDirOf(floor), codexHome: o.codex.paths.home })
         return forkClaudeExecution({ expected, target, file, cwd: conversationCwd(file) || codeDirOf(floor), projectsDir })
       },
     })
@@ -1330,7 +1346,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * chat's profile is written (its brief, model, effort and MCP servers; the chat's own key is only NAMED there), and codex is started in the shared home.
    * A chat whose conversation id is not known yet is a new conversation; its id is learnt from its rollout file once Codex has written it.
    */
-  async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+  async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void): Promise<boolean> {
+    executionGuard?.()
     const cx = o.codex
     if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
     const thread = agent.codexThread ?? learnThread(sid, floor.id, agent.id, 0)?.thread ?? null
@@ -1338,6 +1355,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const binding = threadBinds.get(sid)
     if (binding) await binding
     const requireConfirmedThread = () => {
+      executionGuard?.()
       const current = bySession(sid)
       if (current?.floor.id !== floor.id || current.agent.id !== agent.id || engineFor(current.agent) !== 'codex' || (current.agent.codexThread ?? null) !== thread) {
         throw pcControlError('engine-change-stale', 'The approved Codex conversation changed before launch. Refresh and open the chat again.')
@@ -1460,7 +1478,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** Starts the agent's chat on this PC (its lease already got). */
-  async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest): Promise<boolean> {
+  async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void): Promise<boolean> {
+    executionGuard?.()
     requireLegacyExecution(agent, defaultsNow())
     assertPcControlTarget(floor, self().id, size)
     if (engineFor(agent) === 'opencode') {
@@ -1476,7 +1495,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
       return !!agent.opencodeSession
     }
-    if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size)
+    if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size, executionGuard)
     const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
     try {
@@ -2143,7 +2162,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
-  async function openChat(floorId: string, agentId: string, req: OpenChatRequest): Promise<ChatOpened> {
+  async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void): Promise<ChatOpened> {
+    executionGuard?.()
     const managed = floorOf(floorId)
     if (isPcControl(managed) && (req.here || req.takeOver)) throw immutablePcControl()
     requireLegacyExecution(agentOf(managed, agentId), defaultsNow())
@@ -2163,6 +2183,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return { sessionId: sid, started: false, resumed: false, engine: actual }
     }
     const atHome = await resumeAtHome(floor, agent, sid, req)
+    executionGuard?.()
     if (atHome) return atHome
     if (!sid) {
       sid = randomUUID()
@@ -2170,8 +2191,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     const tookOverFrom = mode() === 'hub' ? await lease(sid, self(), req.takeOver === true, agent.name) : undefined
     try {
+      executionGuard?.()
       const now = floorOf(floorId)
-      const resumed = await startHere(now, agentOf(now, agentId), sid, req)
+      const resumed = await startHere(now, agentOf(now, agentId), sid, req, executionGuard)
+      executionGuard?.()
       requireRunningEngine(engineFor(agentOf(floorOf(floorId), agentId)), chats.info(sid)?.engine)
       return { sessionId: sid, started: true, resumed, engine: chats.info(sid)!.engine, ...(tookOverFrom ? { tookOverFrom } : {}) }
     } catch (e) {
@@ -3101,8 +3124,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
         access.needChat(me, a, 'owner', toolWhere)
         const explicitProfile = args.executionProfile
-        if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1') throw executionHttpError('execution-invalid', 'open')
-        if (explicitProfile === 'codex-in-claude-v1' || executionIdentityOf(a, defaultsNow()).profile === 'codex-in-claude-v1') {
+        if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1' && explicitProfile !== 'codex-native-v1') throw executionHttpError('execution-invalid', 'open')
+        if (explicitProfile || executionIdentityOf(a, defaultsNow()).profile === 'codex-in-claude-v1') {
           workflowExecutionAgent(f.id, a.id)
           if (!executionService || !me.person || !a.owner || !a.homePc || a.homePc !== self().id
             || (args.pc !== undefined && args.pc !== self().id && String(args.pc).toLowerCase() !== self().name.toLowerCase())) throw executionHttpError('execution-capability-required', 'open')
@@ -3113,7 +3136,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             access.needChat(me, workflowExecutionAgent(f.id, a.id), 'owner', toolWhere)
           })
           const operationId = typeof args.operationId === 'string' ? args.operationId : explicitProfile ? '' : randomUUID()
-          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1')
+          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1', explicitProfile === 'codex-native-v1' ? explicitProfile : 'codex-in-claude-v1')
           return json({ ...reply, sessionId: reply.committed.sessionId, agent: a.name, floor: f.name, pc: self().name })
         }
         const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null

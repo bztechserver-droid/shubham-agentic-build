@@ -13,6 +13,7 @@ import { createBridgeRuntime, type BridgeRuntimeOptions } from '../codex-claude/
 import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.ts'
 import { readChildConfig } from '../codex-claude/child.ts'
 import { recoverUnreportedHostPids } from './execution-host-observation.ts'
+import { createNativeCodexExecution } from './execution-native.ts'
 
 export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
   actor(scope: ExecutionIntentScope): void
@@ -23,6 +24,8 @@ export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
   /** Stop/ack and durably seal the actual native source; no floor/profile change here. */
   seal(scope: ExecutionIntentScope, expected: ExecutionSnapshot): Promise<{ assertCurrent(): void; finish(committed: boolean, changed: boolean): void }>
   prepare(scope: ExecutionIntentScope, expected: ExecutionSnapshot, target: ExecutionIdentity): Promise<PreparedExecutionSelection>
+  /** Existing native launcher, with the same current-profile/owner guards around its awaits. */
+  nativeOpen?(request: ExecutionStartRequest, assertCurrent: () => void): Promise<void>
 }
 interface FenceState {
   scope: ExecutionIntentScope; expected: ExecutionSnapshot; next: ExecutionSnapshot | null;
@@ -30,7 +33,7 @@ interface FenceState {
 }
 export interface ExecutionToolIntent {
   version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest;
-  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply;
+  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply; targetProfile?: 'codex-in-claude-v1' | 'codex-native-v1';
 }
 /** Recover only the FIRST unused open of an exact, authoritatively reconciled selection.
  * This is called by the explicit open POST, never by GET or an ambiguous started operation. */
@@ -118,6 +121,9 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   let initialization: Promise<void> | null = null
   const key = (scope: ExecutionIntentScope) => `${scope.floorId}:${scope.agentId}`
   const actor = (scope: ExecutionIntentScope) => { o.actor(scope); const check = actors.get(scopeDigest(scope)); if (!check) throw executionHttpError('execution-forbidden', 'authorization'); check() }
+  const native = o.nativeOpen && o.manager && o.host ? createNativeCodexExecution({ directory: o.directory, manager: o.manager, host: o.host, pool: o.pool,
+    open: (request, fence) => o.nativeOpen!(request, () => { fence(); actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) }),
+    guard: request => { actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) } }) : null
   const assertCurrent = (context: FenceState) => {
     actor(context.scope); runtime.storage!.assertExclusiveWriter(); context.source.assertCurrent()
     if (sourceHash(context.floorFile) !== context.floorHash) throw executionHttpError('execution-stale', 'selection')
@@ -135,6 +141,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       assertExecutionCAS(request.expected, context.expected); assertExecutionCAS(request.next, context.next)
       assertCurrent(context)
       if (request.target.profile === CODEX_IN_CLAUDE_PROFILE) runtime.cachedCapability()
+      else if (request.target.profile === 'codex-native-v1' && native) native.capability()
       else throw executionHttpError('execution-capability-required', 'selection')
     },
     persist(file, text) {
@@ -148,7 +155,15 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   }
   const currentTarget = (scope: ExecutionIntentScope, execution: ExecutionIdentity): ExecutionTargetObservation => {
     actor(scope)
-    if (scope.targetPcId !== o.self().id || execution.profile !== CODEX_IN_CLAUDE_PROFILE || !o.host?.current) throw executionHttpError('execution-capability-required', 'capability')
+    if (scope.targetPcId !== o.self().id || !o.host?.current) throw executionHttpError('execution-capability-required', 'capability')
+    if (execution.profile === 'codex-native-v1' && native) {
+      const source = o.state(scope).binding.execution.profile
+      if (source !== CODEX_IN_CLAUDE_PROFILE && source !== 'codex-native-v1') throw executionHttpError('execution-capability-required', 'capability')
+      const target = native.capability(), now = Date.now()
+      return { targetPcId: o.self().id, execution, linkGeneration: `native_${runtimeEpoch}_${target.host.generation}_${target.binHash}`,
+        observedAtMs: now, validUntilMs: now + 30_000, nativeVerified: true }
+    }
+    if (execution.profile !== CODEX_IN_CLAUDE_PROFILE) throw executionHttpError('execution-capability-required', 'capability')
     const { capability, pins } = runtime.cachedCapability(), host = o.host.current(), now = Date.now()
     return { targetPcId: o.self().id, execution, linkGeneration: `local_${runtimeEpoch}_${host.generation}`, observedAtMs: now, validUntilMs: now + 30_000,
       nativeVerified: false, pins, bridgeCapability: capability }
@@ -196,8 +211,12 @@ export function createExecutionService(o: ExecutionServiceOptions) {
               lineage: prepared?.lineage ?? null, homePcName: o.self().name, stamp })
           } finally { committing.delete(key(scope)) }
         },
-        start: (request: ExecutionStartRequest) => runtime.start(request),
+        start: (request: ExecutionStartRequest) => {
+          if (request.kind === 'native' && native) return native.start(request)
+          return runtime.start(request)
+        },
         observeRun: async (_scope, intent) => {
+          if (intent.binding.execution.profile === 'codex-native-v1' && native) return native.observe(intent)
           if (!intent.lease) return { state: 'unknown' }
           const observed = await runtime.observe(intent.lease.request)
           return observed.state === 'running' ? { state: 'running', proof: observed.runtime }
@@ -223,7 +242,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       if (!initialization) throw executionHttpError('execution-capability-required', 'status', id)
       await initialization; return coordinator!.status(scope, id)
     },
-    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean): Promise<ExecutionOpenReply> {
+    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean, profile: 'codex-in-claude-v1' | 'codex-native-v1' = CODEX_IN_CLAUDE_PROFILE): Promise<ExecutionOpenReply> {
       actor(scope)
       if (!executionIntentId(operationId)) throw executionHttpError('execution-invalid', 'open')
       await ensure()
@@ -231,7 +250,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       let intent: ExecutionToolIntent
       if (fs.existsSync(file)) {
         intent = JSON.parse(fs.readFileSync(file, 'utf8')) as ExecutionToolIntent
-        if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope)) throw executionHttpError('execution-intent-conflict', 'open', operationId)
+        if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope) || (intent.targetProfile ?? CODEX_IN_CLAUDE_PROFILE) !== profile) throw executionHttpError('execution-intent-conflict', 'open', operationId)
         const id = intent.selected?.openIntentId ?? intent.reply?.openIntentId ?? intent.request?.selectionIntentId
         if (!id) throw executionHttpError('execution-intent-uncertain', 'open', operationId)
         const status = await coordinator!.status(scope, id)
@@ -253,11 +272,11 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       const state = o.state(scope)
       if (fs.readdirSync(o.directory).filter(name => name.endsWith('.tool.json')).length >= 512) throw executionHttpError('execution-ledger-full', 'open')
       // Consume the original tool ID BEFORE native/provider verification; a lost setup response is not permission to repeat it.
-      intent = { version: 1, scope, expected: state.binding, openIssued: false }
+      intent = { version: 1, scope, expected: state.binding, openIssued: false, targetProfile: profile }
       writePrivateAtomic(file, JSON.stringify(intent) + '\n')
       if (verify) { try { runtime.cachedCapability() } catch { await runtime.verify(scope.ownerId) } }
       actor(scope); assertExecutionCAS(intent.expected, o.state(scope).binding)
-      if (state.binding.execution.profile === CODEX_IN_CLAUDE_PROFILE && state.selection) {
+      if (state.binding.execution.profile === profile && state.selection) {
         const status = await coordinator!.status(scope, state.selection.openIntentId)
         if (status.state === 'running' && status.actual && status.committed) {
           intent.reply = { executionVersion: 1, openIntentId: status.intentId, state: 'already-running', committed: status.committed, actual: status.actual }
@@ -265,7 +284,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
         }
         if (status.state !== 'stopped' && status.state !== 'refused') throw executionHttpError('execution-intent-uncertain', 'open', status.intentId)
       }
-      const capability = await coordinator!.capability(scope, { profile: CODEX_IN_CLAUDE_PROFILE })
+      const capability = await coordinator!.capability(scope, { profile })
       if (!capability.available) throw executionHttpError(capability.unavailableCode, 'capability')
       intent.request = { version: 1, selectionIntentId: capability.selectionIntentId,
         expected: capability.current, target: capability.target, capabilityReceiptId: capability.capabilityReceiptId, confirmCarryOver: true }

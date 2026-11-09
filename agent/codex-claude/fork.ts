@@ -9,6 +9,21 @@ import { transcriptPath } from '../agentic/transcripts.ts'
 import { switchConversation } from '../codex/switch-conversation.ts'
 import { commitPreparedTranscript, protectPath } from './storage.ts'
 
+/** A hybrid Claude JSONL is converted as Claude history, never resumed as a Codex rollout. */
+export function forkNativeCodexExecution(options: { expected: ExecutionSnapshot; target: ExecutionIdentity; file: string; cwd: string; codexHome: string }) {
+  const { expected, target } = options
+  if (!expected.sessionId || expected.execution.profile !== 'codex-in-claude-v1' || target.profile !== 'codex-native-v1') throw executionHttpError('execution-lineage-invalid', 'selection')
+  const before = sourceHash(options.file)
+  const converted = switchConversation({ to: 'codex', file: options.file, cwd: options.cwd, codexHome: options.codexHome })
+  protectPath(converted.file)
+  const handle = fs.openSync(converted.file, 'r+')
+  try { fs.fsyncSync(handle) } finally { fs.closeSync(handle) }
+  if (sourceHash(options.file) !== before) throw executionHttpError('execution-stale', 'selection')
+  const binding = { ...expected, execution: target, sessionId: randomUUID(), codexThread: converted.id, opencodeSession: null, executionRevision: expected.executionRevision + 1 }
+  const lineage = assertPreparedExecution(expected, { binding, sourceSessionId: expected.sessionId, recordedAt: new Date().toISOString() }, expected.homePc!, target)
+  return { lineage, sourceSealId: before, file: converted.file }
+}
+
 export async function forkClaudeExecution(options: { expected: ExecutionSnapshot; target: ExecutionIdentity; file: string; cwd: string; projectsDir: string }) {
   const { expected, target } = options
   if (!expected.sessionId || target.engine !== 'claude' || expected.execution.engine === 'opencode') throw executionHttpError('execution-lineage-invalid', 'selection')
