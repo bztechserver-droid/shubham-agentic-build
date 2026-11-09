@@ -106,7 +106,8 @@ import type { CodexManager } from '../codex/index.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
-import { switchConversation } from '../codex/switch-conversation.ts'
+import { switchConversationComplete } from '../codex/complete-conversion.ts'
+import { createConversionProgress } from './conversion-progress.ts'
 import { claudeFileContext, conversationCwd, conversationLines, convertClaude } from '../codex/from-claude.ts'
 import { toClaude } from '../codex/to-claude.ts'
 import { createSwitchFences } from './switch-fence.ts'
@@ -1000,6 +1001,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const rolloutCache = new Map<string, string>()
   const switchFences = createSwitchFences(path.join(o.dir, 'engine-switches.json'))
   const activeSwitches = new Set<string>()
+  const conversionProgress = createConversionProgress()
   const pullFrom = (peer: LinkPeer, sid: string, file: string) => {
     const guard = controlTransferGuard(peer, sid)
     guard()
@@ -1153,6 +1155,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
       floorFile: () => path.join(o.dir, mode() === 'member' ? 'floors-local.json' : 'floors.json'),
       commit: request => { floors.commitExecution(request) },
       target: (scope, profile) => targetExecution(profile, workflowExecutionAgent(scope.floorId, scope.agentId)),
+      progress: (scope, stage, operationId) => {
+        if (operationId) conversionProgress.begin(scope.floorId, scope.agentId, operationId)
+        conversionProgress.update(scope.floorId, scope.agentId, stage)
+      },
       nativeOpen: async (request, assertCurrent, executable) => {
         const guard = () => {
           assertCurrent()
@@ -1178,6 +1184,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           mcpConfig: built.file, strictMcp: true, model: 'gpt-6.1-sol', effort: 'max', resume: !!findClaudeTranscript(sid, projectsDir), cols: request.cols, rows: request.rows }
       },
       seal: async (scope, expected) => {
+        conversionProgress.update(scope.floorId, scope.agentId, 'stopping')
         assertExecutionCAS(expected, floors.executionState(scope.floorId, scope.agentId).binding)
         if (!expected.sessionId || expected.execution.engine === 'opencode') throw executionHttpError('execution-lineage-invalid', 'selection')
         const token = randomUUID(), file = expected.execution.engine === 'codex'
@@ -1198,9 +1205,37 @@ export function createAgentic(o: AgenticOptions): Agentic {
           ? expected.codexThread && o.codex ? findRollout(o.codex.paths.home, expected.codexThread) : null
           : findClaudeTranscript(expected.sessionId!, projectsDir)
         if (!file) throw executionHttpError('execution-lineage-invalid', 'selection')
-        if (target.profile === 'codex-native-v1' && o.codex) return forkNativeCodexExecution({ expected, target, file,
-          cwd: conversationCwd(file) || codeDirOf(floor), codexHome: o.codex.paths.home })
-        return forkClaudeExecution({ expected, target, file, cwd: conversationCwd(file) || codeDirOf(floor), projectsDir })
+        const onProgress = (stage: import('../../shared/conversion-progress.ts').ConversionStage, transfer: import('../codex/complete-conversion.ts').TransferProgress) => conversionProgress.update(scope.floorId, scope.agentId, stage, transfer)
+        if (target.profile === 'codex-native-v1' && o.codex) {
+          let recovery: import('../codex/complete-conversion.ts').CompleteConversionOptions['recovery']
+          if (expected.execution.profile === 'codex-native-v1') {
+            const agent=workflowExecutionAgent(scope.floorId,scope.agentId),history=agent.conversationHistory??[]
+            const chain: import('../../shared/agentic.ts').ConversationRecord[]=[]
+            const visited=new Set<string>()
+            let cursor=history.find(r=>r.sessionId===expected.sessionId&&r.engine==='codex')
+            while(cursor) {
+              if(visited.has(cursor.sessionId)||chain.length>=32)throw executionHttpError('execution-lineage-invalid','selection')
+              visited.add(cursor.sessionId);chain.unshift(cursor)
+              if(!cursor.sourceSessionId)break
+              const previous=history.filter(r=>r.sessionId===cursor!.sourceSessionId)
+              cursor=previous.find(r=>r.sourceSessionId)||previous[0]
+              if(!cursor)throw executionHttpError('execution-lineage-invalid','selection')
+            }
+            if(chain.length<3||chain[0].engine!=='codex')throw executionHttpError('execution-lineage-invalid','selection')
+            const seals=JSON.parse(readFileSync(path.join(o.dir,'engine-switches.json'),'utf8')) as Array<{sessionId:string;state:string;file?:string;sha256?:string}>
+            const segments: NonNullable<typeof recovery>['segments']=[]
+            for(const [index,record] of chain.entries()) {
+              const source=record.engine==='codex'&&record.codexThread?findRollout(o.codex.paths.home,record.codexThread):record.engine==='claude'?findClaudeTranscript(record.sessionId,projectsDir):null
+              if(!source||record.homePc!==self().id)throw executionHttpError('execution-lineage-invalid','selection')
+              if(record.sessionId!==expected.sessionId){const seal=seals.find(s=>s.sessionId===record.sessionId)
+                if(nativeChats.info(record.sessionId)||seal?.state!=='retired'||seal.file!==source||seal.sha256!==sourceHash(source))throw executionHttpError('execution-lineage-invalid','selection')}
+              segments.push({file:source,format:record.engine as 'codex'|'claude',sessionId:record.sessionId,delta:index!==0})
+            }
+            recovery={segments}
+          }
+          return forkNativeCodexExecution({ expected, target, file, cwd: conversationCwd(file) || codeDirOf(floor), codexHome: o.codex.paths.home, onProgress, recovery })
+        }
+        return forkClaudeExecution({ expected, target, file, cwd: conversationCwd(file) || codeDirOf(floor), projectsDir, onProgress })
       },
     })
   }
@@ -3124,6 +3159,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
         access.needChat(me, a, 'owner', toolWhere)
         const explicitProfile = args.executionProfile
+        if (args.restoreHistory !== undefined && (args.restoreHistory !== true || explicitProfile !== 'codex-native-v1')) throw executionHttpError('execution-invalid', 'selection')
         if (explicitProfile !== undefined && explicitProfile !== 'codex-in-claude-v1' && explicitProfile !== 'codex-native-v1') throw executionHttpError('execution-invalid', 'open')
         if (explicitProfile || executionIdentityOf(a, defaultsNow()).profile === 'codex-in-claude-v1') {
           workflowExecutionAgent(f.id, a.id)
@@ -3136,7 +3172,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             access.needChat(me, workflowExecutionAgent(f.id, a.id), 'owner', toolWhere)
           })
           const operationId = typeof args.operationId === 'string' ? args.operationId : explicitProfile ? '' : randomUUID()
-          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1', explicitProfile === 'codex-native-v1' ? explicitProfile : 'codex-in-claude-v1')
+          const reply = await executionService.openTool(scope, operationId, explicitProfile === 'codex-in-claude-v1', explicitProfile === 'codex-native-v1' ? explicitProfile : 'codex-in-claude-v1', args.restoreHistory === true)
           return json({ ...reply, sessionId: reply.committed.sessionId, agent: a.name, floor: f.name, pc: self().name })
         }
         const pcName = typeof args.pc === 'string' && args.pc.trim() ? args.pc.trim().toLowerCase() : null
@@ -3496,6 +3532,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (isPcControl(floor) && previous.sessionId && chats.info(previous.sessionId)) requireRunningEngine(engineFor(previous), chats.info(previous.sessionId)!.engine)
     const file = localSwitchSource(previous)
     const sid = previous.sessionId!, from = engineFor(previous), to = engineFor(next)
+    conversionProgress.begin(floor.id, previous.id, switchId)
+    conversionProgress.update(floor.id, previous.id, 'stopping')
     switchFences.begin(sid, switchId)
     if (from !== 'opencode' && chats.info(sid)) {
       chats.kill(sid, 'engine-change')
@@ -3515,7 +3553,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (from !== 'opencode' && to !== 'opencode') {
       if (!file) throw apiError(409, 'Source transcript is unavailable')
       cwd = chats.info(sid)?.cwd || conversationCwd(file) || cwd
-      const converted = switchConversation({ to, file, cwd, codexHome: o.codex?.paths.home, projectsDir })
+      const converted = await switchConversationComplete({ to, file, cwd, codexHome: o.codex?.paths.home, projectsDir,
+        onProgress: (stage, transfer) => conversionProgress.update(floor.id, previous.id, stage, transfer) })
       result = { sessionId: to === 'claude' ? converted.id : randomUUID(), codexThread: to === 'codex' ? converted.id : null, opencodeSession: null, file: converted.file }
     } else {
       let source: unknown
@@ -3624,6 +3663,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     let committed: Floor | undefined
     activeSwitches.add(switchId)
+    for (const {previous} of changes) conversionProgress.begin(id, previous.id, switchId)
     try {
       // Hub lease/open/input barrier begins before any async preparation. The source host also fences itself.
       for (const { previous } of changes) switchFences.begin(previous.sessionId!, switchId)
@@ -3640,6 +3680,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const peer = peers.get(previous.id)
         let raw: unknown
         if (peer) {
+          conversionProgress.update(id, previous.id, 'converting')
           const reply = await request<{ binding: unknown; sourceSessionId: string; to: string }>(peer, 'engine-switch-prepare', peerBody(previous, next), 120_000)
           if (reply.sourceSessionId !== previous.sessionId || reply.to !== engineFor(next)) throw new Error('Home PC returned a mismatched source or target')
           raw = reply.binding
@@ -3650,6 +3691,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       for (const { previous } of changes) if (peers.has(previous.id)) await finishPeer(previous, 'seal')
       for (const { previous } of changes) if (!peers.has(previous.id)) switchFences.seal(previous.sessionId!, switchId)
       if (JSON.stringify(floorOf(id)) !== fingerprint || defaultsNow().engine !== defaultEngine) throw Object.assign(apiError(409, 'This floor changed while the conversation was prepared. Refresh and confirm again.'), { code: 'engine-change-stale' })
+      for (const {previous} of changes) conversionProgress.update(id, previous.id, 'saving')
       committed = floors.patch(id, body as FloorPatch, as)
       // Never release an old session after success, even while the member still has a debounced old replica.
       for (const { previous } of changes) {
@@ -3661,8 +3703,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const after = committed.agents.find(a => a.id === old.id)
         if (old.sessionId && (!kept.has(old.id) || after?.sessionId !== old.sessionId || (engineFor(old) === 'opencode' && (old.opencodeProvider !== after?.opencodeProvider || old.opencodeModel !== after?.opencodeModel)))) stopAnywhere(old.sessionId)
       }
+      for (const {previous} of changes) conversionProgress.update(id, previous.id, 'complete')
       return { floor: committed }
     } catch (error) {
+      for (const {previous} of changes) conversionProgress.update(id, previous.id, committed ? 'complete' : 'failed')
       if (committed) { log?.warn('Conversation switch committed; cleanup will be retried: ' + message(error)); return { floor: committed } }
       if (isObject(error) && ['engine-change-stale', 'engine-change-home-offline', 'engine-change-in-progress', 'engine-runtime-mismatch', 'pc-control-wrong-device', 'pc-control-update-required'].includes(String(error.code))) throw error
       log?.warn('Engine switch blocked: ' + message(error))
@@ -4902,6 +4946,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // The separately-owned legacy access/POLICY file is outside this allocation. These explicit owner rules
   // pass through the SAME PC Control/SID/ACL dispatcher; there is no unguarded raw/forwarding shortcut.
   const executionRoutes: ProfileRoute[] = [
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/conversion-progress$/, ([id, agentId]) => ({ progress: conversionProgress.get(id, agentId) }), 'local', profileOwner],
     ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-capability$/, ([id, agentId], r) => executionCapability(id, agentId, r), 'local', profileOwner],
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/execution-selection$/, ([id, agentId], r) => {
       const agent = workflowExecutionAgent(id, agentId), request = requireExecutionSelectionRequest(r.body)

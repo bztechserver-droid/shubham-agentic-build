@@ -82,13 +82,15 @@ export interface ExecutionSelectionRequest {
   readonly target: ExecutionIdentity
   readonly capabilityReceiptId: string
   readonly confirmCarryOver: true
+  readonly rebuildHistory?: true
 }
 export function requireExecutionSelectionRequest(value: unknown): ExecutionSelectionRequest {
-  if (!only(value, ['version', 'selectionIntentId', 'expected', 'target', 'capabilityReceiptId', 'confirmCarryOver'])
+  if (!only(value, ['version', 'selectionIntentId', 'expected', 'target', 'capabilityReceiptId', 'confirmCarryOver', 'rebuildHistory'])
     || value.version !== 1 || !executionIntentId(value.selectionIntentId) || !executionIntentId(value.capabilityReceiptId)
-    || value.confirmCarryOver !== true) return invalid('selection')
+    || value.confirmCarryOver !== true || value.rebuildHistory !== undefined && value.rebuildHistory !== true) return invalid('selection')
   return Object.freeze({ version: 1, selectionIntentId: value.selectionIntentId, expected: requireHttpExecutionSnapshot(value.expected),
-    target: requireHttpExecutionIdentity(value.target), capabilityReceiptId: value.capabilityReceiptId, confirmCarryOver: true })
+    target: requireHttpExecutionIdentity(value.target), capabilityReceiptId: value.capabilityReceiptId, confirmCarryOver: true,
+    ...(value.rebuildHistory===true?{rebuildHistory:true as const}:{}) })
 }
 export interface ExecutionOpenRequest {
   readonly executionVersion: 1

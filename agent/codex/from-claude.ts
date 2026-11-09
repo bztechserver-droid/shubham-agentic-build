@@ -9,19 +9,20 @@ const cap = (s: string, limit = LIMIT) => s.length > limit ? `${s.slice(0, limit
 const secret = /(?:token|api.?key|secret|password|authorization|credential|private.?key|^keys?$)/i
 
 /** Remove credential fields recursively, including JSON embedded in tool output text. */
-export function sanitizeConversationValue(v: unknown, depth = 0, limit = LIMIT): unknown {
-  if (depth > 30) return '[depth limit]'
+export function sanitizeConversationValue(v: unknown, depth = 0, limit = LIMIT, complete = false): unknown {
+  if (depth > 30) { if (complete) throw Error('Saved content exceeds the supported nesting depth'); return '[depth limit]' }
   if (typeof v === 'string') {
+    let parsed: unknown
     try {
-      const parsed: unknown = JSON.parse(v)
-      if (object(parsed) || Array.isArray(parsed)) return cap(JSON.stringify(sanitizeConversationValue(parsed, depth + 1, limit)), limit)
+      parsed = JSON.parse(v)
     } catch { /* Ordinary conversation text. */ }
+    if (object(parsed) || Array.isArray(parsed)) return cap(JSON.stringify(sanitizeConversationValue(parsed, depth + 1, limit, complete)), limit)
     return cap(cap(v, limit).replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~-]+)/gi, '[redacted]')
       .replace(/(\b[\w-]+\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/g,
         (match, field: string) => /token|api[_-]?key|password|secret/i.test(field) ? `${field}[redacted]` : match), limit)
   }
-  if (Array.isArray(v)) return v.slice(0, 1000).map(x => sanitizeConversationValue(x, depth + 1, limit))
-  if (object(v)) return Object.fromEntries(Object.entries(v).filter(([k]) => !secret.test(k)).map(([k, x]) => [k, sanitizeConversationValue(x, depth + 1, limit)]))
+  if (Array.isArray(v)) return (complete ? v : v.slice(0, 1000)).map(x => sanitizeConversationValue(x, depth + 1, limit, complete))
+  if (object(v)) return Object.fromEntries(Object.entries(v).filter(([k]) => !secret.test(k)).map(([k, x]) => [k, sanitizeConversationValue(x, depth + 1, limit, complete)]))
   return v
 }
 const text = (v: unknown): string => typeof v === 'string' ? String(sanitizeConversationValue(v)) : Array.isArray(v)

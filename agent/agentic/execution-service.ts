@@ -14,8 +14,10 @@ import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.t
 import { readChildConfig } from '../codex-claude/child.ts'
 import { recoverUnreportedHostPids } from './execution-host-observation.ts'
 import { createNativeCodexExecution } from './execution-native.ts'
+import type { ConversionStage } from '../../shared/conversion-progress.ts'
 
 export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
+  progress?(scope: ExecutionIntentScope, stage: ConversionStage, operationId?: string): void
   actor(scope: ExecutionIntentScope): void
   state(scope: ExecutionIntentScope): { binding: ExecutionSnapshot; selection: import('./execution-intents.ts').ExecutionCommitStamp | null }
   floorFile(scope: ExecutionIntentScope): string
@@ -33,7 +35,7 @@ interface FenceState {
 }
 export interface ExecutionToolIntent {
   version: 1; scope: ExecutionIntentScope; expected: ExecutionSnapshot; request?: ExecutionSelectionRequest;
-  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply; targetProfile?: 'codex-in-claude-v1' | 'codex-native-v1';
+  selected?: ExecutionSelectionReply; openIssued: boolean; reply?: ExecutionOpenReply; targetProfile?: 'codex-in-claude-v1' | 'codex-native-v1'; restoreHistory?: true;
 }
 /** Recover only the FIRST unused open of an exact, authoritatively reconciled selection.
  * This is called by the explicit open POST, never by GET or an ambiguous started operation. */
@@ -51,7 +53,7 @@ export function confirmedPreparedToolSelection(intent: ExecutionToolIntent, pare
   if (intent.selected && (intent.selected.openIntentId !== child.id || intent.selected.selectionIntentId !== parent.id)) return refuse()
   if (intent.selected) assertExecutionCAS(intent.selected.committed, child.binding)
   return { version: 1, selectionIntentId: parent.id,
-    state: sameExecution(intent.expected.execution, child.binding.execution) ? 'unchanged' : 'committed',
+    state: intent.expected.sessionId === child.binding.sessionId && sameExecution(intent.expected.execution, child.binding.execution) ? 'unchanged' : 'committed',
     committed: child.binding, openIntentId: child.id }
 }
 export function createExecutionService(o: ExecutionServiceOptions) {
@@ -175,6 +177,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       ledger = await ExecutionIntentLedger.open({ directory: storage.directory, assertPrivateStorage: storage.assertPrivateStorage,
         assertExclusiveWriter: storage.assertExclusiveWriter, syncDirectory: storage.syncDirectory })
       coordinator = new ExecutionCoordinator({ ledger, broker: runtime.broker!, assertAuthorized: actor,
+        progress: o.progress,
         assertExecutionCurrent: (scope, expected) => { actor(scope); assertExecutionCAS(expected, o.state(scope).binding) },
         readFloor: async scope => o.state(scope), resolveTarget: (scope, profile) => o.target(scope, profile),
         readTarget: async (scope, execution) => currentTarget(scope, execution), currentTarget,
@@ -242,7 +245,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       if (!initialization) throw executionHttpError('execution-capability-required', 'status', id)
       await initialization; return coordinator!.status(scope, id)
     },
-    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean, profile: 'codex-in-claude-v1' | 'codex-native-v1' = CODEX_IN_CLAUDE_PROFILE): Promise<ExecutionOpenReply> {
+    async openTool(scope: ExecutionIntentScope, operationId: string, verify: boolean, profile: 'codex-in-claude-v1' | 'codex-native-v1' = CODEX_IN_CLAUDE_PROFILE, restoreHistory = false): Promise<ExecutionOpenReply> {
       actor(scope)
       if (!executionIntentId(operationId)) throw executionHttpError('execution-invalid', 'open')
       await ensure()
@@ -250,7 +253,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       let intent: ExecutionToolIntent
       if (fs.existsSync(file)) {
         intent = JSON.parse(fs.readFileSync(file, 'utf8')) as ExecutionToolIntent
-        if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope) || (intent.targetProfile ?? CODEX_IN_CLAUDE_PROFILE) !== profile) throw executionHttpError('execution-intent-conflict', 'open', operationId)
+        if (intent.version !== 1 || scopeDigest(intent.scope) !== scopeDigest(scope) || (intent.targetProfile ?? CODEX_IN_CLAUDE_PROFILE) !== profile || !!intent.restoreHistory !== restoreHistory) throw executionHttpError('execution-intent-conflict', 'open', operationId)
         const id = intent.selected?.openIntentId ?? intent.reply?.openIntentId ?? intent.request?.selectionIntentId
         if (!id) throw executionHttpError('execution-intent-uncertain', 'open', operationId)
         const status = await coordinator!.status(scope, id)
@@ -272,11 +275,11 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       const state = o.state(scope)
       if (fs.readdirSync(o.directory).filter(name => name.endsWith('.tool.json')).length >= 512) throw executionHttpError('execution-ledger-full', 'open')
       // Consume the original tool ID BEFORE native/provider verification; a lost setup response is not permission to repeat it.
-      intent = { version: 1, scope, expected: state.binding, openIssued: false, targetProfile: profile }
+      intent = { version: 1, scope, expected: state.binding, openIssued: false, targetProfile: profile, ...(restoreHistory?{restoreHistory:true as const}:{}) }
       writePrivateAtomic(file, JSON.stringify(intent) + '\n')
       if (verify) { try { runtime.cachedCapability() } catch { await runtime.verify(scope.ownerId) } }
       actor(scope); assertExecutionCAS(intent.expected, o.state(scope).binding)
-      if (state.binding.execution.profile === profile && state.selection) {
+      if (!restoreHistory && state.binding.execution.profile === profile && state.selection) {
         const status = await coordinator!.status(scope, state.selection.openIntentId)
         if (status.state === 'running' && status.actual && status.committed) {
           intent.reply = { executionVersion: 1, openIntentId: status.intentId, state: 'already-running', committed: status.committed, actual: status.actual }
@@ -287,7 +290,8 @@ export function createExecutionService(o: ExecutionServiceOptions) {
       const capability = await coordinator!.capability(scope, { profile })
       if (!capability.available) throw executionHttpError(capability.unavailableCode, 'capability')
       intent.request = { version: 1, selectionIntentId: capability.selectionIntentId,
-        expected: capability.current, target: capability.target, capabilityReceiptId: capability.capabilityReceiptId, confirmCarryOver: true }
+        expected: capability.current, target: capability.target, capabilityReceiptId: capability.capabilityReceiptId, confirmCarryOver: true,
+        ...(restoreHistory?{rebuildHistory:true as const}:{}) }
       writePrivateAtomic(file, JSON.stringify(intent) + '\n')
       intent.selected = await coordinator!.select(scope, intent.request)
       writePrivateAtomic(file, JSON.stringify(intent) + '\n')

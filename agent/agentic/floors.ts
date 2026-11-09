@@ -445,9 +445,8 @@ export function createFloorStore(file: string, onChange: () => void = () => {}, 
       assertExecutionCAS(expected, snapshotAgentExecution(source, executionDefaults()))
       if (expected.agentId !== request.agentId || !expected.homePc || next.homePc !== expected.homePc || !validExecutionStamp(request.stamp)
         || !sameExecution(next.execution, target)) throw executionHttpError('execution-lineage-invalid', 'selection')
-      if (sameExecution(expected.execution, target)) {
+      if (sameExecution(expected.execution, target) && request.lineage === null) {
         assertExecutionCAS(expected, next)
-        if (request.lineage !== null) throw executionHttpError('execution-lineage-invalid', 'selection')
       } else {
         assertExecutionCAS(next, assertPreparedExecution(expected, request.lineage, expected.homePc, target).binding)
         validatePreparedConversation({ ...next, homePcName: request.homePcName }, target.engine, source, expected.homePc,

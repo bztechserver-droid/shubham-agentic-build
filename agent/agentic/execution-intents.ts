@@ -340,7 +340,7 @@ export class ExecutionIntentLedger {
       const current = this.current(expected), binding = requireExecutionSnapshot(bindingValue)
       if (current.state !== 'reserved' || !executionIntentId(openIntentId) || !executionIntentId(runId) || this.get(current.scope, openIntentId)
         || [...this.entries.values()].some(entry => entry.kind === 'open' && entry.runId === runId)) throw executionHttpError('execution-intent-conflict', 'selection', current.id)
-      if (sameExecution(current.request.expected.execution, current.request.target)) assertExecutionCAS(current.request.expected, binding)
+      if (sameExecution(current.request.expected.execution, current.request.target) && !current.request.rebuildHistory) assertExecutionCAS(current.request.expected, binding)
       else assertPreparedExecution(current.request.expected, { binding, sourceSessionId: current.request.expected.sessionId,
         recordedAt: new Date(this.options.now()).toISOString() }, current.scope.targetPcId, current.request.target)
       const stamp: ExecutionCommitStamp = { selectionIntentId: current.id, openIntentId, scopeDigest: scopeDigest(current.scope), fingerprint: current.fingerprint }

@@ -42,7 +42,18 @@ function bottom(lines: readonly string[], n: number): string[] {
 
 /** Whether a menu is on the screen. */
 export function menuOnScreen(lines: readonly string[]): boolean {
-  return bottom(lines, 14).some(l => OPTION_UNDER_CURSOR.test(l) || MENU_FOOTER.test(l))
+  let lastMenu = -1, remaining = 14
+  for (let i = lines.length - 1; i >= 0 && remaining > 0; i--) {
+    if (!lines[i].trim()) continue
+    remaining--
+    if (OPTION_UNDER_CURSOR.test(lines[i]) || MENU_FOOTER.test(lines[i])) { lastMenu = i; break }
+  }
+  if (lastMenu < 0) return false
+  // Tool output and conversation text can quote a menu. A newer, fully drawn
+  // composer below it establishes that those words are history. A missing
+  // footer, later activity or a menu BELOW the composer stays fail closed.
+  const current = composerFrame(lines)
+  return !current || current.footer < 0 || current.index <= lastMenu
 }
 
 /** What is typed in the input box and not sent yet ('' when it is empty or shows the placeholder, or when a menu is up). */
@@ -53,6 +64,11 @@ export function draftText(lines: readonly string[]): string {
 /** Current composer only: a historical prompt above a reply is never an empty input. */
 export function composer(lines: readonly string[]): { text: string; collapsed: boolean } | null {
   if (menuOnScreen(lines)) return null
+  const current = composerFrame(lines)
+  return current ? { text: current.text, collapsed: current.collapsed } : null
+}
+
+function composerFrame(lines: readonly string[]): { index: number; footer: number; text: string; collapsed: boolean } | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const m = INPUT_LINE.exec(lines[i])
     if (!m) continue
@@ -64,7 +80,7 @@ export function composer(lines: readonly string[]): { text: string; collapsed: b
     // A blank paragraph is fine; native response/activity rows are not composer continuations.
     if (after.some(l => /^\s*(?:[•■]|Working\b|Worked for\b)/.test(l))) return null
     const text = [m[1], ...after].join('\n').trim()
-    return { text: PLACEHOLDER.test(text) ? '' : text, collapsed: /\[Pasted (?:Content|text)\b/i.test(text) }
+    return { index: i, footer, text: PLACEHOLDER.test(text) ? '' : text, collapsed: /\[Pasted (?:Content|text)\b/i.test(text) }
   }
   return null
 }

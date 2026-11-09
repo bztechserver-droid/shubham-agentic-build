@@ -52,6 +52,7 @@ export const TOOLS: ToolDef[] = [
       type: 'object',
       properties: { ...agentRef, pc: { type: 'string', description: 'Which PC runs it (a name); this PC when left out.' }, takeOver: { type: 'boolean' },
         executionProfile: { type: 'string', enum: ['codex-in-claude-v1', 'codex-native-v1'], description: 'Explicitly select Codex in Claude Code, or carry that bridge conversation back to native Codex, on its proved home PC. Only at the human\'s request; bridge selection may run the isolated setup proof.' },
+        restoreHistory: { type: 'boolean', description: 'Only at the human\'s request: recover an earlier truncated Codex round trip from verified saved lineage, carrying later messages into a fresh native Codex conversation.' },
         operationId: { type: 'string', minLength: 16, maxLength: 128, description: 'Required for explicit profile selection. Generate once and retain after any uncertain result; the same operation is only observed on retry.' } },
       required: ['floor', 'agent'],
       additionalProperties: false,
