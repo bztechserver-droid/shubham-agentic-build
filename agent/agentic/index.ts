@@ -1301,10 +1301,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   // F-075: the chats the agent before this one left running in the chat host are taken over at once.
+  let hostAdopted = !o.chatHost
+  function requireHostAdoption() {
+    if(!hostAdopted)throw apiError(503,'Chats are reconnecting. Try again shortly.')
+  }
   const adopted: Promise<void> = o.chatHost
     ? Promise.resolve(existsSync(path.join(o.dir, 'codex-claude', 'capability.json')) ? executionService?.runtime.ensure() : undefined)
         .then(() => o.chatHost!.adopt(chats))
         .then(r => {
+          hostAdopted = true
           // F-134: a Codex chat the host kept running holds the Codex login file: it counts as one of the chats that keep it.
           for (const c of chats.live()) if (c.engine === 'codex') o.codex?.adopt(c.sessionId)
           if (r.adopted.length || r.ended.length) log?.info(`chat host: took over ${r.adopted.length} running chat${r.adopted.length === 1 ? '' : 's'}${r.ended.length ? `; ${r.ended.length} ended while no agent was there` : ''}`)
@@ -1335,10 +1340,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // The host is lost (it died): the chats that ran in it end. Noted first; reopened (resumed) when a host is back.
   let lostWithHost: Array<{ sid: string; state: ChatState }> = []
   o.chatHost?.onLost(why => {
+    hostAdopted = false
     lostWithHost = Object.entries(chats.states()).map(([sid, state]) => ({ sid, state }))
     log?.error(`the chat host is gone (${why}): ${lostWithHost.length} chat(s) ended with it; they are reopened when a host is back`)
   })
   o.chatHost?.onBack(() => {
+    hostAdopted = true
     const list = lostWithHost
     lostWithHost = []
     void (async () => {
@@ -2209,6 +2216,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
   async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
+    requireHostAdoption()
     executionGuard?.()
     const managed = floorOf(floorId)
     if (isPcControl(managed) && (req.here || req.takeOver)) throw immutablePcControl()
@@ -2284,6 +2292,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-058: the chats that were open when the app stopped come back (recover.ts)
 
   async function resumeChat(sid: string, text?: string): Promise<boolean> {
+    await adopted
     if (team?.role() === 'member') return false
     const at = floors.bySession(sid)
     if (!at) return false
@@ -3166,6 +3175,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
       }
       case 'app_open_chat': {
+        requireHostAdoption()
         const { floor: f, agent: a } = findAgent(args.floor, args.agent)
         access.needChat(me, a, 'owner', toolWhere)
         const explicitProfile = args.executionProfile
@@ -5081,6 +5091,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       checkRule(profileRule ?? ruleOf(method, pattern), params, r)
       guardWorkflowExecution(r, params, profileRule !== undefined)
       if (forward && where !== 'local' && !runsHere(method, pattern, params)) return await forward(r)
+      if(r.method==='POST'&&/^\/floors\/[^/]+\/agents\/[^/]+\/(?:chat|execution-selection)$/.test(r.rest))requireHostAdoption()
       return await run(params, r)
     }
     throw apiError(methodMismatch ? 405 : 404, methodMismatch ? `${r.method} is not allowed here` : `No such path: ${AGENTIC_PREFIX}${r.rest}`)
