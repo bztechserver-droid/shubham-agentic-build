@@ -17,12 +17,22 @@ interface NativeProcess { pid: number; ppid: number; created: number; file: stri
 interface NativeRecord {
   version: 1; runId: string; binding: ExecutionStartRequest['binding']; scope: ExecutionStartRequest['scope'];
   startedAt?: string; process?: { pid: number; created: number }; binHash: string;
+  host?: { hostPid: number; hostStartedAt: number };
+  ended?: { at: number; hostPid: number; hostStartedAt: number };
 }
 export interface NativeCodexOptions {
   directory: string; manager: CodexManager; host: ChatHostLink; pool(): ChatPool;
   open(request: ExecutionStartRequest, assertCurrent: () => void, executable: string): Promise<void>;
   guard(request: Pick<ExecutionStartRequest, 'scope' | 'binding'>): void;
+  /** Current owner/actor/home authorization for observing an older run's end.
+   * Running proof and input still require guard's complete current binding. */
+  authorizeObservation?(request: Pick<ExecutionStartRequest, 'scope' | 'binding'>): void;
+  /** The exact durable run must still own its one permitted start at dispatch. */
+  dispatchGuard?(request: ExecutionStartRequest): void;
+  /** Only a completed uncertain start with no pending/replayable dispatch may use absence recovery. */
+  canConfirmAbsent?(intent: OpenIntent): boolean;
   processes?(hostPid: number): Promise<NativeProcess[]>;
+  allProcesses?(): Promise<NativeProcess[]>;
 }
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 
@@ -79,52 +89,97 @@ export function createNativeCodexExecution(o: NativeCodexOptions) {
   }
   async function observe(intent: OpenIntent): Promise<ExecutionRunObservation> {
     const binding = intent.binding, scope = intent.scope
-    o.guard({ binding, scope })
+    const authorize = () => (o.authorizeObservation ?? o.guard)({ binding, scope })
+    authorize()
     if (binding.execution.profile !== 'codex-native-v1' || !binding.sessionId || !binding.codexThread) return { state: 'unknown' }
     const file = recordFile(intent.runId)
     if (!fs.existsSync(file)) return { state: 'unknown' }
     assertPrivatePath(file)
     const record = JSON.parse(fs.readFileSync(file, 'utf8')) as NativeRecord
     assertExecutionCAS(binding, record.binding)
-    if (record.version !== 1 || record.runId !== intent.runId || !isDeepStrictEqual(record.scope, scope) || !record.startedAt) return { state: 'unknown' }
+    if (record.version !== 1 || record.runId !== intent.runId || !isDeepStrictEqual(record.scope, scope)
+      || typeof record.startedAt !== 'string' || !Number.isFinite(Date.parse(record.startedAt))) return { state: 'unknown' }
+    if (record.ended && Number.isSafeInteger(record.ended.at) && record.ended.at >= Date.parse(record.startedAt)
+      && Number.isSafeInteger(record.ended.hostPid) && record.ended.hostPid > 0 && Number.isSafeInteger(record.ended.hostStartedAt)
+      && record.ended.hostStartedAt <= Date.parse(record.startedAt)) return { state: 'ended', dispatchFenced: true }
+    if (record.ended) return { state: 'unknown' }
     const target = capability(), observation = await o.host.inspect!()
     const fence = () => {
-      o.guard({ binding, scope })
+      authorize()
       const current = capability()
       if (!isDeepStrictEqual(current.host, target.host) || current.binHash !== target.binHash || record.binHash !== target.binHash
+        || record.host && (record.host.hostPid !== target.host.hostPid || record.host.hostStartedAt !== target.host.hostStartedAt)
         || observation.hostPid !== target.host.hostPid || observation.hostStartedAt !== target.host.hostStartedAt) throw executionHttpError('execution-runtime-mismatch', 'runtime')
     }
     fence()
     const chat = observation.chats.find(chat => chat.id === binding.sessionId)
-    if (!chat || chat.meta.engine !== 'codex' || chat.meta.floorId !== scope.floorId || chat.meta.agentId !== scope.agentId
+    const possible = (rows: NativeProcess[]) => rows.some(row => {
+      if (record.process && row.pid === record.process.pid && row.created === record.process.created) return true
+      if (typeof row.command !== 'string') return true
+      const words = [...row.command.matchAll(/"([^"]*)"|([^\s"]+)/g)].map(part => part[1] ?? part[2])
+      return words.includes(profileName(binding.sessionId!)) || words.includes(binding.codexThread!)
+    })
+    const saveEnd = (extra?: () => void): ExecutionRunObservation => {
+      record.ended = { at: Date.now(), hostPid: target.host.hostPid, hostStartedAt: target.host.hostStartedAt }
+      writePrivateAtomic(file, JSON.stringify(record) + '\n', () => { fence(); extra?.() })
+      return { state: 'ended', dispatchFenced: true }
+    }
+    if (!chat) {
+      // The authenticated host removes entries only after exit. Unlike a bare
+      // missing PID, recovery additionally requires a completed managed start,
+      // an exact durable no-dispatch fence and a machine-wide process scan.
+      if (!o.canConfirmAbsent?.(intent) || Date.parse(record.startedAt) < target.host.hostStartedAt
+        || record.host && (record.host.hostPid !== target.host.hostPid || record.host.hostStartedAt !== target.host.hostStartedAt)) return { state: 'unknown' }
+      const rows = await (o.allProcesses ?? (() => nativeProcesses()))()
+      fence()
+      if (possible(rows) || !o.canConfirmAbsent(intent)) return { state: 'unknown' }
+      return saveEnd(() => { if (!o.canConfirmAbsent?.(intent)) throw executionHttpError('execution-intent-uncertain', 'runtime') })
+    }
+    if (chat.meta.engine !== 'codex' || chat.meta.floorId !== scope.floorId || chat.meta.agentId !== scope.agentId
       || chat.meta.startedAt !== record.startedAt || Object.hasOwn(chat.meta, 'bridgeRunId') || Object.hasOwn(chat.meta, 'execution')) return { state: 'unknown' }
     const rows = await (o.processes ?? nativeProcesses)(target.host.hostPid)
     fence()
     if (chat.exited) {
-      if (!record.process || rows.some(row => row.pid === record.process!.pid && row.created === record.process!.created)) return { state: 'unknown' }
-      return { state: 'ended', dispatchFenced: true }
+      const started = Date.parse(record.startedAt)
+      if (!Number.isFinite(started) || started < target.host.hostStartedAt || !Number.isFinite(chat.exited.at) || chat.exited.at < started) return { state: 'unknown' }
+      const stillPossible = rows.some(row => {
+        if (record.process && row.pid === record.process.pid && row.created === record.process.created) return true
+        if (chat.pid && row.pid === chat.pid) return true
+        if (row.ppid !== target.host.hostPid || typeof row.command !== 'string') return false
+        const words = [...row.command.matchAll(/"([^"]*)"|([^\s"]+)/g)].map(part => part[1] ?? part[2])
+        return words.includes(profileName(binding.sessionId!)) || words.includes(binding.codexThread!)
+      })
+      // A positive exit from the same authenticated host incarnation and exact
+      // owned start fences delayed dispatch, even when the process exited before
+      // the first OS-proof poll. Any possible survivor keeps it uncertain.
+      if (stillPossible) return { state: 'unknown' }
+      return saveEnd()
     }
     const actual = matchNativeCodexProcess(rows, { hostPid: target.host.hostPid, hostStartedAt: target.host.hostStartedAt,
       reportedPid: chat.pid, startedAt: record.startedAt, executable: target.bin, sessionId: binding.sessionId, thread: binding.codexThread })
     const info = o.pool().info(binding.sessionId)
+    o.guard({ binding, scope })
     if (!actual || info?.engine !== 'codex' || info.startedAt !== record.startedAt) return { state: 'unknown' }
     if (record.process && (record.process.pid !== actual.pid || record.process.created !== actual.created)) return { state: 'unknown' }
     if (!record.process) {
       record.process = { pid: actual.pid, created: actual.created }
-      writePrivateAtomic(file, JSON.stringify(record) + '\n', fence)
+      writePrivateAtomic(file, JSON.stringify(record) + '\n', () => { fence(); o.guard({ binding, scope }) })
     }
     return { state: 'running', proof: { version: 1, runId: intent.runId, targetPcId: scope.targetPcId, verified: true, binding, execution: binding.execution } }
   }
   return { capability, observe,
     async start(request: ExecutionStartRequest) {
       o.guard(request)
+      o.dispatchGuard?.(request)
       if (request.kind !== 'native' || request.binding.execution.profile !== 'codex-native-v1' || !request.binding.codexThread || request.signal.aborted) throw executionHttpError('execution-invalid', 'open')
       const file = recordFile(request.runId), target = capability()
       if (fs.existsSync(file) || o.pool().info(request.binding.sessionId!)) throw executionHttpError('execution-intent-uncertain', 'open')
-      const record: NativeRecord = { version: 1, runId: request.runId, scope: request.scope, binding: request.binding, binHash: target.binHash }
+      const record: NativeRecord = { version: 1, runId: request.runId, scope: request.scope, binding: request.binding, binHash: target.binHash,
+        host: { hostPid: target.host.hostPid, hostStartedAt: target.host.hostStartedAt } }
       writePrivateAtomic(file, JSON.stringify(record) + '\n')
       const assertCurrent = () => {
         o.guard(request)
+        o.dispatchGuard?.(request)
         const current = capability()
         if (request.signal.aborted || current.binHash !== target.binHash || !isDeepStrictEqual(current.host, target.host)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
       }
@@ -139,12 +194,13 @@ export function createNativeCodexExecution(o: NativeCodexOptions) {
   }
 }
 
-function nativeProcesses(hostPid: number): Promise<NativeProcess[]> {
-  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return Promise.resolve([])
-  const script = `@(Get-CimInstance Win32_Process -Filter 'ParentProcessId=${hostPid}' -ErrorAction Stop | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath;command=$_.CommandLine}}) | ConvertTo-Json -Depth 3 -Compress`
-  return new Promise(resolve => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+function nativeProcesses(hostPid?: number): Promise<NativeProcess[]> {
+  if (hostPid !== undefined && (!Number.isSafeInteger(hostPid) || hostPid <= 0)) return Promise.reject(Error('Invalid host identity'))
+  const filter = hostPid === undefined ? '"Name=\'codex.exe\'"' : `'ParentProcessId=${hostPid}'`
+  const script = `@(Get-CimInstance Win32_Process -Filter ${filter} -ErrorAction Stop | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath;command=$_.CommandLine}}) | ConvertTo-Json -Depth 3 -Compress`
+  return new Promise((resolve,reject) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     { encoding: 'utf8', timeout: 8000, windowsHide: true, maxBuffer: 1024 * 1024 }, (error, stdout) => {
-      if (error) return resolve([])
-      try { const rows = JSON.parse(stdout); resolve(Array.isArray(rows) ? rows : rows && typeof rows === 'object' ? [rows] : []) } catch { resolve([]) }
+      if (error) return reject(Error('Native process ownership could not be observed'))
+      try { const rows = JSON.parse(stdout || '[]'); if (!Array.isArray(rows) && (!rows || typeof rows !== 'object')) throw Error('Invalid process observation'); resolve(Array.isArray(rows) ? rows : [rows]) } catch { reject(Error('Native process ownership could not be observed')) }
     }))
 }

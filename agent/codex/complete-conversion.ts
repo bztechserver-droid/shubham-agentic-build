@@ -65,7 +65,8 @@ export async function switchConversationComplete(o: CompleteConversionOptions) {
   const id=randomUUID(), now=new Date(), timestamp=now.toISOString()
   const destination=o.to==='claude'?o.projectsDir:o.codexHome
   if(!destination)throw Error('A native destination is required')
-  const file=o.to==='claude'?transcriptPath(o.cwd,id,destination):path.join(destination,'sessions',String(now.getFullYear()),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0'),`rollout-${timestamp.replace(/:/g,'-')}-${id}.jsonl`)
+  // Codex's paginated history loader requires exactly YYYY-MM-DDTHH-MM-SS.
+  const file=o.to==='claude'?transcriptPath(o.cwd,id,destination):path.join(destination,'sessions',String(now.getFullYear()),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0'),`rollout-${timestamp.slice(0,19).replace(/:/g,'-')}-${id}.jsonl`)
   const sources=[...new Set(o.recovery?o.recovery.segments.map(s=>s.file):[o.file])].map(file=>({file,size:fs.statSync(file).size,hash:digest(file)}))
   const progress:TransferProgress={completedBytes:0,totalBytes:sources.reduce((n,s)=>n+s.size,0),convertedRows:0}
   const boundaries=new Map<string,number|null>()

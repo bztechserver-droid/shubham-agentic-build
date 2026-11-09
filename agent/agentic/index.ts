@@ -1156,7 +1156,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       commit: request => { floors.commitExecution(request) },
       target: (scope, profile) => targetExecution(profile, workflowExecutionAgent(scope.floorId, scope.agentId)),
       progress: (scope, stage, operationId) => {
-        if (operationId) conversionProgress.begin(scope.floorId, scope.agentId, operationId)
+        if (operationId && stage === 'checking') conversionProgress.begin(scope.floorId, scope.agentId, operationId)
+        if (operationId && conversionProgress.get(scope.floorId, scope.agentId)?.operationId !== operationId) return
         conversionProgress.update(scope.floorId, scope.agentId, stage)
       },
       nativeOpen: async (request, assertCurrent, executable) => {

@@ -262,17 +262,17 @@ export class ExecutionCoordinator {
           if (this.evidenceDigest(current) !== receipt.evidenceDigest) throw executionHttpError('execution-capability-required', 'selection')
           if (receipt.expiresAtMs <= this.now()) throw executionHttpError('execution-capability-required', 'selection')
         } }
-        this.ports.progress?.(scope, 'saving')
+        this.ports.progress?.(scope, 'saving', record.id)
         await this.awaited(scope, () => this.ports.commitFloor(scope, request.expected, next, prepared, plan.stamp, commitFence), signal, commitFence)
         const authoritative = await this.floor(scope, signal, fence)
         assertExecutionCAS(next, authoritative.binding)
         if (!stampEqual(authoritative.selection, plan.stamp)) throw executionHttpError('execution-intent-uncertain', 'selection')
         record = await this.awaited(scope, () => this.ports.ledger.commitSelection(record), signal, fence)
-        this.ports.progress?.(scope, 'complete')
+        this.ports.progress?.(scope, 'complete', record.id)
         return this.selectionReply(record)
       }), signal)
     } catch (error) {
-      this.ports.progress?.(scope, 'failed')
+      this.ports.progress?.(scope, 'failed', record.id)
       const current = this.ports.ledger.get(scope, record.id)
       if (current?.kind === 'selection' && current.state !== 'committed' && current.state !== 'refused') {
         await this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'selection'))
@@ -352,19 +352,20 @@ export class ExecutionCoordinator {
       } else startRequest = { ...base, kind: 'native' }
       await this.assertOpenFloor(scope, record as OpenIntent, signal)
       await this.target(scope, (record as OpenIntent).binding.execution, signal)
-      this.ports.progress?.(scope, 'opening')
+      this.ports.progress?.(scope, 'opening', owned.selectionIntentId)
       await this.openAwaited(record as OpenIntent, () => this.ports.start(startRequest), signal)
       const observation = await this.openAwaited(record as OpenIntent, () => this.ports.observeRun(scope, record as OpenIntent), signal)
       await this.assertOpenFloor(scope, record as OpenIntent, signal)
       const target = await this.target(scope, (record as OpenIntent).binding.execution, signal)
       const actual = this.runtimeSummary(record as OpenIntent, observation, target)
       record = await this.openAwaited(record as OpenIntent, () => this.ports.ledger.markRunning(record as OpenIntent, actual), signal)
-      this.ports.progress?.(scope, 'complete')
+      this.ports.progress?.(scope, 'complete', record.selectionIntentId)
       this.executionGuard(scope, record.binding, signal)
       return Object.freeze({ executionVersion: 1, openIntentId: record.id, state: 'running', committed: (record as OpenIntent).binding, actual })
     } catch (error) {
       const current = this.ports.ledger.get(scope, request.openIntentId)
       if (claimed && current?.kind === 'open' && !['stopped', 'refused'].includes(current.state)) await this.ports.ledger.markUnavailable(current, 'uncertain', codeOf(error, 'open'))
+      if (claimed && current?.kind === 'open') this.ports.progress?.(scope, 'failed', current.selectionIntentId)
       // Retain the run/lease on ambiguous failure. Lifecycle owner confirms end/adopts before sweep; no fallback/restart.
       throw executionHttpError(codeOf(error, 'open'), 'open', request.openIntentId)
     } finally { this.active.delete(operation) }

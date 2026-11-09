@@ -125,7 +125,17 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   const actor = (scope: ExecutionIntentScope) => { o.actor(scope); const check = actors.get(scopeDigest(scope)); if (!check) throw executionHttpError('execution-forbidden', 'authorization'); check() }
   const native = o.nativeOpen && o.manager && o.host ? createNativeCodexExecution({ directory: o.directory, manager: o.manager, host: o.host, pool: o.pool,
     open: (request, fence, executable) => o.nativeOpen!(request, () => { fence(); actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) }, executable),
-    guard: request => { actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) } }) : null
+    guard: request => { actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) },
+    authorizeObservation: request => { actor(request.scope) },
+    dispatchGuard: request => {
+      const entry=ledger?.get(request.scope,request.openIntentId)
+      if(entry?.kind!=='open'||entry.state!=='starting'||entry.runId!==request.runId)throw executionHttpError('execution-intent-uncertain','open',request.openIntentId)
+      assertExecutionCAS(request.binding,entry.binding)
+    },
+    canConfirmAbsent: intent => {
+      const entry=ledger?.get(intent.scope,intent.id)
+      return entry?.kind==='open'&&entry.state==='uncertain'&&entry.revision===intent.revision&&entry.runId===intent.runId
+    } }) : null
   const assertCurrent = (context: FenceState) => {
     actor(context.scope); runtime.storage!.assertExclusiveWriter(); context.source.assertCurrent()
     if (sourceHash(context.floorFile) !== context.floorHash) throw executionHttpError('execution-stale', 'selection')
