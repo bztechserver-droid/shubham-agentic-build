@@ -2472,8 +2472,19 @@
     "added": "2026-11-09",
     "notes": [
       "2026-11-09 Agent 8: the error was \"The operation outcome is uncertain. Observe this same operation.\" Lead's last bridge run 1bf505fb had been released (lease freed, child files deleted) but a concurrent check in runtime.ts physical() then wrote it back to \"ended\"; every later open saw an uncertain old run and refused. Lead unstuck by hand at 22:17 (record restored to released, hub restarted). Code fix for the race: in progress, scratch only, not merged.",
-      "2026-11-09 Agent 8: the permanent fix is Fix other PCS's F-163 v3, merged into Dev at 22:21 (agent/codex-claude/run-state.ts: run states only move forward, the state is re-read after every await, retirement no longer needs the child config); publish started 22:22. Agent 8's parallel scratch fix (C:/saw/f164-bridge-race) is dropped, not merged. Tick once the published build is installed (Update) and a Codex in Claude chat reopens cleanly."
+      "2026-11-09 Agent 8: the permanent fix is Fix other PCS's F-163 v3, merged into Dev at 22:21 (agent/codex-claude/run-state.ts: run states only move forward, the state is re-read after every await, retirement no longer needs the child config); publish started 22:22. Agent 8's parallel scratch fix (C:/saw/f164-bridge-race) is dropped, not merged. Tick once the published build is installed (Update) and a Codex in Claude chat reopens cleanly.",
+      "2026-11-09 Shubham: The target has not proved this execution capability.Please fix this error whenver i stip the claide in codex chat",
+      "2026-11-09 Fix other PCS: build 2026.11.09-2231 installed 22:32; stop then reopen of Memory (paused) worked on it at 22:38. Two causes of \"has not proved this execution capability\" still in the code: a failed bridge start-up was kept until the next restart (seen 15:12 and 17:18), and the 24 h proof was never renewed without an Update. Fix (retry with back-off, renewal at 20 h; agent/codex-claude/capability-renewal.ts) built and tested in C:/saw/api400-20261109/work, not merged."
     ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-165",
+    "title": "Dependencies page: what Codex in Claude needs on each PC",
+    "said": "Please create a route called `dependencies` and in that, in the dependency, mention all the dependencies that are required so that the provision is shown. The error that comes should not show. If, let's say, I start Codex in Claude on another computer, then how do I make sure it doesn't come on that computer? What are the required dependencies and what is the reason because of which it can show? Please show that.",
+    "added": "2026-11-09",
+    "notes": [],
     "done": null,
     "doneNote": ""
   }

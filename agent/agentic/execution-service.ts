@@ -10,6 +10,7 @@ import { ExecutionIntentLedger, scopeDigest, selectionFingerprint, type Executio
 import type { FloorExecutionAuthority, FloorExecutionCommit } from './floors.ts'
 import { sourceHash } from './switch-fence.ts'
 import { createBridgeRuntime, type BridgeRuntimeOptions } from '../codex-claude/runtime.ts'
+import { initRetryDelay } from '../codex-claude/capability-renewal.ts'
 import { assertPrivatePath, writePrivateAtomic } from '../codex-claude/storage.ts'
 import { readChildConfig } from '../codex-claude/child.ts'
 import { recoverUnreportedHostPids } from './execution-host-observation.ts'
@@ -190,8 +191,22 @@ export function createExecutionService(o: ExecutionServiceOptions) {
     return { targetPcId: o.self().id, execution, linkGeneration: `local_${runtimeEpoch}_${host.generation}`, observedAtMs: now, validUntilMs: now + 30_000,
       nativeVerified: false, pins, bridgeCapability: capability }
   }
-  async function ensure() {
-    return initialization ??= (async () => {
+  // A failed start-up is retried in the background (5 s, 15 s, 1 min, then every 2 min) for a PC that is set up,
+  // because the page's capability GET never runs setup itself; kept failed, every open said "has not proved".
+  let retryAttempt = 0, retryTimer: NodeJS.Timeout | null = null
+  function ensure(): Promise<void> {
+    const attempt: Promise<void> = initialization ??= start().then(() => { retryAttempt = 0 }, error => {
+      if (initialization === attempt) initialization = null
+      if (!retryTimer && fs.existsSync(path.join(o.directory, 'capability.json'))) {
+        retryTimer = setTimeout(() => { retryTimer = null; void ensure().catch(() => {}) }, initRetryDelay(retryAttempt++))
+        retryTimer.unref()
+      }
+      throw error
+    })
+    return attempt
+  }
+  async function start() {
+    {
       await runtime.ensure()
       const storage = runtime.storage!
       ledger = await ExecutionIntentLedger.open({ directory: storage.directory, assertPrivateStorage: storage.assertPrivateStorage,
@@ -254,7 +269,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
             : observed.state === 'ended' ? { state: 'ended', dispatchFenced: true } : { state: 'unknown' }
         },
       })
-    })()
+    }
   }
   const runtimeEpoch = randomUUID()
   if (fs.existsSync(path.join(o.directory, 'capability.json'))) void ensure().catch(() => {})

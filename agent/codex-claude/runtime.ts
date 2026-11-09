@@ -21,6 +21,8 @@ import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
 import { requestFailureSummary, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
+import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
+import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
 import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, settleUndispatchedLease, validUndispatchedRelease,
@@ -29,12 +31,19 @@ import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, s
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
-const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts']
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts', 'capability-renewal.ts', 'requirements.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
   state: RunState; proof?: BridgeActualRuntimeProof;
   dispatchPaused?: boolean;
   unstartedEnd?: UnstartedBridgeEnd;
+}
+export interface BridgeStatus {
+  setUp: boolean
+  started: 'ok' | 'starting' | 'failed' | 'idle' | 'closed'
+  failure: string | null
+  verifiedAt: string | null
+  forThisBuild: boolean | null
 }
 export interface BridgeRuntimeOptions {
   directory: string; manager: CodexManager | null; host: ChatHostLink | null;
@@ -215,18 +224,20 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     } catch { ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); return { state: 'unknown' } }
   }
   async function initialize() {
-    if (closed || !o.host?.inspect || !o.host.current || !o.manager || process.platform !== 'win32' || process.arch !== 'x64') throw executionHttpError('execution-capability-required', 'runtime')
+    if (closed || !o.host?.inspect || !o.host.current || !o.manager || process.platform !== REQUIRED.platform || process.arch !== REQUIRED.arch) throw executionHttpError('execution-capability-required', 'runtime')
+    // A retried start-up begins from the saved files again, never from a half-read earlier attempt.
+    capability = null; previousCapabilities.length = 0
     storage = await openExecutionStorage(o.directory)
     claude = findClaude()
     const codex = findCodex()
-    if (!claude || !/\.exe$/i.test(claude) || !codex || codex.version !== '0.163.0' || process.versions.node !== '24.22.1') throw executionHttpError('execution-capability-required', 'runtime')
+    if (!claude || !/\.exe$/i.test(claude) || !codex || codex.version !== REQUIRED.codex || process.versions.node !== REQUIRED.node) throw executionHttpError('execution-capability-required', 'runtime')
     const version = spawnSync(claude, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
-    if (version.status !== 0 || parseVersion(version.stdout) !== '2.1.319') throw executionHttpError('execution-capability-required', 'runtime')
+    if (version.status !== 0 || parseVersion(version.stdout) !== REQUIRED.claude) throw executionHttpError('execution-capability-required', 'runtime')
     binaryPin = pinImmutableBinary(claude)
     claudeHash = binaryPin.sha256
     await o.host.inspect()
     o.host.current()
-    pins = { platform: 'win32', arch: 'x64', nodeVersion: process.versions.node, claudeVersion: '2.1.319', codexVersion: codex.version,
+    pins = { platform: 'win32', arch: 'x64', nodeVersion: process.versions.node, claudeVersion: REQUIRED.claude, codexVersion: codex.version,
       adapterSha256: createHash('sha256').update(PIN_FILES.map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
     const capFile = path.join(o.directory, 'capability.json')
     const priorFile=path.join(o.directory,'previous-controller-capability.json')
@@ -267,7 +278,43 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       } catch { /* Hold survives; dispatch remains paused until the owner context can be proved. */ }
     }
   }
-  function ensure(): Promise<void> { return initialization ??= initialize().catch(error => { binaryPin?.close(); server?.close(); storage?.close(); throw error }) }
+  // For the Dependencies page (F-165): how the last start-up went, by app code only.
+  let startedOk = false, lastStartFailure: string | null = null
+  function ensure(): Promise<void> {
+    const attempt: Promise<void> = initialization ??= initialize().then(() => { startedOk = true; lastStartFailure = null }, error => {
+      startedOk = false
+      const code = (error as { code?: unknown })?.code
+      lastStartFailure = typeof code === 'string' && /^(execution|bridge)-[a-z-]{3,48}$/.test(code) ? code : 'unavailable'
+      server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close()
+      server = null; binaryPin = null; storage = null; capability = null
+      // A failed start-up (chat host not back yet, a slow check) is retried by the next caller; kept, it
+      // refused every Codex in Claude Code open with "has not proved this execution capability" until a restart.
+      if (initialization === attempt) initialization = null
+      throw error
+    })
+    return attempt
+  }
+  // The 24 h proof is renewed in the background at 20 h with the same verification (one Sol/max request plus the
+  // harness probe), only for a PC that is already set up. Expired, it refused every open and paused running chats.
+  let lastOwner: string | null = null, renewing: Promise<void> | null = null
+  async function renewCapability() {
+    // Only a PC that was set up (capability.json exists) and started: its check is renewed from 20 h, or redone
+    // when it had expired at start-up. A PC never set up is never set up in the background.
+    if (closed || renewing || !initialization || !startedOk || !fs.existsSync(path.join(o.directory, 'capability.json'))) return
+    if (capability && !renewalDue(capability.endpointProof.verifiedAt, Date.now())) return
+    // The person who used the bridge here; the manager still refuses unless that person is signed in to the CRM now.
+    const owner = lastOwner ?? [...runs.values()].find(record => record.state !== 'released')?.lease.request.ownerId
+      ?? [...runs.values()].at(-1)?.lease.request.ownerId
+    if (!owner) return
+    renewing = initialization.then(() => verifyPinned(owner)).then(() => {}, () => { /* The current proof stays until it expires; retried next check. */ })
+      .finally(() => { renewing = null })
+    await renewing
+  }
+  const renewTimer = setInterval(() => { void renewCapability() }, CAPABILITY_RENEW_CHECK_MS)
+  renewTimer.unref()
+  // Once soon after start-up too, so an expired check after a restart is redone in a minute, not 15.
+  const firstRenew = setTimeout(() => { void renewCapability() }, 60_000)
+  firstRenew.unref()
   async function verify(ownerId: string): Promise<BridgeTargetCapability> {
     await ensure()
     return verifyPinned(ownerId)
@@ -298,6 +345,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         claudeJsonlResume: true, perChildIsolation: true }, o.self().id, pins, Date.now())
       writePrivateAtomic(path.join(o.directory, 'capability.json'), JSON.stringify(capability) + '\n')
       writePrivateAtomic(path.join(o.directory, 'setup-proof.json'), JSON.stringify({ ...harness, pins }) + '\n')
+      lastOwner = ownerId
       return capability
     } finally { await source.release(id) }
   }
@@ -498,9 +546,27 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     }
     throw executionHttpError('execution-intent-uncertain','runtime')
   }
-  return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt, cancelUnstarted,
+  /** Read-only, for the Dependencies page (F-165): whether this PC was set up, whether its setup check is
+   * current and for this build, and how the last start-up went. No provider, native or credential call. */
+  function status(): BridgeStatus {
+    let saved: { verifiedAt: string | null; adapter: string | null } | null = null
+    const file = path.join(o.directory, 'capability.json')
+    try {
+      if (fs.existsSync(file)) {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+        saved = { verifiedAt: typeof raw?.endpointProof?.verifiedAt === 'string' ? raw.endpointProof.verifiedAt : null,
+          adapter: typeof raw?.pins?.adapterSha256 === 'string' ? raw.pins.adapterSha256 : null }
+      }
+    } catch { saved = { verifiedAt: null, adapter: null } }
+    let digest: string | null = null
+    try { digest = createHash('sha256').update(PIN_FILES.map(name => hash(path.join(import.meta.dirname, name))).join(':')).digest('hex') } catch { /* Unreadable: unknown. */ }
+    return { setUp: saved !== null, started: closed ? 'closed' : startedOk ? 'ok' : initialization ? 'starting' : lastStartFailure ? 'failed' : 'idle',
+      failure: startedOk ? null : lastStartFailure, verifiedAt: saved?.verifiedAt ?? null,
+      forThisBuild: saved?.adapter && digest ? saved.adapter === digest : null }
+  }
+  return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt, cancelUnstarted, status,
     get storage() { return storage },
-    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close();unstarted.invalidate(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close() } }
+    close() { closed = true; clearInterval(cleanupTimer); clearInterval(renewTimer); clearTimeout(firstRenew); retirementWork.close(); ownership.close();unstarted.invalidate(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close() } }
 }
 
 function unstartedProcesses(names:readonly string[]):Promise<UnstartedProcess[]> {

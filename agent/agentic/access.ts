@@ -64,6 +64,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/codex\/status$/, SIGNED],
   ['GET', /^\/opencode\/status$/, SIGNED],
   ['POST', /^\/codex\/refresh$/, OWNER],
+  // F-165: what Codex in Claude Code needs on each PC (versions, sign-in, setup state): the owner of the app only.
+  ['GET', /^\/dependencies$/, OWNER],
   ['GET', /^\/codex\/settings$/, SIGNED],
   ['PUT', /^\/codex\/settings$/, OWNER],
   ['PUT', /^\/offline-chats$/, OWNER],

@@ -82,7 +82,7 @@ import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
 import { createChatLog, describeEvents } from './chat-log.ts'
 import { createVoice, type AskView } from './voice.ts'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
 import { namesChoice, namesFor, type NamesChoice } from '../../shared/fast-names.ts'
 import { fastHello } from '../../shared/fast.ts'
@@ -106,6 +106,9 @@ import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from '.
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
 import { CODEX_EFFORTS, CODEX_MODEL_MAX, engineOf, type AgentEngine, type CodexEffort, type CodexStatus } from '../../shared/codex.ts'
 import type { CodexManager } from '../codex/index.ts'
+import { parseVersion } from '../codex/find.ts'
+import { dependencyReport } from './dependencies.ts'
+import type { DependenciesAnswer, DependencyPc, DependencyReport } from '../../shared/dependencies.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
@@ -2120,6 +2123,42 @@ export function createAgentic(o: AgenticOptions): Agentic {
       lastWrittenBackAt: null,
       waitingToWriteBack: false,
     }
+  }
+
+  // F-165: the facts behind the Dependencies page, all already on this PC. `claude --version` is the one
+  // process started, at most once a minute; nothing reaches ChatGPT, the CRM or a credential.
+  let claudeSeen: { at: number; path: string | null; version: string | null } | null = null
+  function claudeVersion() {
+    if (claudeSeen && Date.now() - claudeSeen.at < 60_000) return claudeSeen
+    const file = o.claude ?? findClaude()
+    let version: string | null = null
+    if (file) {
+      const r = spawnSync(file, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
+      version = r.status === 0 ? parseVersion(r.stdout) : null
+    }
+    return (claudeSeen = { at: Date.now(), path: file, version })
+  }
+  function localDependencies(): DependencyReport {
+    const codex = o.codex?.status() ?? null, claude = claudeVersion()
+    let chatHost = false
+    try { o.chatHost?.current?.(); chatHost = !!o.chatHost } catch { chatHost = false }
+    return dependencyReport({ pc: { id: self().id, name: self().name }, platform: process.platform, arch: process.arch, node: process.versions.node,
+      claude: { found: !!claude.path, version: claude.version }, codex: { found: !!codex?.installed, version: codex?.version ?? null }, chatHost,
+      codexState: codex?.state ?? null, codexKind: codex?.assigned?.kind ?? null, codexHint: codex?.hint ?? null,
+      bridge: executionService?.runtime.status() ?? null }, Date.now())
+  }
+  const dependencyShape = (v: unknown): v is DependencyReport => isObject(v) && v.version === 1 && Array.isArray(v.checks) && isObject(v.pc)
+  async function dependenciesAnswer(): Promise<DependenciesAnswer> {
+    return { pcs: await Promise.all(pcs().map(async (pc): Promise<DependencyPc> => {
+      if (pc.here) return { ...pc, report: localDependencies(), error: null }
+      try {
+        const report = await request<unknown>(peerOf(pc.id), 'dependencies', {}, 20_000)
+        return dependencyShape(report) ? { ...pc, report, error: null } : { ...pc, report: null, error: 'It answered something this page can\'t read: update that PC.' }
+      } catch (e) {
+        // A PC on a build from before F-165 does not know the question.
+        return { ...pc, report: null, error: /doesn't do dependencies/.test(message(e)) ? 'That PC runs an older build: update it to see its checks.' : `Can't reach it right now (${message(e)}).` }
+      }
+    })) }
   }
 
   function retireCodexSettings(r: MountRequest) {
@@ -4538,6 +4577,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-134: Codex on this PC.
     ['GET', /^\/opencode\/status$/, () => openCode.status(), 'local'],
     ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
+    // F-165: what Codex in Claude Code needs on this PC and on each PC within reach, read-only.
+    ['GET', /^\/dependencies$/, () => dependenciesAnswer(), 'local'],
     ['POST', /^\/codex\/refresh$/, async () => {
         await o.codex?.check()
         return codexAnswer()
@@ -5141,6 +5182,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const m = mode()
     if (m === 'hub') {
       switch (op) {
+        // F-165: a member's Dependencies page asks for the hub's checks.
+        case 'dependencies':
+          return answer(() => localDependencies())
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         case 'delivery-authorize':
@@ -5260,6 +5304,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } else if (m === 'member' && from.id === team!.hub()?.id) {
       const approvalHubToken = team?.hub()?.link?.token ?? null
       switch (op) {
+        // F-165: the hub's Dependencies page asks for this PC's checks.
+        case 'dependencies':
+          return answer(() => localDependencies())
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         case 'delivery-status':
