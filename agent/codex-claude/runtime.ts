@@ -21,7 +21,8 @@ import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
 import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
-import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, type UnstartedBridgeEnd, type UnstartedProcess } from './unstarted.ts'
+import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, settleUndispatchedLease, validUndispatchedRelease,
+  type UndispatchedRelease, type UnstartedBridgeEnd, type UnstartedProcess } from './unstarted.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
@@ -168,9 +169,30 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (!record.proof) { record.proof = proof; record.state = 'running'; save(record) }
     return { state: 'running', runtime: proof }
   }
-  async function observe(request: BridgeLeaseRequest): Promise<BridgeOwnerObservation> {
+  async function observe(request: BridgeLeaseRequest, undispatched?:{lease:CodexBridgeLease;fence():void}): Promise<BridgeOwnerObservation> {
     const record = runs.get(request.runId)
-    if (!record || !isDeepStrictEqual(record.lease.request, request)) return { state: 'unknown' }
+    if(!record){
+      try{
+        if(!safeId(request.runId)||!storage||closed)return{state:'unknown'}
+        storage.assertExclusiveWriter()
+        const file=path.join(o.directory,request.runId+'.not-started.json')
+        const exists=(suffix:string)=>fs.existsSync(path.join(o.directory,request.runId+suffix))
+        if(exists('.run.json')||exists('.child.json'))return{state:'unknown'}
+        if(fs.existsSync(file)){
+          assertPrivatePath(file)
+          const saved=JSON.parse(fs.readFileSync(file,'utf8')) as UndispatchedRelease
+          return validUndispatchedRelease(saved,saved.lease)&&isDeepStrictEqual(saved.lease.request,request)?{state:'ended'}:{state:'unknown'}
+        }
+        if(!undispatched||!isDeepStrictEqual(undispatched.lease.request,request))return{state:'unknown'}
+        await settleUndispatchedLease(undispatched.lease,{
+          fence:()=>{storage!.assertExclusiveWriter();undispatched.fence()},exists,
+          release:(id,guard)=>o.manager!.bridgeCredentials.release(id,guard),
+          save:(receipt,guard)=>writePrivateAtomic(file,JSON.stringify(receipt)+'\n',guard),
+        })
+        return{state:'ended'}
+      }catch{return{state:'unknown'}}
+    }
+    if(!isDeepStrictEqual(record.lease.request,request))return{state:'unknown'}
     try {
       if (record.state === 'released') return record.proof ? ownership.released(record.lease, record.proof)
         : record.unstartedEnd&&validUnstartedEnd(record.unstartedEnd,record.lease)?{state:'ended'}:{state:'unknown'}
@@ -269,7 +291,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   async function start(request: ExecutionStartRequest) {
     if (request.kind !== 'bridge' || !broker) throw executionHttpError('execution-capability-required', 'open')
     await ensure(); cachedCapability()
-    if (!current(request.lease.request) || runs.has(request.runId)) throw executionHttpError('execution-stale', 'open')
+    if (!current(request.lease.request) || runs.has(request.runId) || fs.existsSync(path.join(o.directory,request.runId+'.not-started.json'))) throw executionHttpError('execution-stale', 'open')
     for (const old of runs.values()) if (old.lease.request.binding.sessionId === request.binding.sessionId && old.state !== 'released') {
       const observed = await observe(old.lease.request)
       if (observed.state === 'unknown') throw executionHttpError('execution-intent-uncertain', 'open')

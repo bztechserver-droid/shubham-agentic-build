@@ -2,7 +2,7 @@ import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { HostChat } from '../chathost/protocol.ts'
 import type { BridgeOwnerObservation } from '../codex/bridge-credentials.ts'
-import type { CodexBridgeLease } from './contract.ts'
+import { requireCodexBridgeLease, type CodexBridgeLease } from './contract.ts'
 import type { HostEpoch } from './ownership.ts'
 
 export interface UnstartedProcess { pid: number; command: string | null }
@@ -60,4 +60,29 @@ export class UnstartedBridgeRetirements {
     }catch{return false}
   }
   invalidate(leaseId?:string):void {if(leaseId)this.receipts.delete(leaseId);else this.receipts.clear()}
+}
+
+export interface UndispatchedRelease { version:1; lease:CodexBridgeLease; releasedAt:number }
+export function validUndispatchedRelease(value:UndispatchedRelease,lease:CodexBridgeLease):boolean {
+  try{return value?.version===1&&positive(value.releasedAt)&&isDeepStrictEqual(requireCodexBridgeLease(value.lease,lease.request),lease)}catch{return false}
+}
+/** The consumed open has returned uncertain and is no longer active. A descriptor/run
+ * is persisted BEFORE native dispatch. Their absence under the exclusive writer proves
+ * this exact unique lease never reached a child. Never applies to an issued/unknown start. */
+export async function settleUndispatchedLease(lease:CodexBridgeLease,ports:{
+  fence():void; exists(suffix:string):boolean; release(id:string,guard:()=>void):Promise<void>;
+  save(receipt:UndispatchedRelease,guard:()=>void):void; now?():number;
+}):Promise<UndispatchedRelease> {
+  requireCodexBridgeLease(lease,lease.request)
+  const assertAbsent=()=>{
+    ports.fence()
+    if(['.child.json','.run.json','.ready.json','.settings.json'].some(suffix=>ports.exists(suffix)))throw Error('Native dispatch cannot be excluded')
+  }
+  assertAbsent()
+  await ports.release(lease.leaseId,assertAbsent)
+  assertAbsent()
+  const receipt:UndispatchedRelease={version:1,lease:structuredClone(lease),releasedAt:(ports.now??Date.now)()}
+  if(!validUndispatchedRelease(receipt,lease))throw Error('Invalid no-dispatch release')
+  ports.save(receipt,assertAbsent)
+  return receipt
 }

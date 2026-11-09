@@ -10,6 +10,8 @@ export interface MissingHostPidPorts {
   /** Reads owner-only, exact-run private artifacts; never a public request's PID. */
   ready(chat: HostChat): number
   process(pid: number): Promise<ProxyProcess | null>
+  /** One fresh OS snapshot for the bounded exact set; no persisted PID cache. */
+  processes?(pids:readonly number[]):Promise<ProxyProcess[]>
   node: string
 }
 
@@ -28,13 +30,27 @@ export async function recoverUnreportedHostPids<T extends { hostPid: number; hos
   fence()
   let changed = false
   const chats: HostChat[] = []
+  const pending=new Map<HostChat,number>()
+  for(const chat of observation.chats){
+    if(chat.exited||(chat.pid!==undefined&&chat.pid!==0)||typeof chat.meta.bridgeRunId!=='string'
+      ||!/^[A-Za-z0-9_-]{16,128}$/.test(chat.meta.bridgeRunId))continue
+    try{const pid=ports.ready(chat);if(Number.isSafeInteger(pid)&&pid>0)pending.set(chat,pid)}catch{/* No ready evidence. */}
+  }
+  const pids=[...new Set(pending.values())]
+  let batch:Map<number,ProxyProcess>|null=null
+  if(ports.processes&&pids.length){
+    if(pids.length>256)throw executionHttpError('execution-runtime-mismatch','runtime')
+    const rows=await ports.processes(pids);fence()
+    if(rows.length>pids.length||rows.some(row=>!pids.includes(row.pid))||new Set(rows.map(row=>row.pid)).size!==rows.length)
+      throw executionHttpError('execution-runtime-mismatch','runtime')
+    batch=new Map(rows.map(row=>[row.pid,row]))
+  }
   for (const chat of observation.chats) {
     if (chat.exited || (chat.pid !== undefined && chat.pid !== 0) || typeof chat.meta.bridgeRunId !== 'string'
       || !/^[A-Za-z0-9_-]{16,128}$/.test(chat.meta.bridgeRunId)) { chats.push(chat); continue }
-    let pid: number
-    try { pid = ports.ready(chat) } catch { chats.push(chat); continue }
-    if (!Number.isSafeInteger(pid) || pid <= 0) { chats.push(chat); continue }
-    const process = await ports.process(pid)
+    const pid=pending.get(chat)
+    if(pid===undefined){chats.push(chat);continue}
+    const process=batch?batch.get(pid)??null:await ports.process(pid)
     fence()
     const started = Date.parse(String(chat.meta.startedAt))
     if (!process || process.pid !== pid || process.ppid !== epoch.hostPid || !Number.isSafeInteger(process.created)

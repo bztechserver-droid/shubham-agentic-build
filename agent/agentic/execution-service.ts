@@ -85,6 +85,16 @@ export function createExecutionService(o: ExecutionServiceOptions) {
             try { resolve(JSON.parse(stdout)) } catch { resolve(null) }
           }))
       },
+      processes(pids) {
+        if(!pids.length||pids.length>256||pids.some(pid=>!Number.isSafeInteger(pid)||pid<=0))return Promise.reject(Error('Invalid host process set'))
+        const filter=pids.map(pid=>`ProcessId=${pid}`).join(' OR ')
+        const script=`@(Get-CimInstance Win32_Process -Filter '${filter}' -ErrorAction Stop | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath}}) | ConvertTo-Json -Compress`
+        return new Promise((resolve,reject)=>execFile('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],
+          {encoding:'utf8',timeout:8000,windowsHide:true,maxBuffer:65536},(error,stdout)=>{
+            if(error)return reject(Error('Physical host processes are unavailable'))
+            try{const value=JSON.parse(stdout||'[]');resolve(Array.isArray(value)?value:[value])}catch{reject(Error('Physical host processes are invalid'))}
+          }))
+      },
     })
     try {
       const after = host.current?.()
@@ -231,10 +241,15 @@ export function createExecutionService(o: ExecutionServiceOptions) {
           if (request.kind === 'native' && native) return native.start(request)
           return runtime.start(request)
         },
-        observeRun: async (_scope, intent) => {
+        observeRun: async (scope, intent) => {
           if (intent.binding.execution.profile === 'codex-native-v1' && native) return native.observe(intent)
           if (!intent.lease) return { state: 'unknown' }
-          const observed = await runtime.observe(intent.lease.request)
+          const observed = await runtime.observe(intent.lease.request,{lease:intent.lease,fence:()=>{
+            actor(scope)
+            const current=ledger!.get(scope,intent.id)
+            if(current?.kind!=='open'||current.state!=='uncertain'||current.revision!==intent.revision
+              ||current.runId!==intent.runId||!isDeepStrictEqual(current.lease,intent.lease))throw executionHttpError('execution-intent-uncertain','runtime')
+          }})
           return observed.state === 'running' ? { state: 'running', proof: observed.runtime }
             : observed.state === 'ended' ? { state: 'ended', dispatchFenced: true } : { state: 'unknown' }
         },

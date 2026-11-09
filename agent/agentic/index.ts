@@ -3222,12 +3222,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return `${kept}, and its running chat (on ${w.name}) is on ${level} now: /effort ${level} was typed into it.`
       }
       case 'app_stop_chat': {
-        const target = anyChat(args.sessionId)
-        if (target.sessionId === sid) throw apiError(400, "That's your own chat")
-        mayOn(target.sessionId, 'owner')
-        const at=bySession(target.sessionId)
-        if(target.id===self().id&&at&&executionIdentityOf(at.agent,defaultsNow()).profile==='codex-in-claude-v1'
+        if (args.sessionId === sid) throw apiError(400, "That's your own chat")
+        const at=typeof args.sessionId==='string'?bySession(args.sessionId):null
+        if(at?.agent.homePc===self().id&&executionIdentityOf(at.agent,defaultsNow()).profile==='codex-in-claude-v1'
           &&!executionService?.runtime.matches(snapshotAgentExecution(at.agent,defaultsNow()))) {
+          access.needChat(me,at.agent,'owner',toolWhere)
           workflowExecutionAgent(at.floor.id,at.agent.id)
           if(!executionService)throw executionHttpError('execution-capability-required','runtime')
           const expected=snapshotAgentExecution(at.agent,defaultsNow())
@@ -3237,8 +3236,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
             assertExecutionCAS(expected,snapshotAgentExecution(fresh,defaultsNow()))
             access.needChat(access.asChat(source.agent),fresh,'owner',toolWhere)
           })
-          return `The exact unconfirmed managed start for ${target.sessionId} was stopped and its end verified.`
+          return `The exact unconfirmed managed start for ${at.agent.sessionId} was stopped and its end verified.`
         }
+        const target = anyChat(args.sessionId)
+        mayOn(target.sessionId, 'owner')
         stopAnywhere(target.sessionId)
         return `Stopping chat ${target.sessionId}.`
       }
