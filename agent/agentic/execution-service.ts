@@ -25,7 +25,7 @@ export interface ExecutionServiceOptions extends BridgeRuntimeOptions {
   seal(scope: ExecutionIntentScope, expected: ExecutionSnapshot): Promise<{ assertCurrent(): void; finish(committed: boolean, changed: boolean): void }>
   prepare(scope: ExecutionIntentScope, expected: ExecutionSnapshot, target: ExecutionIdentity): Promise<PreparedExecutionSelection>
   /** Existing native launcher, with the same current-profile/owner guards around its awaits. */
-  nativeOpen?(request: ExecutionStartRequest, assertCurrent: () => void): Promise<void>
+  nativeOpen?(request: ExecutionStartRequest, assertCurrent: () => void, executable: string): Promise<void>
 }
 interface FenceState {
   scope: ExecutionIntentScope; expected: ExecutionSnapshot; next: ExecutionSnapshot | null;
@@ -122,7 +122,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   const key = (scope: ExecutionIntentScope) => `${scope.floorId}:${scope.agentId}`
   const actor = (scope: ExecutionIntentScope) => { o.actor(scope); const check = actors.get(scopeDigest(scope)); if (!check) throw executionHttpError('execution-forbidden', 'authorization'); check() }
   const native = o.nativeOpen && o.manager && o.host ? createNativeCodexExecution({ directory: o.directory, manager: o.manager, host: o.host, pool: o.pool,
-    open: (request, fence) => o.nativeOpen!(request, () => { fence(); actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) }),
+    open: (request, fence, executable) => o.nativeOpen!(request, () => { fence(); actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) }, executable),
     guard: request => { actor(request.scope); assertExecutionCAS(request.binding, o.state(request.scope).binding) } }) : null
   const assertCurrent = (context: FenceState) => {
     actor(context.scope); runtime.storage!.assertExclusiveWriter(); context.source.assertCurrent()

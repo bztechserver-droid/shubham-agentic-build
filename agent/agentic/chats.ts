@@ -139,7 +139,7 @@ export interface StartChat {
    * F-134, for the Codex engine: the Codex home it runs in (CODEX_HOME), its profile (codex -p <profile>) and, to resume, the Codex conversation id.
    * model/effort/brief/MCP servers are in the profile file (codex/home.ts writeProfile), so none of the Claude flags above are used.
    */
-  codex?: { home: string; profile: string; thread: string | null }
+  codex?: { home: string; profile: string; thread: string | null; bin?: string }
 }
 
 /** F-078: how a chat ended. cause: stopped (by him), idle-reaper, agent-stop (the app stopping: an Update, a restart), exited (it ended itself, code 0), crashed (a non-zero code), ended (no code). */
@@ -762,7 +762,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         spawnPty = loaded.spawn
       }
       const engine = s.engine === 'codex' ? 'codex' : 'claude'
-      const codexBin = engine === 'codex' ? (o.codexBin?.() ?? null) : null
+      if (s.codex?.bin && (!path.isAbsolute(s.codex.bin) || !/\.exe$/i.test(s.codex.bin))) throw Object.assign(new Error('Invalid pinned native executable.'), { status: 409, code: 'execution-runtime-mismatch' })
+      const codexBin = engine === 'codex' ? (s.codex?.bin ?? o.codexBin?.() ?? null) : null
       if (engine === 'codex' && (!codexBin || !s.codex)) throw Object.assign(new Error("The Codex CLI isn't installed on this PC"), { status: 503, code: 'not-installed' })
       const claude = engine === 'codex' ? codexBin! : (o.claude ?? findClaude(o.env))
       if (!claude) throw Object.assign(new Error("Claude Code isn't installed on this PC (no claude on PATH)"), { status: 503 })

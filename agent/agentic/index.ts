@@ -1153,7 +1153,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       floorFile: () => path.join(o.dir, mode() === 'member' ? 'floors-local.json' : 'floors.json'),
       commit: request => { floors.commitExecution(request) },
       target: (scope, profile) => targetExecution(profile, workflowExecutionAgent(scope.floorId, scope.agentId)),
-      nativeOpen: async (request, assertCurrent) => {
+      nativeOpen: async (request, assertCurrent, executable) => {
         const guard = () => {
           assertCurrent()
           const agent = workflowExecutionAgent(request.scope.floorId, request.scope.agentId)
@@ -1163,7 +1163,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
             || loadSession(o.crmSession ?? path.join(o.dir, '..', 'crm-session.json'))?.user.id !== request.scope.ownerId) throw executionHttpError('execution-forbidden', 'open')
         }
         guard()
-        await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard)
+        await openChat(request.scope.floorId, request.scope.agentId, { cols: request.cols, rows: request.rows }, guard, executable)
         guard()
       },
       launch: request => {
@@ -1346,7 +1346,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * chat's profile is written (its brief, model, effort and MCP servers; the chat's own key is only NAMED there), and codex is started in the shared home.
    * A chat whose conversation id is not known yet is a new conversation; its id is learnt from its rollout file once Codex has written it.
    */
-  async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void): Promise<boolean> {
+  async function startCodexHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<boolean> {
     executionGuard?.()
     const cx = o.codex
     if (!cx) throw Object.assign(apiError(503, "Codex isn't set up on this PC."), { code: 'not-installed' })
@@ -1398,7 +1398,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         cols: size.cols,
         rows: size.rows,
         engine: 'codex',
-        codex: { home: cx.paths.home, profile: profileName(sid), thread: resume ? thread : null },
+        codex: { home: cx.paths.home, profile: profileName(sid), thread: resume ? thread : null, ...(nativeExecutable ? { bin: nativeExecutable } : {}) },
       })
       launched.set(sid, { effort: agent.codexEffort || dflt.codexEffort || '', at: new Date().toISOString(), ultracode: false })
       heartbeat.opened(sid)
@@ -1478,7 +1478,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** Starts the agent's chat on this PC (its lease already got). */
-  async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void): Promise<boolean> {
+  async function startHere(floor: Floor, agent: FloorAgent, sid: string, size: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<boolean> {
     executionGuard?.()
     requireLegacyExecution(agent, defaultsNow())
     assertPcControlTarget(floor, self().id, size)
@@ -1495,7 +1495,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (team) tail.track(sid, fileOf(sid), markOf(fileOf(sid)).bytes)
       return !!agent.opencodeSession
     }
-    if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size, executionGuard)
+    if (engineFor(agent) === 'codex') return startCodexHere(floor, agent, sid, size, executionGuard, nativeExecutable)
     const { cwd, resume } = placeForRun(sid, codeDirOf(floor))
     if (!resume && !UUID_RE.test(sid)) throw apiError(400, `"${sid}" has no conversation to resume, and a new chat's id must be a UUID`)
     try {
@@ -2162,7 +2162,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** Its chat, running here: started fresh, resumed from its transcript, taken over, or as it was. */
-  async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void): Promise<ChatOpened> {
+  async function openChat(floorId: string, agentId: string, req: OpenChatRequest, executionGuard?: () => void, nativeExecutable?: string): Promise<ChatOpened> {
     executionGuard?.()
     const managed = floorOf(floorId)
     if (isPcControl(managed) && (req.here || req.takeOver)) throw immutablePcControl()
@@ -2193,7 +2193,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     try {
       executionGuard?.()
       const now = floorOf(floorId)
-      const resumed = await startHere(now, agentOf(now, agentId), sid, req, executionGuard)
+      const resumed = await startHere(now, agentOf(now, agentId), sid, req, executionGuard, nativeExecutable)
       executionGuard?.()
       requireRunningEngine(engineFor(agentOf(floorOf(floorId), agentId)), chats.info(sid)?.engine)
       return { sessionId: sid, started: true, resumed, engine: chats.info(sid)!.engine, ...(tookOverFrom ? { tookOverFrom } : {}) }

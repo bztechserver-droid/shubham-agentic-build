@@ -20,11 +20,27 @@ interface NativeRecord {
 }
 export interface NativeCodexOptions {
   directory: string; manager: CodexManager; host: ChatHostLink; pool(): ChatPool;
-  open(request: ExecutionStartRequest, assertCurrent: () => void): Promise<void>;
+  open(request: ExecutionStartRequest, assertCurrent: () => void, executable: string): Promise<void>;
   guard(request: Pick<ExecutionStartRequest, 'scope' | 'binding'>): void;
   processes?(hostPid: number): Promise<NativeProcess[]>;
 }
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+
+/** Accept only a direct executable or an exact, simple local forwarding wrapper.
+ * Complex shell launchers remain unsupported; their code is never evaluated here. */
+export function nativeCodexExecutable(launcher: string): { executable: string; fingerprint: string } {
+  let executable = launcher
+  if (/\.cmd$/i.test(launcher)) {
+    if (fs.statSync(launcher).size > 16_384) throw executionHttpError('execution-capability-required', 'capability')
+    const commands = fs.readFileSync(launcher, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/).map(s => s.trim())
+      .filter(s => s && !/^@?echo off$/i.test(s) && !/^rem(?:\s|$)/i.test(s))
+    const match = commands.length === 1 && /^"([^"\r\n]+\.exe)" %\*$/i.exec(commands[0])
+    if (!match) throw executionHttpError('execution-capability-required', 'capability')
+    executable = match[1]
+  }
+  if (!path.isAbsolute(executable) || !/\.exe$/i.test(executable) || !fs.statSync(executable).isFile()) throw executionHttpError('execution-capability-required', 'capability')
+  return { executable, fingerprint: createHash('sha256').update(`${launcher}:${hash(launcher)}:${executable}:${hash(executable)}`).digest('hex') }
+}
 
 /** Match the actual executable and complete native resume arguments, including the new thread.
  * A missing protocol-1 PTY PID can be recovered only from one matching OS child of this host. */
@@ -57,8 +73,9 @@ export function createNativeCodexExecution(o: NativeCodexOptions) {
   const capability = () => {
     const status = o.manager.status(), bin = o.manager.bin()
     if (process.platform !== 'win32' || process.arch !== 'x64' || !o.host.inspect || !o.host.current || !bin
-      || !/\.exe$/i.test(bin) || !status.installed || status.version !== '0.163.0' || status.state !== 'ok') throw executionHttpError('execution-capability-required', 'capability')
-    return { bin, binHash: hash(bin), host: { ...o.host.current() } }
+      || !status.installed || status.version !== '0.163.0' || status.state !== 'ok') throw executionHttpError('execution-capability-required', 'capability')
+    const resolved = nativeCodexExecutable(bin)
+    return { bin: resolved.executable, binHash: resolved.fingerprint, host: { ...o.host.current() } }
   }
   async function observe(intent: OpenIntent): Promise<ExecutionRunObservation> {
     const binding = intent.binding, scope = intent.scope
@@ -112,7 +129,7 @@ export function createNativeCodexExecution(o: NativeCodexOptions) {
         if (request.signal.aborted || current.binHash !== target.binHash || !isDeepStrictEqual(current.host, target.host)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
       }
       assertCurrent()
-      await o.open(request, assertCurrent)
+      await o.open(request, assertCurrent, target.bin)
       assertCurrent()
       const info = o.pool().info(request.binding.sessionId!)
       if (request.signal.aborted || info?.engine !== 'codex' || !isDeepStrictEqual(capability().host, target.host)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
