@@ -303,6 +303,13 @@ export class ExecutionIntentLedger {
     if (!executionIntentId(id)) throw executionHttpError('execution-invalid', 'status')
     return this.entries.get(journalKey(requireIntentScope(scope), id)) ?? null
   }
+  /** Backend-only observation candidates. Other actors, owners, PCs and agents stay fenced. */
+  uncertainOpenIds(scope: ExecutionIntentScope): readonly string[] {
+    this.check()
+    const digest = scopeDigest(requireIntentScope(scope))
+    return [...this.entries.values()].filter(entry => entry.kind === 'open' && entry.state === 'uncertain'
+      && scopeDigest(entry.scope) === digest).map(entry => entry.id)
+  }
   reserveSelection(scopeValue: ExecutionIntentScope, value: ExecutionSelectionRequest, admitUntilMs: number): Promise<{ created: boolean; record: SelectionIntent }> {
     return this.serial(async () => {
       const scope = requireIntentScope(scopeValue), request = requireExecutionSelectionRequest(value)

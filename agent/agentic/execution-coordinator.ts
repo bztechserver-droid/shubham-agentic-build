@@ -230,6 +230,10 @@ export class ExecutionCoordinator {
     assertExecutionCAS(receipt.current, request.expected)
     assertExecutionCAS(request.expected, (await this.floor(scope, signal)).binding)
     if (this.evidenceDigest(await this.target(scope, request.target, signal)) !== receipt.evidenceDigest) throw executionHttpError('execution-capability-required', 'selection', request.selectionIntentId)
+    // A superseded run can have a durable confirmed-end tombstone even though
+    // its old floor binding no longer matches. Observe it before admission;
+    // unknown/disconnected runs remain uncertain and still block reservation.
+    for (const id of this.ports.ledger.uncertainOpenIds(scope)) await this.status(scope, id)
     const reservation = await this.awaited(scope, () => this.ports.ledger.reserveSelection(scope, request, receipt.expiresAtMs), signal)
     if (!reservation.created) return this.selectionReply(reservation.record)
     this.ports.progress?.(scope, 'checking', request.selectionIntentId)
@@ -400,15 +404,19 @@ export class ExecutionCoordinator {
     } else if (record.kind === 'open' && ['starting', 'running', 'uncertain'].includes(record.state)) {
       try {
         const owned = record
-        await this.assertOpenFloor(scope, owned)
-        const observation = await this.openAwaited(owned, () => this.ports.observeRun(scope, owned))
-        if (observation.state === 'running') {
+        const observation = await this.awaited(scope, () => this.ports.observeRun(scope, owned))
+        if ((observation.state === 'not-started' || observation.state === 'ended') && observation.dispatchFenced === true) {
+          // End proof belongs to this exact run, independently of the later
+          // selected conversation. It authorizes status only, never dispatch.
+          record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(owned, 'stopped', 'execution-intent-uncertain'))
+        } else if (observation.state === 'running') {
+          await this.assertOpenFloor(scope, owned)
+          this.executionGuard(scope, owned.binding)
           const target = await this.target(scope, owned.binding.execution)
           const actual = this.runtimeSummary(owned, observation, target)
           record = await this.openAwaited(owned, () => this.ports.ledger.markRunning(owned, actual))
         } else {
-          const state = (observation.state === 'not-started' || observation.state === 'ended') && observation.dispatchFenced === true ? 'stopped' : 'uncertain'
-          record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(owned, state, 'execution-intent-uncertain'))
+          record = await this.awaited(scope, () => this.ports.ledger.markUnavailable(owned, 'uncertain', 'execution-intent-uncertain'))
         }
       } catch (error) {
         this.guard(scope)
