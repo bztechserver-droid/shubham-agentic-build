@@ -19,12 +19,13 @@ import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
-import { compatibleControllerUpgrade, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
+import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
+import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
-const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts']
+const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
   state: 'starting' | 'running' | 'ended' | 'released'; proof?: BridgeActualRuntimeProof;
@@ -48,7 +49,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   let closed = false, storage: Awaited<ReturnType<typeof openExecutionStorage>> | null = null
   let server: http.Server | null = null, port = 0, capability: BridgeTargetCapability | null = null
   let pins: BridgeRuntimePins | null = null, claude: string | null = null, claudeHash: string | null = null
-  let previousCapability: unknown = null
+  const previousCapabilities: unknown[] = []
+  let binaryPin: ReturnType<typeof pinImmutableBinary> | null = null
   let initialization: Promise<void> | null = null
   const ownership = new BridgeOwnership(() => {
     if (closed || !o.host?.current) throw executionHttpError('execution-runtime-mismatch', 'runtime')
@@ -91,8 +93,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       return !!record?.proof && ownership.canRetire(lease, record.proof, observation)
     },
   }) : null
-  const compatiblePrevious = (record: RunRecord) => !!pins && compatibleControllerUpgrade(previousCapability, record.pins,
-    record.proof, record.lease, pins, Object.fromEntries(Object.keys(UNCHANGED_CHILD_FILES).map(file => [file, hash(path.join(import.meta.dirname,file))])), Date.now())
+  const previousFor = (record: RunRecord) => pins ? previousCapabilities.find(cap => compatibleControllerUpgrade(cap, record.pins,
+    record.proof, record.lease, pins!, Object.fromEntries(Object.keys(UNCHANGED_CHILD_FILES).map(file => [file, hash(path.join(import.meta.dirname,file))])), Date.now())) : undefined
+  const compatiblePrevious = (record: RunRecord) => previousFor(record) !== undefined
 
   async function physical(record: RunRecord): Promise<BridgeOwnerObservation> {
     if (!o.host?.inspect || !pins || !capability || closed) return { state: 'unknown' }
@@ -131,7 +134,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       || path.resolve(proxy.file).toLowerCase() !== path.resolve(process.execPath).toLowerCase()
       || path.resolve(child.file).toLowerCase() !== path.resolve(config.claude).toLowerCase()
       || !proxy.command.includes(record.configFile) || !proxy.command.includes(path.join(import.meta.dirname, 'child.ts'))
-      || config.claudeSha256 !== hash(config.claude) || upgrade && !compatiblePrevious(record)) return { state: 'unknown' }
+      || path.resolve(config.claude).toLowerCase() !== path.resolve(claude!).toLowerCase()
+      || config.claudeSha256 !== claudeHash || upgrade && !compatiblePrevious(record)) return { state: 'unknown' }
     const execution = normalizeExecution({ engine: 'claude', executionProfile: CODEX_IN_CLAUDE_PROFILE })
     const proof: BridgeActualRuntimeProof = { version: 1, runId: record.runId, ownerId: record.lease.request.ownerId,
       targetPcId: o.self().id, leaseId: record.lease.leaseId, binding: record.lease.request.binding, execution: execution as BridgeActualRuntimeProof['execution'], pins,
@@ -142,7 +146,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (record.proof && (!isDeepStrictEqual(record.proof.proxy, proof.proxy) || !isDeepStrictEqual(record.proof.claude, proof.claude))) return { state: 'unknown' }
     requireBridgeRuntimeProof(proof, record.lease, record.lease.request, capability, pins, Date.now())
     if (upgrade) {
-      const file=path.join(o.directory,`${record.runId}.controller-upgrade.json`)
+      // Keep every earlier migration receipt; never rewrite the original child/process provenance.
+      const file=path.join(o.directory,`${record.runId}.controller-upgrade-${record.pins.adapterSha256}.json`)
       const receipt={version:1,runId:record.runId,fromPins:record.pins,toPins:pins,previousProof:record.proof,proof}
       if (fs.existsSync(file)) { assertPrivatePath(file); if (!isDeepStrictEqual(JSON.parse(fs.readFileSync(file,'utf8')),receipt)) return {state:'unknown'} }
       else writePrivateAtomic(file,JSON.stringify(receipt)+'\n')
@@ -170,29 +175,35 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (!claude || !/\.exe$/i.test(claude) || !codex || codex.version !== '0.163.0' || process.versions.node !== '24.22.1') throw executionHttpError('execution-capability-required', 'runtime')
     const version = spawnSync(claude, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
     if (version.status !== 0 || parseVersion(version.stdout) !== '2.1.319') throw executionHttpError('execution-capability-required', 'runtime')
-    claudeHash = hash(claude)
+    binaryPin = pinImmutableBinary(claude)
+    claudeHash = binaryPin.sha256
     await o.host.inspect()
     o.host.current()
     pins = { platform: 'win32', arch: 'x64', nodeVersion: process.versions.node, claudeVersion: '2.1.319', codexVersion: codex.version,
       adapterSha256: createHash('sha256').update(PIN_FILES.map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex') }
     const capFile = path.join(o.directory, 'capability.json')
     const priorFile=path.join(o.directory,'previous-controller-capability.json')
-    if (fs.existsSync(priorFile)) { assertPrivatePath(priorFile); previousCapability=JSON.parse(fs.readFileSync(priorFile,'utf8')) }
+    for (const file of [priorFile,...PREVIOUS_CONTROLLERS.map(digest=>path.join(o.directory,`previous-controller-capability-${digest}.json`))]) {
+      if (fs.existsSync(file)) { assertPrivatePath(file); previousCapabilities.push(JSON.parse(fs.readFileSync(file,'utf8'))) }
+    }
     if (fs.existsSync(capFile)) {
       assertPrivatePath(capFile)
       const raw=JSON.parse(fs.readFileSync(capFile,'utf8'))
       try { capability = requireBridgeCapability(raw, o.self().id, pins, Date.now()) }
-      catch { capability = null; if (!previousCapability) previousCapability=raw }
+      catch { capability = null; previousCapabilities.push(raw) }
     }
     server = http.createServer((req, res) => { void handleProvider(req, res) })
     await new Promise<void>((resolve, reject) => { server!.once('error', reject); server!.listen(0, '127.0.0.1', () => resolve()) })
     const address = server.address(); if (!address || typeof address === 'string') throw executionHttpError('execution-capability-required', 'runtime'); port = address.port
-    if (!capability && previousCapability) {
+    if (!capability && previousCapabilities.length) {
       const survivor=[...runs.values()].find(record=>record.state==='running'&&current(record.lease.request)&&compatiblePrevious(record))
       if (survivor) {
         // One fresh manager/harness proof before adopting identical surviving children.
         // Keep the old capability as migration provenance if startup is interrupted.
-        if (!fs.existsSync(priorFile)) writePrivateAtomic(priorFile,JSON.stringify(previousCapability)+'\n')
+        const previous=previousFor(survivor),archive=path.join(o.directory,`previous-controller-capability-${survivor.pins.adapterSha256}.json`)
+        if (!previous) throw executionHttpError('execution-capability-required','capability')
+        if (fs.existsSync(archive)) { assertPrivatePath(archive); if (!isDeepStrictEqual(JSON.parse(fs.readFileSync(archive,'utf8')),previous)) throw executionHttpError('execution-capability-required','capability') }
+        else writePrivateAtomic(archive,JSON.stringify(previous)+'\n')
         await verifyPinned(survivor.lease.request.ownerId)
       }
     }
@@ -209,7 +220,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       } catch { /* Hold survives; dispatch remains paused until the owner context can be proved. */ }
     }
   }
-  function ensure(): Promise<void> { return initialization ??= initialize().catch(error => { server?.close(); storage?.close(); throw error }) }
+  function ensure(): Promise<void> { return initialization ??= initialize().catch(error => { binaryPin?.close(); server?.close(); storage?.close(); throw error }) }
   async function verify(ownerId: string): Promise<BridgeTargetCapability> {
     await ensure()
     return verifyPinned(ownerId)
@@ -276,7 +287,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   function cachedCapability() {
     if (!capability || !pins || !o.host?.inspect || !o.host.current || closed || Date.now() - Date.parse(capability.endpointProof.verifiedAt) > 86_400_000) throw executionHttpError('execution-capability-required', 'capability')
     const currentHash = createHash('sha256').update(PIN_FILES.map(file => hash(path.join(import.meta.dirname, file))).join(':')).digest('hex')
-    if (currentHash !== pins.adapterSha256 || !claude || hash(claude) !== claudeHash) throw executionHttpError('execution-capability-required', 'capability')
+    if (currentHash !== pins.adapterSha256 || !claude || !binaryPin || binaryPin.sha256 !== claudeHash) throw executionHttpError('execution-capability-required', 'capability')
+    binaryPin.assertCurrent()
     storage!.assertExclusiveWriter()
     o.host.current()
     return { capability, pins }
@@ -410,16 +422,16 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   }
   return { ensure, verify, start, observe, broker, cachedCapability, matches, ended, adopt,
     get storage() { return storage },
-    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); storage?.close() } }
+    close() { closed = true; clearInterval(cleanupTimer); retirementWork.close(); ownership.close(); hostLifetime.abort(); lifetime.abort(); server?.closeAllConnections(); server?.close(); binaryPin?.close(); storage?.close() } }
 }
 
 interface ObservedProcess { pid: number; ppid: number; created: number; file: string; command: string }
 function processes(proxy: number, child: number, host: number, port: number): Promise<{ rows: ObservedProcess[]; listener: boolean }> {
   for (const value of [proxy, child, host, port]) if (!Number.isSafeInteger(value) || value <= 0) return Promise.reject(new Error('Invalid process observation'))
-  const script = `$p=@(${proxy},${child},${host});$r=@(Get-CimInstance Win32_Process | Where-Object {$p -contains $_.ProcessId} | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath;command=$_.CommandLine}});$l=@(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Where-Object {$_.LocalAddress -eq '127.0.0.1' -and $_.OwningProcess -eq ${proxy}});@{rows=$r;listener=($l.Count -eq 1)} | ConvertTo-Json -Depth 4 -Compress`
+  const script = `$r=@(Get-CimInstance Win32_Process -Filter 'ProcessId=${proxy} OR ProcessId=${child} OR ProcessId=${host}' | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();file=$_.ExecutablePath;command=$_.CommandLine}});@{rows=$r} | ConvertTo-Json -Depth 4 -Compress`
   return new Promise((resolve, reject) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     { encoding: 'utf8', timeout: 10_000, windowsHide: true, maxBuffer: 1024 * 1024 }, (error, stdout) => {
       if (error) return reject(new Error('Physical runtime ownership is unavailable'))
-      try { resolve(JSON.parse(stdout)) } catch { reject(new Error('Physical runtime ownership is invalid')) }
+      try { resolve({ ...JSON.parse(stdout), listener: ownsLoopbackListener(proxy,port) }) } catch { reject(new Error('Physical runtime ownership is invalid')) }
     }))
 }
