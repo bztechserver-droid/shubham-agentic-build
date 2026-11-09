@@ -310,6 +310,34 @@ export class ExecutionIntentLedger {
     return [...this.entries.values()].filter(entry => entry.kind === 'open' && entry.state === 'uncertain'
       && scopeDigest(entry.scope) === digest).map(entry => entry.id)
   }
+  uncertainSelectionIds(scope: ExecutionIntentScope): readonly string[] {
+    this.check()
+    const digest = scopeDigest(requireIntentScope(scope))
+    return [...this.entries.values()].filter(entry => entry.kind === 'selection' && ['prepared', 'uncertain'].includes(entry.state)
+      && scopeDigest(entry.scope) === digest).map(entry => entry.id)
+  }
+  /** The floor store never rolls a committed stamp back. Its exact earlier WAL-backed stamp,
+   * unchanged binding and an unclaimed child prove this failed precommit never opened anything.
+   * Missing/foreign/newer stamps, lost commit acknowledgements and claimed opens stay fenced. */
+  refuseUncommittedSelection(expected: SelectionIntent, binding: ExecutionSnapshot, stamp: ExecutionCommitStamp): Promise<SelectionIntent> {
+    return this.serial(async () => {
+      const current = this.current(expected), prior = this.get(current.scope, stamp.selectionIntentId)
+      const child = current.plan ? this.get(current.scope, current.plan.stamp.openIntentId) : null
+      if (current.state !== 'uncertain' || current.reason !== 'execution-stale' || !current.plan
+        || !sameExecution(current.request.expected.execution, current.request.target) || current.request.rebuildHistory
+        || prior?.kind !== 'selection' || prior.state !== 'committed' || !prior.plan || prior.id === current.id
+        || prior.createdAtMs > current.createdAtMs || prior.updatedAtMs > current.createdAtMs
+        || executionDigest(prior.plan.stamp) !== executionDigest(stamp)
+        || child?.kind !== 'open' || child.state !== 'ready' || child.revision !== 1 || child.lease || child.actual || child.dimensions
+        || child.selectionIntentId !== current.id || child.runId !== current.plan.runId) throw executionHttpError('execution-intent-uncertain', 'status', current.id)
+      assertExecutionCAS(current.request.expected, binding)
+      assertExecutionCAS(prior.plan.binding, binding)
+      assertExecutionCAS(current.plan.binding, child.binding)
+      const now = this.options.now(), updated: SelectionIntent = { ...current, state: 'refused', revision: current.revision + 1, updatedAtMs: now }
+      await this.persist([updated, { ...child, state: 'refused', reason: 'execution-stale', revision: child.revision + 1, updatedAtMs: now }])
+      return this.get(current.scope, current.id) as SelectionIntent
+    })
+  }
   reserveSelection(scopeValue: ExecutionIntentScope, value: ExecutionSelectionRequest, admitUntilMs: number): Promise<{ created: boolean; record: SelectionIntent }> {
     return this.serial(async () => {
       const scope = requireIntentScope(scopeValue), request = requireExecutionSelectionRequest(value)

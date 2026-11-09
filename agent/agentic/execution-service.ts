@@ -191,11 +191,14 @@ export function createExecutionService(o: ExecutionServiceOptions) {
         assertExecutionCurrent: (scope, expected) => { actor(scope); assertExecutionCAS(expected, o.state(scope).binding) },
         readFloor: async scope => o.state(scope), resolveTarget: (scope, profile) => o.target(scope, profile),
         readTarget: async (scope, execution) => currentTarget(scope, execution), currentTarget,
-        withSourceFence: async (scope, expected, action) => {
+        withSourceFence: async (scope, expected, action, conversionRequired) => {
           actor(scope)
           if (active.size) throw executionHttpError('execution-intent-conflict', 'selection')
           let source: Awaited<ReturnType<typeof o.seal>>
-          try { source = await o.seal(scope, expected) } catch (error) { noteSelectionFailure(error, 'seal'); throw error }
+          // Ordinary resume reuses its native transcript. Only an actual conversion may stop,
+          // settle/hash/seal history; floor CAS, actor, storage and runtime proofs remain mandatory.
+          try { source = conversionRequired ? await o.seal(scope, expected) : { assertCurrent() {}, finish() {} } }
+          catch (error) { noteSelectionFailure(error, 'seal'); throw error }
           const file = o.floorFile(scope), context: FenceState = { scope, expected, next: null, source, floorFile: file, floorHash: sourceHash(file) }
           active.set(key(scope), context)
           const finishSource = (committed: boolean, changed: boolean) => {
