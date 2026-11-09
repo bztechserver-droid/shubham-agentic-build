@@ -2351,7 +2351,9 @@
     "said": "Now proposing a major change in the agent chat. When the agent chat window becomes too small, we have two selects, right? Now we have to merge them.\n\nOn any screen we have to have only one dropdown and that dropdown should have floors on the same floor, meaning this floor, which is already selected. That shows all the chats on the same floor and then there should be options to select floors there only. Once we select a floor, it gives you the option of chat, right?\n\nThe steps should be:\n1. This floor\n2. Change floor\n\nOnce you change floor, it gives you the option to select the floor. You select the floor and after that you select the agent. That is how it should be. Please make that, give it to someone, and you become free. Okay.",
     "added": "2026-11-08",
     "notes": [
-      "2026-11-08 Lead: Delegated to Web, private fresh Dev snapshot, one dropdown This floor chats / Change floor -> floor -> agent. Keyboard/back/cancel and zero browsing side effects; preserve native/history/drafts and all screen widths. Private artifact C:/saw/unified-chat-selector-20261108. Browser work paused for human-priority PCControl tab amendment. NOT integrated or published."
+      "2026-11-08 Lead: Delegated to Web, private fresh Dev snapshot, one dropdown This floor chats / Change floor -> floor -> agent. Keyboard/back/cancel and zero browsing side effects; preserve native/history/drafts and all screen widths. Private artifact C:/saw/unified-chat-selector-20261108. Browser work paused for human-priority PCControl tab amendment. NOT integrated or published.",
+      "2026-11-09 Shubham:  please merge the Flow and the Agent tab into one. Once I click Select there should be a tab over there for what I want to select. The default tab should be the current flow and it should have all the chats of the current flow.\n\nOn the top right there should be a tab for Other Flows and when I click on that I can choose it. After selecting the flow I can choose an agent. I want that in the chat system, in the agents.\n\nCurrently there are two Select buttons which I don't want. I want them to be merged into a single Select button.",
+      "2026-11-09 Lead: Reaffirmed F155 implementation, not a duplicate feature. Exactly one Select trigger per Agents chat pane; default tab shows current flow/floor chats, top-right Other Flows tab lists authorized other flows then that flow's agents. Browsing/cancel must not switch panes, start/stop chats or change native/session/history/ownership. Current implementation/handoff and guards being rechecked with Web; no publication or Update requested."
     ],
     "done": null,
     "doneNote": ""
@@ -2484,7 +2486,20 @@
     "title": "Dependencies page: what Codex in Claude needs on each PC",
     "said": "Please create a route called `dependencies` and in that, in the dependency, mention all the dependencies that are required so that the provision is shown. The error that comes should not show. If, let's say, I start Codex in Claude on another computer, then how do I make sure it doesn't come on that computer? What are the required dependencies and what is the reason because of which it can show? Please show that.",
     "added": "2026-11-09",
-    "notes": [],
+    "notes": [
+      "2026-11-09 Fix other PCS: built (agent/agentic/dependencies.ts, shared/dependencies.ts, src/pages/Dependencies.tsx, GET /agentic/dependencies, owner-only), published in build 2026.11.09-2300; tick after Shubham sees it after his Update."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-166",
+    "title": "Make Codex in Claude as fast as a plain Claude session",
+    "said": "How do we make Claude in Codex faster? Currently it's very slow as compared to a pure Claude session. How do we make it faster? Can you think and tell me and then just implement it because it runs very slow as compared to a normal Claude session?",
+    "added": "2026-11-09",
+    "notes": [
+      "2026-11-09 Fix other PCS: measured over 12 h of transcripts: Codex in Claude median 19.3 s per model call (p90 43 s) vs plain Claude 3.1 s (p90 13.8 s), both at max effort. The app's own per-step check is ~0.76 s (a PowerShell process query); the rest is the provider. The bridge dropped Sol's reasoning between steps (Codex carries it encrypted), sent no prompt-cache key (0% cache reads vs 100% for Claude) and showed nothing until a reply was complete. Building in C:/saw/api400-20261109/work: reasoning carried within a turn (account-bound), prompt_cache_key, live text after a Sol/max-confirmed response.created (tool calls still wait for the validated completion), kernel process check between full proofs, per-request timings in request-timings.json. Model and max effort unchanged."
+    ],
     "done": null,
     "doneNote": ""
   }
