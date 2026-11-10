@@ -2528,6 +2528,46 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-167",
+    "title": "A stable, simple chat input separate from the loading status",
+    "said": "one more thign to cahgne is that the input bar keep on showing on the loading part\nCrystallizing… (2m 37s · ↓ 4.0k tokens)  in yellow keeps on going here and there please fix it",
+    "added": "2026-11-10",
+    "notes": [
+      "2026-11-10 (Lead): Shubham added, verbatim: \"also check the agentic claude manger that has a simple input bar liek normal word and all can we implement that as well in this please\"",
+      "2026-11-10 (Lead): Development requested. Compare Agentic Claude Manager's existing plain input read-only; diagnose the yellow loading-line/input movement rather than assuming its cause. Keep typing and loading-status rendering separate and stable, with ordinary text editing and preserved drafts, attachments, focus, keyboard/IME and existing send/interrupt safety. No full word-processor ribbon or unrelated feature expansion inferred. Coordinate Web/terminal ownership; private implementation and reviewed acceptance before a shared-source merge. No publication or Update requested."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-168",
+    "title": "One common MCP management route for Claude, Codex and Codex in Claude Code",
+    "said": "can you please start implmeneting the mcp route in the application please its better so we cna have common place for all mcps and it gets instally globally and can be used in claude codex or codex in claude code",
+    "added": "2026-11-10",
+    "notes": [
+      "2026-11-10 (Lead): Original human request independently read from Special's saved conversation at 2026-11-10T06:42:15.832Z. This is the requested common in-app place for MCP management across engines; implementation scope and secret-safe configuration/install behavior must be reviewed separately.",
+      "2026-11-10 (Lead): Shubham repeated the request, verbatim: can you please start implmeneting the mcp route in the application please its better so we cna have common place for all mcps and it gets instally    \n  globally and can be used in claude codex or codex in claude code",
+      "2026-11-10 (Special/Lead): Common MCP work is private and separate from the urgent Add Agent regression. No code, global package installation, live engine configuration, credentials, publication or Update is authorized by this log entry or the Add Agent merge slot."
+    ],
+    "done": null,
+    "doneNote": ""
+  },
+  {
+    "id": "F-169",
+    "title": "Add and edit a healthy new agent without an unrelated sibling's uncertain operation blocking it",
+    "said": "stop whatever your doing form nwo your only job is starting chats \nim in such a big toruble \ni went to add agent no matter what engine \nThe operation outcome is uncertain. Observe this same operation.\nso now i wont try to create chats my self ok give your work to someone else",
+    "added": "2026-11-10",
+    "notes": [
+      "2026-11-10 (Lead): Shubham added, verbatim: stop whatever your doing form nwo your only job is starting chats \nim in such a big toruble \ni went to add agent no matter what engine \nThe operation outcome is uncertain. Observe this same operation.\nso now i wont try to create chats my self ok give your work to someone else\njust open a new claude chat for me and hadnover this process of fixing to another chat special and make it full codex and give me new claude chat here please",
+      "2026-11-10 (Special/Lead): The human messages above were independently read in Fix other PCS's saved conversation at 2026-11-10T06:48:01.364Z and 2026-11-10T06:48:50.438Z. The chat-opening/handover instruction was directed to that chat, not fresh publication or process-recovery permission from this review.",
+      "2026-11-10 (Special/Lead): Root cause reproduced privately in the actual frontend store/coordinator with mocked UI/auth/network: patchFloor blocked every agent-array save when any sibling had an unresolved execution operation; the Add acknowledgement also was not hydrated before its editor when the live floor push was late. v1 was held for equal-timestamp and stale-identity acknowledgement hazards; v2 fixes those narrowly without deleting, editing or replaying the unresolved operation.",
+      "2026-11-10 (Lead): Guarded two-path DEV-ONLY integration applied at 07:15:34Z: src/agentic/store.ts and src/agentic/execution-choice-ui.test.mjs. Independent private focused tests 151/151 plus backend guards 34/34, app types and deny-warnings lint exit 0. Exact frozen/preimage/postimage guards reviewed. Target changes/removal/duplicate and existing CAS/ACL/unknown-outcome fences remain; unchanged siblings stay exactly once and byte-equivalent. Source-level mocked evidence is not a physical-browser/native-provider test.",
+      "2026-11-10 (Lead): Not published or installed by this task. The historical browser-local uncertain operation was not read or cleared; no automatic retry, native fallback, stranded-process stop/reopen, history or credential changes. Common MCP and F167 input-bar work remain separate."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
