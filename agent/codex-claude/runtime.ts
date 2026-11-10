@@ -15,11 +15,11 @@ import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
 import { bridgeConversationKey, fromResponses, providerFailureSummary, reasoningTag, recordedProviderFailure, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
-import { readChildConfig, type BridgeChildConfig } from './child.ts'
+import { CUT_HEADER, RUN_VERDICT_HEADER, readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
-import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
-import { CLAUDE_CODE_ENDED, endedByClaudeCode, requestFailureSummary, type RequestPhase } from './request-failure.ts'
+import { openMessage, pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
+import { CLAUDE_CODE_ENDED, endedByClaudeCode, keepsRunOpen, requestFailureSummary, type OpenReason, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
@@ -457,7 +457,11 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     return { capability, pins }
   }
   async function handleProvider(req: http.IncomingMessage, res: http.ServerResponse) {
-    const fail = () => { if (!res.headersSent) res.writeHead(400, { 'content-type': 'application/json', 'x-should-retry': 'false' }); res.end(JSON.stringify({ error: 'The approved Codex execution is paused. No provider retry or fallback was made.' })) }
+    // `open`: the run is not paused (the child gateway is told, and passes this message on instead of pausing).
+    const fail = (open?: OpenReason | null) => {
+      if (!res.headersSent) res.writeHead(400, { 'content-type': 'application/json', 'x-should-retry': 'false', ...(open ? { [RUN_VERDICT_HEADER]: 'open' } : {}) })
+      res.end(JSON.stringify(open ? { type: 'error', error: { type: 'api_error', message: openMessage(open) } } : { error: 'The approved Codex execution is paused. No provider retry or fallback was made.' }))
+    }
     const match = /^\/bridge\/([A-Za-z0-9_-]{16,128})\/v1\/messages(\/count_tokens)?$/.exec(req.url ?? '')
     if (req.method !== 'POST' || req.headers.origin !== undefined || !match || !broker) return fail()
     const probe = probes.get(match[1])
@@ -496,6 +500,15 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const key = req.headers.authorization, expected = `Bearer ${config.controllerKey}`
     if (typeof key !== 'string' || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) return fail()
     if (record.dispatchPaused) return fail()
+    // The child gateway lost its controller with a request in flight (hub restart, Update) and has refused that request ever
+    // since: recorded here as this run's last failure, so it is visible; the run itself was never paused for it.
+    const cutAt = req.headers[CUT_HEADER]
+    if (typeof cutAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(cutAt)) {
+      try {
+        writePrivateAtomic(path.join(o.directory, `${record.runId}.failure.json`), JSON.stringify({ version: 1, at: cutAt, runId: record.runId,
+          phase: 'gateway', stage: 'transport', category: 'controller-lost', outcome: 'unknown', paused: false, recovery: 'new-message', reportedAt: new Date().toISOString() }) + '\n')
+      } catch { /* Diagnostics never change a request. */ }
+    }
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
     // Claude Code ending its own request aborts with CLAUDE_CODE_ENDED, so the cause stays known (request-failure.ts).
     const claudeCodeEnded = () => abort.abort(CLAUDE_CODE_ENDED)
@@ -559,10 +572,14 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       // A request Claude Code ended (Esc, a stopped background task) does not pause the chat, but only when that end is provably
       // what stopped it (request-failure.ts); every other failure pauses, as before.
       const ended = endedByClaudeCode({ outer: signal, phase, dispatched: providerDispatched, inner: providerSignal, cause: providerFailure, provider: providerRecord, error })
-      if (!ended) pause(record)
+      // 10 Nov 2026: two causes no longer pause (request-failure.ts keepsRunOpen): an unanswered CRM login check before anything
+      // was sent, and this controller stopping (hub restart, Update). Every other failure pauses, as before.
+      const open = ended ? null : keepsRunOpen({ phase, dispatched: providerDispatched, error, stopping: lifetime.signal.aborted || hostLifetime.signal.aborted })
+      const paused = !ended && !open
+      if (paused) pause(record)
       const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
       const diagnostic={version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,
-        phase,...(providerDispatched?{progress}:{}),...failure,paused:!ended,...(ended?{endedBy:'claude-code'}:{}),
+        phase,...(providerDispatched?{progress}:{}),...failure,paused,...(ended?{endedBy:'claude-code'}:{}),...(open?{open}:{}),
         // What the adapter itself saw (e.g. the HTTP status) when that differs from the cancellation recorded above.
         ...(providerRecord&&providerRecord.stage!=='transport'?{provider:providerRecord}:{})}
       try {
@@ -570,7 +587,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         writePrivateAtomic(path.join(o.directory,`${record.runId}.failure.json`),bytes)
         writePrivateAtomic(path.join(o.directory,'last-provider-failure.json'),bytes)
       } catch { /* Pause remains latched even when diagnostics cannot be saved. */ }
-      if(pending)pending.fail(failure);else fail()
+      if(pending)pending.fail(failure,open);else fail(open)
     }
   }
   function matches(binding: ExecutionSnapshot, runId?: string): boolean {

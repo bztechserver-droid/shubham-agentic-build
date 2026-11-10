@@ -2,10 +2,15 @@ import type { ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { BRIDGE_MODEL } from '../../shared/chat-execution.ts'
 import { blockEvents, messageEndEvents, messagesEvents, sseEvent, type AdapterReply, type LiveSink } from './adapter.ts'
-import type { RequestFailureSummary } from './request-failure.ts'
+import type { OpenReason, RequestFailureSummary } from './request-failure.ts'
+import { RUN_VERDICT_HEADER } from './child.ts'
 
 export const BRIDGE_REQUEST_TIMEOUT_MS = 10 * 60_000
 const PING_MS = 15_000
+/** A failure that leaves the run open: what happened, and that the next message goes through. Nothing was retried. */
+export const openMessage = (open: OpenReason) => open === 'validation-unanswered'
+  ? 'Codex in Claude Code: the ChatGPT login could not be confirmed with the CRM in time (this PC is very busy), so nothing was sent. Send your message again in a moment; nothing was retried.'
+  : 'Codex in Claude Code: the app restarted while this reply was being written. That request is not sent again (its result is unknown). Send a new message to continue; nothing was retried.'
 const errorMessage = (summary?: RequestFailureSummary) => {
   const reason = summary?.stage === 'authorization' ? 'Authorization for this execution is no longer current.'
     : summary?.stage === 'runtime' ? 'This execution no longer has current runtime proof.'
@@ -65,11 +70,12 @@ export function pendingMessages(res: ServerResponse, streaming: boolean) {
       liveOpen = false
     },
   } : undefined
-  const fail = (summary?: RequestFailureSummary) => {
+  /** `open`: the run is NOT paused (the gateway is told so it does not pause either); the message says what to do. */
+  const fail = (summary?: RequestFailureSummary, open?: OpenReason | null) => {
     cleanup()
     if (res.destroyed || res.writableEnded) return
-    const error = { type: 'error', error: { type: 'api_error', message: errorMessage(summary) } }
-    if (!streaming) res.writeHead(summary?.category === 'timeout' ? 504 : 502, { 'content-type': 'application/json', 'x-should-retry': 'false' })
+    const error = { type: 'error', error: { type: 'api_error', message: open ? openMessage(open) : errorMessage(summary) } }
+    if (!streaming) res.writeHead(summary?.category === 'timeout' ? 504 : 502, { 'content-type': 'application/json', 'x-should-retry': 'false', ...(open ? { [RUN_VERDICT_HEADER]: 'open' } : {}) })
     res.end(streaming ? `event: error\ndata: ${JSON.stringify(error)}\n\n` : JSON.stringify(error))
   }
   return {

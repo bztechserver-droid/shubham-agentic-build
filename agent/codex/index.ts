@@ -7,6 +7,7 @@ import * as crmApi from './crm.ts'
 import type { CodexCredential, WriteBack } from './crm.ts'
 import { codexPaths, hasLogin, placeLogin, readLogin, readSidecar, removeLogin, writeBase, writeSidecar, type CodexPaths } from './home.ts'
 import { BRIDGE_VALIDATION_CADENCE_MS, BRIDGE_VALIDATION_TIMEOUT_MS, BRIDGE_VALIDATION_MAX_AGE_MS,
+  BRIDGE_VALIDATION_RETRY_MS, BRIDGE_VALIDATION_RETRIES, bridgeCredentialFailureCode,
   bridgeCredentialError, requireBridgeContext, sameBridgeCredential, type BridgeCredentialCode,
   type ManagedBridgeSource, type ManagerBridgeContext } from './bridge-credentials.ts'
 import type { BridgeRequestAuthorization } from '../codex-claude/contract.ts'
@@ -144,12 +145,39 @@ export function createCodex(o: CodexOptions): CodexManager {
   type Validation = { active: boolean; authority: number; binding: string; controller: AbortController; timer: NodeJS.Timeout; done: Promise<void>; finish: () => void }
   let validation: Validation | null = null
   let validationNotBefore = 0
+  // 10 Nov 2026: a check that ran out of time (CRM slow on a loaded PC) was taken as a revocation and cut every running bridge
+  // request (Special and Memory, "active requests 2"). An unanswered check now proves nothing either way: it is retried soon
+  // (bounded); running requests continue; new ones are fenced only once the receipt itself is older than 60 s.
+  let inconclusive = 0, lastCheck: 'ok' | 'inconclusive' | 'definitive' | null = null
+  let retryTimer: NodeJS.Timeout | null = null
+  const activeFlights = () => [...bridgeFlights.values()].reduce((count, flights) => count + flights.size, 0)
+  function noteInconclusive(why: 'validation-timeout' | 'validation-unavailable') {
+    inconclusive++; lastCheck = 'inconclusive'
+    const retry = inconclusive <= BRIDGE_VALIDATION_RETRIES
+    if (retry) {
+      validationNotBefore = Math.min(validationNotBefore, now() + BRIDGE_VALIDATION_RETRY_MS)
+      if (o.timers !== false && !retryTimer) { retryTimer = setTimeout(() => { retryTimer = null; void validateBridge() }, BRIDGE_VALIDATION_RETRY_MS); retryTimer.unref() }
+    }
+    try {
+      const until = bridgeReceipt ? new Date(bridgeReceipt.validationExpiresAtMs).toISOString() : 'none'
+      log.warn(`bridge: credential check inconclusive (${why}; attempt ${inconclusive}; ${activeFlights()} running requests continue; receipt valid until ${until}; ${retry ? `retry in ${BRIDGE_VALIDATION_RETRY_MS / 1000} s` : 'next regular check'})`)
+    } catch { /* Diagnostics cannot change credential authority. */ }
+  }
+  /** The receipt only aged past its 60 s: new requests wait for a fresh check; nothing running is cut, and the check that
+   * may be on its way is not cancelled (it is what renews the receipt). */
+  function staleBridge() {
+    if (!bridgeValidated && bridgeFailure === 'bridge-validation-stale') return
+    bridgeValidated = false; bridgeFailure = 'bridge-validation-stale'
+    try { log.warn(`bridge: credential receipt older than ${BRIDGE_VALIDATION_MAX_AGE_MS / 1000} s; new requests wait for a fresh CRM check; ${activeFlights()} running requests continue`) }
+    catch { /* Diagnostics cannot change credential authority. */ }
+  }
   const sessionEpoch = (s: CrmSession | null) => s ? createHash('sha256').update(JSON.stringify([s.url, s.user.id, s.signedInAt, s.cookie])).digest('hex') : null
   type BridgeInvalidationSource = 'manager-operation' | 'credential-integrity' | 'credential-validity' |
     'validation-timeout' | 'validation-rejected' | 'validation-unavailable' | 'manager-closed'
   function invalidateBridge(reason: BridgeCredentialCode, forget = false, source: BridgeInvalidationSource = 'manager-operation') {
-    const active = [...bridgeFlights.values()].reduce((count, flights) => count + flights.size, 0)
+    const active = activeFlights()
     const report = bridgeValidated || active > 0
+    lastCheck = 'definitive'
     bridgeValidated = false
     bridgeFailure = reason
     if (forget) bridgeReceipt = null
@@ -189,7 +217,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     }
     try { requireBridgeContext(candidate, s.user.id, now()) }
     catch { invalidateBridge('bridge-refresh-required'); return }
-    bridgeReceipt = Object.freeze(candidate); bridgeValidated = true
+    bridgeReceipt = Object.freeze(candidate); bridgeValidated = true; inconclusive = 0; lastCheck = 'ok'
     advanceBridgeAuthority()
   }
   function currentBridge(expected?: ManagerBridgeContext): ManagerBridgeContext | null {
@@ -204,7 +232,21 @@ export function createCodex(o: CodexOptions): CodexManager {
     if (expected && !sameBridgeCredential(receipt, expected)) return null
     if (!bridgeValidated) return null
     try { requireBridgeContext(receipt, receipt.ownerId, now()); return receipt }
-    catch { invalidateBridge(now() >= receipt.validationExpiresAtMs ? 'bridge-validation-stale' : 'bridge-refresh-required', false, 'credential-validity'); return null }
+    catch (error) {
+      if (bridgeCredentialFailureCode(error) === 'bridge-validation-stale' && now() >= receipt.validationExpiresAtMs) { staleBridge(); return null }
+      invalidateBridge(now() >= receipt.validationExpiresAtMs ? 'bridge-validation-stale' : 'bridge-refresh-required', false, 'credential-validity'); return null
+    }
+  }
+  /** For an operation already sent with `expected`: the same credential is still held, unchanged and not revoked. A receipt
+   * that only aged (validation stale, no definite answer) still holds; any definite revocation or change does not. */
+  function heldBridge(expected: ManagerBridgeContext): boolean {
+    const receipt = bridgeReceipt
+    if (closed || !receipt || !sameBridgeCredential(receipt, expected)) return false
+    if (!bridgeValidated && bridgeFailure !== 'bridge-validation-stale') return false
+    const s = o.session(), login = readLogin(paths), side = readSidecar(paths)
+    return !!s && sessionEpoch(s) === receipt.sessionEpoch && s.user.id === receipt.ownerId && !key && !waiting &&
+      !!login && login.sha256 === receipt.contentHash && !!side && side.sha256 === receipt.contentHash && side.userId === receipt.ownerId &&
+      side.subscriptionId === receipt.subscriptionId && side.baseRevision === receipt.revision
   }
   function validationBinding(): string {
     const login = readLogin(paths), side = readSidecar(paths)
@@ -221,7 +263,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     return !closed && validation === flight && flight.active && !flight.controller.signal.aborted && bridgeConsumers.size > 0
       && flight.authority === bridgeAuthority && flight.binding === validationBinding()
   }
-  function stopBridgeTimer() { if (bridgeTimer) clearInterval(bridgeTimer); bridgeTimer = null; cancelValidation() }
+  function stopBridgeTimer() { if (bridgeTimer) clearInterval(bridgeTimer); bridgeTimer = null; if (retryTimer) clearTimeout(retryTimer); retryTimer = null; cancelValidation() }
   function protectBridge(id: string) {
     if (closed || !/^bridge-[a-f0-9-]{36}$/.test(id)) throw bridgeCredentialError('bridge-lease-invalid')
     bridgeConsumers.add(id); leases.add(id)
@@ -245,7 +287,8 @@ export function createCodex(o: CodexOptions): CodexManager {
         if (validation !== flight || !flight.active) return
         const owns = ownsValidation(flight)
         flight.active = false; controller.abort()
-        if (owns) invalidateBridge('bridge-validation-stale', false, 'validation-timeout')
+        // No answer in time: unknown, not a revocation (see noteInconclusive). Its late answer is never applied.
+        if (owns) noteInconclusive('validation-timeout')
         finish()
       }, BRIDGE_VALIDATION_TIMEOUT_MS) }
       flight.timer.unref(); validation = flight
@@ -254,14 +297,15 @@ export function createCodex(o: CodexOptions): CodexManager {
       try { response = Promise.resolve(crm.credential(s, build, controller.signal)) } catch { response = Promise.reject(new Error('validation unavailable')) }
       void response.then(r => serial(async () => {
         if (!ownsValidation(flight)) return
-        if (now() < at || now() - at >= BRIDGE_VALIDATION_TIMEOUT_MS) {
-          invalidateBridge('bridge-validation-stale', false, 'validation-timeout'); return
-        }
+        // An answer from outside its own time window is not applied either way.
+        if (now() < at || now() - at >= BRIDGE_VALIDATION_TIMEOUT_MS) { noteInconclusive('validation-timeout'); return }
+        // A definite answer: the CRM no longer gives this person a ChatGPT login. That revokes, and cuts what is running.
         if (r.kind !== 'ok' || r.login.kind !== 'chatgpt') { invalidateBridge('bridge-credential-unavailable', true, 'validation-rejected'); return }
         // Normal manager ordering owns replacement. Never apply a stale response over a pending native refresh.
         await pull({ session: s, at, result: r })
       })).catch(() => serial(async () => {
-        if (ownsValidation(flight)) invalidateBridge('bridge-credential-unavailable', false, 'validation-unavailable')
+        // The CRM could not be reached or answered with an error: unknown, not a revocation.
+        if (ownsValidation(flight)) noteInconclusive('validation-unavailable')
       })).finally(() => {
         clearTimeout(flight.timer); flight.active = false; finish()
         if (validation === flight) validation = null
@@ -279,16 +323,26 @@ export function createCodex(o: CodexOptions): CodexManager {
         if (o.session()?.user.id !== ownerId) throw bridgeCredentialError('bridge-context-changed')
         return { context: currentBridge() }
       })
-      if (!found.context) await validateBridge()
+      // Nothing is sent yet, so this request may wait for the check (bounded): an unanswered check is tried again a few times
+      // (the check only, never a model request). Only then is the request refused, with the visible reason.
+      if (!found.context) {
+        for (let attempt = 0; attempt <= BRIDGE_VALIDATION_RETRIES; attempt++) {
+          await validateBridge()
+          if (await serial(async () => currentBridge() !== null || closed || !bridgeConsumers.has(id) || lastCheck !== 'inconclusive')) break
+          const wait = validationNotBefore - now()
+          if (wait > 0 && o.timers !== false) await new Promise<void>(resolve => { setTimeout(resolve, Math.min(wait, BRIDGE_VALIDATION_RETRY_MS)).unref() })
+        }
+      }
       return serial(async () => {
         if (!bridgeConsumers.has(id)) throw bridgeCredentialError('bridge-lease-invalid')
         const context = currentBridge()
-        if (!context) throw bridgeCredentialError(bridgeFailure)
+        if (!context) throw bridgeCredentialError(lastCheck === 'inconclusive' ? 'bridge-validation-stale' : bridgeFailure)
         if (context.ownerId !== ownerId) throw bridgeCredentialError('bridge-context-changed')
         return context
       })
     },
     current: (id, expected) => bridgeConsumers.has(id) ? currentBridge(expected) : null,
+    held: (id, expected) => bridgeConsumers.has(id) && heldBridge(expected),
     async use(id, expected, send, signal) {
       const controller = new AbortController(), combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
       let invoked = false
@@ -310,7 +364,8 @@ export function createCodex(o: CodexOptions): CodexManager {
           return { result: send(guarded, combined) }
         })
         const result = await envelope.result
-        if (combined.aborted || !bridgeConsumers.has(id) || !currentBridge(expected)) throw bridgeCredentialError('bridge-dispatch-unknown')
+        // Sent with a current receipt; a receipt that only aged meanwhile (slow CRM) does not discard the completed reply.
+        if (combined.aborted || !bridgeConsumers.has(id) || !heldBridge(expected)) throw bridgeCredentialError('bridge-dispatch-unknown')
         return result
       } catch (error) {
         if (invoked) throw bridgeCredentialError('bridge-dispatch-unknown')
@@ -333,7 +388,9 @@ export function createCodex(o: CodexOptions): CodexManager {
 
   const iso = () => new Date(now()).toISOString()
   const set = (outcome: Outcome | 'ok', hint: string | null = null) => {
-    if (outcome !== 'ok') invalidateBridge('bridge-credential-unavailable')
+    // A CRM that cannot be reached or answers with an error says nothing about the credential (it is the same unknown as an
+    // unanswered check): bridge authority keeps its own 60 s receipt. A definite answer (signed out, no subscription) revokes.
+    if (outcome !== 'ok' && outcome !== 'crm-offline' && outcome !== 'error') invalidateBridge('bridge-credential-unavailable')
     if (lastOutcome === outcome && outcomeHint === hint) return
     lastOutcome = outcome
     outcomeHint = hint

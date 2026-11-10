@@ -40,6 +40,20 @@ export function endedByClaudeCode(o: { outer: AbortSignal; phase: RequestPhase; 
   return false
 }
 
+/** Why a failed request that Claude Code did not end leaves its run open (not paused). Nothing is retried either way.
+ * - 'validation-unanswered': nothing was sent, and the only reason is that the CRM login check went unanswered (timeout or CRM
+ *   unreachable, retried a bounded number of times first): refused with that reason; the next message goes through once the
+ *   check answers. A definite answer (revoked, changed, signed out) still pauses.
+ * - 'controller-stopping': the controller itself is stopping (hub restart, Update). The request's result is unknown, so it is
+ *   never sent again (the child gateway refuses exactly that request); a message with new content may continue the chat.
+ * 10 Nov 2026: Special and Memory paused at 16:38 on an unanswered check (94% CPU), Special at the 15:16 and 16:56 Updates. */
+export type OpenReason = 'validation-unanswered' | 'controller-stopping'
+export function keepsRunOpen(o: { phase: RequestPhase; dispatched: boolean; error: unknown; stopping: boolean }): OpenReason | null {
+  if (o.stopping) return 'controller-stopping'
+  if (!o.dispatched && o.phase === 'authorization' && bridgeCredentialFailureCode(o.error) === 'bridge-validation-stale') return 'validation-unanswered'
+  return null
+}
+
 /** Classify only app-owned codes and adapter-whitelisted metadata. Never copy an error's
  * message, cause, body, headers, request, credentials, or arbitrary fields to diagnostics.
  */

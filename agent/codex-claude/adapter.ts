@@ -84,6 +84,21 @@ function contentBlocks(value: unknown): Array<Record<string, unknown>> {
   if (typeof value === 'string') return [{ type: 'text', text: value }]
   return array(value).map(record)
 }
+/** A Claude Code tool result as Codex sends a tool output. Text only stays one string, exactly as before. A result holding
+ * images (a screenshot, an image file that was Read) becomes the content-item list native Codex 0.163 sends to the same
+ * endpoint: input_text and input_image (detail high), in order (10 Nov 2026: Web paused on screenshots in its history).
+ * Anything else (a PDF document, unknown blocks) is still refused before dispatch, never turned into fabricated text. */
+function toolOutput(value: unknown): string | Array<Record<string, unknown>> {
+  if (typeof value === 'string') return value
+  const parts = contentBlocks(value ?? []).map(part => {
+    if (part.type === 'text') return { type: 'input_text', text: text(part.text) }
+    if (part.type === 'tool_reference' && typeof part.tool_name === 'string') return { type: 'input_text', text: `Available tool: ${part.tool_name}` }
+    if (part.type === 'image') return { ...image(part), detail: 'high' }
+    return refused()
+  })
+  if (parts.every(part => part.type === 'input_text')) return parts.map(part => part.text).join('\n')
+  return parts.filter(part => part.type !== 'input_text' || part.text !== '')
+}
 
 /** Every request, including small/secondary/compaction calls, is explicitly Sol/max.
  * `cacheKey`: one per conversation, so the endpoint keeps reusing its cached prefix (Codex sends its conversation id).
@@ -129,13 +144,7 @@ export function toResponses(value: unknown, options: { cacheKey?: string; carryR
         flush(); emit({ type: 'function_call', call_id: text(block.id), name: text(block.name), arguments: JSON.stringify(record(block.input)) })
       } else if (block.type === 'tool_result' && message.role === 'user') {
         flush()
-        const result = typeof block.content === 'string' ? block.content : contentBlocks(block.content ?? []).map(part => {
-          if (part.type === 'text') return text(part.text)
-          if (part.type === 'tool_reference' && typeof part.tool_name === 'string') return `Available tool: ${part.tool_name}`
-          // File/image tool results remain explicit, and are not turned into fabricated text.
-          return refused()
-        }).join('\n')
-        input.push({ type: 'function_call_output', call_id: text(block.tool_use_id), output: result })
+        input.push({ type: 'function_call_output', call_id: text(block.tool_use_id), output: toolOutput(block.content) })
       } else if (block.type === 'redacted_thinking' && scope && carriedReasoning(block.data)) {
         // Sent only if it belongs to the account that will be used (sendResponses compares the tag); never serialized itself.
         const carried = carriedReasoning(block.data)!

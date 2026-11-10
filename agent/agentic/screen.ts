@@ -77,7 +77,15 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
     else y++
   }
   function put(ch: string) {
-    if (noWidth(ch)) return
+    if (noWidth(ch)) {
+      // Zero-width is not absent text. Keep accents/selectors/joiners on their
+      // preceding cell, including at the wrap margin and across PTY chunks.
+      // Cap a cell's payload; truncation fails ownership closed, not by
+      // deleting the same characters from the expected message.
+      const previous = wrapNext ? x : x - 1
+      if (previous >= 0 && cells[y][previous].length < 128) cells[y][previous] += ch
+      return
+    }
     if (wrapNext) {
       x = 0
       lineFeed()

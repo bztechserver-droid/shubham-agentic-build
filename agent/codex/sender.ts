@@ -6,6 +6,8 @@ const PASTE_END = '\u001b[201~'
 export interface SenderIO {
   write(data: string): boolean
   lines(): string[]
+  /** A non-Codex TUI adapter has already proved its own box/menu boundaries. */
+  frame?(lines: string[]): { menu: boolean; composer: { text: string; collapsed: boolean } | null }
   sleep(ms: number): Promise<void>
   /** External keystrokes invalidate paste ownership, even if they empty the composer. */
   interrupted?(): boolean
@@ -38,12 +40,14 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   const expired = () => Date.now() >= deadline || slept >= timeoutMs
   const sleep = async (ms: number) => { const wait = Math.max(0, Math.min(ms, timeoutMs - slept, deadline - Date.now())); await io.sleep(wait); slept += wait }
   const read = () => { try { return io.lines() } catch { return null } }
+  const menu = (lines: string[]) => io.frame ? io.frame(lines).menu : menuOnScreen(lines)
+  const input = (lines: string[]) => io.frame ? io.frame(lines).composer : composer(lines)
   const blocked = (reason: DeliveryBlockReason): SendResult => { io.onBlocked?.(reason); return 'blocked' }
   const before = read()
   if (!before) return io.gone?.() ? 'gone' : blocked('screen-unavailable')
-  if (menuOnScreen(before)) return blocked('menu')
+  if (menu(before)) return blocked('menu')
   if (io.interrupted?.()) return blocked('input-changed')
-  const initial = composer(before)
+  const initial = input(before)
   if (!initial) return blocked('composer-unavailable')
   if (initial.text) return blocked('draft')
   const pasted = text.split(PASTE_END).join('')
@@ -52,9 +56,9 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   if (io.beforeInput && !(await io.beforeInput('paste').catch(() => false))) return blocked('authorization-revoked')
   if (io.interrupted?.() || expired()) return 'unconfirmed'
   if (io.beforeInput) {
-    const ready = read(), c = ready && composer(ready)
+    const ready = read(), c = ready && input(ready)
     if (!ready) return blocked('screen-unavailable')
-    if (menuOnScreen(ready)) return blocked('menu')
+    if (menu(ready)) return blocked('menu')
     if (!c) return blocked('composer-unavailable')
     if (c.text) return blocked('draft')
   }
@@ -63,7 +67,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.interrupted?.() || expired()) { io.write(PASTE_END); return 'unconfirmed' }
     if (io.beforeInput && !(await io.beforeInput('paste').catch(() => false))) { io.write(PASTE_END); return 'unconfirmed' }
     if (io.interrupted?.() || expired()) { io.write(PASTE_END); return 'unconfirmed' }
-    if (io.beforeInput) { const current = read(); if (!current || menuOnScreen(current)) { io.write(PASTE_END); return 'unconfirmed' } }
+    if (io.beforeInput) { const current = read(); if (!current || menu(current)) { io.write(PASTE_END); return 'unconfirmed' } }
     let end = Math.min(offset + 1024, pasted.length)
     if (end < pasted.length && /[\uD800-\uDBFF]/.test(pasted[end - 1])) end--
     if (!io.write(pasted.slice(offset, end))) return 'gone'
@@ -73,10 +77,10 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   if (!io.write(PASTE_END)) return 'gone'
   const expected = normalized(pasted)
   const currentOwned = (lines: string[]) => {
-    const full = composer(lines)
+    const full = input(lines)
     if (full && (full.collapsed || normalized(full.text) === expected)) return full
     // Tail recognition requires external-input ownership tracking, never just a footer.
-    return io.interrupted ? ownedComposerTail(lines, pasted) : null
+    return !io.frame && io.interrupted ? ownedComposerTail(lines, pasted) : null
   }
   let previous: string | undefined
   let ownedText: string | undefined
@@ -87,7 +91,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.interrupted?.() || expired()) return 'unconfirmed'
     const lines = read()
     if (!lines) return io.gone?.() ? 'gone' : 'unconfirmed'
-    if (menuOnScreen(lines)) return 'unconfirmed'
+    if (menu(lines)) return 'unconfirmed'
     const c = currentOwned(lines)
     if (c && previous === c.text) { settled = true; ownedText = c.text; break }
     previous = c?.text
@@ -97,14 +101,14 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.interrupted?.() || expired()) return 'unconfirmed'
     const lines = read()
     if (!lines) return attemptedEnter ? 'unconfirmed' : io.gone?.() ? 'gone' : 'unconfirmed'
-    if (menuOnScreen(lines)) return 'unconfirmed'
+    if (menu(lines)) return 'unconfirmed'
     const c = currentOwned(lines)
     if (!c || c.text !== ownedText) return 'unconfirmed'
     if (io.beforeInput && !(await io.beforeInput('submit').catch(() => false))) return 'unconfirmed'
     // Network authorization may have yielded while a person typed or a prompt changed.
     if (io.interrupted?.() || expired()) return 'unconfirmed'
     const fresh = read()
-    if (!fresh || menuOnScreen(fresh) || currentOwned(fresh)?.text !== ownedText) return 'unconfirmed'
+    if (!fresh || menu(fresh) || currentOwned(fresh)?.text !== ownedText) return 'unconfirmed'
     attemptedEnter = true
     if (!io.write('\r')) return 'unconfirmed'
     // Submit redraws can temporarily erase the whole input box. Observe for a
@@ -117,8 +121,8 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
       if (io.interrupted?.() || expired() || io.gone?.()) return 'unconfirmed'
       const after = read()
       if (!after) continue
-      if (menuOnScreen(after)) return 'unconfirmed'
-      const next = composer(after)
+      if (menu(after)) return 'unconfirmed'
+      const next = input(after)
       if (!next) continue
       if (!next.text) return 'sent'
       if ((!next.collapsed && normalized(next.text) !== expected) || next.text !== ownedText) return 'unconfirmed'

@@ -23,14 +23,19 @@ export const RETIRED_CONTROLLERS = Object.freeze([PREVIOUS_CONTROLLER_SHA256,
   // Build 2026.11.10-1102 (F-166 v9, cache).
   '518ef63f8d5c2882b94739c4bea9c417922023e0e084998586a7a8e0f24df697',
   // Build 2026.11.10-1140 (cancel-pause v10, child 4bf487c8…): superseded before its children were carried on.
-  'ed6cc93b55462f22352a7789b4812a2739a390c0d3b61c32d1723cf3bf721c19'])
+  'ed6cc93b55462f22352a7789b4812a2739a390c0d3b61c32d1723cf3bf721c19',
+  // Builds 2026.11.10-1210 / -1514 / -1653 (cancel-pause v13, child 63fe0f33…).
+  '18f0332157312396c623951b125284bfd60af8143b87e00ea5a6b705c67d143d',
+  // The tool-result image fix (child 63fe0f33…, adopted 1210's children).
+  'ee5eb0e41c8ecda0011be7ca867b8c1e2cd0695d10ac44495ffad8aa9496b86f'])
 /** The controllers whose running children the next build adopts: only builds whose children run exactly UNCHANGED_CHILD_FILES.
- * Empty now: child.ts changed (a request Claude Code ends itself no longer pauses the gateway), so no earlier child is
- * identical, and those chats are stopped and reopened once at that Update. The build after it lists this build's controller. */
+ * Empty now: child.ts changed (a lost controller no longer pauses the gateway for good; the cut request alone stays refused),
+ * so no earlier child is identical, and those chats are stopped and reopened once at that Update. The build after it lists
+ * this build's controller. */
 export const PREVIOUS_CONTROLLERS: readonly string[] = Object.freeze([])
 /** The exact child sources the adopted children run (checked against these files on disk at every start). */
 export const UNCHANGED_CHILD_FILES = Object.freeze({
-  'child.ts':'63fe0f3330d0dd08fa46432a2af6cee63d57bba4463b4018fa7978e01c517c83',
+  'child.ts':'40342aa55e547065cf92e1e4c1acab060549d8388eab77c4aa9e7565152ec50e',
   'storage.ts':'b14908415eab7477a79bac9d6818bd2408686b83fc9f2f4e7ff46e3e0eae1835',
   '../../shared/chat-execution.ts':'b47a79cb321513dfad8482b98f242602bb92b886efee0b42b4b7b56fec6c51ef',
 })

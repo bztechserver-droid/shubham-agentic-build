@@ -2421,7 +2421,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. */
   const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void, actor?: Caller) =>
     typeInto(c, body, { confirmed: true, caller: actor }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
-      if (e?.code === 'delivery-unconfirmed') uncertain?.()
+      if (e?.code === 'delivery-unconfirmed' || e?.code === 'delivery-pending') uncertain?.()
       else undo()
       throw e
     })
@@ -2541,12 +2541,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       else {
         const at = bySession(c.sessionId)
         if (!at) return false
-        const tracking = remoteNativeDelivery(c.id, c.sessionId, body, 'agent-message', randomUUID(), deliveryBinding(at.agent), opt.caller).catch(() => null)
+        // Observe the one native operation; timing out this tool does not end
+        // that operation or turn a known pending receipt into a final failure.
+        const observation: { receipt: DeliveryReceipt | null } = { receipt: null }
+        const tracking = remoteNativeDelivery(c.id, c.sessionId, body, 'agent-message', randomUUID(), deliveryBinding(at.agent), opt.caller, undefined, r => { observation.receipt = r }).catch(() => null)
         let timer: ReturnType<typeof setTimeout> | undefined
         try {
           const receipt = await Promise.race([tracking, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 18_000) })])
-          diagnostic = receipt
-          result = receipt?.blockedByDraft ? 'draft' : { delivery: receipt?.state === 'pending' ? 'unconfirmed' : receipt?.state ?? 'unconfirmed' }
+          diagnostic = receipt ?? observation.receipt
+          result = receipt?.blockedByDraft ? 'draft' : { delivery: diagnostic?.state ?? 'unconfirmed' }
         } finally { clearTimeout(timer) }
       }
       if (result === 'draft') throw apiError(409, draftWords(c.sessionId))
@@ -2554,6 +2557,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (delivery === 'sent') return true
       if (delivery === 'blocked') throw Object.assign(apiError(409, blockDescription(diagnostic)), { code: 'delivery-blocked' })
       if (delivery === 'gone') return false
+      if (delivery === 'pending') throw Object.assign(apiError(409, `Delivery is still in progress${diagnostic ? ` (receipt ${diagnostic.id})` : ''}; the tool's observation window ended, not the native send. Wait for this same operation and inspect the destination; never resend or automatically press Enter.`), { code: 'delivery-pending' })
       throw Object.assign(apiError(409, 'Delivery is not confirmed; the one pending message may already have been submitted, may still complete, or may remain in the composer. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
     }
     if (c.id === self().id) return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
@@ -2642,7 +2646,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const owner = 'agent-message', receipt = beginNativeDelivery(sessionId, body, owner, undefined, undefined, actor ? () => deliveryAcl(actor, sessionId) : undefined)
       const final = await nativeReceipts.wait(receipt.id, owner, at.floor.id, at.agent.id)
       if (final) onResult?.(final)
-      return final?.state === 'pending' ? 'unconfirmed' as const : final?.state ?? 'unconfirmed' as const
+      return final?.state ?? 'unconfirmed' as const
     } catch { return 'unconfirmed' as const }
   }
 
@@ -2651,7 +2655,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** The initial request is sent once. A broken response changes the operation into status-only observation. */
-  async function remoteNativeDelivery(pcId: string, sid: string, body: string, owner: string, id: string, binding: string, actor?: Caller, humanAuthority?: () => boolean): Promise<(DeliveryReceipt & { blockedByDraft?: boolean }) | null> {
+  async function remoteNativeDelivery(pcId: string, sid: string, body: string, owner: string, id: string, binding: string, actor?: Caller, humanAuthority?: () => boolean, onObservation?: (receipt: DeliveryReceipt | null) => void): Promise<(DeliveryReceipt & { blockedByDraft?: boolean }) | null> {
     assertLegacySid(sid)
     const peer = () => team?.member(pcId) ?? null
     const first = peer()
@@ -2685,6 +2689,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const deadline = Date.now() + 300_000
     for (;;) {
       const r = isObject(raw) ? raw.receipt : null
+      onObservation?.(validReceipt(r, id) ? r : null)
       if (validReceipt(r, id) && r.state !== 'pending') {
         if (r.state === 'blocked') {
           logDeliveryBlock(sid, r.reason ?? 'peer-blocked')
@@ -3395,18 +3400,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const drafts = all.filter(c => !c.asking && c.drafting)
         // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
         const outcomes = await Promise.all(to.map(async c => {
-          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true, caller: me }), unknown: false, draft: false } }
-          catch (e) { return { c, sent: false, unknown: isObject(e) && e.code === 'delivery-unconfirmed', draft: e instanceof Error && /unsent text in its box/.test(e.message) } }
+          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true, caller: me }), unknown: false, pending: false, draft: false } }
+          catch (e) { return { c, sent: false, unknown: isObject(e) && e.code === 'delivery-unconfirmed', pending: isObject(e) && e.code === 'delivery-pending', draft: e instanceof Error && /unsent text in its box/.test(e.message) } }
         }))
         const uncertain = outcomes.filter(r => r.unknown).map(r => r.c)
-        const refused = outcomes.filter(r => !r.sent && !r.unknown).map(r => r.c)
-        const failed = outcomes.filter(r => !r.sent && !r.unknown && !r.draft).map(r => r.c)
-        if (refused.length || uncertain.length) {
+        const progressing = outcomes.filter(r => r.pending).map(r => r.c)
+        const refused = outcomes.filter(r => !r.sent && !r.unknown && !r.pending).map(r => r.c)
+        const failed = outcomes.filter(r => !r.sent && !r.unknown && !r.pending && !r.draft).map(r => r.c)
+        if (refused.length || uncertain.length || progressing.length) {
           drafts.push(...outcomes.filter(r => r.draft).map(r => r.c))
-          to.splice(0, to.length, ...to.filter(c => !refused.includes(c) && !uncertain.includes(c)))
+          to.splice(0, to.length, ...to.filter(c => !refused.includes(c) && !uncertain.includes(c) && !progressing.includes(c)))
         }
         const nameOf = (c: { sessionId: string }) => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)
-        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}${failed.length ? ` Not submitted to ${failed.map(nameOf).join(', ')}: blocked or unavailable.` : ''}${uncertain.length ? ` Delivery not confirmed for ${uncertain.map(nameOf).join(', ')}; the pending messages may already be submitted or may still complete. Inspect those chats; do not automatically press Enter or resend.` : ''}`
+        return `Sent to ${to.length} chat${to.length === 1 ? '' : 's'}.${skipped.length ? ` Skipped ${skipped.length} waiting at a prompt (Approvals tab): ${skipped.map(nameOf).join(', ')}.` : ''}${drafts.length ? ` Skipped ${drafts.length} with unsent text in the box (try again shortly): ${drafts.map(nameOf).join(', ')}.` : ''}${failed.length ? ` Not submitted to ${failed.map(nameOf).join(', ')}: blocked or unavailable.` : ''}${progressing.length ? ` Delivery still in progress for ${progressing.map(nameOf).join(', ')}; the observation window ended, not the native sends. Wait for those same operations; never resend or automatically press Enter.` : ''}${uncertain.length ? ` Delivery not confirmed for ${uncertain.map(nameOf).join(', ')}; the pending messages may already be submitted or may still complete. Inspect those chats; do not automatically press Enter or resend.` : ''}`
       }
       case 'memory_save': {
         const entry = memory.save(floor.id, {

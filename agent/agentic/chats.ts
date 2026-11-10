@@ -385,15 +385,20 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   // Fail-safe: a screen that cannot be read counts as a menu being up.
   const OPTION_UNDER_CURSOR_RE = /^\s*❯\s*\d{1,2}\.\s+\S/
   const MENU_FOOTER_RE = /Enter to (?:select|confirm)|Esc to cancel/i
-  const RULE_LINE_RE = /^\s*[─━]{8,}/
+  const RULE_LINE_RE = /^\s*[─━]{8,}\s*$/
   const INPUT_LINE_RE = /^\s*❯(?!\s*\d{1,2}\.\s)/
-  /** Whether an idle input box is drawn from line `from` on: a rule, the "❯" line (typed text may run on a few lines), a rule. */
-  function inputBoxBelow(lines: string[], from: number): boolean {
-    for (let j = from + 1; j < lines.length; j++) {
+  // One bound for both menu exclusion and ownership reconstruction. Narrow
+  // terminals routinely wrap past eight rows; an incomplete/oversized newest
+  // box must never fall back to an older empty composer.
+  const MAX_COMPOSER_ROWS = 64
+  function inputBox(lines: string[]): { start: number; end: number } | null {
+    for (let j = lines.length - 1; j >= 1; j--) {
       if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
-      for (let k = j + 1; k < Math.min(lines.length, j + 9); k++) if (RULE_LINE_RE.test(lines[k])) return true
+      for (let k = j + 1; k < Math.min(lines.length, j + MAX_COMPOSER_ROWS + 1); k++)
+        if (RULE_LINE_RE.test(lines[k])) return { start: j, end: k }
+      return null
     }
-    return false
+    return null
   }
   /**
    * What is typed in the idle input box (the lowest one drawn) and not sent yet: a draft. '' when no box is drawn or it is empty.
@@ -403,20 +408,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
    * and the Enter would send both as one message.
    */
   function boxComposer(lines: string[], typed: string[] = lines): string | null {
-    for (let j = lines.length - 1; j >= 1; j--) {
-      if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
-      let end = -1
-      for (let k = j + 1; k < lines.length; k++) {
-        if (RULE_LINE_RE.test(lines[k])) {
-          end = k
-          break
-        }
-      }
-      if (end < 0) continue
-      const text = [typed[j].replace(/^\s*❯/, ''), ...typed.slice(j + 1, end)].join(' ').replace(/\s+/g, ' ').trim()
-      return /^Try "/.test(text) ? '' : text
-    }
-    return null
+    const box = inputBox(lines)
+    if (!box) return null
+    const text = [typed[box.start].replace(/^\s*❯/, ''), ...typed.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
+    return /^Try "/.test(text) ? '' : text
   }
   const boxText = (lines: string[], typed = lines) => boxComposer(lines, typed) ?? ''
   function draftOnScreen(c: Chat): boolean {
@@ -432,10 +427,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     try {
       const lines = c.screen.lines()
       if (c.engine === 'codex') return cxs.menuOnScreen(lines)
-      let last = -1
-      for (let i = lines.length - 1; i >= 0 && last < 0; i--) if (OPTION_UNDER_CURSOR_RE.test(lines[i]) || MENU_FOOTER_RE.test(lines[i])) last = i
-      if (last < 0) return false
-      return !inputBoxBelow(lines, last)
+      const box = inputBox(lines)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        // Quoted menu instructions inside a complete composer are typed input.
+        // A real menu below it still wins, and unreadable boxes exclude nothing.
+        if (box && i >= box.start && i < box.end) continue
+        if (OPTION_UNDER_CURSOR_RE.test(lines[i]) || MENU_FOOTER_RE.test(lines[i])) return !box || i > box.end
+      }
+      return false
     } catch {
       return null
     }
@@ -981,6 +980,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
             const box = boxComposer(c.screen.lines(), c.screen.typedLines())
             return box === null ? [] : ['\u203a ' + box, ' GPT-CLAUDE']
           },
+          // This is a parsed Claude frame, not native Codex output. Re-reading
+          // its message text as Codex menu prose would reject quoted footers.
+          frame: lines => ({
+            menu: lines.length > 0 && lines[1] !== ' GPT-CLAUDE',
+            composer: lines.length === 2 && lines[1] === ' GPT-CLAUDE' ? { text: lines[0].slice(2), collapsed: false } : null,
+          }),
           sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
           interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
           gone: () => c.exited,

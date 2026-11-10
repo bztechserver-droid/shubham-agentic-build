@@ -6,7 +6,13 @@ import { requireBridgeLeaseRequest, requireCodexBridgeLease, type BridgeActualRu
 export const BRIDGE_VALIDATION_MAX_AGE_MS = 60_000
 export const BRIDGE_MIN_ACCESS_VALIDITY_MS = 120_000
 export const BRIDGE_VALIDATION_CADENCE_MS = 30_000
-export const BRIDGE_VALIDATION_TIMEOUT_MS = 10_000
+/** One CRM check's limit: the CRM client's own (20 s). 10 Nov 2026: at 10 s it ran out 10 times on a loaded PC (94% CPU)
+ * and every running bridge request was cut. */
+export const BRIDGE_VALIDATION_TIMEOUT_MS = 20_000
+/** A check that did not answer (timeout, CRM unreachable) proves nothing either way: it is tried again this soon, at most
+ * BRIDGE_VALIDATION_RETRIES times in a row, before the regular cadence. Only the CHECK is retried, never a model request. */
+export const BRIDGE_VALIDATION_RETRY_MS = 3_000
+export const BRIDGE_VALIDATION_RETRIES = 2
 export type BridgeCredentialCode = 'bridge-lease-invalid' | 'bridge-context-changed' | 'bridge-validation-stale' |
   'bridge-refresh-required' | 'bridge-credential-unavailable' | 'bridge-owner-ambiguous' | 'bridge-owner-busy' |
   'bridge-dispatch-unknown' | 'bridge-cancelled'
@@ -50,6 +56,9 @@ export interface ManagerBridgeSource {
   protect(consumerId: string): void
   retain(consumerId: string, ownerId: string): Promise<ManagerBridgeContext>
   current(consumerId: string, expected: ManagerBridgeContext): ManagerBridgeContext | null
+  /** For an operation already sent: the same credential is still held and nothing revoked or changed it. A receipt that only
+   * grew older than its 60 s (a slow or unanswered CRM check) still holds; it fences new requests, not completed ones. */
+  held?(consumerId: string, expected: ManagerBridgeContext): boolean
   /** Capture/validate + invoke send synchronously under the queue; await its result OUTSIDE the global queue. */
   use<T>(consumerId: string, expected: ManagerBridgeContext, send: (authorization: BridgeRequestAuthorization, signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>
   /** The ownership guard runs inside the manager queue immediately before deleting the hold. */
@@ -127,6 +136,15 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
     requireBridgeContext(fresh, e.lease.request.ownerId, now(), margin)
     e.context = Object.freeze({ ...fresh })
   }
+  /** After the provider operation completed: the lease, binding and the very credential it was sent with must still hold.
+   * Freshness was required at dispatch (fence); a receipt that only aged meanwhile does not discard a completed reply. */
+  function settled(e: Entry, signal?: AbortSignal) {
+    cancelled(signal)
+    if (e.closed || e.blocked || !e.context) throw bridgeCredentialError('bridge-lease-invalid')
+    binding(e.lease.request)
+    const held = o.source.held ? o.source.held(e.consumerId, e.context) : o.source.current(e.consumerId, e.context) !== null
+    if (!held) throw bridgeCredentialError('bridge-context-changed')
+  }
   function pause(e: Entry) { e.blocked = true; for (const c of e.flights) c.abort(bridgeCredentialError('bridge-lease-invalid')) }
   const runtimeMatches = (e: Entry, runtime: BridgeActualRuntimeProof) => runtime.ownerId === e.lease.request.ownerId && runtime.runId === e.lease.request.runId &&
     runtime.targetPcId === e.lease.request.targetPcId && runtime.leaseId === e.lease.leaseId && isDeepStrictEqual(runtime.binding, e.lease.request.binding)
@@ -194,7 +212,7 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
           initiated = true
           return send(guarded, controller.signal)
         }, controller.signal)
-        fence(e, controller.signal)
+        settled(e, controller.signal)
         return result
       } catch (error) {
         if (initiated) throw bridgeCredentialError('bridge-dispatch-unknown')
