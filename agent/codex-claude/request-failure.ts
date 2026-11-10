@@ -9,6 +9,25 @@ export interface RequestFailureSummary extends Omit<ProviderFailureSummary, 'sta
   interruption?: BridgeCredentialCode
 }
 
+/** Who ended a bridge request. `client()` is wired to the request's own abort/close events (Claude Code: Esc, a stopped
+ * background task, its connection closed). It counts as Claude Code's doing only when nothing else (timeout, host loss,
+ * shutdown) had already ended the request; `abort` then ends the provider request as before. */
+export function requestEnd(signal: AbortSignal, abort: () => void) {
+  let byClient = false
+  return {
+    client() { if (!signal.aborted) byClient = true; abort() },
+    get byClient() { return byClient },
+  }
+}
+
+/** Whether a failed bridge request pauses its chat. Every failure does, except Claude Code ending the request itself outside
+ * authorization: nothing about the run is uncertain then, the bridge never retries, and Claude Code decides what to send next.
+ * While credentials may be refreshing (authorization), an ended request still pauses. 10 Nov: Lead's TaskStop of a background
+ * review cancelled one request and left Lead answering every message with "API Error: 400 ... paused" for an hour. */
+export function pausesRun(byClient: boolean, phase: RequestPhase): boolean {
+  return !(byClient && phase !== 'authorization')
+}
+
 /** Classify only app-owned codes and adapter-whitelisted metadata. Never copy an error's
  * message, cause, body, headers, request, credentials, or arbitrary fields to diagnostics.
  */

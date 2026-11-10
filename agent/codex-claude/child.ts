@@ -30,21 +30,23 @@ export function readChildConfig(file: string): BridgeChildConfig {
 const equalKey = (value: unknown, expected: string) => typeof value === 'string' && Buffer.byteLength(value) === Buffer.byteLength(expected)
   && timingSafeEqual(Buffer.from(value), Buffer.from(expected))
 
-export async function runBridgeChild(configFile: string, args: string[]): Promise<void> {
-  const initial = readChildConfig(configFile)
-  const { createHash } = await import('node:crypto')
-  if (createHash('sha256').update(fs.readFileSync(initial.claude)).digest('hex') !== initial.claudeSha256) throw new Error('The pinned Claude Code executable changed')
+/** The loopback gateway Claude Code talks to. It forwards each request once to the controller and never retries. Any failure
+ * pauses it for good (every later request gets the paused error), except a request Claude Code ends itself (Esc, a stopped
+ * background task, its connection closed): that is not a failure of the execution, so the next request goes through.
+ * 10 Nov 2026: a stopped background review paused Lead's chat ("API Error: 400 ... paused") until it was restarted. */
+export function bridgeGateway(initial: BridgeChildConfig, configFile: string): http.Server {
   let paused = false
-  const server = http.createServer((req, res) => {
+  return http.createServer((req, res) => {
     const fail = (status: number) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json', 'x-should-retry': 'false' }); res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Codex in Claude Code is paused. Review the execution in the app; no fallback or automatic retry was used.' } })) }
     if (req.headers.origin !== undefined || req.method !== 'POST'
       || !['/v1/messages', '/v1/messages/count_tokens'].includes((req.url ?? '').split('?')[0])
       || !(equalKey(req.headers.authorization, `Bearer ${initial.loopbackKey}`) || equalKey(req.headers['x-api-key'], initial.loopbackKey))) return fail(403)
     if (paused) return fail(400)
-    let size = 0; const chunks: Buffer[] = [], abort = new AbortController()
+    let size = 0, endedByClaudeCode = false; const chunks: Buffer[] = [], abort = new AbortController()
+    const ended = () => { endedByClaudeCode = true; abort.abort() }
     req.on('data', data => { size += data.length; if (size > 16 * 1024 * 1024) { fail(413); req.destroy() } else chunks.push(data) })
-    req.on('aborted', () => abort.abort())
-    res.on('close', () => { if (!res.writableEnded) abort.abort() })
+    req.on('aborted', ended)
+    res.on('close', () => { if (!res.writableEnded) ended() })
     req.on('end', () => { void (async () => {
       try {
         const config = readChildConfig(configFile)
@@ -59,9 +61,16 @@ export async function runBridgeChild(configFile: string, args: string[]): Promis
           if (!res.write(data)) await new Promise<void>(resolve => res.once('drain', resolve))
         }
         res.end()
-      } catch { paused = true; fail(400) }
+      } catch { if (!endedByClaudeCode) paused = true; fail(400) }
     })() })
   })
+}
+
+export async function runBridgeChild(configFile: string, args: string[]): Promise<void> {
+  const initial = readChildConfig(configFile)
+  const { createHash } = await import('node:crypto')
+  if (createHash('sha256').update(fs.readFileSync(initial.claude)).digest('hex') !== initial.claudeSha256) throw new Error('The pinned Claude Code executable changed')
+  const server = bridgeGateway(initial, configFile)
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()) })
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('The child loopback listener is unavailable')

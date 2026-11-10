@@ -19,7 +19,7 @@ import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
-import { requestFailureSummary, type RequestPhase } from './request-failure.ts'
+import { pausesRun, requestEnd, requestFailureSummary, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
@@ -497,7 +497,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (typeof key !== 'string' || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) return fail()
     if (record.dispatchPaused) return fail()
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
-    req.on('aborted', () => abort.abort()); res.on('close', () => { if (!res.writableEnded) abort.abort() })
+    const end = requestEnd(signal, () => abort.abort())
+    req.on('aborted', () => end.client()); res.on('close', () => { if (!res.writableEnded) end.client() })
     let pending:ReturnType<typeof pendingMessages>|null=null
     let phase:RequestPhase='request',providerDispatched=false
     let providerFailure:ReturnType<typeof requestFailureSummary>|undefined
@@ -553,10 +554,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         ms:{beforeProvider:timing.dispatched?timing.dispatched-started:null,headers:since(timing.headers),firstByte:since(timing.firstByte),
           firstText:since(timing.firstText),total:done-started},usage:responseUsage(response)})
     } catch (error) {
-      pause(record)
+      // Claude Code ending its own request (Esc, a stopped background task) does not pause the chat; every other failure does.
+      const paused = pausesRun(end.byClient, phase)
+      if (paused) pause(record)
       const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
       const diagnostic={version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,
-        phase,...(providerDispatched?{progress}:{}),...failure}
+        phase,...(providerDispatched?{progress}:{}),...failure,paused,...(end.byClient?{endedBy:'claude-code'}:{})}
       try {
         const bytes=JSON.stringify(diagnostic)+'\n'
         writePrivateAtomic(path.join(o.directory,`${record.runId}.failure.json`),bytes)
