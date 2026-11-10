@@ -13,6 +13,8 @@ const note = (observer: ProgressObserver | undefined, value: ProviderProgress) =
 const cancellation = (signal: AbortSignal) => signal.reason?.name === 'TimeoutError' ? 'timeout' : 'aborted'
 const failures = new WeakMap<Error, ProviderFailureSummary>()
 export const providerFailureSummary = (error: unknown): ProviderFailureSummary => error instanceof Error && failures.has(error) ? failures.get(error)! : { stage: 'stream' }
+/** The adapter's own record of how a provider call failed, or null when the error did not come from the adapter. */
+export const recordedProviderFailure = (error: unknown): ProviderFailureSummary | null => error instanceof Error ? failures.get(error) ?? null : null
 const unavailable = (summary: ProviderFailureSummary = { stage: 'stream' }): never => {
   const error = Object.assign(new Error('The Codex endpoint did not complete the requested Sol/max operation. No retry was made.'), { status: 502, code: 'bridge-policy-refused' })
   failures.set(error, Object.freeze(summary)); throw error
@@ -272,7 +274,8 @@ export async function readCompletedResponse(response: Response, signal: AbortSig
   const mediaType: ProviderFailureSummary['mediaType'] = !type ? 'missing' : type === 'text/event-stream' ? 'event-stream' : type === 'application/json' ? 'json' : type === 'text/html' ? 'html' : type === 'text/plain' ? 'text' : 'other'
   if (!response.ok) {
     let raw = ''
-    if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await read(reader); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } finally { void reader.cancel().catch(() => {}); reader.releaseLock() } }
+    // The failed status is known from the headers: a cancellation or broken body while reading its details does not erase it.
+    if (response.body) { const reader = response.body.getReader(); try { while (raw.length < 8192) { const chunk = await read(reader); if (chunk.done) break; raw += new TextDecoder().decode(chunk.value) } } catch { /* The status stays the failure. */ } finally { void reader.cancel().catch(() => {}); reader.releaseLock() } }
     let parameter: string | undefined, category = response.status === 401 || response.status === 403 ? 'authorization' : response.status === 429 ? 'rate-limit' : 'refused'
     try {
       const data = JSON.parse(raw), detail = typeof data.detail === 'string' ? data.detail : ''

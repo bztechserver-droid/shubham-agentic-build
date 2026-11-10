@@ -5,7 +5,7 @@ import { requireBridgeCapability, requireBridgeRuntimeProof, requireBridgePins,
 // Build 1303: the child, its storage implementation and execution contract are unchanged.
 // This permits a verified controller replacement, never an unproved child/profile change.
 export const PREVIOUS_CONTROLLER_SHA256 = '65c0381cbb90319bbd8fecfa49b42fbbd73596feea1df8d49f4428b486a4017c'
-/** History only: the controllers of the builds whose children ran child.ts 38bb4e51… (up to build 2026.11.10-1102).
+/** History only: the controllers of earlier builds (child.ts 38bb4e51… up to build 2026.11.10-1102, 4bf487c8… in -1140).
  * None of them is adopted any more, since the child changed after them. */
 export const RETIRED_CONTROLLERS = Object.freeze([PREVIOUS_CONTROLLER_SHA256,
   'abdbe052e541f14b7b73658fb182b99bf83ced17a4491dc2904296a165ddb63d',
@@ -21,14 +21,16 @@ export const RETIRED_CONTROLLERS = Object.freeze([PREVIOUS_CONTROLLER_SHA256,
   // Build 2026.11.10-1024 (F-166 v8, speed).
   '00e8c52fe82fbfa15e809d9bb0affcffbbea088f9dd1e74f58f4b2a2226b181c',
   // Build 2026.11.10-1102 (F-166 v9, cache).
-  '518ef63f8d5c2882b94739c4bea9c417922023e0e084998586a7a8e0f24df697'])
+  '518ef63f8d5c2882b94739c4bea9c417922023e0e084998586a7a8e0f24df697',
+  // Build 2026.11.10-1140 (cancel-pause v10, child 4bf487c8…): superseded before its children were carried on.
+  'ed6cc93b55462f22352a7789b4812a2739a390c0d3b61c32d1723cf3bf721c19'])
 /** The controllers whose running children the next build adopts: only builds whose children run exactly UNCHANGED_CHILD_FILES.
  * Empty now: child.ts changed (a request Claude Code ends itself no longer pauses the gateway), so no earlier child is
  * identical, and those chats are stopped and reopened once at that Update. The build after it lists this build's controller. */
 export const PREVIOUS_CONTROLLERS: readonly string[] = Object.freeze([])
 /** The exact child sources the adopted children run (checked against these files on disk at every start). */
 export const UNCHANGED_CHILD_FILES = Object.freeze({
-  'child.ts':'4bf487c85dcab7625a426ca8ba142f8a1fd24befeb8e64c0bb0dfce1b3d5a936',
+  'child.ts':'63fe0f3330d0dd08fa46432a2af6cee63d57bba4463b4018fa7978e01c517c83',
   'storage.ts':'b14908415eab7477a79bac9d6818bd2408686b83fc9f2f4e7ff46e3e0eae1835',
   '../../shared/chat-execution.ts':'b47a79cb321513dfad8482b98f242602bb92b886efee0b42b4b7b56fec6c51ef',
 })

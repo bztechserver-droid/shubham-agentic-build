@@ -30,9 +30,14 @@ export function readChildConfig(file: string): BridgeChildConfig {
 const equalKey = (value: unknown, expected: string) => typeof value === 'string' && Buffer.byteLength(value) === Buffer.byteLength(expected)
   && timingSafeEqual(Buffer.from(value), Buffer.from(expected))
 
+/** The abort reason for a request Claude Code itself ended; only a failure that is exactly this cancellation (fetch rejects
+ * with the abort reason, before the reply and while reading it) leaves the gateway open. */
+const CLAUDE_CODE_ENDED = new Error('Claude Code ended this request')
+
 /** The loopback gateway Claude Code talks to. It forwards each request once to the controller and never retries. Any failure
  * pauses it for good (every later request gets the paused error), except a request Claude Code ends itself (Esc, a stopped
- * background task, its connection closed): that is not a failure of the execution, so the next request goes through.
+ * background task, its connection closed) when that end is what stopped it: the next request then goes through. A failed or
+ * broken controller reply that came first still pauses, whatever Claude Code does after it.
  * 10 Nov 2026: a stopped background review paused Lead's chat ("API Error: 400 ... paused") until it was restarted. */
 export function bridgeGateway(initial: BridgeChildConfig, configFile: string): http.Server {
   let paused = false
@@ -42,8 +47,8 @@ export function bridgeGateway(initial: BridgeChildConfig, configFile: string): h
       || !['/v1/messages', '/v1/messages/count_tokens'].includes((req.url ?? '').split('?')[0])
       || !(equalKey(req.headers.authorization, `Bearer ${initial.loopbackKey}`) || equalKey(req.headers['x-api-key'], initial.loopbackKey))) return fail(403)
     if (paused) return fail(400)
-    let size = 0, endedByClaudeCode = false; const chunks: Buffer[] = [], abort = new AbortController()
-    const ended = () => { endedByClaudeCode = true; abort.abort() }
+    let size = 0; const chunks: Buffer[] = [], abort = new AbortController()
+    const ended = () => abort.abort(CLAUDE_CODE_ENDED)
     req.on('data', data => { size += data.length; if (size > 16 * 1024 * 1024) { fail(413); req.destroy() } else chunks.push(data) })
     req.on('aborted', ended)
     res.on('close', () => { if (!res.writableEnded) ended() })
@@ -61,7 +66,7 @@ export function bridgeGateway(initial: BridgeChildConfig, configFile: string): h
           if (!res.write(data)) await new Promise<void>(resolve => res.once('drain', resolve))
         }
         res.end()
-      } catch { if (!endedByClaudeCode) paused = true; fail(400) }
+      } catch (error) { if (error !== CLAUDE_CODE_ENDED || abort.signal.reason !== CLAUDE_CODE_ENDED) paused = true; fail(400) }
     })() })
   })
 }

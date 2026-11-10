@@ -9,23 +9,35 @@ export interface RequestFailureSummary extends Omit<ProviderFailureSummary, 'sta
   interruption?: BridgeCredentialCode
 }
 
-/** Who ended a bridge request. `client()` is wired to the request's own abort/close events (Claude Code: Esc, a stopped
- * background task, its connection closed). It counts as Claude Code's doing only when nothing else (timeout, host loss,
- * shutdown) had already ended the request; `abort` then ends the provider request as before. */
-export function requestEnd(signal: AbortSignal, abort: () => void) {
-  let byClient = false
-  return {
-    client() { if (!signal.aborted) byClient = true; abort() },
-    get byClient() { return byClient },
-  }
-}
+/** The abort reason the bridge gives a request that Claude Code itself ended (Esc, a stopped background task, its connection
+ * closed). Only this exact object counts as Claude Code's end: a timeout, host loss, shutdown, or a credential, lease or
+ * runtime interruption aborts with its own reason. */
+export const CLAUDE_CODE_ENDED: Error = Object.freeze(new Error('Claude Code ended this request'))
 
-/** Whether a failed bridge request pauses its chat. Every failure does, except Claude Code ending the request itself outside
- * authorization: nothing about the run is uncertain then, the bridge never retries, and Claude Code decides what to send next.
- * While credentials may be refreshing (authorization), an ended request still pauses. 10 Nov: Lead's TaskStop of a background
- * review cancelled one request and left Lead answering every message with "API Error: 400 ... paused" for an hour. */
-export function pausesRun(byClient: boolean, phase: RequestPhase): boolean {
-  return !(byClient && phase !== 'authorization')
+/** Whether a failed bridge request was ended by Claude Code and by nothing else, so its chat is not paused (the cause, not
+ * the order of events, decides). All of these must hold:
+ * - the request's own first end was Claude Code's: `outer` (request + timeout + host + shutdown) aborted with CLAUDE_CODE_ENDED;
+ * - and the failure is exactly that cancellation:
+ *   - provider call started: the provider call's own signal (through the broker and the credential manager) ended with
+ *     CLAUDE_CODE_ENDED, not with a manager or broker interruption, AND the provider call itself failed as a plain cancellation:
+ *     the runtime's record (`cause`: transport/aborted, no interruption) and the adapter's own record (`provider`: transport/
+ *     aborted) both say so. An HTTP status seen first (kept by the adapter even if its body read is cancelled), a stream or
+ *     policy failure, a call that completed and failed afterwards (validation, live mismatch: no record), or a failure the
+ *     adapter did not record, is never excused by a later end;
+ *   - authorization (nothing sent): the broker only stopped waiting (`bridge-cancelled`), not a credential, lease, binding or
+ *     runtime error;
+ *   - request (nothing authorized): reading Claude Code's request was cut off by that end.
+ * Everything else pauses, as before; nothing is retried either way. 10 Nov 2026: Lead's TaskStop of a background review
+ * cancelled one request and left Lead answering every message with "API Error: 400 ... paused" until it was restarted. */
+export function endedByClaudeCode(o: { outer: AbortSignal; phase: RequestPhase; dispatched: boolean; inner?: AbortSignal; cause?: RequestFailureSummary;
+  provider?: ProviderFailureSummary | null; error: unknown }): boolean {
+  if (!o.outer.aborted || o.outer.reason !== CLAUDE_CODE_ENDED) return false
+  if (o.dispatched) return o.inner?.aborted === true && o.inner.reason === CLAUDE_CODE_ENDED
+    && o.cause?.stage === 'transport' && o.cause.category === 'aborted' && o.cause.interruption === undefined
+    && o.provider?.stage === 'transport' && o.provider.category === 'aborted'
+  if (o.phase === 'authorization') return bridgeCredentialFailureCode(o.error) === 'bridge-cancelled'
+  if (o.phase === 'request') return o.error === CLAUDE_CODE_ENDED || ['ECONNRESET', 'ERR_STREAM_PREMATURE_CLOSE'].includes(String((o.error as { code?: unknown } | null)?.code))
+  return false
 }
 
 /** Classify only app-owned codes and adapter-whitelisted metadata. Never copy an error's

@@ -13,13 +13,13 @@ import { findClaude, type ChatPool, type StartChat } from '../agentic/chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
-import { bridgeConversationKey, fromResponses, providerFailureSummary, reasoningTag, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
+import { bridgeConversationKey, fromResponses, providerFailureSummary, reasoningTag, recordedProviderFailure, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
-import { pausesRun, requestEnd, requestFailureSummary, type RequestPhase } from './request-failure.ts'
+import { CLAUDE_CODE_ENDED, endedByClaudeCode, requestFailureSummary, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
@@ -497,11 +497,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     if (typeof key !== 'string' || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) return fail()
     if (record.dispatchPaused) return fail()
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.signal, hostLifetime.signal, AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS)])
-    const end = requestEnd(signal, () => abort.abort())
-    req.on('aborted', () => end.client()); res.on('close', () => { if (!res.writableEnded) end.client() })
+    // Claude Code ending its own request aborts with CLAUDE_CODE_ENDED, so the cause stays known (request-failure.ts).
+    const claudeCodeEnded = () => abort.abort(CLAUDE_CODE_ENDED)
+    req.on('aborted', claudeCodeEnded); res.on('close', () => { if (!res.writableEnded) claudeCodeEnded() })
+    let providerSignal: AbortSignal | undefined
     let pending:ReturnType<typeof pendingMessages>|null=null
     let phase:RequestPhase='request',providerDispatched=false
-    let providerFailure:ReturnType<typeof requestFailureSummary>|undefined
+    let providerFailure:ReturnType<typeof requestFailureSummary>|undefined,providerRecord:ProviderFailureSummary|null|undefined
     const started=Date.now();let lastSaved=0,lastPhase=''
     // Speed diagnostics (numbers only): where the time of each request goes.
     const timing={dispatched:0,headers:0,firstByte:0,firstText:0}
@@ -535,12 +537,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         if (record.dispatchPaused) throw executionHttpError('execution-intent-uncertain', 'runtime')
         if (!record.proof || !current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         ownership.assertRunning(record.lease, record.proof)
-        phase='provider';providerDispatched=true;timing.dispatched=Date.now()
+        phase='provider';providerDispatched=true;providerSignal=abort;timing.dispatched=Date.now()
         tag=reasoningTag(authorization.accountId)
         // The manager and broker deliberately replace initiated failures with UNKNOWN.
         // Capture only the adapter's safe metadata at this boundary, never its raw error.
         return sendResponses(body, authorization, abort,noteProgress,sink).catch(error => {
-          providerFailure=requestFailureSummary(error,'provider',abort);throw error
+          providerFailure=requestFailureSummary(error,'provider',abort);providerRecord=recordedProviderFailure(error);throw error
         })
       }, signal)
       phase='response'
@@ -554,12 +556,15 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         ms:{beforeProvider:timing.dispatched?timing.dispatched-started:null,headers:since(timing.headers),firstByte:since(timing.firstByte),
           firstText:since(timing.firstText),total:done-started},usage:responseUsage(response)})
     } catch (error) {
-      // Claude Code ending its own request (Esc, a stopped background task) does not pause the chat; every other failure does.
-      const paused = pausesRun(end.byClient, phase)
-      if (paused) pause(record)
+      // A request Claude Code ended (Esc, a stopped background task) does not pause the chat, but only when that end is provably
+      // what stopped it (request-failure.ts); every other failure pauses, as before.
+      const ended = endedByClaudeCode({ outer: signal, phase, dispatched: providerDispatched, inner: providerSignal, cause: providerFailure, provider: providerRecord, error })
+      if (!ended) pause(record)
       const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
       const diagnostic={version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,
-        phase,...(providerDispatched?{progress}:{}),...failure,paused,...(end.byClient?{endedBy:'claude-code'}:{})}
+        phase,...(providerDispatched?{progress}:{}),...failure,paused:!ended,...(ended?{endedBy:'claude-code'}:{}),
+        // What the adapter itself saw (e.g. the HTTP status) when that differs from the cancellation recorded above.
+        ...(providerRecord&&providerRecord.stage!=='transport'?{provider:providerRecord}:{})}
       try {
         const bytes=JSON.stringify(diagnostic)+'\n'
         writePrivateAtomic(path.join(o.directory,`${record.runId}.failure.json`),bytes)
