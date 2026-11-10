@@ -4,6 +4,7 @@ import { apiError } from '../api.ts'
 import { writeAtomic } from '../config.ts'
 
 import type { DeliveryReceipt, DeliveryState } from '../../shared/chat.ts'
+import { isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 interface Record extends DeliveryReceipt {
   owner: string
   floorId: string
@@ -20,7 +21,7 @@ interface Intent {
 }
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const STATES = new Set<DeliveryState>(['pending', 'sent', 'blocked', 'unconfirmed', 'gone'])
-const receipt = ({ id, state, sessionId, generation, started, updatedAt }: Record): DeliveryReceipt => ({ id, state, sessionId, generation, started, updatedAt })
+const receipt = ({ id, state, sessionId, generation, started, updatedAt, reason, targetPcName }: Record): DeliveryReceipt => ({ id, state, sessionId, generation, started, updatedAt, ...(reason ? { reason } : {}), ...(targetPcName ? { targetPcName } : {}) })
 
 /** IDs are durable tombstones, not a replay queue. Text and credentials are never persisted. */
 export function createDeliveryReceipts(file: string, options: { now?: () => number; capacity?: number } = {}) {
@@ -36,6 +37,7 @@ export function createDeliveryReceipts(file: string, options: { now?: () => numb
     if (raw.version !== 1 || !Array.isArray(raw.records)) throw Error('Invalid receipt store')
     for (const r of raw.records) {
       if (!r || !UUID.test(r.id) || records.has(r.id) || !STATES.has(r.state) || typeof r.owner !== 'string' || typeof r.floorId !== 'string' || typeof r.agentId !== 'string' || !/^[0-9a-f]{64}$/.test(r.digest) || !(r.sessionId === null || typeof r.sessionId === 'string') || !(r.generation === null || typeof r.generation === 'string') || typeof r.started !== 'boolean' || typeof r.updatedAt !== 'string') throw Error('Invalid receipt record')
+      if (r.reason !== undefined && !isDeliveryBlockReason(r.reason) || r.targetPcName !== undefined && (typeof r.targetPcName !== 'string' || r.targetPcName.length > 120)) throw Error('Invalid delivery diagnostic')
       records.set(r.id, { ...r, ...(r.state === 'pending' ? { state: 'unconfirmed' as const, updatedAt: stamp() } : {}) })
     }
     // A crash cannot prove whether Enter/HTTP commit happened. Never start it again.
@@ -56,7 +58,7 @@ export function createDeliveryReceipts(file: string, options: { now?: () => numb
       for (const r of records.values()) if (r.state === 'pending') { r.state = 'unconfirmed'; r.updatedAt = stamp() }
       try { if (!unavailable) save() } catch { unavailable = true } finally { closed = true }
     },
-    begin(intent: Intent, send: (bind: (sid: string, generation: string, started: boolean) => void) => Promise<Exclude<DeliveryState, 'pending'>>) {
+    begin(intent: Intent, send: (bind: (sid: string, generation: string, started: boolean) => void, blocked: (reason: DeliveryBlockReason, targetPcName?: string) => 'blocked') => Promise<Exclude<DeliveryState, 'pending'>>) {
       available()
       const id = intent.id ?? randomUUID()
       if (!UUID.test(id)) throw apiError(400, 'messageId must be a UUID')
@@ -75,9 +77,14 @@ export function createDeliveryReceipts(file: string, options: { now?: () => numb
         if (r.sessionId !== null && (r.sessionId !== sid || r.generation !== generation)) throw Error('Delivery generation changed')
         r.sessionId = sid; r.generation = generation; r.started = started; r.updatedAt = stamp()
         try { save() } catch (error) { unavailable = true; throw error }
+      }, (reason, targetPcName) => {
+        r.reason = reason
+        r.targetPcName = targetPcName?.slice(0, 120)
+        return 'blocked'
       })).then(state => {
         if (!STATES.has(state) || state === ('pending' as DeliveryState)) throw Error('Invalid final delivery state')
         r.state = state
+        if (state !== 'blocked') { delete r.reason; delete r.targetPcName }
       }, () => { r.state = 'unconfirmed' }).catch(() => { r.state = 'unconfirmed' }).then(() => {
         r.updatedAt = stamp()
         try { save() } catch { unavailable = true; r.state = 'unconfirmed' }

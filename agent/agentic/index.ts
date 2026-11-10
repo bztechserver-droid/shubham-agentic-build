@@ -61,6 +61,7 @@ import {
   type TuneRequest,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
+import { deliveryBlockWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
 import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
@@ -2532,9 +2533,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     assertMessageRuntime(c.sessionId,c.id,opt.confirmed===true)
     const refuseDraft = opt.human !== true
     if (opt.confirmed) {
-      let result: unknown
+      let result: unknown, diagnostic: DeliveryReceipt | null = null
       if (c.id === self().id) {
-        const delivery = await confirmedDelivery(c.sessionId, body, refuseDraft, opt.caller)
+        const delivery = await confirmedDelivery(c.sessionId, body, refuseDraft, opt.caller, r => { diagnostic = r })
         result = delivery === 'blocked' && chats.drafting(c.sessionId) ? 'draft' : { delivery }
       }
       else {
@@ -2544,13 +2545,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
         let timer: ReturnType<typeof setTimeout> | undefined
         try {
           const receipt = await Promise.race([tracking, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 18_000) })])
+          diagnostic = receipt
           result = receipt?.blockedByDraft ? 'draft' : { delivery: receipt?.state === 'pending' ? 'unconfirmed' : receipt?.state ?? 'unconfirmed' }
         } finally { clearTimeout(timer) }
       }
       if (result === 'draft') throw apiError(409, draftWords(c.sessionId))
       const delivery = isObject(result) ? result.delivery : undefined
       if (delivery === 'sent') return true
-      if (delivery === 'blocked') throw Object.assign(apiError(409, 'The message was not submitted: a draft, menu, or earlier unresolved send blocked it.'), { code: 'delivery-blocked' })
+      if (delivery === 'blocked') throw Object.assign(apiError(409, blockDescription(diagnostic)), { code: 'delivery-blocked' })
       if (delivery === 'gone') return false
       throw Object.assign(apiError(409, 'Delivery is not confirmed; the one pending message may already have been submitted, may still complete, or may remain in the composer. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
     }
@@ -2562,6 +2564,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return r === true
   }
 
+  const logDeliveryBlock = (sid: string | null, reason: DeliveryBlockReason) => log?.warn(`chat ${sid?.slice(0, 8) ?? 'unbound'}: delivery blocked (${reason})`)
+  const blockDescription = (r: Pick<DeliveryReceipt, 'reason' | 'targetPcName'> | null | undefined) => r?.reason
+    ? `${deliveryBlockWords(r.reason, r.targetPcName)} [${r.reason}]`
+    : 'The destination refused this send without a specific diagnostic. Inspect the terminal before another send. [peer-blocked]'
   const messageReceipts = createDeliveryReceipts(path.join(o.dir, 'message-receipts.json'))
   const nativeReceipts = createDeliveryReceipts(path.join(o.dir, 'native-delivery-receipts.json'))
   const humanInputGrants = createHumanInputGrants()
@@ -2599,36 +2605,49 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = bySession(sessionId)
     if (!at) throw apiError(409, 'The destination conversation changed. Nothing was submitted.')
     const { floor, agent } = at
-    return nativeReceipts.begin({ id: messageId, owner, floorId: floor.id, agentId: agent.id, text: body, expectedSessionId: sessionId }, async bind => {
+    return nativeReceipts.begin({ id: messageId, owner, floorId: floor.id, agentId: agent.id, text: body, expectedSessionId: sessionId }, async (bind, noteBlocked) => {
       const generation = chats.generation?.(sessionId)
       let binding = expectedBinding ?? deliveryBinding(agent)
+      let reason: DeliveryBlockReason | undefined
+      const fail = (code: DeliveryBlockReason) => { reason = code; return false }
+      const refuse = () => { const code = reason ?? 'preflight-failed'; logDeliveryBlock(sessionId, code); return noteBlocked(code) }
       const valid = () => {
         const current = bySession(sessionId), runtime = chats.info(sessionId)
-        if (closing || !current || current.floor.id !== floor.id || current.agent.id !== agent.id || !runtime || chats.generation?.(sessionId) !== generation || runtime.engine !== engineFor(current.agent) || switchFences.blocked(sessionId)) return false
+        if (closing) return fail('agent-closing')
+        if (!current || current.floor.id !== floor.id || current.agent.id !== agent.id) return fail('binding-changed')
+        if (!runtime) return fail('runtime-unavailable')
+        if (chats.generation?.(sessionId) !== generation) return fail('generation-changed')
+        if (runtime.engine !== engineFor(current.agent)) return fail('runtime-mismatch')
+        if (switchFences.blocked(sessionId)) return fail('switch-in-progress')
         const advanced = advanceDeliveryBinding(binding, current.agent)
-        if (!advanced) return false
+        if (!advanced) return fail('binding-changed')
         binding = advanced
-        try { assertMessageRuntime(sessionId,self().id,true);assertPcControlTarget(current.floor, self().id, {}); return extraGuard?.() !== false } catch { return false }
+        try { assertMessageRuntime(sessionId,self().id,true) } catch { return fail('runtime-mismatch') }
+        try { assertPcControlTarget(current.floor, self().id, {}) } catch { return fail('pc-control-denied') }
+        return extraGuard?.() === false ? fail('authorization-revoked') : true
       }
-      if (!generation || !valid()) return 'blocked'
+      if (!generation) { reason = 'runtime-unavailable'; return refuse() }
+      if (!valid()) return refuse()
       bind(sessionId, generation, false)
-      return chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize }) ?? 'unconfirmed'
+      const state = await chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize, onBlocked: code => { reason ??= code } }) ?? 'unconfirmed'
+      return state === 'blocked' ? refuse() : state
     })
   }
 
   /** Tool callers retain a bounded observation window; the one native transaction continues. */
-  async function confirmedDelivery(sessionId: string, body: string, _refuseDraft: boolean, actor?: Caller) {
+  async function confirmedDelivery(sessionId: string, body: string, _refuseDraft: boolean, actor?: Caller, onResult?: (receipt: DeliveryReceipt) => void) {
     try {
       const at = bySession(sessionId)
       if (!at) return 'gone' as const
       const owner = 'agent-message', receipt = beginNativeDelivery(sessionId, body, owner, undefined, undefined, actor ? () => deliveryAcl(actor, sessionId) : undefined)
       const final = await nativeReceipts.wait(receipt.id, owner, at.floor.id, at.agent.id)
+      if (final) onResult?.(final)
       return final?.state === 'pending' ? 'unconfirmed' as const : final?.state ?? 'unconfirmed' as const
     } catch { return 'unconfirmed' as const }
   }
 
   function validReceipt(raw: unknown, id: string): raw is DeliveryReceipt {
-    return isObject(raw) && raw.id === id && ['pending','sent','blocked','unconfirmed','gone'].includes(String(raw.state)) && (raw.sessionId === null || typeof raw.sessionId === 'string') && (raw.generation === null || typeof raw.generation === 'string') && typeof raw.started === 'boolean' && typeof raw.updatedAt === 'string'
+    return isObject(raw) && raw.id === id && ['pending','sent','blocked','unconfirmed','gone'].includes(String(raw.state)) && (raw.sessionId === null || typeof raw.sessionId === 'string') && (raw.generation === null || typeof raw.generation === 'string') && typeof raw.started === 'boolean' && typeof raw.updatedAt === 'string' && (raw.reason === undefined || isDeliveryBlockReason(raw.reason)) && (raw.targetPcName === undefined || typeof raw.targetPcName === 'string' && raw.targetPcName.length <= 120)
   }
 
   /** The initial request is sent once. A broken response changes the operation into status-only observation. */
@@ -2636,22 +2655,45 @@ export function createAgentic(o: AgenticOptions): Agentic {
     assertLegacySid(sid)
     const peer = () => team?.member(pcId) ?? null
     const first = peer()
-    if (!first) return null
-    const support = await request<unknown>(first, 'delivery-capabilities', {}, 3000).catch(() => null)
-    if (!isObject(support) || support.version !== 1 || support.idempotent !== true || (humanAuthority && support.humanInputAuthorization !== 1)) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    const refuse = (reason: DeliveryBlockReason): DeliveryReceipt => {
+      logDeliveryBlock(sid, reason)
+      return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString(), reason, targetPcName: first?.name.slice(0, 120) }
+    }
+    if (!first) return refuse('peer-unreachable')
+    let support: unknown
+    try { support = await request<unknown>(first, 'delivery-capabilities', {}, 3000) }
+    catch (error) {
+      const old = (error as { code?: string }).code === 'unknown-op' || /this PC doesn't do delivery-capabilities/i.test(message(error))
+      log?.warn(`chat ${sid.slice(0, 8)}: delivery capability check (${old ? 'unknown-operation' : 'no-capability-answer'})`)
+      return refuse(old ? 'peer-delivery-unsupported' : 'peer-unreachable')
+    }
+    if (!isObject(support) || support.version !== 1 || support.idempotent !== true) {
+      log?.warn(`chat ${sid.slice(0, 8)}: delivery capability check (missing-capability-fields)`)
+      return refuse('peer-delivery-unsupported')
+    }
+    if (humanAuthority && support.humanInputAuthorization !== 1) return refuse('peer-authorization-unsupported')
     const target = bySession(sid)
-    if (!target) return null
+    if (!target) return refuse('binding-changed')
     const currentBinding = advanceDeliveryBinding(binding, target.agent)
-    if (!currentBinding || (actor && !deliveryAcl(actor, sid))) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    if (!currentBinding) return refuse('binding-changed')
+    if (actor && !deliveryAcl(actor, sid)) return refuse('access-denied')
     binding = currentBinding
     const grant = humanAuthority ? humanInputGrants.register(pcId, first.token, id, sid, humanAuthority) : null
-    if (humanAuthority && !grant) return { id, state: 'blocked', sessionId: sid, generation: null, started: false, updatedAt: new Date().toISOString() }
+    if (humanAuthority && !grant) return refuse('authorization-revoked')
     try {
     let raw: unknown = await request(first, 'type', { sessionId: sid, text: body, refuseDraft: true, confirmDelivery: true, messageId: id, owner, expectedBinding: binding, floorId: target.floor.id, agentId: target.agent.id, targetPcId: pcId, actor, ...(grant ? { humanAuthorization: grant.nonce } : {}) }, 16_000).catch(() => null)
     const deadline = Date.now() + 300_000
     for (;;) {
       const r = isObject(raw) ? raw.receipt : null
-      if (validReceipt(r, id) && r.state !== 'pending') return { ...r, ...(r.state === 'blocked' && isObject(raw) && raw.blockedByDraft === true ? { blockedByDraft: true } : {}) }
+      if (validReceipt(r, id) && r.state !== 'pending') {
+        if (r.state === 'blocked') {
+          logDeliveryBlock(sid, r.reason ?? 'peer-blocked')
+          // Older senders could call a post-paste menu 'blocked'. Without a
+          // specific pre-input diagnostic, preserve uncertainty and its fence.
+          if (!r.reason) return { ...r, state: 'unconfirmed' }
+        }
+        return { ...r, ...(r.state === 'blocked' && r.reason === 'draft' ? { blockedByDraft: true } : {}) }
+      }
       if (raw !== null && !validReceipt(r, id)) return null
       if (Date.now() >= deadline || closing) return validReceipt(r, id) ? { ...r, state: 'unconfirmed' } : null
       await new Promise<void>(resolve => setTimeout(resolve, 500))
@@ -4038,16 +4080,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** One durable intent; neither a timeout nor reopening the chat replays its paste. */
   async function sayTo(id: string, agentId: string, body: string, intent: Omit<SayRequest, 'text'> = {}, actor: Caller = OPEN, onSent?: (sid: string) => void, humanAuthority?: () => boolean): Promise<SayAnswer> {
     const owner = deliveryActor({ caller: actor })
-    const receipt = messageReceipts.begin({ id: intent.messageId, owner, floorId: id, agentId, text: body, expectedSessionId: intent.expectedSessionId }, async bind => {
-      let mayHaveSubmitted = false
+    const receipt = messageReceipts.begin({ id: intent.messageId, owner, floorId: id, agentId, text: body, expectedSessionId: intent.expectedSessionId }, async (bind, noteBlocked) => {
+      let mayHaveSubmitted = false, observedSid = intent.expectedSessionId ?? null
+      let reason: DeliveryBlockReason | undefined
+      const refuse = (code: DeliveryBlockReason, pcName?: string) => { logDeliveryBlock(observedSid, code); return noteBlocked(code, pcName) }
       try {
-      if (humanAuthority?.() === false) return 'blocked'
+      if (humanAuthority?.() === false) return refuse('authorization-revoked')
       let agent = agentOf(floorOf(id), agentId)
-      if (intent.expectedSessionId !== undefined && agent.sessionId !== intent.expectedSessionId) return 'blocked'
-      try { access.needChat(actor, agent, 'type', 'message delivery') } catch { return 'blocked' }
+      observedSid = agent.sessionId
+      if (intent.expectedSessionId !== undefined && agent.sessionId !== intent.expectedSessionId) return refuse('stale-session')
+      try { access.needChat(actor, agent, 'type', 'message delivery') } catch { return refuse('access-denied') }
       let sid = agent.sessionId, pc = sid ? whereAll()[sid]?.id : undefined, started = false
       if (!sid || !pc) {
-        if (access.rights(actor, agent)?.can !== 'owner') return 'blocked'
+        if (access.rights(actor, agent)?.can !== 'owner') return refuse('owner-required')
         const requestedHome = agent.homePc
         // Opening never carries text. Only the receipt-owned transaction can submit it afterwards.
         const opened = await openChat(id, agentId, {})
@@ -4058,27 +4103,32 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!pc && opened.on && requestedHome && agentOf(floorOf(id), agentId).homePc === requestedHome) pc = requestedHome
       }
       agent = agentOf(floorOf(id), agentId)
-      if (!sid || !pc || agent.sessionId !== sid) return 'blocked'
+      if (!sid || !pc) return refuse('target-unavailable')
+      if (agent.sessionId !== sid) return refuse('binding-changed')
+      observedSid = sid
       const targetSid = sid
       let binding = deliveryBinding(agent)
+      const invalid = (code: DeliveryBlockReason) => { reason = code; return false }
       const valid = () => {
         try {
           const current = agentOf(floorOf(id), agentId)
           const advanced = advanceDeliveryBinding(binding, current)
-          if (!advanced) return false
+          if (!advanced) return invalid('binding-changed')
           binding = advanced
-          access.needChat(actor, current, 'type', 'message delivery')
-          return !switchFences.blocked(targetSid) && humanAuthority?.() !== false
-        } catch { return false }
+          try { access.needChat(actor, current, 'type', 'message delivery') } catch { return invalid('access-denied') }
+          if (switchFences.blocked(targetSid)) return invalid('switch-in-progress')
+          if (humanAuthority?.() === false) return invalid('authorization-revoked')
+          return true
+        } catch { return invalid('target-unavailable') }
       }
-      if (!valid()) return 'blocked'
+      if (!valid()) return refuse(reason ?? 'preflight-failed')
       let final: DeliveryReceipt | null
       if (pc === self().id) {
         const generation = chats.generation?.(sid)
-        if (!generation) return 'gone'
+        if (!generation) return refuse('runtime-unavailable')
         bind(sid, generation, started)
-        mayHaveSubmitted = true
         const native = beginNativeDelivery(sid, body, owner, receiptId(), binding, valid)
+        mayHaveSubmitted = true
         do { final = await nativeReceipts.wait(native.id, owner, id, agentId, 15_000) } while (final?.state === 'pending' && !closing)
       } else {
         mayHaveSubmitted = true
@@ -4086,8 +4136,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (final?.generation) bind(sid, final.generation, started)
       }
       if (final?.state === 'sent') onSent?.(sid)
+      if (final?.state === 'blocked') return refuse(reason ?? final.reason ?? 'peer-blocked', final.targetPcName)
       return final?.state === 'pending' ? 'unconfirmed' : final?.state ?? 'unconfirmed'
-      } catch { return mayHaveSubmitted ? 'unconfirmed' : 'blocked' }
+      } catch { return mayHaveSubmitted ? 'unconfirmed' : refuse(reason ?? 'preflight-failed') }
     })
     // The send callback is always a microtask, after this stable ID has been allocated.
     function receiptId() { return receipt.id }
@@ -4097,7 +4148,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const description = state === 'pending'
       ? 'The one message is still awaiting submission confirmation and may still complete. Observe its receipt; do not press Enter or resend.'
       : state === 'blocked' || state === 'gone'
-        ? 'The message was not submitted: the chat, binding, draft or prompt is unavailable. Refresh the destination before trying a new message.'
+        ? blockDescription(final)
         : 'Delivery is not confirmed. The one message may already have been submitted or may remain in the composer. Inspect the destination; do not press Enter or resend.'
     throw Object.assign(apiError(409, description), { code: `delivery-${state}` })
   }

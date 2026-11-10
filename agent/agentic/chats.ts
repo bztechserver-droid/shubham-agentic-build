@@ -5,11 +5,12 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
+import type { DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 import * as cxs from '../codex/screen.ts'
 import { sendToCodex, type SendOptions, type SendResult } from '../codex/sender.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
-import { createScreen, type Screen } from './screen.ts'
+import { createScreen, readTurnState, type Screen } from './screen.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
 // (node-pty, ConPTY on Windows), as agentic-claude-manager runs them (server/lib/terminal.js):
@@ -223,6 +224,7 @@ export interface ChatPool {
 
 export interface DeliveryOptions {
   refuseDraft?: boolean
+  onBlocked?: (reason: DeliveryBlockReason) => void
   /** The HTTP/RPC caller still bounds its observation wait independently. */
   waitForOutcome?: boolean
   waitUntilReady?: boolean
@@ -446,7 +448,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function correct(c: Chat) {
     const running = (() => {
       try {
-        return c.screen.lines().some(l => /esc to interrupt/i.test(l))
+        const lines = c.screen.lines()
+        return c.engine === 'claude' ? readTurnState(lines) === 'running' : lines.some(l => /esc to interrupt/i.test(l))
       } catch {
         return false
       }
@@ -494,6 +497,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     if (re.question.test(t)) c.state = 'question'
     else if (re.running.test(t)) c.state = 'running'
     else if (re.done.test(t) || re.idle.test(t)) c.state = 'idle'
+    // The PTY/host can coalesce an old running paint with the later completed
+    // one (including on adoption). Trust their final rendered order, not the
+    // presence of any historical interrupt marker in the whole stream chunk.
+    // Question/menu handling keeps its existing fail-closed/grace behaviour.
+    if (c.engine === 'claude' && c.state !== 'question') c.state = readTurnState(c.screen.lines()) ?? c.state
     if (c.state === 'question' && before !== 'question') c.questionAt = Date.now()
     if (c.state !== before) {
       c.lastActive = Date.now() // a turn started or ended
@@ -625,13 +633,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         await new Promise<void>(resolve => setTimeout(resolve, 100))
       }
       if (c.exited) return 'gone'
-      if (opt?.guard?.() === false) return 'blocked'
+      if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
       return sendToCodex({
       write: d => d !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, d), lines: () => { if (c.exited) throw Error('gone'); return c.screen.lines() },
       sleep: ms => new Promise<void>(r => setTimeout(r, ms)),
       interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
       gone: () => c.exited,
       beforeInput: opt?.authorize,
+      onBlocked: opt?.onBlocked,
     }, text, { ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
     }
     const sending = (c.codexSending ? c.codexSending.then(r => r === 'sent' ? send() : 'blocked' as const) : send())
@@ -942,17 +951,19 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     async deliver(id, text, opt) {
       const c = chats.get(id)
       if (!c || c.exited) return 'gone'
-      if (blocked(c)) return 'blocked'
+      const refuse = (reason: DeliveryBlockReason): SendResult => { opt?.onBlocked?.(reason); return 'blocked' }
+      if (blocked(c)) return refuse('menu')
       if (c.engine === 'codex') {
         // Never repaste after an uncertain receipt. The one owned transaction may still drain.
-        if (c.codexSending) return 'blocked'
+        if (c.codexSending) return refuse('unresolved-send')
         const sending = sendCodex(c, text, opt)
         if (opt?.waitForOutcome) return sending
         let timer: ReturnType<typeof setTimeout> | undefined
         try { return await Promise.race([sending, new Promise<SendResult>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
         finally { clearTimeout(timer) }
       }
-      if (c.delivering || draftOnScreen(c)) return 'blocked'
+      if (c.delivering) return refuse('unresolved-send')
+      if (draftOnScreen(c)) return refuse('draft')
       const epoch = c.inputEpoch ?? 0
       const sending = (async (): Promise<SendResult> => {
         const deadline = Date.now() + (o.codexSend?.timeoutMs ?? 96_000)
@@ -961,7 +972,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) return 'unconfirmed'
           await new Promise<void>(resolve => setTimeout(resolve, 100))
         }
-        if (opt?.guard?.() === false) return 'blocked'
+        if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
         return sendToCodex({
           write: data => data !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, data),
           lines: () => {
@@ -974,6 +985,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
           gone: () => c.exited,
           beforeInput: opt?.authorize,
+      onBlocked: opt?.onBlocked,
         }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
       })().catch(() => 'unconfirmed' as const)
       c.delivering = sending

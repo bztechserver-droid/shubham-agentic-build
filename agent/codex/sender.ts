@@ -1,4 +1,5 @@
 import { composer, menuOnScreen, ownedComposerTail } from './screen.ts'
+import type { DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 
 const PASTE_START = '\u001b[200~'
 const PASTE_END = '\u001b[201~'
@@ -11,6 +12,8 @@ export interface SenderIO {
   gone?(): boolean
   /** Fresh authorization for this input only; denial never causes a repaste/retry. */
   beforeInput?(phase: 'paste' | 'submit'): Promise<boolean>
+  /** A pre-paste refusal only. Once input starts, failure is uncertain, never retry-safe. */
+  onBlocked?(reason: DeliveryBlockReason): void
 }
 export type SendResult = 'sent' | 'blocked' | 'unconfirmed' | 'gone'
 export interface SendOptions {
@@ -26,7 +29,7 @@ const normalized = (s: string) => s.replace(/\s+/g, '')
 /** Working output alone never proves acceptance. Only submit the owned composer. */
 export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {}): Promise<SendResult> {
   const settleMs = Math.max(1, o.settleMs ?? 2000)
-  const checkMs = o.checkMs ?? 1500
+  const checkMs = Math.max(1, o.checkMs ?? 1500)
   const tries = Math.max(1, Math.min(3, o.tries ?? 3))
   const maxSettleMs = o.maxSettleMs ?? Math.min(300_000, Math.max(90_000, Buffer.byteLength(text) * 50))
   const timeoutMs = Math.min(300_000, o.timeoutMs ?? maxSettleMs + 6000)
@@ -35,19 +38,25 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   const expired = () => Date.now() >= deadline || slept >= timeoutMs
   const sleep = async (ms: number) => { const wait = Math.max(0, Math.min(ms, timeoutMs - slept, deadline - Date.now())); await io.sleep(wait); slept += wait }
   const read = () => { try { return io.lines() } catch { return null } }
+  const blocked = (reason: DeliveryBlockReason): SendResult => { io.onBlocked?.(reason); return 'blocked' }
   const before = read()
-  if (!before) return io.gone?.() ? 'gone' : 'blocked'
-  if (menuOnScreen(before) || io.interrupted?.()) return 'blocked'
+  if (!before) return io.gone?.() ? 'gone' : blocked('screen-unavailable')
+  if (menuOnScreen(before)) return blocked('menu')
+  if (io.interrupted?.()) return blocked('input-changed')
   const initial = composer(before)
-  if (!initial || initial.text) return 'blocked'
+  if (!initial) return blocked('composer-unavailable')
+  if (initial.text) return blocked('draft')
   const pasted = text.split(PASTE_END).join('')
-  if (!pasted.trim()) return 'blocked'
+  if (!pasted.trim()) return blocked('empty-message')
   if (expired()) return 'unconfirmed'
-  if (io.beforeInput && !(await io.beforeInput('paste').catch(() => false))) return 'blocked'
+  if (io.beforeInput && !(await io.beforeInput('paste').catch(() => false))) return blocked('authorization-revoked')
   if (io.interrupted?.() || expired()) return 'unconfirmed'
   if (io.beforeInput) {
     const ready = read(), c = ready && composer(ready)
-    if (!ready || menuOnScreen(ready) || !c || c.text) return 'blocked'
+    if (!ready) return blocked('screen-unavailable')
+    if (menuOnScreen(ready)) return blocked('menu')
+    if (!c) return blocked('composer-unavailable')
+    if (c.text) return blocked('draft')
   }
   if (!io.write(PASTE_START)) return 'gone'
   for (let offset = 0; offset < pasted.length;) {
@@ -78,7 +87,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.interrupted?.() || expired()) return 'unconfirmed'
     const lines = read()
     if (!lines) return io.gone?.() ? 'gone' : 'unconfirmed'
-    if (menuOnScreen(lines)) return 'blocked'
+    if (menuOnScreen(lines)) return 'unconfirmed'
     const c = currentOwned(lines)
     if (c && previous === c.text) { settled = true; ownedText = c.text; break }
     previous = c?.text
@@ -88,7 +97,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (io.interrupted?.() || expired()) return 'unconfirmed'
     const lines = read()
     if (!lines) return attemptedEnter ? 'unconfirmed' : io.gone?.() ? 'gone' : 'unconfirmed'
-    if (menuOnScreen(lines)) return attemptedEnter ? 'unconfirmed' : 'blocked'
+    if (menuOnScreen(lines)) return 'unconfirmed'
     const c = currentOwned(lines)
     if (!c || c.text !== ownedText) return 'unconfirmed'
     if (io.beforeInput && !(await io.beforeInput('submit').catch(() => false))) return 'unconfirmed'
@@ -98,16 +107,27 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (!fresh || menuOnScreen(fresh) || currentOwned(fresh)?.text !== ownedText) return 'unconfirmed'
     attemptedEnter = true
     if (!io.write('\r')) return 'unconfirmed'
-    await sleep(checkMs)
-    if (io.interrupted?.() || expired()) return 'unconfirmed'
-    const after = read()
-    if (!after) return 'unconfirmed'
-    if (menuOnScreen(after)) return 'unconfirmed'
-    const next = composer(after)
-    if (next && !next.text) return 'sent'
-    // A clipped suffix can also be the newly submitted message in history. Without the
-    // current prompt glyph after Enter, its commit is ambiguous: never press Enter again.
-    if (!next || (!next.collapsed && normalized(next.text) !== expected) || next.text !== ownedText) return 'unconfirmed'
+    // Submit redraws can temporarily erase the whole input box. Observe for a
+    // bounded window; missing input or running output alone is never acceptance.
+    let unchangedOwned = false
+    for (let waited = 0; waited < 3000;) {
+      const interval = Math.min(checkMs, 3000 - waited)
+      await sleep(interval)
+      waited += interval
+      if (io.interrupted?.() || expired() || io.gone?.()) return 'unconfirmed'
+      const after = read()
+      if (!after) continue
+      if (menuOnScreen(after)) return 'unconfirmed'
+      const next = composer(after)
+      if (!next) continue
+      if (!next.text) return 'sent'
+      if ((!next.collapsed && normalized(next.text) !== expected) || next.text !== ownedText) return 'unconfirmed'
+      unchangedOwned = true
+      break
+    }
+    // Retry Enter only with the same readable owned text, exactly as before.
+    // An absent/clipped/unreadable box never authorizes another Enter.
+    if (!unchangedOwned) return 'unconfirmed'
   }
   return 'unconfirmed'
 }

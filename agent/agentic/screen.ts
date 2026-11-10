@@ -416,14 +416,45 @@ export function findMenu(lines: string[]): MenuAt | null {
 }
 
 const SPINNER_RE = /^\s*[✻✽✶✢✳·*⏺]\s+(\S.*?…)\s*(?:\(([^)]*)\))?\s*$/
+const INTERRUPT_RE = /esc to interrupt/i
+// Claude varies the verb (Crunched, Cooked, Worked, ...). The completion shape,
+// not a particular verb or the optional middle dot, establishes a finished turn.
+const FINISHED_RE = /^\s*(?:[✻✽✶✢✳·*⏺]\s+)?[a-z][a-z -]*\s+for\s+<?(?:\d+h\s*)?(?:\d+m\s*)?\d+(?:\.\d+)?(?:ms|s)\s*(?:[·•]\s*)?done(?:\s+\d{1,2}:\d{2}(?:\s*[ap]m)?)?\s*$/i
+
+/** The newest input box separates response/activity rows from typed draft and footer rows. */
+function activityFrame(lines: readonly string[]): { body: readonly string[]; footer: readonly string[] } {
+  for (let i = lines.length - 1; i >= 1; i--) {
+    if (!RULE_RE.test(lines[i - 1]) || !/^\s*❯(?!\s*\d{1,2}\.\s)/.test(lines[i])) continue
+    const end = lines.findIndex((line, n) => n > i && RULE_RE.test(line))
+    if (end >= 0) return { body: lines.slice(0, i - 1), footer: lines.slice(end + 1) }
+  }
+  return { body: lines, footer: [] }
+}
+
+/** Explicit turn evidence on the rendered Claude screen; null during an incomplete paint. */
+export function readTurnState(lines: readonly string[]): 'running' | 'idle' | null {
+  const { body, footer } = activityFrame(lines)
+  if (footer.some(line => INTERRUPT_RE.test(line))) return 'running'
+  for (let i = body.length - 1; i >= 0; i--) {
+    if (FINISHED_RE.test(body[i])) return 'idle'
+    // A newer spinner prevents an older completed turn from ending the new one.
+    if (SPINNER_RE.test(body[i])) return null
+    if (INTERRUPT_RE.test(body[i])) return 'running'
+  }
+  return null
+}
 
 /** What claude says it is doing while it works: "Pollinating… (5s · ↓ 167 tokens)". Null when it isn't working. */
 export function readStatus(lines: string[]): ChatStatus | null {
-  // Only while its footer says it can be interrupted: the spinner glyphs also mark finished lines.
-  if (!lines.some(l => /esc to interrupt/i.test(l))) return null
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const m = SPINNER_RE.exec(lines[i])
+  const { body, footer } = activityFrame(lines)
+  let interrupt = footer.some(line => INTERRUPT_RE.test(line))
+  for (let i = body.length - 1; i >= 0; i--) {
+    // Neither an older spinner nor its old interrupt footer survives a newer completion.
+    if (FINISHED_RE.test(body[i])) return null
+    if (INTERRUPT_RE.test(body[i])) interrupt = true
+    const m = SPINNER_RE.exec(body[i])
     if (!m) continue
+    if (!interrupt) return null
     const extra = m[2] ?? ''
     const time = /(?:(\d+)m\s*)?(\d+)s/.exec(extra)
     const tokens = /([\d.,]+k?)\s*tokens/i.exec(extra)
