@@ -274,6 +274,10 @@ export interface AgenticOptions {
   defaultCodeDir?: string
   /** CLAUDE_CODE_OAUTH_TOKEN as this account has it now (F-007). */
   token?: () => string | null
+  /** 10 Nov 2026: an agent's message to a plain native Claude chat is typed the old direct way (one paste, one Enter, no receipt). true = the checked
+   *  sender for those too (default: SAD_CHECK_AGENT_MESSAGES=1 or <state>/agent/check-agent-messages.on; off, the old way). Codex, OpenCode and
+   *  Codex-in-Claude-Code chats always use the checked sender. */
+  checkAgentMessages?: boolean
   /** F-087: the fast Assistant's warm process (fast-host.ts): on or off (default: SAD_FAST_ASSISTANT=1 or <state>/agent/fast-assistant.on; off, nothing exists). */
   fastAssistant?: boolean
   /** F-087: tests: the pieces of the fast host that would start a real claude, replaced. */
@@ -2526,6 +2530,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // 10 Nov 2026 (Shubham): a message joins the text in a CLAUDE chat's box (old direct send). A native Codex chat's own sender never types over
   // text it did not paste, so for a Codex chat the refusal stays, and says so honestly instead of reporting a send that typed nothing.
   const joinsDraft = (sessionId: string) => { const at = floors.bySession(sessionId); return !at || engineFor(at.agent) !== 'codex' }
+  // A plain native Claude chat (not Codex, OpenCode or Codex in Claude Code): agent messages to it use the old direct send (see typeInto).
+  const oldWayForClaude = (sessionId: string) => {
+    if (o.checkAgentMessages ?? (process.env.SAD_CHECK_AGENT_MESSAGES === '1' || existsSync(path.join(o.dir, '..', 'check-agent-messages.on')))) return false
+    const at = floors.bySession(sessionId)
+    if (!at) return false
+    try { return requireLegacyExecution(at.agent, defaultsNow()) === 'claude' } catch { return false }
+  }
 
   /**
    * Types `body` into a chat here or on a member PC.
@@ -2536,9 +2547,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * the callers). A restart (/exit) still refuses a draft: that is not a message. A Codex chat keeps the refusal (see joinsDraft).
    */
   async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller } = {}): Promise<boolean> {
-    assertMessageRuntime(c.sessionId,c.id,opt.confirmed===true)
+    // 10 Nov 2026, Shubham ("before Codex everything worked"): a message from an agent (agent tools, broadcast, order reply) to a NATIVE CLAUDE
+    // chat goes the old direct way again: one paste, one Enter, no receipt, no confirmation, no retry. The checked sender stayed for the chats
+    // that need it (Codex, OpenCode, Codex in Claude Code). It also ends the stuck "[Pasted text #N]": Claude Code collapses a long paste, the
+    // checked sender could not recognise its own text and never pressed Enter. Never sends twice: there is no retry.
+    const confirmed = opt.confirmed === true && !oldWayForClaude(c.sessionId)
+    assertMessageRuntime(c.sessionId,c.id,confirmed)
     const refuseDraft = false
-    if (opt.confirmed) {
+    if (confirmed) {
       let result: unknown, diagnostic: DeliveryReceipt | null = null
       if (c.id === self().id) {
         const delivery = await confirmedDelivery(c.sessionId, body, refuseDraft, opt.caller, r => { diagnostic = r })
