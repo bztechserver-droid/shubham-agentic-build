@@ -2523,15 +2523,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // Known only for chats on this PC (their screens); another PC's chats are typed into as before.
   const hasDraft = (sessionId: string) => (chats.info(sessionId) ? chats.drafting(sessionId) : false)
   const draftWords = (sessionId: string) => `${floors.bySession(sessionId)?.agent.name ?? 'That agent'}'s chat has unsent text in its box; try again shortly.`
+  // 10 Nov 2026 (Shubham): a message joins the text in a CLAUDE chat's box (old direct send). A native Codex chat's own sender never types over
+  // text it did not paste, so for a Codex chat the refusal stays, and says so honestly instead of reporting a send that typed nothing.
+  const joinsDraft = (sessionId: string) => { const at = floors.bySession(sessionId); return !at || engineFor(at.agent) !== 'codex' }
 
   /**
-   * Types `body` into a chat here or on a member PC. `human`: Shubham's own words (the chat view's say, a setting he changed): they may join
-   * his draft. Every other caller (an agent's message, a broadcast, a nudge, an order's reply) never does: on his unsent text nothing is
-   * typed and it throws 409. A chat on a member PC reports its draft back, because only that PC knows its screen.
+   * Types `body` into a chat here or on a member PC.
+   * 10 Nov 2026, Shubham's order ("remove the rule"): a CLAUDE chat is no longer refused because its box holds unsent text (an agent's message,
+   * a broadcast, a nudge, an order's reply). The confirmed sender never types over text it did not paste, so when it finds a draft it
+   * reports 'blocked'; the message then goes in the OLD direct way instead: pasted after the text, one Enter, no receipt. That is what the
+   * old app did, and it unblocks a chat whose box holds a stuck paste. Prompts/menus are still never pressed Enter on (atPrompt guards
+   * the callers). A restart (/exit) still refuses a draft: that is not a message. A Codex chat keeps the refusal (see joinsDraft).
    */
   async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller } = {}): Promise<boolean> {
     assertMessageRuntime(c.sessionId,c.id,opt.confirmed===true)
-    const refuseDraft = opt.human !== true
+    const refuseDraft = false
     if (opt.confirmed) {
       let result: unknown, diagnostic: DeliveryReceipt | null = null
       if (c.id === self().id) {
@@ -2552,7 +2558,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
           result = receipt?.blockedByDraft ? 'draft' : { delivery: diagnostic?.state ?? 'unconfirmed' }
         } finally { clearTimeout(timer) }
       }
-      if (result === 'draft') throw apiError(409, draftWords(c.sessionId))
+      if (result === 'draft') {
+        if (!joinsDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
+        // Nothing was typed by the confirmed sender. Send the old direct way, joining the unsent text.
+        log?.info(`chat ${c.sessionId.slice(0, 8)}: the box holds unsent text; the message is typed the old direct way after it (no receipt)`)
+        if (c.id === self().id) return chats.type(c.sessionId, body)
+        const peerLink = team?.member(c.id)
+        if (!peerLink) return false
+        return (await request<boolean | 'draft'>(peerLink, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)) === true
+      }
       const delivery = isObject(result) ? result.delivery : undefined
       if (delivery === 'sent') return true
       if (delivery === 'blocked') throw Object.assign(apiError(409, blockDescription(diagnostic)), { code: 'delivery-blocked' })
@@ -3255,7 +3269,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const body = text(args.text, 'text')
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(target.sessionId)) throw apiError(409, promptWords(target.sessionId))
-        if (hasDraft(target.sessionId)) throw apiError(409, draftWords(target.sessionId))
+        // 10 Nov 2026, Shubham: unsent text in a Claude chat's box no longer refuses a message (typeInto sends it the old direct way after the text).
+        if (!joinsDraft(target.sessionId) && hasDraft(target.sessionId)) throw apiError(409, draftWords(target.sessionId))
         const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
@@ -3373,7 +3388,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const body = text(args.text, 'text')
         // M1: first, so a refusal starts no cooldown and opens no order.
         if (atPrompt(c.sessionId)) throw apiError(409, promptWords(c.sessionId))
-        if (hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
+        // 10 Nov 2026, Shubham: unsent text in a Claude chat's box no longer refuses a message (typeInto sends it the old direct way after the text).
+        if (!joinsDraft(c.sessionId) && hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
         if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, c.sessionId, body) }, me))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
@@ -3394,10 +3410,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
             return !at || (r !== null && r.can !== 'view')
           })
           .map(([s, w]) => ({ sessionId: s, id: w.id, asking: atPrompt(s), drafting: hasDraft(s) }))
-        // M1: a chat at a prompt is skipped, not pressed Enter on. A chat with his unsent text in its box is skipped too.
-        const to = all.filter(c => !c.asking && !c.drafting)
+        // M1: a chat at a prompt is skipped, not pressed Enter on. 10 Nov 2026 (Shubham): a chat with unsent text in its box is NOT skipped
+        // any more; the message goes in after the text the old direct way.
+        // (A Codex chat's native sender never types over text it did not paste, so a Codex chat with a draft is still skipped, honestly.)
+        const to = all.filter(c => !c.asking && (!c.drafting || joinsDraft(c.sessionId)))
         const skipped = all.filter(c => c.asking)
-        const drafts = all.filter(c => !c.asking && c.drafting)
+        const drafts = all.filter(c => !c.asking && c.drafting && !joinsDraft(c.sessionId))
         // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
         const outcomes = await Promise.all(to.map(async c => {
           try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true, caller: me }), unknown: false, pending: false, draft: false } }
