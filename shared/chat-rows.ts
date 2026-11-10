@@ -20,6 +20,8 @@ export interface PendingMessage {
   attachments?: ChatAttachment[]
   /** F-069: where each is kept (the PC the chat runs on), to say it again when sending is retried. */
   paths?: string[]
+  /** The agent's clock when it answered this send (its receipt): closer to claude's own timestamps than the page's `sentAt`. */
+  anchorAt?: string
 }
 
 /**
@@ -62,26 +64,92 @@ export const senderName = (i: ChatUserItem) => (i.from ? (i.from.name ?? (i.from
  * words that wasn't there when it was sent; each echo answers one pending message, oldest first.
  */
 export function reconcile(items: ChatItem[], pending: PendingMessage[]): { matched: Map<string, string>; open: PendingMessage[] } {
+  // The words alone cannot say which send an echo answers when the same words were sent several times (Shubham sent "update" over and over),
+  // and claude's file carries none of our ids. So every possible pair is listed and the pairs that are closest in TIME are taken first: claude
+  // stamps an echo with the moment the message was typed, so the echo of a send is the nearest one to it. An old send whose own echo is out of
+  // the window therefore finds only echoes that belong to newer sends, which are already taken, and stays unmatched instead of stealing one.
+  // Without usable times the order is the old one: oldest send first, earliest echo first.
+  const pairs: { pi: number; ii: number; gap: number }[] = []
+  pending.forEach((p, pi) => {
+    if (p.state === 'failed') return
+    const sent = when(p.anchorAt ?? p.sentAt)
+    items.forEach((i, ii) => {
+      if (!isMine(i) || i.command || p.known.has(i.id) || i.text.trim() !== p.text.trim()) return
+      const echoed = when(i.at)
+      pairs.push({ pi, ii, gap: Number.isNaN(sent) || Number.isNaN(echoed) ? Number.POSITIVE_INFINITY : Math.abs(echoed - sent) })
+    })
+  })
+  pairs.sort((a, b) => (a.gap === b.gap ? 0 : a.gap < b.gap ? -1 : 1) || a.pi - b.pi || a.ii - b.ii)
   const taken = new Set<string>()
   const matched = new Map<string, string>()
-  for (const p of pending) {
-    if (p.state === 'failed') continue
-    const echo = items.find(i => isMine(i) && !i.command && !p.known.has(i.id) && !taken.has(i.id) && i.text.trim() === p.text.trim())
-    if (echo) {
-      taken.add(echo.id)
-      matched.set(p.id, echo.id)
-    }
+  for (const { pi, ii } of pairs) {
+    const p = pending[pi]
+    const echo = items[ii]
+    if (matched.has(p.id) || taken.has(echo.id)) continue
+    taken.add(echo.id)
+    matched.set(p.id, echo.id)
   }
   return { matched, open: pending.filter(p => !matched.has(p.id)) }
 }
 
-const when = (at: string | null) => (at ? Date.parse(at) : Number.NaN)
+const when = (at: string | null | undefined) => (at ? Date.parse(at) : Number.NaN)
+
+/**
+ * The items as things really entered the conversation. Claude writes what the person typed while it was working (a `queued_command`, also a
+ * sub-agent's report) into its file when it TAKES it, but stamps it with the moment it was TYPED, so in the file it sits after answers that
+ * came later than it. The chat shows such a message at the moment it was typed, above those answers, as the terminal's own time order does.
+ * Only a person's message or a notice is ever moved, and only above rows stamped later than it; a row without a time stays put; the feed's
+ * own list (file order, ids, merges) is never touched. Nothing out of order: the same array comes back.
+ */
+export function inTimeOrder(items: ChatItem[]): ChatItem[] {
+  let out: ChatItem[] | null = null
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
+    const t = it.kind === 'user' || it.kind === 'notice' ? when(it.at) : Number.NaN
+    if (Number.isNaN(t)) { out?.push(it); continue }
+    // Walk back over what is stamped later than this row; the first row at or before its time (or the start) is where it belongs.
+    const src = out ?? items
+    const end = out ? out.length : i
+    let j = end
+    for (let steps = 0; j > 0 && steps < 2000; steps++) {
+      const above = when(src[j - 1].at)
+      if (Number.isNaN(above) || above <= t) break   // a row without a time is never passed: its place against this one is unknown
+      j--
+    }
+    if (j === end) { out?.push(it); continue }
+    out ??= items.slice(0, i)
+    out.splice(j, 0, it)
+  }
+  return out ?? items
+}
 
 /** Whether two instants are on the same calendar day, here. */
 const sameDay = (a: string, b: string) => new Date(a).toDateString() === new Date(b).toDateString()
 
-export function toRows(items: ChatItem[], pending: PendingMessage[] = []): ChatRow[] {
-  const { matched, open } = reconcile(items, pending)
+export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = []): ChatRow[] {
+  const items = inTimeOrder(feedItems)
+  const { matched } = reconcile(items, pending)
+  // A message sent from here and not echoed yet waits where it was sent: right after the last item the page had when it was sent, so
+  // what arrives afterwards lands BELOW it, and its echo (stamped with the same moment) takes that very place. When the page cannot tell
+  // (nothing was on screen, or none of what was is any more) it is the newest, at the bottom, as before.
+  const index = new Map(items.map((it, n) => [it.id, n]))
+  const placed = new Map<number, PendingMessage[]>()
+  const bottom: PendingMessage[] = []
+  // Two sends before the first echo knew the same items, but the second was sent after the first: never above its echo or its row.
+  let floor = -1
+  let toBottom = false
+  for (const p of pending) {
+    if (p.state === 'failed') continue
+    const echo = matched.get(p.id)
+    if (echo !== undefined) { floor = Math.max(floor, index.get(echo) ?? -1); continue }
+    let after = -1
+    for (const id of p.known) after = Math.max(after, index.get(id) ?? -1)
+    if (toBottom || after < 0) { toBottom = true; bottom.push(p); continue }
+    after = Math.max(after, floor)
+    floor = after
+    placed.set(after, [...(placed.get(after) ?? []), p])
+  }
+  for (const p of pending) if (p.state === 'failed') bottom.push(p)
   const echoOf = new Map([...matched].map(([pendingId, itemId]) => [itemId, pendingId]))
   const rows: ChatRow[] = []
   let lastAt: string | null = null
@@ -100,7 +168,19 @@ export function toRows(items: ChatItem[], pending: PendingMessage[] = []): ChatR
     lastAt = at
   }
 
+  const pushPending = (p: PendingMessage) => {
+    const item: ChatUserItem = { kind: 'user', id: `pending:${p.id}`, at: p.sentAt, text: p.text, from: null, command: false, ...(p.attachments?.length ? { attachments: p.attachments } : {}) }
+    day(p.sentAt)
+    rows.push({ k: 'msg', id: item.id, key: item.id, item, mine: true, sender: null, first: true, last: true, ticks: p.state === 'failed' ? 'failed' : p.state === 'sent' ? 'sent' : 'sending', pending: p })
+  }
+
   items.forEach((it, idx) => {
+    emit(it, idx)
+    for (const p of placed.get(idx) ?? []) pushPending(p)
+  })
+  for (const p of bottom) pushPending(p)
+
+  function emit(it: ChatItem, idx: number) {
     if (it.kind === 'tool') {
       day(it.at)
       if (it.ask) {
@@ -132,12 +212,6 @@ export function toRows(items: ChatItem[], pending: PendingMessage[] = []): ChatR
       ticks: mine && !it.command ? (answeredFrom.has(idx) ? 'answered' : 'delivered') : null,
       pending: null,
     })
-  })
-
-  for (const p of open) {
-    const item: ChatUserItem = { kind: 'user', id: `pending:${p.id}`, at: p.sentAt, text: p.text, from: null, command: false, ...(p.attachments?.length ? { attachments: p.attachments } : {}) }
-    day(p.sentAt)
-    rows.push({ k: 'msg', id: item.id, key: item.id, item, mine: true, sender: null, first: true, last: true, ticks: p.state === 'failed' ? 'failed' : p.state === 'sent' ? 'sent' : 'sending', pending: p })
   }
 
   // Clusters: neighbours on the same side, by the same sender, close in time.
