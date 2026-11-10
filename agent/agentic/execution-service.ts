@@ -61,6 +61,7 @@ export function createExecutionService(o: ExecutionServiceOptions) {
   // Observe through the existing authenticated controller. Diagnostics contain only predicates;
   // a failed observation still refuses admission and never creates a runtime proof.
   const host = o.host
+  const lastDiagnostic = { facts: '', at: 0 }
   const observedHost = host?.inspect ? { ...host, inspect: async () => {
     const before = host.current?.()
     let observation = await host.inspect!()
@@ -110,9 +111,14 @@ export function createExecutionService(o: ExecutionServiceOptions) {
             hasStartedAt: Number.isFinite(Date.parse(String(chat.meta.startedAt))), exited: !!chat.exited }
         } catch { return { runId: chat.meta.bridgeRunId, privateRecordReadable: false } }
       })
-      writePrivateAtomic(path.join(o.directory, 'host-observation-diagnostic.json'), JSON.stringify({ version: 1, at: new Date().toISOString(),
-        controllerUnchanged: isDeepStrictEqual(before, after), hostMatches: observation.hostPid === before?.hostPid && observation.hostStartedAt === before?.hostStartedAt,
-        managed }) + '\n')
+      // Speed: inspect runs before every provider request; the diagnostic is rewritten (a synced, protected write)
+      // only when what it says changes, or once a minute, instead of every time.
+      const facts = JSON.stringify({ controllerUnchanged: isDeepStrictEqual(before, after),
+        hostMatches: observation.hostPid === before?.hostPid && observation.hostStartedAt === before?.hostStartedAt, managed })
+      if (facts !== lastDiagnostic.facts || Date.now() - lastDiagnostic.at >= 60_000) {
+        writePrivateAtomic(path.join(o.directory, 'host-observation-diagnostic.json'), JSON.stringify({ version: 1, at: new Date().toISOString(), ...JSON.parse(facts) }) + '\n')
+        lastDiagnostic.facts = facts; lastDiagnostic.at = Date.now()
+      }
     } catch { /* Diagnostics never replace the physical admission checks. */ }
     return observation
   } } : host

@@ -32,7 +32,29 @@ function loadWindows() {
     info: kernel.func('bool __stdcall GetFileInformationByHandle(intptr_t,_Out_ void*)'),
     read: kernel.func('bool __stdcall ReadFile(intptr_t,_Out_ void*,uint32_t,_Out_ uint32_t*,void*)'),
     close: kernel.func('bool __stdcall CloseHandle(intptr_t)'),
+    openProcess: kernel.func('intptr_t __stdcall OpenProcess(uint32_t,bool,uint32_t)'),
+    processTimes: kernel.func('bool __stdcall GetProcessTimes(intptr_t,_Out_ void*,_Out_ void*,_Out_ void*,_Out_ void*)'),
+    exitCode: kernel.func('bool __stdcall GetExitCodeProcess(intptr_t,_Out_ uint32_t*)'),
   }
+}
+
+/** One running process instance, from the kernel directly (no shell): its PID and exact creation time (100 ns
+ * FILETIME), or null when that PID is not running now. A PID reused by another process has another creation time.
+ * Microseconds instead of the ~0.8 s a PowerShell process query takes. */
+export function processIdentity(pid: number): string | null {
+  if (!validPid(pid)) return null
+  const os = api()
+  // PROCESS_QUERY_LIMITED_INFORMATION: enough for times and exit code of the same user's processes.
+  const handle = os.openProcess(0x1000, false, pid)
+  if (!handle) return null
+  try {
+    const code = [0]
+    if (!os.exitCode(handle, code) || code[0] !== 259) return null // STILL_ACTIVE
+    const created = Buffer.alloc(8), exited = Buffer.alloc(8), kernel = Buffer.alloc(8), user = Buffer.alloc(8)
+    if (!os.processTimes(handle, created, exited, kernel, user)) return null
+    const at = created.readBigUInt64LE(0)
+    return at > 0n ? `${pid}:${at}` : null
+  } finally { os.close(handle) }
 }
 const api = () => windows ??= loadWindows()
 

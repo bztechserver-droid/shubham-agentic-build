@@ -13,7 +13,7 @@ import { findClaude, type ChatPool, type StartChat } from '../agentic/chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
-import { fromResponses, providerFailureSummary, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
+import { fromResponses, providerFailureSummary, reasoningTag, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
@@ -25,13 +25,23 @@ import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
 import { claudeBinDir, installedClaudeSources, provedClaudeBinary } from './claude-binary.ts'
 import { compatibleControllerUpgrade, PREVIOUS_CONTROLLERS, UNCHANGED_CHILD_FILES } from './controller-upgrade.ts'
-import { ownsLoopbackListener, pinImmutableBinary } from './windows-observation.ts'
+import { ownsLoopbackListener, pinImmutableBinary, processIdentity } from './windows-observation.ts'
 import { confirmedUnstartedEnd, validUnstartedEnd, UnstartedBridgeRetirements, settleUndispatchedLease, validUndispatchedRelease,
   type UndispatchedRelease, type UnstartedBridgeEnd, type UnstartedProcess } from './unstarted.ts'
 
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const safeId = (id: string) => /^[A-Za-z0-9_-]{16,128}$/.test(id)
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+/** How long a full process proof is trusted for the quick kernel check of the same instances (see physical()). */
+const FULL_PROOF_MS = 5 * 60_000
+/** When the full proof is due but its process query cannot run at all, the kernel check of the same proven instances keeps
+ * the run admitted for at most this long after its last full proof. A query that runs and disagrees still refuses. */
+const FULL_PROOF_FALLBACK_MS = 60 * 60_000
+/** A kernel identity (`pid:FILETIME`, 100 ns since 1601) and a process-query creation time (ms since 1970) name the same instant. */
+const sameInstant = (identity: string, createdMs: number) => {
+  const filetime = BigInt(identity.slice(identity.indexOf(':') + 1))
+  return Math.abs(Number(filetime / 10_000n - 11_644_473_600_000n) - createdMs) <= 1
+}
 const PIN_FILES = ['adapter.ts', 'child.ts', 'runtime.ts', 'storage.ts', 'probe.ts', 'ownership.ts', 'messages-stream.ts', 'controller-upgrade.ts', 'windows-observation.ts', 'unstarted.ts', 'request-failure.ts', 'run-state.ts', 'capability-renewal.ts', 'requirements.ts', 'claude-binary.ts']
 interface RunRecord {
   version: 1; runId: string; lease: CodexBridgeLease; pins: BridgeRuntimePins; configFile: string;
@@ -74,12 +84,28 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     return o.host.current()
   })
   const unstarted = new UnstartedBridgeRetirements(epoch=>ownership.fence(epoch))
-  o.host?.onLost(() => { ownership.invalidate(); unstarted.invalidate(); hostLifetime.abort() })
+  // Runs fully proven recently, for the quick per-request check (see physical()). Forgotten on any doubt.
+  const provenRuns = new Map<string, { epoch: unknown; proxyPid: number; claudePid: number; proxyIdentity: string; claudeIdentity: string; port: number; at: number }>()
+  o.host?.onLost(() => { provenRuns.clear(); ownership.invalidate(); unstarted.invalidate(); hostLifetime.abort() })
   o.host?.onBack(() => { if (!closed) hostLifetime = new AbortController() })
   const cleanupTimer = setInterval(() => { void retirementWork.reconcile() }, 1000)
   cleanupTimer.unref()
   const recordFile = (id: string) => { if (!safeId(id)) throw executionHttpError('execution-invalid', 'runtime'); return path.join(o.directory, `${id}.run.json`) }
   const save = (record: RunRecord) => writePrivateAtomic(recordFile(record.runId), JSON.stringify(record) + '\n')
+  /** One prompt-cache key per conversation (a hash of its session id): the endpoint keeps its cached prefix warm. */
+  const cacheKeyOf = (record: RunRecord) => createHash('sha256').update(`sad-bridge-cache:${record.lease.request.binding.sessionId}`).digest('hex').slice(0, 32)
+  // The last 300 requests' timings (numbers only), so the speed of Codex in Claude Code can be measured, not guessed.
+  let timings: unknown[] | null = null
+  const recordTiming = (entry: Record<string, unknown>) => {
+    try {
+      const file = path.join(o.directory, 'request-timings.json')
+      if (!timings) { try { const raw = JSON.parse(fs.readFileSync(file, 'utf8')); timings = Array.isArray(raw?.entries) ? raw.entries.slice(-300) : [] } catch { timings = [] } }
+      const list = timings ?? []
+      list.push(entry); if (list.length > 300) list.splice(0, list.length - 300)
+      timings = list
+      writePrivateAtomic(file, JSON.stringify({ version: 1, entries: list }) + '\n')
+    } catch { /* Diagnostics never change a request. */ }
+  }
   const pause = (record: RunRecord) => {
     record.dispatchPaused = true
     try { save(record) } catch { closed = true; lifetime.abort() }
@@ -155,12 +181,44 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       queueRetirement(record)
       return retired
     }
+    // Speed: the full proof below (a PowerShell process query, ~0.8 s) runs on a run's first observation and then at most
+    // every 5 minutes. In between, the same proven instances (exact PID + kernel creation time of the proxy and of
+    // Claude Code) and the proxy's own loopback listener are re-checked directly with the kernel, in microseconds.
+    const proven = provenRuns.get(record.runId)
+    provenRuns.delete(record.runId)
+    // The same proven instances, still running, still listening: admitted again without a process query.
+    const quick = (maxAgeMs: number): BridgeOwnerObservation | null => {
+      try {
+        if (proven && isDeepStrictEqual(proven.epoch, epoch) && proven.proxyPid === ch.pid && record.proof && stateNow(record) === 'running'
+          && isDeepStrictEqual(record.pins, pins) && Date.now() - proven.at < maxAgeMs
+          && processIdentity(proven.proxyPid) === proven.proxyIdentity && processIdentity(proven.claudePid) === proven.claudeIdentity
+          && ownsLoopbackListener(proven.proxyPid, proven.port)) {
+          requireBridgeRuntimeProof(record.proof, record.lease, record.lease.request, capability, pins, Date.now())
+          ownership.fence(epoch)
+          ownership.admit(record.lease, record.proof, epoch)
+          provenRuns.set(record.runId, proven)
+          return { state: 'running', runtime: record.proof }
+        }
+      } catch { /* Not proven by the quick check: the full proof decides. */ }
+      return null
+    }
+    const fast = quick(FULL_PROOF_MS)
+    if (fast) return fast
     const config = readChildConfig(record.configFile)
     assertPrivatePath(config.readyFile); assertPrivatePath(config.settingsFile)
     const ready = JSON.parse(fs.readFileSync(config.readyFile, 'utf8'))
     if (ready.version !== 1 || ready.runId !== record.runId || ready.leaseId !== record.lease.leaseId || ready.proxyPid !== ch.pid
       || !Number.isSafeInteger(ready.claudePid) || !Number.isSafeInteger(ready.port) || ready.port < 1 || ready.port > 65535) return { state: 'unknown' }
-    const observed = await processes(ch.pid, ready.claudePid, host.hostPid, ready.port)
+    let observed: Awaited<ReturnType<typeof processes>>
+    try { observed = await processes(ch.pid, ready.claudePid, host.hostPid, ready.port) }
+    catch (error) {
+      // The process query itself could not run (it timed out under heavy load on 10 Nov 00:01 and paused Lead):
+      // that is not evidence against the run. A run proven in full within the hour stays admitted on the kernel check of
+      // the very same instances; a run never proven in full, or whose instances changed, stays unproven.
+      const fallback = quick(FULL_PROOF_FALLBACK_MS)
+      if (fallback) return fallback
+      throw error
+    }
     ownership.fence(epoch)
     // Ended or retired by a concurrent observation while this one awaited: never report or admit it as running.
     if (stateNow(record) === 'released') return tombstone(record)
@@ -193,6 +251,11 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     }
     ownership.admit(record.lease, proof, epoch)
     if (!record.proof) { record.proof = proof; advanceRunState(record, 'running'); save(record) }
+    // Remember the instances this full proof saw, for the quick check. The kernel's creation time must agree with the
+    // one the process query reported (same instance), or nothing is remembered and the next request proves in full again.
+    const proxyIdentity = processIdentity(proxy.pid), claudeIdentity = processIdentity(child.pid)
+    if (proxyIdentity && claudeIdentity && sameInstant(proxyIdentity, proxy.created) && sameInstant(claudeIdentity, child.created))
+      provenRuns.set(record.runId, { epoch, proxyPid: proxy.pid, claudePid: child.pid, proxyIdentity, claudeIdentity, port: ready.port, at: Date.now() })
     return { state: 'running', runtime: proof }
   }
   async function observe(request: BridgeLeaseRequest, undispatched?:{lease:CodexBridgeLease;fence():void}): Promise<BridgeOwnerObservation> {
@@ -222,9 +285,9 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     try {
       if (record.state === 'released') return tombstone(record)
       const observed = await physical(record)
-      if (observed.state === 'unknown') {ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId)}
+      if (observed.state === 'unknown') {ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId);provenRuns.delete(record.runId)}
       return observed
-    } catch { ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); return { state: 'unknown' } }
+    } catch { ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId);provenRuns.delete(record.runId); return { state: 'unknown' } }
   }
   async function initialize() {
     if (closed || !o.host?.inspect || !o.host.current || !o.manager || process.platform !== REQUIRED.platform || process.arch !== REQUIRED.arch) throw executionHttpError('execution-capability-required', 'runtime')
@@ -439,8 +502,12 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     let phase:RequestPhase='request',providerDispatched=false
     let providerFailure:ReturnType<typeof requestFailureSummary>|undefined
     const started=Date.now();let lastSaved=0,lastPhase=''
+    // Speed diagnostics (numbers only): where the time of each request goes.
+    const timing={dispatched:0,headers:0,firstByte:0,firstText:0}
     let progress:ProviderProgress={phase:'connecting',bytes:0,events:0}
     const noteProgress=(value:ProviderProgress)=>{
+      if(value.phase==='headers'&&!timing.headers)timing.headers=Date.now()
+      if(value.phase==='reading'&&!timing.firstByte)timing.firstByte=Date.now()
       progress=value
       if(value.phase!==lastPhase||Date.now()-lastSaved>=15_000){
         lastPhase=value.phase;lastSaved=Date.now()
@@ -450,7 +517,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     try {
       const chunks: Buffer[] = []; let size = 0
       for await (const data of req) { size += data.length; if (size > 16 * 1024 * 1024) return fail(); chunks.push(data) }
-      const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input)
+      // Speed: one prompt-cache key per conversation, and Sol's reasoning carried between the steps of a turn (as Codex does).
+      const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input, { cacheKey: cacheKeyOf(record), carryReasoning: true })
       phase='authorization'
       if (!current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch','runtime')
       if (match[2]) {
@@ -458,21 +526,32 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ input_tokens: Buffer.byteLength(JSON.stringify(body)) })); return
       }
       pending=pendingMessages(res,input.stream===true)
+      const live=pending.live
+      const sink=live&&{...live,text:(delta:string)=>{if(!timing.firstText)timing.firstText=Date.now();live.text(delta)}}
+      let tag=''
       const sender = dispatch.get(record.runId) ?? (<T>(send: Parameters<NonNullable<typeof broker>['dispatch']>[1], abort?: AbortSignal) => broker.dispatch(record.lease, send, abort) as Promise<T>)
       const response = await sender((authorization, abort) => {
         if (record.dispatchPaused) throw executionHttpError('execution-intent-uncertain', 'runtime')
         if (!record.proof || !current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch', 'runtime')
         ownership.assertRunning(record.lease, record.proof)
-        phase='provider';providerDispatched=true
+        phase='provider';providerDispatched=true;timing.dispatched=Date.now()
+        tag=reasoningTag(authorization.accountId)
         // The manager and broker deliberately replace initiated failures with UNKNOWN.
         // Capture only the adapter's safe metadata at this boundary, never its raw error.
-        return sendResponses(body, authorization, abort,noteProgress).catch(error => {
+        return sendResponses(body, authorization, abort,noteProgress,sink).catch(error => {
           providerFailure=requestFailureSummary(error,'provider',abort);throw error
         })
       }, signal)
       phase='response'
-      const reply = fromResponses(response)
-      pending.complete(reply)
+      const reply = fromResponses(response, { reasoningTag: tag })
+      // What went out live must equal the validated reply; if not, the request failed (and the run pauses as for any failure).
+      if (!pending.complete(reply)) throw new Error('The live reply did not match the validated reply')
+      const done=Date.now(),since=(at:number)=>at&&timing.dispatched?at-timing.dispatched:null
+      recordTiming({at:new Date(done).toISOString(),runId:record.runId,live:pending.started,
+        carried:Array.isArray(body.input)?body.input.filter(item=>(item as {type?:unknown})?.type==='reasoning').length:0,
+        tools:reply.content.filter(block=>block.type==='tool_use').length,
+        ms:{beforeProvider:timing.dispatched?timing.dispatched-started:null,headers:since(timing.headers),firstByte:since(timing.firstByte),
+          firstText:since(timing.firstText),total:done-started},usage:responseUsage(response)})
     } catch (error) {
       pause(record)
       const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
@@ -515,7 +594,7 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
       }
       if (advanceRunState(record, 'released')) save(record)
       for (const file of [files.settings, files.ready, files.child]) { try { fs.unlinkSync(file) } catch { /* Only this run's exact private artifacts. */ } }
-      ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); dispatch.delete(record.runId)
+      ownership.invalidate(record.runId);unstarted.invalidate(record.lease.leaseId); dispatch.delete(record.runId); provenRuns.delete(record.runId)
       return true
     })
   }
