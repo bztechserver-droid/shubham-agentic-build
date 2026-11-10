@@ -5,9 +5,10 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import type { AgentModel, ChatState, TerminalServerMessage } from '../../shared/agentic.ts'
-import type { DeliveryBlockReason } from '../../shared/delivery-reason.ts'
+import type { DeliveryBlockReason, DeliveryCause, DeliveryMark } from '../../shared/delivery-reason.ts'
 import * as cxs from '../codex/screen.ts'
-import { sendToCodex, type SendOptions, type SendResult } from '../codex/sender.ts'
+import { sendToCodex, type DeliveryReport, type SendOptions, type SendResult } from '../codex/sender.ts'
+import { ANY_CLAUDE_CHIP_RE, isOwnedClaudeChip } from './claude-paste.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, readTurnState, type Screen } from './screen.ts'
@@ -232,6 +233,8 @@ export interface DeliveryOptions {
   guard?: () => boolean
   /** Optional current coordinator authorization immediately before new native input. */
   authorize?: (phase: 'paste' | 'submit') => Promise<boolean>
+  /** Diagnostics only: once, when the send ends, which branch ended it and when each step happened. Never any text. */
+  onReport?: (report: DeliveryReport) => void
 }
 
 export interface ChatActivity {
@@ -411,6 +414,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     const box = inputBox(lines)
     if (!box) return null
     const text = [typed[box.start].replace(/^\s*❯/, ''), ...typed.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
+    // A pasted-text chip ("[Pasted text #3 +4 lines]") is real input in whatever colour the TUI draws it, never a grey suggestion: a box
+    // holding one is never empty, even where the typed-cells view blanked it.
+    if (typed !== lines) {
+      const raw = [lines[box.start].replace(/^\s*❯/, ''), ...lines.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
+      if (ANY_CLAUDE_CHIP_RE.test(raw)) return raw
+    }
     return /^Try "/.test(text) ? '' : text
   }
   const boxText = (lines: string[], typed = lines) => boxComposer(lines, typed) ?? ''
@@ -623,23 +632,39 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     return strip(c.buffer.join('')).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   }
 
+  /** Diagnostics only: pass the sender's report on with its steps shifted by the time spent waiting for the composer first. */
+  function offsetReport(opt: DeliveryOptions | undefined, r: DeliveryReport, waited: number) {
+    try { opt?.onReport?.(waited > 0 ? { ...r, marks: [['wait-ready', waited], ...r.marks.map(([n, ms]) => [n, ms + waited] as [DeliveryMark, number])].slice(0, 16) as [DeliveryMark, number][] } : r) } catch { /* never changes a delivery */ }
+  }
+  /** A send refused while waiting for the composer (before any input): the one step and the cause. */
+  function reportBefore(opt: DeliveryOptions | undefined, began: number, cause: DeliveryCause) {
+    const ms = Date.now() - began
+    try { opt?.onReport?.({ result: 'blocked', cause, marks: [['wait-ready', ms], ['end', ms]] }) } catch { /* never changes a delivery */ }
+  }
+
   function sendCodex(c: Chat, text: string, opt?: DeliveryOptions): Promise<SendResult> {
     const epoch = c.inputEpoch ?? 0
     const deadline = Date.now() + Math.min(300_000, o.codexSend?.timeoutMs ?? Math.max(96_000, Buffer.byteLength(text) * 50 + 6000))
     const send = async (): Promise<SendResult> => {
+      const began = Date.now()
+      const interruptCause = () => (c.inputEpoch ?? 0) !== epoch ? 'terminal-input' as const : 'guard-revoked' as const
       while (opt?.waitUntilReady && !c.exited && !cxs.composer(c.screen.lines()) && !menuOnScreen(c) && Date.now() < deadline) {
-        if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) return 'unconfirmed'
+        // Nothing of the message is typed yet: this is a refusal, safe to send again, not an unconfirmed send.
+        if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) { opt.onBlocked?.('input-changed'); reportBefore(opt, began, interruptCause()); return 'blocked' }
         await new Promise<void>(resolve => setTimeout(resolve, 100))
       }
       if (c.exited) return 'gone'
       if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
+      const sendStart = Date.now()
       return sendToCodex({
       write: d => d !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, d), lines: () => { if (c.exited) throw Error('gone'); return c.screen.lines() },
       sleep: ms => new Promise<void>(r => setTimeout(r, ms)),
       interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
+      interruptCause,
       gone: () => c.exited,
       beforeInput: opt?.authorize,
       onBlocked: opt?.onBlocked,
+      report: r => offsetReport(opt, r, sendStart - began),
     }, text, { ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
     }
     const sending = (c.codexSending ? c.codexSending.then(r => r === 'sent' ? send() : 'blocked' as const) : send())
@@ -964,14 +989,18 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (c.delivering) return refuse('unresolved-send')
       if (draftOnScreen(c)) return refuse('draft')
       const epoch = c.inputEpoch ?? 0
+      const pasted = text.split(PASTE_END).join('')
       const sending = (async (): Promise<SendResult> => {
-        const deadline = Date.now() + (o.codexSend?.timeoutMs ?? 96_000)
+        const began = Date.now(), deadline = began + (o.codexSend?.timeoutMs ?? 96_000)
+        const interruptCause = () => (c.inputEpoch ?? 0) !== epoch ? 'terminal-input' as const : 'guard-revoked' as const
         while (opt?.waitUntilReady && boxComposer(c.screen.lines(), c.screen.typedLines()) === null && !blocked(c) && Date.now() < deadline) {
           if (c.exited) return 'gone'
-          if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) return 'unconfirmed'
+          // Nothing of the message is typed yet: a refusal, safe to send again, not an unconfirmed send.
+          if ((c.inputEpoch ?? 0) !== epoch || opt.guard?.() === false) { opt.onBlocked?.('input-changed'); reportBefore(opt, began, interruptCause()); return 'blocked' }
           await new Promise<void>(resolve => setTimeout(resolve, 100))
         }
         if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
+        const sendStart = Date.now()
         return sendToCodex({
           write: data => data !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, data),
           lines: () => {
@@ -982,15 +1011,21 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           },
           // This is a parsed Claude frame, not native Codex output. Re-reading
           // its message text as Codex menu prose would reject quoted footers.
-          frame: lines => ({
-            menu: lines.length > 0 && lines[1] !== ' GPT-CLAUDE',
-            composer: lines.length === 2 && lines[1] === ' GPT-CLAUDE' ? { text: lines[0].slice(2), collapsed: false } : null,
-          }),
+          // A long paste is shown as a chip: owned only when it is exactly OUR chip (claude-paste.ts); anything else stays foreign.
+          frame: lines => {
+            const box = lines.length === 2 && lines[1] === ' GPT-CLAUDE' ? lines[0].slice(2) : null
+            return {
+              menu: lines.length > 0 && lines[1] !== ' GPT-CLAUDE',
+              composer: box === null ? null : { text: box, collapsed: isOwnedClaudeChip(box, pasted) },
+            }
+          },
           sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
           interrupted: () => (c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false,
+          interruptCause,
           gone: () => c.exited,
           beforeInput: opt?.authorize,
-      onBlocked: opt?.onBlocked,
+          onBlocked: opt?.onBlocked,
+          report: r => offsetReport(opt, r, sendStart - began),
         }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
       })().catch(() => 'unconfirmed' as const)
       c.delivering = sending

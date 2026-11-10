@@ -61,7 +61,7 @@ import {
   type TuneRequest,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
-import { deliveryBlockWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
+import { deliveryBlockWords, diagnosticWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
 import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
@@ -2603,7 +2603,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ? `${deliveryBlockWords(r.reason, r.targetPcName)} [${r.reason}]`
     : 'The destination refused this send without a specific diagnostic. Inspect the terminal before another send. [peer-blocked]'
   const messageReceipts = createDeliveryReceipts(path.join(o.dir, 'message-receipts.json'))
-  const nativeReceipts = createDeliveryReceipts(path.join(o.dir, 'native-delivery-receipts.json'))
+  // One log line for every send that ended here (sent, unconfirmed, gone) with which branch ended it and when each step happened: milliseconds
+  // and codes only, never the message. It is how a false "unconfirmed" is explained afterwards.
+  const nativeReceipts = createDeliveryReceipts(path.join(o.dir, 'native-delivery-receipts.json'), { onFinal: (r, diag) => {
+    if (r.state === 'blocked' || !diag) return
+    const line = `chat ${r.sessionId?.slice(0, 8) ?? 'unbound'}: delivery ${r.state} (${diagnosticWords(diag)})`
+    if (r.state === 'sent') log?.info(line); else log?.warn(line)
+  } })
   const humanInputGrants = createHumanInputGrants()
   const deliveryActor = (r?: { caller?: Caller }) => r?.caller?.person ? `person:${r.caller.person.id}` : JSON.stringify(r?.caller ?? OPEN)
   const deliveryBinding = (a: FloorAgent) => {
@@ -2639,7 +2645,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const at = bySession(sessionId)
     if (!at) throw apiError(409, 'The destination conversation changed. Nothing was submitted.')
     const { floor, agent } = at
-    return nativeReceipts.begin({ id: messageId, owner, floorId: floor.id, agentId: agent.id, text: body, expectedSessionId: sessionId }, async (bind, noteBlocked) => {
+    return nativeReceipts.begin({ id: messageId, owner, floorId: floor.id, agentId: agent.id, text: body, expectedSessionId: sessionId }, async (bind, noteBlocked, note) => {
       const generation = chats.generation?.(sessionId)
       let binding = expectedBinding ?? deliveryBinding(agent)
       let reason: DeliveryBlockReason | undefined
@@ -2663,7 +2669,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!generation) { reason = 'runtime-unavailable'; return refuse() }
       if (!valid()) return refuse()
       bind(sessionId, generation, false)
-      const state = await chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize, onBlocked: code => { reason ??= code } }) ?? 'unconfirmed'
+      const state = await chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize, onBlocked: code => { reason ??= code }, onReport: report => note(report) }) ?? 'unconfirmed'
       return state === 'blocked' ? refuse() : state
     })
   }
@@ -4120,7 +4126,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** One durable intent; neither a timeout nor reopening the chat replays its paste. */
   async function sayTo(id: string, agentId: string, body: string, intent: Omit<SayRequest, 'text'> = {}, actor: Caller = OPEN, onSent?: (sid: string) => void, humanAuthority?: () => boolean): Promise<SayAnswer> {
     const owner = deliveryActor({ caller: actor })
-    const receipt = messageReceipts.begin({ id: intent.messageId, owner, floorId: id, agentId, text: body, expectedSessionId: intent.expectedSessionId }, async (bind, noteBlocked) => {
+    const receipt = messageReceipts.begin({ id: intent.messageId, owner, floorId: id, agentId, text: body, expectedSessionId: intent.expectedSessionId }, async (bind, noteBlocked, note) => {
       let mayHaveSubmitted = false, observedSid = intent.expectedSessionId ?? null
       let reason: DeliveryBlockReason | undefined
       const refuse = (code: DeliveryBlockReason, pcName?: string) => { logDeliveryBlock(observedSid, code); return noteBlocked(code, pcName) }
@@ -4177,8 +4183,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       if (final?.state === 'sent') onSent?.(sid)
       if (final?.state === 'blocked') return refuse(reason ?? final.reason ?? 'peer-blocked', final.targetPcName)
+      // Diagnostics: the native receipt (here or on the member PC) already says which branch ended it; the hub's own endings say theirs.
+      if (final?.diag) note(final.diag)
+      else if (final?.state === 'pending') note({ cause: closing ? 'agent-closing' : 'exception', marks: [] })
       return final?.state === 'pending' ? 'unconfirmed' : final?.state ?? 'unconfirmed'
-      } catch { return mayHaveSubmitted ? 'unconfirmed' : refuse(reason ?? 'preflight-failed') }
+      } catch { if (mayHaveSubmitted) note({ cause: 'exception', marks: [] }); return mayHaveSubmitted ? 'unconfirmed' : refuse(reason ?? 'preflight-failed') }
     })
     // The send callback is always a microtask, after this stable ID has been allocated.
     function receiptId() { return receipt.id }

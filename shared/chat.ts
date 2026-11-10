@@ -7,7 +7,7 @@
 
 /** How many messages (not tool calls) the first answer and a history page hold. */
 import type { ChatAttachment } from './attachments.ts'
-import type { DeliveryBlockReason } from './delivery-reason.ts'
+import type { DeliveryBlockReason, DeliveryDiagnostic } from './delivery-reason.ts'
 
 export const CHAT_WINDOW_MESSAGES = 40
 
@@ -170,6 +170,8 @@ export interface DeliveryReceipt {
   /** Stable pre-input refusal code; never message text or private proof details. */
   reason?: DeliveryBlockReason
   targetPcName?: string
+  /** Which branch ended it and when each step happened; for diagnosing an unconfirmed send. Not shown to the person, never text. */
+  diag?: DeliveryDiagnostic
 }
 /** GET /floors/:f/agents/:a/deliveries/:messageId, with the same typing ACL and original actor. */
 export interface DeliveryAnswer { receipt: DeliveryReceipt }

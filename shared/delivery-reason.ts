@@ -11,6 +11,48 @@ export type DeliveryBlockReason = typeof DELIVERY_BLOCK_REASONS[number]
 export function isDeliveryBlockReason(value: unknown): value is DeliveryBlockReason {
   return typeof value === 'string' && (DELIVERY_BLOCK_REASONS as readonly string[]).includes(value)
 }
+
+// Which branch ended a delivery, and when each step happened. For explaining a false "unconfirmed" afterwards from the receipt and the
+// log alone: stable codes and milliseconds only. No message text, screen text, paths or credentials. Never shown to the person.
+export const DELIVERY_CAUSES = [
+  'confirmed',
+  'deadline',                   // the whole native budget was spent
+  'terminal-input',             // a terminal input frame / approval key / restart /exit reached the chat (its input epoch moved)
+  'guard-revoked',              // the binding, generation, access or authorization check failed mid-send
+  'authorization-denied',       // the fresh per-input authorization said no
+  'menu-appeared',
+  'screen-unreadable',
+  'not-settled',                // the owned text never showed in two identical frames
+  'composer-changed',           // before Enter the box no longer held exactly the owned text
+  'box-unreadable-after-enter', // 3 s with no readable input box after Enter
+  'text-changed-after-enter',
+  'enter-attempts-exhausted',
+  'terminal-gone',
+  'write-refused',
+  'agent-closing',              // the agent/hub was closing while it was pending
+  'agent-restarted',            // found pending when the agent started again
+  'exception',
+] as const
+export type DeliveryCause = typeof DELIVERY_CAUSES[number]
+export const DELIVERY_MARKS = ['wait-ready', 'paste', 'pasted', 'settled', 'enter-1', 'enter-2', 'enter-3', 'readback-1', 'readback-2', 'readback-3', 'end'] as const
+export type DeliveryMark = typeof DELIVERY_MARKS[number]
+/** `marks`: [step, milliseconds since the send began], in order, at most one per step per attempt. */
+export interface DeliveryDiagnostic { cause: DeliveryCause; marks: [DeliveryMark, number][] }
+const MARK_SET: readonly string[] = DELIVERY_MARKS, CAUSE_SET: readonly string[] = DELIVERY_CAUSES
+/** Whatever arrives (a file, a peer PC) is cut down to this shape or dropped; it can never carry free text. */
+export function cleanDeliveryDiagnostic(raw: unknown): DeliveryDiagnostic | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const { cause, marks } = raw as { cause?: unknown; marks?: unknown }
+  if (typeof cause !== 'string' || !CAUSE_SET.includes(cause) || !Array.isArray(marks) || marks.length > 16) return undefined
+  const clean: [DeliveryMark, number][] = []
+  for (const m of marks) {
+    if (!Array.isArray(m) || m.length !== 2 || typeof m[0] !== 'string' || !MARK_SET.includes(m[0]) || typeof m[1] !== 'number' || !Number.isFinite(m[1]) || m[1] < 0 || m[1] > 86_400_000) return undefined
+    clean.push([m[0] as DeliveryMark, Math.round(m[1])])
+  }
+  return { cause: cause as DeliveryCause, marks: clean }
+}
+export const diagnosticWords = (d: DeliveryDiagnostic) => `cause=${d.cause} ${d.marks.map(([n, ms]) => `${n}=${ms}ms`).join(' ')}`.trim()
+
 export function deliveryBlockWords(reason: DeliveryBlockReason, targetPcName?: string): string {
   const pc = targetPcName ? targetPcName.slice(0, 120) : 'the destination PC'
   switch (reason) {
