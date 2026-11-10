@@ -116,6 +116,7 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/previews$/, SIGNED],
   ['GET', /^\/runs$/, SIGNED],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/say$/, chat('type')],
+  ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/say-direct$/, chat('type')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries$/, chat('type')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries\/([^/]+)$/, chat('type')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/share$/, chat('owner')],

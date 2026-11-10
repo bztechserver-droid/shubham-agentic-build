@@ -60,7 +60,7 @@ import {
   type TuneAnswer,
   type TuneRequest,
 } from '../../shared/agentic.ts'
-import type { PreviewsAnswer, SayAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
+import type { PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
 import { deliveryBlockWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
 import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
@@ -840,7 +840,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(r.method) || r.rest.startsWith('/pc-control')) return
     if (!/^\/floors(?:\/|$)/.test(r.rest)) return
     // Sending is subject to the existing typing ACL and pinned launch guards, not workspace editing.
-    if (r.method === 'POST' && /^\/floors\/[^/]+\/agents\/[^/]+\/say$/.test(r.rest)) return
+    if (r.method === 'POST' && /^\/floors\/[^/]+\/agents\/[^/]+\/say(?:-direct)?$/.test(r.rest)) return
     const id = params[0], f = id ? allFloors().find(f => f.id === id) : null
     if (isPcControl(f)) throw immutablePcControl()
     if (isObject(r.body)) {
@@ -4963,6 +4963,31 @@ export function createAgentic(o: AgenticOptions): Agentic {
           throw authError(403, 'That chat is not running, and only its owner can start it.', 'not-yours')
         }
         return sayTo(id, agentId, body, sayIntent(r.body), callerOf(r))
+      },
+    ],
+    [
+      // Settings > Chats > direct send (default off, per person and device): the OLD way. Exactly one typeInto{human,confirmed:false} into a
+      // RUNNING native Claude chat: one paste, one Enter, no receipt, no fence, no confirmation, no retry. It never starts or resumes a chat and
+      // never answers for a Codex-in-Claude bridge chat (guardWorkflowExecution + requireMessageExecution refuse that profile); the same
+      // access rule as /say (chat('type')), the captured session must still be the chat's, and an engine switch in progress refuses it.
+      'POST',
+      /^\/floors\/([^/]+)\/agents\/([^/]+)\/say-direct$/,
+      async ([id, agentId], r): Promise<SayDirectAnswer> => {
+        const caller = callerOf(r), body = text(isObject(r.body) ? r.body.text : undefined, 'text', MAX_SAY_TEXT)
+        const expected = isObject(r.body) ? r.body.expectedSessionId : undefined
+        if (typeof expected !== 'string' || !validTransferSid(expected)) throw apiError(400, 'expectedSessionId must be the captured session ID')
+        const refuse = (status: number, code: string, words: string) => Object.assign(apiError(status, words), { code })
+        const agent = agentOf(floorOf(id), agentId)
+        access.needChat(caller, agent, 'type', 'direct send')
+        requireLegacyExecution(agent, defaultsNow())
+        if (executionIdentityOf(agent, defaultsNow()).engine !== 'claude') throw refuse(409, 'direct-send-unsupported', 'Direct send is only for native Claude chats.')
+        if (agent.sessionId !== expected) throw refuse(409, 'stale-session', 'This chat changed since the page captured it. Nothing was typed.')
+        const live = whereAll()[expected]
+        if (!live) throw refuse(409, 'not-running', "This chat isn't running. Resume it first: a direct send never starts one. Nothing was typed.")
+        if (switchFences.blocked(expected)) throw refuse(409, 'switch-in-progress', 'This chat is changing engines. Nothing was typed.')
+        log?.info(`chat ${expected.slice(0, 8)}: direct send without a delivery check (${caller.person ? `person ${caller.person.id}` : 'app'})`)
+        if (!(await typeInto({ sessionId: expected, id: live.id }, body, { human: true, confirmed: false, caller }))) throw refuse(409, 'direct-not-typed', 'The terminal could not take the message (it is asking a question, has a send in progress, or is gone). Nothing was confirmed.')
+        return { ok: true, sent: true }
       },
     ],
     ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries$/, () => ({ version: 1, idempotent: true, expectedSessionId: true, receipts: true })],

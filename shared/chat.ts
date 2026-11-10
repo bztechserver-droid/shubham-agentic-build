@@ -176,6 +176,13 @@ export interface DeliveryAnswer { receipt: DeliveryReceipt }
 /** GET /floors/:f/agents/:a/deliveries before sending to a possibly older hub. */
 export interface DeliveryCapabilities { version: 1; idempotent: true; expectedSessionId: true; receipts: true }
 
+/**
+ * POST /floors/:f/agents/:a/say-direct (Settings > Chats > "Send without a delivery check", default off): the OLD way, one
+ * paste and one Enter into a running native Claude chat, no receipt, no fence, no confirmation. `sent: true` only means the
+ * terminal took the keystrokes. A refusal is a 409 with a `code`; nothing is retried by either side.
+ */
+export interface SayDirectAnswer { ok: true; sent: true }
+
 export interface SayAnswer {
   ok: true
   /** The chat wasn't running: it was started (or resumed) before accepting the message. */
