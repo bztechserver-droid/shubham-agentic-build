@@ -20,22 +20,33 @@ import { clean, promptFor, whisperLang } from './words.ts'
 // own; a server whose agent has gone (died without stopping it) is ended by the next agent to load Whisper,
 // by its exact PID and start time, never by name, and never one whose agent is still running.
 
-// Measured on this PC (i5-12500H, CPU only, 8 threads) on 3 Nov 2026, for a 5 s sentence once loaded:
-// small 1.2 s with the window below (3.4 s without), large-v3-turbo q5 4.8 s (18 s without). Turbo is too slow
-// here, so small is the default; SAD_WHISPER_MODEL can still pick another file from the models folder.
+// Measured on this PC (i5-12500H, CPU only, 8 threads, no GPU): 3 Nov, a 5 s sentence once loaded: small 1.2 s with a short window (3.4 s full window), large-v3-turbo q5 4.8 s (18 s without).
+// Turbo is too slow here, so small is the default; SAD_WHISPER_MODEL can still pick another file from the models folder. 10 Nov (F-176): small at the fixed window below: 2.1-2.3 s for 5 s or
+// 10 s of speech, 3.6-3.7 s full window; load 6.5-17 s (22-25 s cold on 3 Nov).
 export const DEFAULT_MODEL = 'small'
-export const IDLE_MS = 5 * 60_000
-/** Whisper's full window: 1500 frames = 30 s of audio, encoded whole even for a short sentence. */
-const FULL_CTX = 1500
+/**
+ * How long the model stays loaded after the last use. 15 minutes (was 5): a dictation after a short break no longer pays the load (6.5 s warm, 8-25 s cold on this PC) while it is being said. The model holds about 0.8 GB, so
+ * SAD_WHISPER_IDLE_MIN (1-240) can shorten or lengthen it for a PC that is short of memory.
+ */
+export const IDLE_MS = 15 * 60_000
+export function idleMsFromEnv(v: string | undefined): number {
+  const n = Number(v)
+  return v !== undefined && Number.isFinite(n) && n >= 1 && n <= 240 ? Math.round(n * 60_000) : IDLE_MS
+}
 
 /**
- * The encoder window for this much audio: the audio plus 4 s, at least 512 frames (10 s), in steps of 64; 0 (the
- * full window) when that reaches 30 s. A short sentence then costs a third of the time. Below 512 the text goes
- * wrong (odd capitals on every word), so that is the floor.
+ * The encoder window: ONE fixed window (768 frames = 15.4 s) for anything up to 11 s, the full 30 s window (0) above that; never a window that follows the length of the audio.
+ * Why (F-176, measured 10 Nov on this PC): whisper.cpp gave wrong text when the window changed between requests: after a 512 frame request and a full-window one, a 704 frame request
+ * for a 10 s sentence came back as just "The" (4 times in 3 sequences; one more gave a clipped sentence). A fixed 768 window, mixed with the full one, never broke in 3 sequences.
+ * Cost (small model, 8 threads): about 2.2 s per request whatever the length up to 11 s (a 5 s sentence was 1.3 s in a 512 window, but that window is the one that corrupted).
  */
+export const SPEECH_WINDOW = 768
+/** The longest audio the fixed window holds with room for the prompt: 11 s of speech + 4 s. */
+export const SPEECH_WINDOW_MAX_MS = 11_000
+/** Dictation chunks (agent/speech/dictation.ts) are at most this long, so they always use the fixed window. */
+export const DICTATION_WINDOW = SPEECH_WINDOW
 export function audioCtx(ms: number): number {
-  const frames = Math.max(512, Math.ceil(((ms / 1000 + 4) * 50) / 64) * 64)
-  return frames >= FULL_CTX ? 0 : frames
+  return ms <= SPEECH_WINDOW_MAX_MS ? SPEECH_WINDOW : 0
 }
 const READY_TIMEOUT_MS = 60_000
 const INFER_TIMEOUT_MS = 60_000
@@ -71,6 +82,8 @@ export interface TranscribeOptions {
   words?: readonly string[]
   /** A live partial: skipped (null) rather than queued when Whisper is busy. */
   partial?: boolean
+  /** Use exactly this encoder window (frames) instead of fitting it to the audio (dictation: DICTATION_WINDOW). Audio too long for it gets the full window. */
+  window?: number
 }
 
 export interface EngineDeps {
@@ -127,7 +140,7 @@ export function createEngine(d: EngineDeps = {}): Engine {
   const model = d.model ?? modelFromEnv(process.env.SAD_WHISPER_MODEL)
   const modelFile = path.join(root, 'models', `ggml-${model}.bin`)
   const threads = d.threads ?? Math.max(2, Math.min(8, os.cpus().length - 4))
-  const idleMs = d.idleMs ?? IDLE_MS
+  const idleMs = d.idleMs ?? idleMsFromEnv(process.env.SAD_WHISPER_IDLE_MIN)
   const exists = d.exists ?? existsSync
   const fetchFn = d.fetch ?? fetch
   const freeMb = d.freeMb ?? (() => Math.round(os.freemem() / 1_048_576))
@@ -313,7 +326,7 @@ export function createEngine(d: EngineDeps = {}): Engine {
     form.append('temperature', '0.0')
     form.append('language', whisperLang(o.lang))
     form.append('prompt', promptFor(o.before, o.words))
-    const ctx = audioCtx(pcmMs(pcm))
+    const ctx = o.window === undefined ? audioCtx(pcmMs(pcm)) : pcmMs(pcm) <= SPEECH_WINDOW_MAX_MS ? o.window : 0
     if (ctx) form.append('audio_ctx', String(ctx))
     let r: Response
     try {

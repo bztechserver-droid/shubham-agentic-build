@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-wp6Kne7g.js";function t(){e(`/goals`)}export{t as default};

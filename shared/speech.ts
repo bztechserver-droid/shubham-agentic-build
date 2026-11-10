@@ -10,16 +10,17 @@ export const SPEECH_RATE = 16_000
  */
 export type VoiceEngine = 'hub' | 'phone' | 'keyboard'
 export const VOICE_ENGINES: readonly { code: VoiceEngine; label: string; note: string }[] = [
-  { code: 'hub', label: 'PC (Whisper)', note: 'Your voice goes to this PC only. Better with Indian English, names and punctuation.' },
-  { code: 'phone', label: 'Phone (Google)', note: "The phone browser's own recogniser. Sends your voice to Google." },
+  { code: 'hub', label: 'PC (Whisper)', note: 'Your voice goes to this PC only. Better with Indian English, names and punctuation. It makes no start sound.' },
+  { code: 'phone', label: 'Phone (Google)', note: "The phone browser's own recogniser. Sends your voice to Google. Chrome plays its own start sound with it, which the app cannot switch off." },
   {
     code: 'keyboard',
     label: 'Keyboard',
     note: "The mic opens your keyboard: tap the keyboard's own mic (Samsung keyboard, Gboard). The same voice typing as in any other app, with punctuation and the words it has learnt. In a terminal the mic uses Phone (Google).",
   },
 ]
-// The old way stays the default until Whisper has been measured on this PC and Shubham has heard it (F-080).
-export const DEFAULT_ENGINE: VoiceEngine = 'phone'
+// Whisper on the PC is the default (his word, 10 Nov: "optimize PC Whisper", it is the silent dictation engine he wants on the phone). The old ways stay one tap away in Settings › Voice (per device, kept in
+// this browser), and the mic itself falls back to the phone's own recogniser, with a note, whenever the PC cannot take speech (no program or model, not enough memory just now, no connection).
+export const DEFAULT_ENGINE: VoiceEngine = 'hub'
 export const parseEngine = (raw: unknown): VoiceEngine => (raw === 'hub' || raw === 'phone' || raw === 'keyboard' ? raw : DEFAULT_ENGINE)
 
 /**
@@ -81,5 +82,7 @@ export type HubMessage =
   | { t: 'stopped' }
   | { t: 'partial'; text: string }
   | { t: 'final'; i: number; text: string; audioMs: number; ms: number }
+  /** Dictation (F-176): one chunk was written in the background; no text, only the timing. The text comes once, in 'done'. */
+  | { t: 'progress'; i: number; audioMs: number; ms: number }
   | { t: 'error'; message: string; status: number }
   | { t: 'done'; text: string }

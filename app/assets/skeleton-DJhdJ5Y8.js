@@ -1,1 +1,0 @@
-import{t as e}from"./jsx-runtime-DePvh3-m.js";import{l as t}from"./button-EycCBeqp.js";var n=e();function r({className:e,...r}){return(0,n.jsx)(`div`,{"data-slot":`skeleton`,"aria-hidden":!0,className:t(`animate-[skeleton-pulse_1600ms_var(--ease-standard)_infinite] rounded-sm bg-surface-strong motion-reduce:animate-none motion-reduce:opacity-70`,e),...r})}export{r as t};

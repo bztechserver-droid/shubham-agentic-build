@@ -1,7 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { apiError, type ApiMount, type WsSocket } from '../api.ts'
 import type { Logger } from '../log.ts'
-import type { Engine, TranscribeOptions } from './engine.ts'
+import { DICTATION_WINDOW, type Engine, type TranscribeOptions } from './engine.ts'
+import { DictationChunker } from './dictation.ts'
 import { Segmenter } from './segmenter.ts'
 import { pcmMs, wavToPcm } from './wav.ts'
 
@@ -22,6 +23,9 @@ import { pcmMs, wavToPcm } from './wav.ts'
 // never logged (only lengths and timings).
 // The recording runs until he presses stop; pauses only cut it into sentences, which are transcribed in
 // order while he goes on speaking, each with the one before as context.
+// F-176 (the dictation button): {t:'start', mode:'dictate'} is one recording that is written ONLY when he finishes: the hub cuts it at his pauses into chunks of 5-11 s and transcribes each in
+// the background with one fixed window (nothing is sent while he speaks except {t:'progress', i, audioMs, ms}: no text, no partials), and after {t:'stop'} it sends {t:'stopped'} and
+// {t:'done', text}. If any chunk fails, no 'done' is sent: it answers {t:'error'} and closes, so the page keeps his audio and offers a retry (a text with a missing piece is never delivered).
 // F-087 (the Assistant, hands-free): {t:'start', once:true, endSilenceMs?, noSpeechMs?} is ONE question that
 // ends by itself: at the first pause of endSilenceMs (default 1.2 s) after speech, or empty when nothing is
 // said within noSpeechMs of audio (default 8 s), or at 60 s. The hub also sends {t:'heard'} the moment speech
@@ -110,6 +114,8 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
     }
     let o: TranscribeOptions & { partials?: boolean } = {}
     let seg: Segmenter | null = null
+    let dictation: DictationChunker | null = null
+    let chunkFailed: string | null = null
     let finals: string[] = []
     let chain: Promise<void> = Promise.resolve()
     let total = 0
@@ -147,10 +153,13 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
           const r = await engine.transcribe(pcm, { ...o, before: finals.join(' ') })
           if (!r || ended) return
           finals[i] = r.text
-          send({ t: 'final', i, text: r.text, audioMs: r.audioMs, ms: r.ms })
+          // Dictation: no text goes to the page until the end (only the timing, for the log and the tests).
+          if (dictation) send({ t: 'progress', i, audioMs: r.audioMs, ms: r.ms })
+          else send({ t: 'final', i, text: r.text, audioMs: r.audioMs, ms: r.ms })
         } catch (e) {
           finals[i] = ''
-          fail(e)
+          if (dictation) chunkFailed = e instanceof Error ? e.message : String(e)
+          else fail(e)
         }
       })
     }
@@ -181,11 +190,20 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
       // The page can let the microphone go now; the words follow.
       send({ t: 'stopped' })
       // After one question's pause, whatever came next is not part of it.
-      const last = dropRest ? null : seg.flush()
-      if (last) queueFinal(last.pcm)
+      if (dictation) for (const c of dictation.flushAll()) queueFinal(c.pcm)
+      else {
+        const last = dropRest ? null : seg.flush()
+        if (last) queueFinal(last.pcm)
+      }
       void chain.then(() => {
         if (ended) return
         ended = true
+        if (chunkFailed !== null) {
+          // A piece of what he said is missing: no text is delivered, so the page keeps the audio and offers a retry.
+          send({ t: 'error', message: `Whisper could not write all of it: ${chunkFailed}`, status: 502 })
+          ws.close(1011, 'incomplete')
+          return
+        }
         send({ t: 'done', text: finals.filter(Boolean).join(' ') })
         ws.close(1000, 'done')
       })
@@ -199,14 +217,19 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         return
       }
       if (m.t === 'start' && !seg) {
-        o = { ...opts(m), partials: m.partials === true }
-        once = m.once === true
+        const dictate = m.mode === 'dictate'
+        // Dictation: no partials, one fixed Whisper window for every chunk (see engine.ts DICTATION_WINDOW).
+        o = { ...opts(m), partials: !dictate && m.partials === true, ...(dictate ? { window: DICTATION_WINDOW } : {}) }
+        once = !dictate && m.once === true
         if (once) {
           noSpeechMs = clampMs(m.noSpeechMs, 2000, 30_000, ONCE_NO_SPEECH_MS)
           limit = Math.min(maxMs, ONCE_MAX_MS)
         }
         // One question is never cut in the middle: its first pause ends it, or its 60 s.
-        seg = once ? new Segmenter({ endSilenceMs: clampMs(m.endSilenceMs, 500, 3000, ONCE_END_SILENCE_MS), maxMs: ONCE_MAX_MS + 1000 }) : new Segmenter()
+        if (dictate) {
+          dictation = new DictationChunker()
+          seg = new Segmenter() // never fed: the chunker owns the audio; it only marks that the recording has started
+        } else seg = once ? new Segmenter({ endSilenceMs: clampMs(m.endSilenceMs, 500, 3000, ONCE_END_SILENCE_MS), maxMs: ONCE_MAX_MS + 1000 }) : new Segmenter()
         unheard()
         const s = engine.status()
         if (!s.available) {
@@ -238,8 +261,9 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
           send({ t: 'error', message: `Recordings stop after ${Math.round(limit / 1000)} s`, status: 413 })
           return finish()
         }
-        const done = seg.push(pcm.length % 2 ? pcm.subarray(0, pcm.length - 1) : pcm)
-        if (!heard && (seg.speaking || done.length)) {
+        const piece = pcm.length % 2 ? pcm.subarray(0, pcm.length - 1) : pcm
+        const done = dictation ? dictation.push(piece) : seg.push(piece)
+        if (!heard && ((dictation ? dictation.speaking : seg.speaking) || done.length)) {
           heard = true
           send({ t: 'heard' })
         }

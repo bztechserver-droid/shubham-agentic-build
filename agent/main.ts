@@ -6,6 +6,7 @@ import path from 'node:path'
 import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type HostOs, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
 import { agenticOff, createAgentic } from './agentic/index.ts'
+import { createMcpCatalogMount } from './agentic/mcp-catalog.ts'
 import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
@@ -45,7 +46,6 @@ import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
 import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
-import { createDrive } from './drive/index.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts } from './ports/index.ts'
 import { createLinuxMount } from './crm-files/mount-linux.ts'
@@ -221,8 +221,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       : null
   // F-079: Shubham's WhatsApp (made below, once the Agents section is: its sends are signed by his approval device).
   let whatsapp: WhatsApp | null = null
-  // F-097: the Common Drive (agent/drive/): the pool of files every device shares. On the hub; opens on first use, so no folder is made until it is asked for.
-  const drive = extras.agents === false ? null : createDrive({ dir: path.join(paths.agent, 'drive'), device: config.name, role, log: log.child('drive') })
+  // F-097's Common Drive was removed on Shubham's order (10 Nov 2026): nothing starts it, and its folder and settings stay on disk untouched.
   // F-126 (Linux): the CRM files in GNOME Files, through a WebDAV listener of this agent's own user that gvfs mounts. Windows keeps its WinFsp drive (left out here).
   let crmFilesService: CrmFilesService | null = null
   const crmFilesLinux = process.platform === 'linux' && extras.agents !== false ? createLinuxMount({ dir: path.join(paths.agent, 'agentic'), service: () => crmFilesService, log: log.child('crm-drive') }) : undefined
@@ -273,8 +272,6 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       }
     },
     // F-021: one session used from the hub's PCs in turn; the hub keeps the floors.
-    // F-097: the Common Drive's end of the member link.
-    driveLink: drive ? (from, body) => drive.linkCall(from, body) : undefined,
     team: {
       self: () => ({ id: identity.id, name: config.name }),
       role: () => role,
@@ -293,10 +290,6 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     crmFilesMountDriver: crmFilesLinux,
   })
   crmFilesService = agentic?.crmFiles.service ?? null
-  // F-097: a member PC's sync folder reaches the hub's Common Drive through the Agents link.
-  drive?.setHubRequest(agentic ? (body, ms) => agentic.driveRequest(body, ms) : null)
-  // F-097: a paired phone's device key (voice pairing) is what lets it upload into the Common Drive's phone inbox.
-  drive?.setPhoneAuth(agentic ? headers => agentic.phoneDeviceOf(headers) : null)
   if (agentic && chatHost && extras.chatHostGate) {
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
   }
@@ -890,7 +883,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, ...(drive ? [drive.mount] : []), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
+      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -915,7 +909,6 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     claude.close()
     agentic?.close()
     auth.close()
-    void drive?.close()
     void portsMod.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()

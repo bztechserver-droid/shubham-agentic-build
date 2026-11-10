@@ -1,1 +1,0 @@
-import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./react-B8SKf8RM.js";var n=e(t(),1),r=(0,n.createContext)(null);function i(){let e=(0,n.useContext)(r);if(!e)throw Error(`useTheme needs <ThemeProvider>`);return e}export{i as n,r as t};

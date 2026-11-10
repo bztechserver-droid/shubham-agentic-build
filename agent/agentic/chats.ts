@@ -501,8 +501,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     const decides = (t: string) => re.question.test(t) || re.running.test(t) || re.done.test(t) || re.idle.test(t)
     const t = decides(clean) ? clean : carry + clean
     const before = c.state
+    // o007f: words alone only GUESS a question. A chat that stands at its idle input box with no menu under it is not asking, however its
+    // last reply is worded ("Which do you want?"): claude repaints that reply with every status update, so each repaint used to make it a
+    // question again for the 3 s grace before settle() put it right, over and over (Lead's chat did it every ~4 s, 184 times in one evening:
+    // a card that came and went in Approvals). A real prompt REPLACES the idle box, so while the box is drawn the words are only text; a
+    // prompt that is still being drawn is caught the moment its menu is on the screen (settle()).
+    const plainWords = c.engine === 'claude' && menuSeen(c) === false && inputBox(c.screen.lines()) !== null
     // A question outranks working: a permission prompt comes mid-turn, and while it's up the agent waits on you.
-    if (re.question.test(t)) c.state = 'question'
+    if (re.question.test(t) && !plainWords) c.state = 'question'
     else if (re.running.test(t)) c.state = 'running'
     else if (re.done.test(t) || re.idle.test(t)) c.state = 'idle'
     // The PTY/host can coalesce an old running paint with the later completed

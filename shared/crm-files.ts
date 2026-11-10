@@ -3,7 +3,7 @@
 //
 // The CRM's own records decide what is a file and where it is (the `files`, `file_groups` and `file_versions` tables), NOT the Google Drive folders.
 // Every write goes through the CRM's own routes (new file, new version, rename, move, new folder), never to Google directly. There is NO delete, anywhere:
-// a DELETE is refused with code 'nodelete'. The Common Drive (F-097) and its Google backup (F-125) are a different thing and a different folder.
+// a DELETE is refused with code 'nodelete'. (The Common Drive, F-097, and its Google backup, F-125, were a different thing; they were removed on Shubham's order, 10 Nov 2026.)
 //
 // Mount: Windows mounts Y: through WinFsp (a host program); Linux runs a loopback WebDAV listener inside the agent and lets GNOME's gvfs mount it (no root, nothing installed).
 // The Linux agent calls the module's CrmFilesService in-process (agent/crm-files/service.ts) instead of going through these routes.
