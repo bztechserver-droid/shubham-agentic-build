@@ -13,7 +13,7 @@ import { findClaude, type ChatPool, type StartChat } from '../agentic/chats.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
-import { fromResponses, providerFailureSummary, reasoningTag, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
+import { bridgeConversationKey, fromResponses, providerFailureSummary, reasoningTag, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
 import { readChildConfig, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
@@ -92,8 +92,8 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   cleanupTimer.unref()
   const recordFile = (id: string) => { if (!safeId(id)) throw executionHttpError('execution-invalid', 'runtime'); return path.join(o.directory, `${id}.run.json`) }
   const save = (record: RunRecord) => writePrivateAtomic(recordFile(record.runId), JSON.stringify(record) + '\n')
-  /** One prompt-cache key per conversation (a hash of its session id): the endpoint keeps its cached prefix warm. */
-  const cacheKeyOf = (record: RunRecord) => createHash('sha256').update(`sad-bridge-cache:${record.lease.request.binding.sessionId}`).digest('hex').slice(0, 32)
+  /** One conversation key per chat session (prompt_cache_key + session_id header, as Codex sends): the endpoint keeps its cached prefix warm. */
+  const cacheKeyOf = (record: RunRecord) => bridgeConversationKey(record.lease.request.binding.sessionId)
   // The last 300 requests' timings (numbers only), so the speed of Codex in Claude Code can be measured, not guessed.
   let timings: unknown[] | null = null
   const recordTiming = (entry: Record<string, unknown>) => {

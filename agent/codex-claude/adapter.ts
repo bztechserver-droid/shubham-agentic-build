@@ -44,6 +44,13 @@ function carriedIds(data: unknown): { tag: string; ids: string[] } | null {
   return idsBlock(tag, ids) ? { tag, ids } : null
 }
 export const reasoningTag = (accountId: string) => createHash('sha256').update(`sad-bridge-reasoning:${accountId}`).digest('hex').slice(0, 16)
+const CONVERSATION_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+/** One key per chat session, shaped like the conversation id native Codex sends (a UUID): it goes out as `prompt_cache_key`
+ * and as the `session_id` header, as Codex sends both. With the body field alone (10 Nov) the endpoint reused nothing (0% cached). */
+export function bridgeConversationKey(sessionId: string | null): string {
+  const h = createHash('sha256').update(`sad-bridge-cache:${sessionId}`).digest('hex')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${(8 | (parseInt(h[16], 16) & 3)).toString(16)}${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
 const ENCRYPTED = /^[A-Za-z0-9+/=_-]{1,1048576}$/
 /** The Claude Code block for one encrypted reasoning item, or null when it is not something to carry. */
 export function reasoningBlock(tag: string, encrypted: unknown): { type: 'redacted_thinking'; data: string } | null {
@@ -336,7 +343,9 @@ export function sendResponses(body: Record<string, unknown>, authorization: Brid
   const request = fetch(CODEX_RESPONSES_ENDPOINT, { method: 'POST', redirect: 'error', signal,
     headers: { authorization: `Bearer ${authorization.accessToken}`, 'chatgpt-account-id': accountId,
       'content-type': 'application/json', accept: 'text/event-stream', originator: 'codex_cli_rs', version: '0.163.0',
-      'user-agent': 'shubham-agentic-codex-claude/1 (Codex protocol 0.163.0; Claude Code 2.1.319)' },
+      'user-agent': 'shubham-agentic-codex-claude/1 (Codex protocol 0.163.0; Claude Code 2.1.319)',
+      // The conversation key, as Codex sends its conversation id: the endpoint keeps the cached prefix of this conversation.
+      ...(typeof body.prompt_cache_key === 'string' && CONVERSATION_KEY.test(body.prompt_cache_key) ? { session_id: body.prompt_cache_key } : {}) },
     body: JSON.stringify({ ...body, input }) })
   return request.then(response => readCompletedResponse(response, signal, observer, live ? { sink: live, tag } : undefined)).catch(error => {
     if (error instanceof Error && failures.has(error)) throw error
