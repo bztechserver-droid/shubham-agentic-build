@@ -64,3 +64,19 @@ export function mergeOrder(full: readonly string[], shown: readonly string[], ne
 
 /** True when two lists name the same ids in the same order. */
 export const sameOrder = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+
+/**
+ * o9ae7: like rankByOrder, but the items the saved order does not name (new goals) go FIRST, the newest first (`createdAt`: a time in ms, or null when unknown, which goes last among them;
+ * a tie keeps the caller's own order), then the named ones in their order. Never changes its input.
+ */
+export function rankByOrderNewFirst<T extends { id: string }>(items: readonly T[], order: readonly string[], createdAt: (item: T) => number | null = () => null): T[] {
+  const named = new Set(order)
+  const fresh = items.filter(item => !named.has(item.id))
+  const rest = items.filter(item => named.has(item.id))
+  fresh.sort((a, b) => {
+    const ta = createdAt(a)
+    const tb = createdAt(b)
+    return ta === tb ? 0 : ta === null ? 1 : tb === null ? -1 : tb - ta
+  })
+  return [...fresh, ...rankByOrder(rest, order)]
+}

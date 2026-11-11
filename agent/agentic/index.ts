@@ -124,6 +124,9 @@ import type { SendOptions } from '../codex/sender.ts'
 import { CLAUDE_FORMAT } from './chatview.ts'
 import type { AdoptStatus, OfflineChats } from '../../shared/agentic.ts'
 import { createDefaultsStore, parseDefaults } from './defaults.ts'
+import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
+import { createToolsSeen, needsRefresh, toolsVersion } from './tools-seen.ts'
+import { TOOLS } from './tools.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
 import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shared/attachments.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -163,7 +166,7 @@ import {
 // their chats, and the tools those chats share), mounted on the agent's local API at /agentic.
 //   the page    /agentic/floors..., WebSockets /agentic/events and /agentic/terminal, with
 //               x-sad-token like the rest of the API (Vite's proxy adds it)
-//   the chats   POST /agentic/mcp/call, with the calling chat's key (x-sad-chat-key) and
+//   the chats   GET /agentic/mcp/tools (the current tool list) and POST /agentic/mcp/call, with the calling chat's key (x-sad-chat-key) and
 //               never the app's token: a chat can reach its floor, not the rest of the API
 // State in <state>/agent/agentic: floors.json, memory/<floorId>.jsonl, briefs/<sessionId>.md,
 // and mcp.json, the --mcp-config every chat is started with.
@@ -350,6 +353,14 @@ export interface AgenticOptions {
   currentBuild?: () => string | null
   /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
   orderReplies?: boolean
+  /**
+   * The Assistant's chat is restarted (its conversation resumes) when the tool list its MCP process was given is not the one now, so a new tool reaches a chat that
+   * was running at an Update. On; SAD_ASSISTANT_TOOLS_REFRESH=0, or an assistant-tools-refresh.off file in this folder, switches it off. Tests set it.
+   */
+  assistantToolsRefresh?: boolean
+  /** How long after the agent starts a chat that does not ask for the new list by itself is left alone (120 s), and how often it is looked at (60 s). Tests shorten them. */
+  toolsRefreshGraceMs?: number
+  toolsRefreshEveryMs?: number
   /** Claude subscription failover: how long a chat told /exit gets to end itself before it is stopped the usual way (15 s). Tests shorten it. */
   restartGraceMs?: number
   /**
@@ -441,7 +452,7 @@ const isMark = (v: unknown): v is FileMark => isObject(v) && typeof v.bytes === 
 export function agenticOff(): ApiMount {
   return {
     prefix: AGENTIC_PREFIX,
-    ownAuth: rest => rest === '/mcp/call',
+    ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/tools',
     http: () =>
       Promise.reject(
         apiError(AGENTS_OFF_STATUS, "Agents are off in Dev: the build runs them, so Dev's chats never mix with its chats. Start Dev with --agents to try them here, apart from the build's"),
@@ -657,6 +668,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() !== 'member') pushState()
   })
   const defaultsNow = (): ChatDefaults => (mode() === 'member' ? (replica.defaults ?? NO_DEFAULTS) : chatDefaults.get())
+  // The overlay Assistant's settings (Settings › Assistant), kept on the hub; the screen tools that use them run on the hub only.
+  const assistantSettings = createAssistantSettings(path.join(o.dir, 'assistant-settings.json'))
+  // Which tool list each chat's MCP process was last given (tools-seen.ts), so a chat behind the current one can be seen.
+  const toolsSeen = createToolsSeen(path.join(o.dir, 'chat-tools.json'))
+  const TOOLS_NOW = toolsVersion(TOOLS)
+  const upSince = Date.now()
   const memory = createMemoryStore(path.join(o.dir, 'memory'))
   // F-056: the task list (the Tasks tab, and the chats' task tools), kept on the hub like the floors.
   // Behind TaskStore (tasks.ts): a hosted database can take its place without anything else changing.
@@ -3185,6 +3202,37 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }, 15_000)
   heartbeatTimer.unref?.()
 
+  // The Assistant's chat and the tool list: its MCP process reads the list when it starts, and the chat host keeps the chat through an
+  // Update, so a tool added since never reached it (the crm_ tools of build 1108). A shim of this build asks again by itself (mcp-shim.ts,
+  // /mcp/tools); one that does not (an older one, or claude not re-reading) is left a couple of minutes, and then the chat is restarted
+  // when it is idle and has no unsent text (restartChat: told /exit, its conversation resumed with the new process). Once per list.
+  const toolsRefreshOn = () => o.assistantToolsRefresh ?? !(process.env.SAD_ASSISTANT_TOOLS_REFRESH === '0' || existsSync(path.join(o.dir, 'assistant-tools-refresh.off')))
+  const refreshedFor = new Set<string>()
+  let refreshing = false
+  async function refreshAssistantTools(): Promise<void> {
+    if (refreshing || closing || mode() === 'member' || !toolsRefreshOn() || !recoveryDone) return
+    const at = assistantAt()
+    const sid = at?.a.sessionId
+    if (!sid || refreshedFor.has(`${sid}:${TOOLS_NOW}`)) return
+    const info = chats.info(sid)
+    if (!info || info.engine !== 'claude') return
+    if (!needsRefresh({ listed: toolsSeen.get(sid), current: TOOLS_NOW, state: info.state, upMs: Date.now() - upSince, graceMs: o.toolsRefreshGraceMs ?? 120_000 })) return
+    refreshing = true
+    try {
+      if (await restartChat(sid)) {
+        refreshedFor.add(`${sid}:${TOOLS_NOW}`)
+        log?.info('The Assistant chat was restarted to take the current tool list')
+      }
+    } catch (e) {
+      // An unsent draft (409) or a chat that would not stop: tried again at the next look.
+      log?.warn(`couldn't restart the Assistant chat for its tool list: ${message(e)}`)
+    } finally {
+      refreshing = false
+    }
+  }
+  const toolsRefreshTimer = setInterval(() => void refreshAssistantTools(), o.toolsRefreshEveryMs ?? 60_000)
+  toolsRefreshTimer.unref?.()
+
   /** The id of the order a message from `agent` to `toSid` is, or null when it is none (not the Assistant's, or an acknowledgement or a reply). */
   function orderFrom(floor: Floor, agent: FloorAgent, sid: string, toSid: string, body: string): string | null {
     if (!orderReplies() || mode() === 'member' || !isOrchestratorAgent(floor.name, agent)) return null
@@ -3570,9 +3618,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'ui_modules':
       case 'ui_invoke': {
         if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
+        // "Goals on mobile: use the API" (Settings › Assistant, on unless turned off): on a phone the CRM Goals page is not driven. What opens
+        // it, or its handlers, is refused here; the page refuses a press or typing while it is on the Goals page (told to by goalsApi).
+        const goalsApi = ui.onPhone() === true && assistantSettings.get().goalsOnMobile
+        if (goalsApi) {
+          const why = goalsPageCall(name, args)
+          if (why) throw apiError(409, why)
+        }
         const out = await ui.call(
           name === 'ui_screen' ? 'screen' : name === 'ui_modules' ? 'modules' : name === 'ui_invoke' ? 'invoke' : typeof args.action === 'string' ? args.action : '',
-          args,
+          goalsApi ? { ...args, goalsApi: true } : args,
         )
         return typeof out === 'string' ? out : json(out)
       }
@@ -4778,6 +4833,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       return { defaults: chatDefaults.set(r.body) }
     }],
+    // Settings › Assistant: "Goals on mobile: use the API". Kept on the hub: a member's page asks the hub (not 'local').
+    ['GET', /^\/assistant-settings$/, () => ({ settings: assistantSettings.get() })],
+    ['PUT', /^\/assistant-settings$/, (_, r) => ({ settings: assistantSettings.set(r.body) })],
     // Forwarded on members: an old hub must answer 404, rather than a new member promising safety for it.
     ['GET', /^\/engine-switch-capabilities$/, () => ({ version: 1, failClosed: true, homePcRouting: true })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
@@ -5115,6 +5173,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
       },
       'local',
     ],
+    // The tool list now, for the chat's MCP process (mcp-shim.ts): it asks when claude asks, and now and then, and tells claude when it
+    // changed. What each chat was given is written down (tools-seen.ts). Answered here, from this build's TOOLS, whoever the hub is.
+    [
+      'GET',
+      /^\/mcp\/tools$/,
+      (_, r) => {
+        const key = r.headers['x-sad-chat-key']
+        if (typeof key !== 'string' || !key) throw apiError(401, 'Missing x-sad-chat-key')
+        const me = chats.byKey(key)
+        if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
+        // Only a request that says it is asking for the list (not just checking its stamp) is a chat given the list.
+        if (r.query.get('given') === '1') toolsSeen.note(me.sessionId, TOOLS_NOW)
+        return r.query.get('stamp') === '1' ? { version: TOOLS_NOW } : { version: TOOLS_NOW, tools: TOOLS }
+      },
+      'local',
+    ],
     // F-051: the memory's hook (memory-hook.ts) for a chat's prompt, with that chat's key, as /mcp/call.
     [
       'POST',
@@ -5344,7 +5418,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** The hub: a member's page change, run here as its own page's would be. */
   function fromMember(from: { id: string; name: string }, raw: unknown): Promise<unknown> {
     if (!isObject(raw) || typeof raw.method !== 'string' || typeof raw.rest !== 'string') throw apiError(400, 'Expected {method, rest, body}')
-    if (raw.rest === '/mcp/call') throw apiError(403, 'Tool calls come as tool')
+    if (raw.rest === '/mcp/call' || raw.rest === '/mcp/tools') throw apiError(403, 'Tool calls come as tool')
     const body = raw.body
     if (isObject(body) && isObject(body.folderFor) && body.folderFor.id !== from.id) throw apiError(403, "A PC sets only its own folder for a floor")
     if (isObject(body) && body.codeDir !== undefined) throw apiError(403, "The hub's own folder is set on the hub")
@@ -5796,7 +5870,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-118: this mount decides by person (policy in access.ts); every other mount is for the owner of the app.
     scoped: true,
     // The chats' own routes: their key, never the app's token, and never from a page (api.ts).
-    ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall',
+    ownAuth: rest => rest === '/mcp/call' || rest === '/mcp/recall' || rest === '/mcp/tools',
     // F-054: the built-in CRM's calls to the CRM's backend, with this PC's CRM session (never passed to the hub).
     raw: (rest, url) => {
       const saved = /^\/saved-views\/(pc|phone)$/.exec(rest)
@@ -5941,6 +6015,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       void fastHost?.stop('the app is stopping')
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
+      clearInterval(toolsRefreshTimer)
       clearInterval(voiceTimer)
       events.clear()
     },

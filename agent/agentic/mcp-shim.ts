@@ -15,8 +15,20 @@ const url = process.env.SAD_AGENTIC_URL ?? ''
 const key = process.env.SAD_AGENTIC_KEY ?? ''
 // F-087: the fast Assistant's process runs this same shim with SAD_TOOLSET=fast: it is told about its own few tools only (the hub still
 // decides every call by its key).
-const LISTED = process.env.SAD_TOOLSET === 'fast' ? FAST_TOOLS : TOOLS
+const FAST = process.env.SAD_TOOLSET === 'fast'
+// What this process was built with. Not the last word for a full toolset: the agent's current list is (below), because this process
+// can outlive an Update (the chat host keeps the chat), and a tool added by then must still reach the chat.
+let LISTED: readonly { name: string }[] = FAST ? FAST_TOOLS : TOOLS
+/** The stamp of the list last given to claude (agent: GET /mcp/tools), null before the first. */
+let given: string | null = null
+/** claude has said hello (initialize): only then is a notification sent. */
+let started = false
+/** The stamp claude was last told about with a list_changed: it is told once per change, not every half minute. */
+let told: string | null = null
 const CALL_TIMEOUT_MS = 120_000
+/** How often the agent is asked whether its list changed, and how long such a question waits. */
+const WATCH_EVERY_MS = Number(process.env.SAD_TOOLS_WATCH_MS) > 0 ? Number(process.env.SAD_TOOLS_WATCH_MS) : 30_000
+const ASK_TIMEOUT_MS = 5000
 /** F-075: how long a call waits for an agent that is restarting (an update) before it says it can't reach it. */
 const AGENT_AWAY_WAIT_MS = 90_000
 
@@ -51,18 +63,52 @@ async function call(name: string, args: unknown): Promise<{ text: string; isErro
   }
 }
 
+/** The agent's current tool list (and its stamp), or null when it can't be asked (an older agent, away): then the list this process was built with stands. */
+async function currentTools(stampOnly: boolean): Promise<{ version: string; tools?: { name: string }[] } | null> {
+  if (FAST || !url || !key) return null
+  try {
+    const res = await fetch(`${url}/tools?${stampOnly ? 'stamp=1' : 'given=1'}`, { headers: { 'x-sad-chat-key': key }, signal: AbortSignal.timeout(ASK_TIMEOUT_MS) })
+    if (!res.ok) return null
+    const data = (await res.json().catch(() => null)) as { version?: unknown; tools?: unknown } | null
+    if (!data || typeof data.version !== 'string') return null
+    if (stampOnly) return { version: data.version }
+    return Array.isArray(data.tools) ? { version: data.version, tools: data.tools as { name: string }[] } : null
+  } catch {
+    return null
+  }
+}
+
+/** Tells claude the list changed (it asks for it again); only after it has been given one, and only when the agent's stamp is another. */
+async function watch() {
+  if (!started) return
+  const now = await currentTools(true)
+  if (now && now.version !== given && now.version !== told) {
+    told = now.version
+    process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`)
+  }
+}
+if (!FAST) setInterval(() => void watch(), WATCH_EVERY_MS).unref()
+
 async function handle(msg: { id?: Id; method?: unknown; params?: Record<string, unknown> }) {
   const id = msg.id ?? null
   const isRequest = msg.id !== undefined
   switch (msg.method) {
     case 'initialize':
+      started = true
       return reply(id, {
         protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2024-11-05',
-        capabilities: { tools: {} },
+        capabilities: { tools: FAST ? {} : { listChanged: true } },
         serverInfo: { name: 'shubham-agentic', version: '1.0.0' },
       })
-    case 'tools/list':
+    case 'tools/list': {
+      const now = await currentTools(false)
+      if (now?.tools) {
+        LISTED = now.tools
+        given = now.version
+        return reply(id, { tools: now.tools })
+      }
       return reply(id, { tools: LISTED })
+    }
     case 'tools/call': {
       const name = typeof msg.params?.name === 'string' ? msg.params.name : ''
       if (!LISTED.some(t => t.name === name)) return reply(id, { content: [{ type: 'text', text: `No tool called ${name}` }], isError: true })

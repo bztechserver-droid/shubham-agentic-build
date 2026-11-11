@@ -6,7 +6,7 @@ import { apiError, type WsSocket } from '../api.ts'
 // open on it and where it was last used. A tool call (ui_screen, ui_control, ...) goes to the ONE
 // page the person is looking at: visible first, then the one with the overlay open, then the one
 // used last. The page does it (src/overlay/driver.ts) and answers with the call's id.
-//   page -> agent   {t:'state', visible, active, overlayOpen, route}   (also the hello)
+//   page -> agent   {t:'state', visible, active, overlayOpen, route, phone}   (also the hello)
 //                   {t:'result', id, ok, result | error}
 //   agent -> page   {t:'cmd', id, cmd, args}
 
@@ -15,6 +15,8 @@ export interface UiClientInfo {
   visible: boolean
   overlayOpen: boolean
   route: string
+  /** The page says it is on a phone-sized screen (the overlay's own rule: narrower than 640px). */
+  phone: boolean
   idleMs: number
 }
 
@@ -24,6 +26,7 @@ interface Client {
   visible: boolean
   overlayOpen: boolean
   route: string
+  phone: boolean
   activeAt: number
 }
 
@@ -41,6 +44,8 @@ export interface UiBridge {
   socket(): (ws: WsSocket) => void
   /** Runs `cmd` on the screen being looked at and answers what the page answered. */
   call(cmd: string, args: unknown, timeoutMs?: number): Promise<unknown>
+  /** Is the screen a call would drive now a phone? null: there is none to drive (nobody is looking, or it is hidden). */
+  onPhone(): boolean | null
   clients(): UiClientInfo[]
   close(): void
 }
@@ -69,10 +74,10 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
 
   return {
     socket: () => ws => {
-      const me: Client = { id: randomUUID(), ws, visible: false, overlayOpen: false, route: '', activeAt: now() }
+      const me: Client = { id: randomUUID(), ws, visible: false, overlayOpen: false, route: '', phone: false, activeAt: now() }
       clients.add(me)
       ws.onText(text => {
-        let m: { t?: unknown; id?: unknown; visible?: unknown; active?: unknown; overlayOpen?: unknown; route?: unknown; ok?: unknown; result?: unknown; error?: unknown }
+        let m: { t?: unknown; id?: unknown; visible?: unknown; active?: unknown; overlayOpen?: unknown; route?: unknown; phone?: unknown; ok?: unknown; result?: unknown; error?: unknown }
         try {
           m = JSON.parse(text)
         } catch {
@@ -82,6 +87,7 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
           me.visible = m.visible === true
           me.overlayOpen = m.overlayOpen === true
           if (typeof m.route === 'string') me.route = m.route.slice(0, 300)
+          me.phone = m.phone === true
           if (m.active === true) me.activeAt = now()
         } else if (m.t === 'result' && typeof m.id === 'string') {
           const w = waiting.get(m.id)
@@ -119,7 +125,12 @@ export function createUiBridge(now: () => number = Date.now): UiBridge {
       })
     },
 
-    clients: () => [...clients].map(c => ({ id: c.id.slice(0, 8), visible: c.visible, overlayOpen: c.overlayOpen, route: c.route, idleMs: now() - c.activeAt })),
+    onPhone() {
+      const c = best()
+      return c?.visible ? c.phone : null
+    },
+
+    clients: () => [...clients].map(c => ({ id: c.id.slice(0, 8), visible: c.visible, overlayOpen: c.overlayOpen, route: c.route, phone: c.phone, idleMs: now() - c.activeAt })),
 
     close() {
       for (const c of clients) c.ws.close(1001, 'the agent is stopping')

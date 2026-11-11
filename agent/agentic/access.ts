@@ -79,6 +79,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/defaults$/, SIGNED],
   ['GET', /^\/engine-switch-capabilities$/, SIGNED],
   ['PUT', /^\/defaults$/, OWNER],
+  // Settings › Assistant › "Goals on mobile: use the API": the owner's own setting, for the owner's own Assistant.
+  ['GET', /^\/assistant-settings$/, OWNER],
+  ['PUT', /^\/assistant-settings$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, chat('owner')],
   ['GET', /^\/approvals$/, SIGNED],
   ['POST', /^\/approvals\/answer$/, SIGNED],
@@ -125,6 +128,7 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['PATCH', /^\/floors\/([^/]+)\/memory\/([^/]+)$/, floor('manage')],
   ['DELETE', /^\/floors\/([^/]+)\/memory\/([^/]+)$/, floor('manage')],
   ['POST', /^\/mcp\/call$/, { kind: 'self' }],
+  ['GET', /^\/mcp\/tools$/, { kind: 'self' }],
   ['POST', /^\/mcp\/recall$/, { kind: 'self' }],
   ['GET', /^\/memory\/status$/, OWNER],
   ['GET', /^\/memory\/search$/, OWNER],
