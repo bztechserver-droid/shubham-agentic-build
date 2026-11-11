@@ -135,6 +135,7 @@ import { authError, OPEN, type Caller } from '../auth/types.ts'
 import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } from './access.ts'
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
+import { createCrmGoals } from './crm-goals.ts'
 import { createCrmProxy } from './crmproxy.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
@@ -216,10 +217,20 @@ const NEEDS_SERVER = new Set([
   'watchdog_status',
   'memory_read',
   'prepare_send',
+  'crm_whoami',
+  'crm_members',
+  'crm_goals',
+  'crm_goal_add',
+  'crm_goal_update',
 ])
 
-/** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory): the owner of the app's chats only. */
+/** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory, his CRM sign-in): the owner of the app's chats only. */
 const ADMIN_TOOLS = new Set([
+  'crm_whoami',
+  'crm_members',
+  'crm_goals',
+  'crm_goal_add',
+  'crm_goal_update',
   'task_add',
   'task_list',
   'task_update',
@@ -646,6 +657,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   let crmChecked: { url: string; app: string | null; at: number; check: CrmCheck } | null = null
   // The CRM built into the page talks to the CRM's backend through this PC's own session, never the page's.
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json') })
+  // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
+  const crmGoals = createCrmGoals({ proxy: crmProxy })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
   void crmFiles.resume().catch(() => undefined)
@@ -3504,6 +3517,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
         })
         const task = await tasks.update(id, patch)
         return json({ id: task.id, text: task.text, done: task.done, deleted: task.deletedAt !== null })
+      }
+      // The CRM's goals (the Goals page's own list), by the person signed in to the CRM on this PC: the owner of the app, so ADMIN_TOOLS above.
+      case 'crm_whoami':
+        return crmGoals.whoami()
+      case 'crm_members':
+        return crmGoals.members(args)
+      case 'crm_goals':
+        return crmGoals.list(args)
+      case 'crm_goal_add': {
+        const out = await crmGoals.add(args)
+        log?.info(`${agent.name} added a CRM goal`)
+        return out
+      }
+      case 'crm_goal_update': {
+        const out = await crmGoals.update(args)
+        log?.info(`${agent.name} changed a CRM goal`)
+        return out
       }
       // F-070: the overlay assistant's hands. Only that agent: nobody else moves Shubham's screen.
       case 'ui_screen':

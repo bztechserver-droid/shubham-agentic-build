@@ -15,6 +15,8 @@ import { pcmMs, wavToPcm } from './wav.ts'
 //     page -> {t:'start', lang?, words?, partials?}  {t:'audio', b64}  {t:'stop'}  {t:'cancel'}
 //     hub  -> {t:'ready', model}  {t:'partial', i, text}  {t:'final', i, text, audioMs, ms}  {t:'error', message, status}
 //             {t:'done', text}   (after stop: every sentence, in order, joined)
+// F-176: a dictation (mode 'dictate') also takes {t:'note', code} frames (a short code for a step of the page's start: press, mic-open, first-frame, no-audio ...) and the agent's log gets one line per
+// start, per code, per first audio and per end (reason, seconds of audio, chunks): codes and numbers only, never words or audio, so a failed start can be explained afterwards.
 // The phone app (F-074, device key) gets the same stream through Overlay's /voice mount: voice.ts hands its
 // device-key WebSocket /voice/speech to stream() below. (The API's JSON bodies stop at 64 KB, so audio
 // travels in WebSocket frames or a raw body, never as JSON.)
@@ -115,6 +117,15 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
     let o: TranscribeOptions & { partials?: boolean } = {}
     let seg: Segmenter | null = null
     let dictation: DictationChunker | null = null
+    let startedAt = 0
+    let firstAudioLogged = false
+    let endLogged = false
+    /** One line when a dictation ends (codes and numbers only). */
+    const logEnd = (reason: string) => {
+      if (!dictation || endLogged) return
+      endLogged = true
+      log?.info(`speech: dictate end ${reason} audio=${Math.round(total / 100) / 10}s chunks=${n} failed=${chunkFailed !== null} after=${Date.now() - startedAt}ms`)
+    }
     let chunkFailed: string | null = null
     let finals: string[] = []
     let chain: Promise<void> = Promise.resolve()
@@ -134,6 +145,7 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
       quiet = stopped || ended ? null : setTimeout(() => {
         if (stopped || ended) return
         send({ t: 'error', message: 'No audio came for a while: the recording was closed', status: 408 })
+        logEnd('no-audio')
         ended = true
         ws.close(1000, 'no audio')
       }, idleMs)
@@ -227,6 +239,8 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         }
         // One question is never cut in the middle: its first pause ends it, or its 60 s.
         if (dictate) {
+          startedAt = Date.now()
+          log?.info('speech: dictate start')
           dictation = new DictationChunker()
           seg = new Segmenter() // never fed: the chunker owns the audio; it only marks that the recording has started
         } else seg = once ? new Segmenter({ endSilenceMs: clampMs(m.endSilenceMs, 500, 3000, ONCE_END_SILENCE_MS), maxMs: ONCE_MAX_MS + 1000 }) : new Segmenter()
@@ -256,9 +270,14 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         }
         const pcm = Buffer.from(m.b64, 'base64')
         total += pcmMs(pcm)
+        if (dictation && !firstAudioLogged) {
+          firstAudioLogged = true
+          log?.info(`speech: dictate first audio +${Date.now() - startedAt}ms`)
+        }
         unheard()
         if (total > limit) {
           send({ t: 'error', message: `Recordings stop after ${Math.round(limit / 1000)} s`, status: 413 })
+          logEnd('limit')
           return finish()
         }
         const piece = pcm.length % 2 ? pcm.subarray(0, pcm.length - 1) : pcm
@@ -273,8 +292,16 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
         partial()
         return
       }
-      if (m.t === 'stop') return finish()
+      if (m.t === 'note' && dictation) {
+        if (typeof m.code === 'string' && /^[a-z][a-z0-9-]{1,23}$/.test(m.code)) log?.info(`speech: dictate note ${m.code} +${Date.now() - startedAt}ms`)
+        return
+      }
+      if (m.t === 'stop') {
+        logEnd('stop')
+        return finish()
+      }
       if (m.t === 'cancel') {
+        logEnd('cancel')
         ended = true
         if (quiet) clearTimeout(quiet)
         ws.close(1000, 'cancelled')
@@ -282,6 +309,7 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
     })
     ws.onClose(() => {
       if (quiet) clearTimeout(quiet)
+      logEnd(stopped ? 'closed-after-stop' : 'closed')
       if (!ended) log?.info('speech: a recording was closed before its end')
       ended = true
     })
