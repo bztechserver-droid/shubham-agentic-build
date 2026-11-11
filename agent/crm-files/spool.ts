@@ -69,8 +69,13 @@ export interface SaveRequest {
   name: string
   type: string
   project?: string | null
-  body: Readable
+  /** The bytes, as a stream... */
+  body?: Readable
+  /** ...or a finished file on this PC that is MOVED into the spool (S9b: the drive's staging copy; it must be on the same disk, inside the spool's own folder). */
+  from?: string
   size: number
+  /** S9b: kept but not to be sent: the CRM would refuse it (a right that went away while the file was open). It is listed as refused with these words, until the person says Try again. */
+  parked?: string
 }
 
 export interface Spool {
@@ -88,6 +93,8 @@ export interface Spool {
   fileOf(id: string): { path: string; size: number; mtime: number } | null
   /** A waiting NEW file given another name or folder (a program's save, a move in Explorer). False when the job is not waiting, or is going up right now. */
   rename(id: string, to: { parent?: string; name?: string; project?: string | null }): boolean
+  /** S9b: a waiting NEW file that turns out to be a new version of a CRM file (a program's save: a temporary file renamed over the document). False when it is going up, or refused. A waiting older save of that file is replaced. */
+  retarget(id: string, to: { target: string; name: string; parent?: string; project?: string | null }): boolean
   /** Try again now (one job, or all when no id); a refused one is tried again too (the person decided). */
   retry(id?: string): number
   /** Starts the worker. Idle when nothing is waiting. */
@@ -273,8 +280,9 @@ export function createSpool(o: SpoolOptions): Spool {
 
   async function add(r: SaveRequest): Promise<CrmSpoolEntry> {
     if (closed) throw new CrmFilesError(503, 'failed', 'The agent is stopping; this save was not kept. Try again in a moment.')
+    if (!r.body && !r.from) throw new CrmFilesError(400, 'failed', 'There is nothing to keep.')
     if (kept() + r.size > maxBytes) {
-      r.body.destroy()
+      r.body?.destroy()
       throw new CrmFilesError(507 as number, 'failed', `This PC is already keeping ${Math.round(kept() / 1024 / 1024)} MB of saves that have not reached the CRM; this one is too much on top. Nothing was lost: it was not accepted.`)
     }
     const id = randomUUID()
@@ -284,16 +292,23 @@ export function createSpool(o: SpoolOptions): Spool {
     const part = path.join(folder, `${file}.part`)
     let got = 0
     try {
-      await pipeline(
-        r.body,
-        new Transform({
-          transform(chunk: Buffer, _e, cb) {
-            got += chunk.length
-            cb(null, chunk)
-          },
-        }),
-        createWriteStream(part),
-      )
+      if (r.from) {
+        // A finished file: moved in (a rename on one disk: instant, whatever its size).
+        if (statSync(r.from).size !== r.size) throw new CrmFilesError(400, 'failed', 'The save was cut short on its way here; nothing was kept.')
+        renameSync(r.from, part)
+        got = r.size
+      } else {
+        await pipeline(
+          r.body as Readable,
+          new Transform({
+            transform(chunk: Buffer, _e, cb) {
+              got += chunk.length
+              cb(null, chunk)
+            },
+          }),
+          createWriteStream(part),
+        )
+      }
       if (got !== r.size) throw new CrmFilesError(400, 'failed', 'The save was cut short on its way here; nothing was kept.')
       // On disk before it is acknowledged (a power cut after the "saved" must not lose it).
       const fh = await open(part, 'r+')
@@ -320,9 +335,9 @@ export function createSpool(o: SpoolOptions): Spool {
       createdAt: new Date(now()).toISOString(),
       file,
       attempts: 0,
-      state: 'waiting',
-      reason: null,
-      nextAt: 0,
+      state: r.parked ? 'refused' : 'waiting',
+      reason: r.parked ?? null,
+      nextAt: r.parked ? Number.MAX_SAFE_INTEGER : 0,
     }
     try {
       persist(j)
@@ -375,6 +390,25 @@ export function createSpool(o: SpoolOptions): Spool {
       if (to.project !== undefined) j.project = to.project
       if (to.name !== undefined) j.name = to.name
       persist(j)
+      return true
+    },
+    retarget(id, to) {
+      const j = jobs.get(id)
+      if (!j || j.kind !== 'new' || sending.has(id) || j.state === 'refused') return false
+      j.kind = 'version'
+      j.target = to.target
+      j.name = to.name
+      if (to.parent !== undefined) j.parent = to.parent
+      if (to.project !== undefined) j.project = to.project
+      persist(j)
+      // An older waiting save of the same file is the same document: replaced by this one (the newer).
+      for (const old of [...jobs.values()]) {
+        if (old.id !== j.id && keyOf(old) === keyOf(j) && (old.state === 'waiting' || old.state === 'unreachable') && !sending.has(old.id) && old.createdAt <= j.createdAt) {
+          jobs.delete(old.id)
+          rmSync(folderOf(old.id), { recursive: true, force: true })
+        }
+      }
+      kick()
       return true
     },
     retry(id) {

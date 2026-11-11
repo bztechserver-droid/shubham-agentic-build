@@ -1,4 +1,4 @@
-import { READ_PART, type FsEntry, type FsOps } from './winfsp-ops.ts'
+import { FsStatusError, NT, READ_PART, WRITE_PART, type FsEntry, type FsOps, type FsWriteOps } from './winfsp-ops.ts'
 
 // o6e65 S9a: how the drive's worker thread asks the agent's main thread about the CRM.
 //
@@ -30,7 +30,19 @@ const OK = 0
 const NOT_FOUND = 1
 const FAILED = 2
 
-export type BridgeRequest = { n: number; op: 'stat'; path: string } | { n: number; op: 'list'; path: string; marker: string | null } | { n: number; op: 'read'; path: string; offset: number; length: number }
+export type BridgeRequest =
+  | { n: number; op: 'stat'; path: string }
+  | { n: number; op: 'list'; path: string; marker: string | null }
+  | { n: number; op: 'read'; path: string; offset: number; length: number }
+  // S9b, the saves. For these the reply's `result` is 0 (done) or the NTSTATUS to answer WinFsp with; `write` carries its bytes in the shared data buffer (`length` of them).
+  | { n: number; op: 'create'; path: string; dir: boolean }
+  | { n: number; op: 'open'; path: string; truncate: boolean }
+  | { n: number; op: 'write'; sid: number; offset: number; length: number; toEnd: boolean }
+  | { n: number; op: 'setsize'; sid: number; size: number }
+  | { n: number; op: 'release'; sid: number; del: boolean }
+  | { n: number; op: 'rename'; from: string; to: string; replace: boolean }
+  | { n: number; op: 'candelete'; sid: number; path: string }
+  | { n: number; op: 'remove'; path: string }
 
 type NoNumber<T> = T extends unknown ? Omit<T, 'n'> : never
 
@@ -60,7 +72,36 @@ export function createBridgeClient(port: BridgePort, bufs: BridgeBuffers, timeou
     return out
   }
   const json = (length: number): unknown => JSON.parse(Buffer.from(d.subarray(0, length)).toString('utf8'))
+  /** A save call: done, or the status WinFsp is to be answered with. */
+  function change(req: NoNumber<BridgeRequest>): { length: number } {
+    const r = ask(req)
+    if (r.result === OK) return { length: r.length }
+    if (r.result === NOT_FOUND) throw new FsStatusError(NT.OBJECT_NAME_NOT_FOUND)
+    if (r.result === FAILED) throw new Error('the agent could not do that')
+    throw new FsStatusError(r.result)
+  }
+  const writes: FsWriteOps = {
+    create: (path, dir) => json(change({ op: 'create', path, dir }).length) as { sid: number; entry: FsEntry },
+    open: (path, truncate) => json(change({ op: 'open', path, truncate }).length) as { sid: number; entry: FsEntry },
+    write(sid, offset, data, toEnd) {
+      if (data.length > WRITE_PART || data.length > d.length) throw new Error('a write part is too large')
+      d.set(data, 0)
+      return json(change({ op: 'write', sid, offset, length: data.length, toEnd }).length) as { written: number; entry: FsEntry }
+    },
+    setSize: (sid, size) => json(change({ op: 'setsize', sid, size }).length) as FsEntry,
+    release(sid, del) {
+      change({ op: 'release', sid, del })
+    },
+    rename(from, to, replace) {
+      change({ op: 'rename', from, to, replace })
+    },
+    canDelete: (sid, path) => (json(change({ op: 'candelete', sid, path }).length) as { ok: boolean }).ok,
+    remove(path) {
+      change({ op: 'remove', path })
+    },
+  }
   return {
+    writes,
     stat(path) {
       const r = ask({ op: 'stat', path })
       if (r.result === NOT_FOUND) return null
@@ -90,6 +131,19 @@ export interface AsyncFsHandler {
   list(path: string, marker: string | null): Promise<{ entries: FsEntry[]; more: boolean }>
   /** At most `length` bytes (never more than READ_PART) from `offset`; fewer only at the end of the file. */
   read(path: string, offset: number, length: number): Promise<Uint8Array>
+  /** S9b: the saves, when this agent keeps a spool (absent: the drive is read-only and says so). */
+  writes?: AsyncFsWrites
+}
+
+export interface AsyncFsWrites {
+  create(path: string, dir: boolean): Promise<{ sid: number; entry: FsEntry }>
+  open(path: string, truncate: boolean): Promise<{ sid: number; entry: FsEntry }>
+  write(sid: number, offset: number, data: Uint8Array, toEnd: boolean): Promise<{ written: number; entry: FsEntry }>
+  setSize(sid: number, size: number): Promise<FsEntry>
+  release(sid: number, del: boolean): Promise<void>
+  rename(from: string, to: string, replace: boolean): Promise<void>
+  canDelete(sid: number, path: string): Promise<boolean>
+  remove(path: string): Promise<void>
 }
 
 /** Answers one request: writes the reply into the shared buffer and wakes the worker. A late answer to a request the worker gave up on is dropped. */
@@ -119,14 +173,30 @@ export async function answerBridgeRequest(handler: AsyncFsHandler, bufs: BridgeB
       page = { entries, more }
       length = writeBytes(d, Buffer.from(text, 'utf8'))
       result = OK
-    } else {
+    } else if (req.op === 'read') {
       const bytes = await handler.read(req.path, req.offset, Math.min(req.length, READ_PART, d.length))
       length = Math.min(bytes.length, d.length)
       d.set(bytes.subarray(0, length), 0)
       result = OK
+    } else {
+      const w = handler.writes
+      if (!w) throw new FsStatusError(NT.MEDIA_WRITE_PROTECTED)
+      if (req.op === 'create') length = writeJson(d, await w.create(req.path, req.dir))
+      else if (req.op === 'open') length = writeJson(d, await w.open(req.path, req.truncate))
+      else if (req.op === 'write') {
+        // The bytes are copied out of the shared buffer at once: the answer goes into the same buffer.
+        const data = Buffer.from(d.subarray(0, Math.min(req.length, WRITE_PART, d.length)))
+        length = writeJson(d, await w.write(req.sid, req.offset, data, req.toEnd))
+      } else if (req.op === 'setsize') length = writeJson(d, await w.setSize(req.sid, req.size))
+      else if (req.op === 'release') await w.release(req.sid, req.del)
+      else if (req.op === 'rename') await w.rename(req.from, req.to, req.replace)
+      else if (req.op === 'candelete') length = writeJson(d, { ok: await w.canDelete(req.sid, req.path) })
+      else if (req.op === 'remove') await w.remove(req.path)
+      result = OK
     }
   } catch (e) {
-    result = (e as { notFound?: boolean })?.notFound ? NOT_FOUND : FAILED
+    const nt = (e as { nt?: unknown })?.nt
+    result = typeof nt === 'number' ? nt : (e as { notFound?: boolean })?.notFound ? NOT_FOUND : FAILED
     length = 0
   }
   if (Atomics.load(c, NUMBER) !== req.n) return

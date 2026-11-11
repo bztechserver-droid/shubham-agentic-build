@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-9PCEI_87.js";function t(){e(`/goals`)}export{t as default};

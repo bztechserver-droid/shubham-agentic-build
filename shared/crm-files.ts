@@ -1,4 +1,4 @@
-// F-126: the CRM's files in this app. The agent shows exactly what the CRM's "Files" page shows to the CRM account signed in on THIS PC (crm-session.json,
+﻿// F-126: the CRM's files in this app. The agent shows exactly what the CRM's "Files" page shows to the CRM account signed in on THIS PC (crm-session.json,
 // F-007), builds the same tree the old agentic-claude-manager drive built, and can mount it as a drive (Windows: Y: through WinFsp; Linux: GNOME gvfs over a loopback WebDAV listener).
 //
 // The CRM's own records decide what is a file and where it is (the `files`, `file_groups` and `file_versions` tables), NOT the Google Drive folders.
@@ -24,6 +24,7 @@
 //   POST /mount    {}                   -> CrmMountStatus   (start the drive)
 //   POST /unmount  {}                   -> CrmMountStatus
 //   POST /mount/auto   { on: boolean }  -> CrmMountStatus   (o6e65: mount the drive by itself while the CRM is signed in; ON by default, OFF is the old press-Start way)
+//   POST /mount/saves  { on: boolean }  -> CrmMountStatus   (S9b: "Save into the drive": whether the in-app drive takes saves into the CRM; OFF by default = read-only; applied by restarting the drive)
 //   POST /mount/driver { via: 'auto' | 'native' | 'winfsp' | 'webdav' } -> CrmMountStatus   (o6e65: how the Windows drive is made; Automatic uses the in-app WinFsp drive (S9a, read-only for now) and falls back to the WinFsp program, then to the built-in WebDAV)
 //   POST /mount/reveal { what: 'drive' | 'pending' | 'recovered' } -> { ok: true }   (o6e65: open File Explorer on one of THREE fixed places; no path is ever taken from the request)
 //   GET  /spool                         -> { entries: CrmSpoolEntry[], dir }   (o6e65 S5: saves kept on this PC until the CRM has them: the waiting list)
@@ -43,6 +44,8 @@
 //   POST /uploads/retry  { id }        -> CrmUpload    (a failed one: from where Google has it; after a checksum mismatch, from the start)
 //   POST /uploads/cancel { id }        -> CrmUpload    (stops it; the agent's copy is dropped; nothing in the CRM or Google Drive is touched)
 //   POST /uploads/clear  { id }        -> { ok: true } (forgets a done or cancelled one)
+//   GET  /uploads/settings             -> CrmUploadSettingsView   (oa2f8: the size limit and where it comes from, the waiting folder, its free space, the warning line)
+//   POST /uploads/settings CrmUploadSettingsChange -> CrmUploadSettingsView   (409 'conflict' to move the folder while uploads wait in it; 400 'failed' for a folder that can not be used)
 // Errors are { error: <plain sentence>, code } with the status below. A CRM that is not signed in is 409 'crm-signin' (not 401: 401 is this app's own sign-in, F-118).
 
 export const CRM_FILES_BASE = '/agentic/crm-files'
@@ -145,6 +148,8 @@ export interface CrmMountStatus {
   mountVia?: CrmVia
   /** o6e65: what the person chose: 'auto' (WinFsp, and the built-in WebDAV where the drive program cannot run or WinFsp is missing), or one of the two. */
   driverChoice?: CrmDriverChoice
+  /** S9b: the "Save into the drive" setting of the in-app drive: false (the default) = read-only; true = a save, a copy or a drag into the drive is saved into the CRM. Left out where there is no in-app drive. */
+  saveInto?: boolean
 }
 
 export type CrmVia = 'native' | 'winfsp' | 'webdav'
@@ -305,7 +310,72 @@ export interface CrmUploadList {
   maxSize: number
   partSize: number
   parallel: number
+  /** oa2f8: where `maxSize` comes from (see CrmUploadSettingsView). Left out by an older agent. */
+  maxSizeFrom?: CrmUploadLimitFrom
+  /** oa2f8: the waiting folder, its disk's free space and what the uploads hold there. Left out by an older agent. */
+  space?: CrmUploadSpace
 }
+
+// ---- oa2f8: the uploads' settings (Shubham, 11 Nov 2026: the CRM's limit as a setting, read from the CRM where possible; the waiting folder a setting, free space shown, a warning when low)
+
+/** Where the size limit in force comes from: the CRM said it ('crm'), the person set a number ('setting'), or neither, so the CRM's known rule of 500 MB ('default'). */
+export type CrmUploadLimitFrom = 'crm' | 'setting' | 'default'
+
+/** What the person sets (POST /uploads/settings takes any of these; a field left out stays as it is). */
+export interface CrmUploadSettings {
+  /** The most one file may be, in MB. null = follow the CRM: its own limit when the CRM has said it, else CRM_FILES_MAX_UPLOAD. A number is used as it is, but never above what the CRM said it takes. */
+  limitMb: number | null
+  /** The waiting folder: a folder on this PC's own disks. null = the agent's own folder (`defaultDir`). It changes only while nothing is waiting there. */
+  dir: string | null
+  /** A warning shows when the waiting folder's disk would have less than this free (MB) once the uploads on their way are in. */
+  lowFreeMb: number
+}
+
+/**
+ * The CRM's own limit as the CRM last said it: in its refusal of a real record ('refused': "file_size must not exceed N bytes"), or in its upload token's answer ('token', should the CRM
+ * ever add the number there). The agent never asks the CRM for it.
+ */
+export interface CrmUploadCrmLimit {
+  bytes: number
+  /** When it was said (ms since 1970). */
+  at: number
+  how: 'refused' | 'token'
+}
+
+export interface CrmUploadSpace {
+  /** The waiting folder in use now. */
+  dir: string
+  /** Free bytes on its disk, or null when that can not be read. */
+  free: number | null
+  /** Bytes the uploads not yet done hold in it now (their copies). */
+  held: number
+  /** Bytes still to come from the pages for them. */
+  coming: number
+  /** The warning line (bytes): `low` is true when free - coming is under it. */
+  lowFree: number
+  low: boolean
+  /** A plain sentence for the page when something is wrong (low space, a folder that can not be used now); null when all is well. */
+  note: string | null
+}
+
+/** GET /uploads/settings (and the answer to POST): the person's settings, and what is in force now. */
+export interface CrmUploadSettingsView extends CrmUploadSettings {
+  /** The agent's own folder, used when `dir` is null. */
+  defaultDir: string
+  maxSize: number
+  maxSizeFrom: CrmUploadLimitFrom
+  /** null until the CRM has said its limit. */
+  crmLimit: CrmUploadCrmLimit | null
+  space: CrmUploadSpace
+}
+
+/** POST /uploads/settings: the fields to change (one left out stays as it is). */
+export type CrmUploadSettingsChange = Partial<CrmUploadSettings>
+
+/** The defaults: follow the CRM, the agent's own folder, warn below 5 GB free. */
+export const CRM_UPLOAD_LOW_FREE_MB = 5 * 1024
+/** A limit the person types is 1 MB to 5 TB (Google Drive's own most for one file). */
+export const CRM_UPLOAD_LIMIT_MB_MAX = 5 * 1024 * 1024
 
 /** The kinds of file the CRM's backend refuses to record (sam-crm-be middleware/fileValidation.js, 11 Nov 2026): refused BEFORE any byte goes up. */
 export const CRM_BLOCKED_EXTENSIONS: readonly string[] = ['.exe', '.bat', '.cmd', '.com', '.msi', '.scr', '.pif', '.vbs', '.vbe', '.js', '.ws', '.wsf', '.wsc', '.wsh', '.ps1', '.ps2', '.psc1', '.psc2', '.reg', '.inf', '.lnk']
@@ -336,6 +406,14 @@ export const CRM_UPLOAD_REASONS = {
   integrity: 'The copy in Google Drive does not match this file (its checksum differs), so the CRM was not told. Retry sends it again.',
   copyGone: "This PC's copy of the file is gone. Upload it again.",
   needFile: 'The page was closed before the whole file reached this PC. Pick the same file again to go on.',
+  // oa2f8: the settings
+  tooLargeHere: (max: number) => `A file is at most ${Math.round(max / 1024 / 1024)} MB here (the upload settings).`,
+  tooLargeForCrm: (max: number) => `The CRM takes files up to ${Math.round(max / 1024 / 1024)} MB (it said so itself). This one is bigger, so the CRM did not record it; the copy in Google Drive has no CRM record.`,
+  // (GB as the page writes sizes: 1 GB = 1,000,000,000 bytes, shared/file-names.ts sizeText.)
+  lowSpace: (free: number) => `Low disk space for the waiting uploads: ${(free / 1e9).toFixed(1)} GB free. Free some space, or choose another waiting folder in the upload settings.`,
+  dirBusy: (n: number) => `${n} upload${n === 1 ? ' is' : 's are'} still waiting in the waiting folder. Let ${n === 1 ? 'it' : 'them'} finish (or cancel ${n === 1 ? 'it' : 'them'}), then change the folder.`,
+  dirBad: (why: string) => `That folder can not be used for the waiting uploads: ${why}`,
+  dirMissing: (dir: string) => `The waiting folder (${dir}) can not be used now. Check that its disk is there, or choose another folder in the upload settings.`,
 } as const
 
 // ---- fixtures, for the page's tests and for a mock (fake names only) -------------------------------------------------
@@ -363,7 +441,7 @@ const CRM_SPOOL_FIXTURE_DIR = 'C:\\Users\\you\\AppData\\Local\\shubham-agentic\\
 export const CRM_MOUNT_FIXTURE: Record<'ready' | 'running' | 'native' | 'webdav' | 'winfspMissing' | 'signedOut' | 'linuxNoGvfs' | 'linuxNoDesktop', CrmMountStatus> = {
   ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0, autoMount: true, mountVia: 'winfsp', driverChoice: 'auto', pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   running: { supported: true, driver: 'installed', driverName: 'WinFsp', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 2, autoMount: true, pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
-  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto', spoolDir: CRM_SPOOL_FIXTURE_DIR },
+  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto', saveInto: false, spoolDir: CRM_SPOOL_FIXTURE_DIR },
   webdav: { supported: true, driver: 'installed', driverName: 'Windows WebDAV (built in)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: false, writable: true, waiting: 0, autoMount: true, mountVia: 'webdav', driverChoice: 'auto', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   winfspMissing: { supported: true, driver: 'missing', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.winfspMissing, reasonCode: 'driver-missing', installable: true, writable: true, waiting: 0 },
   signedOut: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.signedOut, reasonCode: 'crm-signin', installable: true, writable: true, waiting: 0 },

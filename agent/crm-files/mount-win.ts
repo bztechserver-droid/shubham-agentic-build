@@ -71,7 +71,7 @@ const defaultOpen = (folder: string) => {
 
 const WINFSP_DLL = 'C:\\Program Files (x86)\\WinFsp\\bin\\winfsp-x64.dll'
 
-export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Promise<void>; close(): Promise<void>; setAuto(on: boolean): Promise<CrmMountStatus>; setDriver(via: CrmDriverChoice): Promise<CrmMountStatus>; reveal(what: CrmReveal): Promise<void> } {
+export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Promise<void>; close(): Promise<void>; setAuto(on: boolean): Promise<CrmMountStatus>; setDriver(via: CrmDriverChoice): Promise<CrmMountStatus>; setSaves(on: boolean): Promise<CrmMountStatus>; reveal(what: CrmReveal): Promise<void> } {
   const letter = (o.letter ?? DEFAULT_LETTER).toUpperCase()
   const platform = o.platform ?? process.platform
   const spawn = o.spawn ?? nodeSpawn
@@ -98,7 +98,7 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
   let nativeBroken = false
   let nativeFailure: { reason: string; code: CrmMountStatus['reasonCode'] } | null = null
   const native =
-    (o.native !== undefined ? o.native : null) ?? (o.native === undefined && o.service && platform === 'win32' ? createWinNative({ letter, service: o.service, log: o.log, markerFile: path.join(o.dir, INAPP_MARKER), exists: o.driveExists ? async l => o.driveExists!(l) : undefined }) : null)
+    (o.native !== undefined ? o.native : null) ?? (o.native === undefined && o.service && platform === 'win32' ? createWinNative({ letter, service: o.service, log: o.log, writable: () => readState().saves === true, markerFile: path.join(o.dir, INAPP_MARKER), exists: o.driveExists ? async l => o.driveExists!(l) : undefined }) : null)
   const dav =
     o.dav ??
     (o.service && platform === 'win32'
@@ -106,15 +106,15 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
       : null)
 
   // What the person chose, kept across restarts: on (true: started by hand and left on; false: stopped on purpose; nothing: never touched) and auto (mount by itself; ON unless false).
-  const readState = (): { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string } => {
+  const readState = (): { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string; saves?: boolean } => {
     try {
-      const j = JSON.parse(readFileSync(stateFile, 'utf8')) as { on?: unknown; auto?: unknown; via?: unknown; crashed?: unknown }
-      return { crashed: typeof j.crashed === 'string' ? j.crashed : undefined, on: typeof j.on === 'boolean' ? j.on : undefined, auto: typeof j.auto === 'boolean' ? j.auto : undefined, via: j.via === 'native' || j.via === 'winfsp' || j.via === 'webdav' || j.via === 'auto' ? j.via : undefined }
+      const j = JSON.parse(readFileSync(stateFile, 'utf8')) as { on?: unknown; auto?: unknown; via?: unknown; crashed?: unknown; saves?: unknown }
+      return { saves: typeof j.saves === 'boolean' ? j.saves : undefined, crashed: typeof j.crashed === 'string' ? j.crashed : undefined, on: typeof j.on === 'boolean' ? j.on : undefined, auto: typeof j.auto === 'boolean' ? j.auto : undefined, via: j.via === 'native' || j.via === 'winfsp' || j.via === 'webdav' || j.via === 'auto' ? j.via : undefined }
     } catch {
       return {}
     }
   }
-  const remember = (patch: { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string | undefined }) => {
+  const remember = (patch: { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string | undefined; saves?: boolean }) => {
     try {
       mkdirSync(o.dir, { recursive: true })
       const tmp = `${stateFile}.tmp`
@@ -199,8 +199,9 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
       driverName: way === 'native' ? 'WinFsp (inside the app)' : way === 'webdav' ? 'Windows WebDAV (built in)' : 'WinFsp',
       where: letter,
       installable: way === 'winfsp' || way === 'native',
-      // the in-app drive is read-only until the write-back queue exists (S9b): the page says so
-      writable: way !== 'native',
+      // the in-app drive takes saves only when the person turned "Save into the drive" on (OFF by default) and the agent keeps a spool (S9b: a save is kept on this PC and goes up by itself); otherwise it is read-only, and the page says so
+      writable: way !== 'native' || (readState().saves === true && !!o.service?.()?.save),
+      saveInto: native ? readState().saves === true : undefined,
       waiting: platform === 'win32' && way === 'winfsp' ? waiting() : 0,
       autoMount: autoOn(),
       pendingDir: way === 'winfsp' ? pendingDir : undefined,
@@ -392,6 +393,20 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
       remember({ auto: on })
       autoTries = 0
       if (on) await tick()
+      return status()
+    },
+    /**
+     * S9b: "Save into the drive": whether the in-app drive takes saves (a save goes into the CRM). OFF unless the person turns it on. It is applied when the drive starts, so changing it takes the
+     * in-app drive down and, if it was up, brings it up again.
+     */
+    async setSaves(on: boolean) {
+      if (!native) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+      const was = nativeAlive()
+      remember({ saves: on })
+      if (was) {
+        await end()
+        await start({ auto: readState().on !== true }).catch(() => undefined)
+      }
       return status()
     },
     /** o6e65 (S4): how the drive is made: WinFsp, Windows' built-in WebDAV, or automatic. Changing it takes the drive down and, if it should be up, brings it up the new way. Without the WebDAV side only WinFsp exists. */

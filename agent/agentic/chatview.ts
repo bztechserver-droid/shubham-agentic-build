@@ -482,6 +482,8 @@ interface Follow {
   format: RowFormat
   subs: Set<(m: ChatFeedMessage) => void>
   timer: ReturnType<typeof setInterval> | null
+  /** o655f: the session claude was on when this was last looked at, when it is not the chat's own (see ChatFeedsOptions.successor). */
+  successor: string | null
   /** What was last said of the screen (JSON), so a change is said once. */
   menu: string
   status: string
@@ -502,6 +504,11 @@ export interface ChatFeedsOptions {
   fileOf?: (sessionId: string) => string | null
   /** F-134: the format of a chat's file (Claude's when left out). */
   formatOf?: (sessionId: string) => RowFormat
+  /**
+   * o655f (Stage 1): the session claude is on NOW for a chat when it is not the chat's own: /clear and /resume move the same terminal to a new
+   * session id and a new file. The chat view follows it (a fresh `hello` on the new file); null: the chat's own file, as before.
+   */
+  successor?: (sessionId: string) => string | null
 }
 
 export interface ChatFeeds {
@@ -522,7 +529,12 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   const follows = new Map<string, Follow>()
   const previews = new Map<string, { key: string; value: ChatPreview | null }>()
   const formatOf = (sessionId: string): RowFormat => o.formatOf?.(sessionId) ?? CLAUDE_FORMAT
-  const fileOf = (sessionId: string): string | null => o.fileOf?.(sessionId) ?? findTranscript(sessionId, projectsDir)
+  const ownFileOf = (sessionId: string): string | null => o.fileOf?.(sessionId) ?? findTranscript(sessionId, projectsDir)
+  /** The file to read for a chat now: the session claude moved to (after /clear or /resume) when there is one, else the chat's own. */
+  const fileOf = (sessionId: string): string | null => {
+    const next = o.successor?.(sessionId) ?? null
+    return next ? findTranscript(next, projectsDir) : ownFileOf(sessionId)
+  }
 
   const send = (f: Follow, m: ChatFeedMessage) => {
     for (const s of f.subs) {
@@ -601,6 +613,18 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   /** One look at the file: what it grew by, as items, or a new hello when it is not the file it was. */
   function follow(f: Follow) {
     try {
+      // o655f (Stage 1): claude moved to a new session (/clear, /resume) or came back to the chat's own: read that file from its start, told as a new `hello`.
+      const next = o.successor?.(f.sessionId) ?? null
+      if (next !== f.successor) {
+        f.successor = next
+        f.file = null
+        f.ident = ''
+        f.pos = 0
+        f.conv = f.format.make()
+        locate(f)
+        send(f, hello(f))
+        return
+      }
       if (!locate(f)) return
       let st: Stats
       try {
@@ -652,7 +676,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
         sendTo({ t: 'hello', sessionId, items: t?.items ?? [], before: t?.before ?? null, size: f.pos })
       } else {
         const format = formatOf(sessionId)
-        f = { sessionId, file: null, ident: '', pos: 0, conv: format.make(), format, subs: new Set(), timer: null, menu: 'null', status: 'null' }
+        f = { sessionId, file: null, ident: '', pos: 0, conv: format.make(), format, subs: new Set(), timer: null, successor: o.successor?.(sessionId) ?? null, menu: 'null', status: 'null' }
         locate(f)
         try {
           sendTo(hello(f))

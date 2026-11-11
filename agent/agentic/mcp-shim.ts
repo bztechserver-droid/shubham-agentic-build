@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline'
 import { retryWhileRefused } from './mcp-retry.ts'
 import { FAST_TOOLS } from './fast-tools-list.ts'
+import { OLD_TOOLS } from './old-reader-tools.ts'
 import { TOOLS } from './tools.ts'
 
 // F-018: the MCP server each agent's chat runs (claude starts it from the --mcp-config file
@@ -16,9 +17,13 @@ const key = process.env.SAD_AGENTIC_KEY ?? ''
 // F-087: the fast Assistant's process runs this same shim with SAD_TOOLSET=fast: it is told about its own few tools only (the hub still
 // decides every call by its key).
 const FAST = process.env.SAD_TOOLSET === 'fast'
+// Order o5007: the old-app reader's process runs it with SAD_TOOLSET=old: its four read-only tools only (the hub decides every call by its key too).
+const OLD = process.env.SAD_TOOLSET === 'old'
+/** A fixed list (the fast Assistant's, the old-app reader's): never asked again, never changed. */
+const FIXED = FAST || OLD
 // What this process was built with. Not the last word for a full toolset: the agent's current list is (below), because this process
 // can outlive an Update (the chat host keeps the chat), and a tool added by then must still reach the chat.
-let LISTED: readonly { name: string }[] = FAST ? FAST_TOOLS : TOOLS
+let LISTED: readonly { name: string }[] = FAST ? FAST_TOOLS : OLD ? OLD_TOOLS : TOOLS
 /** The stamp of the list last given to claude (agent: GET /mcp/tools), null before the first. */
 let given: string | null = null
 /** claude has said hello (initialize): only then is a notification sent. */
@@ -65,7 +70,7 @@ async function call(name: string, args: unknown): Promise<{ text: string; isErro
 
 /** The agent's current tool list (and its stamp), or null when it can't be asked (an older agent, away): then the list this process was built with stands. */
 async function currentTools(stampOnly: boolean): Promise<{ version: string; tools?: { name: string }[] } | null> {
-  if (FAST || !url || !key) return null
+  if (FIXED || !url || !key) return null
   try {
     const res = await fetch(`${url}/tools?${stampOnly ? 'stamp=1' : 'given=1'}`, { headers: { 'x-sad-chat-key': key }, signal: AbortSignal.timeout(ASK_TIMEOUT_MS) })
     if (!res.ok) return null
@@ -87,7 +92,7 @@ async function watch() {
     process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`)
   }
 }
-if (!FAST) setInterval(() => void watch(), WATCH_EVERY_MS).unref()
+if (!FIXED) setInterval(() => void watch(), WATCH_EVERY_MS).unref()
 
 async function handle(msg: { id?: Id; method?: unknown; params?: Record<string, unknown> }) {
   const id = msg.id ?? null
@@ -97,7 +102,7 @@ async function handle(msg: { id?: Id; method?: unknown; params?: Record<string, 
       started = true
       return reply(id, {
         protocolVersion: typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '2024-11-05',
-        capabilities: { tools: FAST ? {} : { listChanged: true } },
+        capabilities: { tools: FIXED ? {} : { listChanged: true } },
         serverInfo: { name: 'shubham-agentic', version: '1.0.0' },
       })
     case 'tools/list': {

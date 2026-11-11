@@ -203,6 +203,10 @@ export interface ChatPool {
    * suggestion is not a draft.
    */
   type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
+  /** o655f (Stage 1): claude's UserPromptSubmit hook reported that this chat took 	ext (length: its full length, when the text here was cut) as prompt promptId; a send waiting for exactly that text is confirmed. */
+  promptSeen?(sessionId: string, text: string, length: number, promptId: string | null, claudeSessionId?: string | null): void
+  /** o655f (Stage 1): the session id claude is on now for this chat when it differs from the chat's own (/clear, /resume), else null. */
+  claudeSession?(sessionId: string): string | null
   /** Await actual input acceptance; legacy type() only reports scheduling. */
   deliver?(sessionId: string, text: string, opt?: DeliveryOptions): Promise<SendResult>
   /** Opaque incarnation: a restarted process must not inherit a pending send. */
@@ -376,6 +380,10 @@ interface Chat {
   /** F-193: the live mirror of its input line (made when a chat box first asks), until when the old direct paste is in flight, and when a person last typed in it. */
   mirror?: InputMirror
   pastingUntil?: number
+  /** o655f (Stage 1): the prompts claude said it TOOK (its UserPromptSubmit hook): the text with its whitespace squashed, whether that text was cut, its prompt id, when. The last 30. */
+  seen?: { norm: string; cut: boolean; id: string | null; at: number }[]
+  /** o655f (Stage 1): the session id claude says it is on NOW when it is not the chat's own (after /clear or /resume claude starts a new session and a new file). */
+  claudeSid?: string
   typedAt?: number
 }
 
@@ -1152,7 +1160,11 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         }
         if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
         const sendStart = Date.now()
-        return sendToCodex({
+        // o655f (Stage 1): claude's own word that it took exactly this text (its UserPromptSubmit hook, noted by promptSeen) since this send began.
+        const expectedNorm = pasted.replace(/\s+/g, '')
+        const tookIt = () => !!c.seen?.some(p => p.at >= began && (p.norm === expectedNorm || (p.cut && expectedNorm.startsWith(p.norm))))
+        const result = await sendToCodex({
+          confirmed: tookIt,
           write: data => data !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, data),
           lines: () => {
             if (c.exited) throw Error('gone')
@@ -1178,6 +1190,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           onBlocked: opt?.onBlocked,
           report: r => offsetReport(opt, r, sendStart - began),
         }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()), preTyped })
+        // An unconfirmed end may only be a hook still on its way (it lands within about 110 ms of the Enter): a short grace before giving up.
+        // (Only for a chat whose hook has already spoken once: for one that never reports, waiting would only slow the old answer down.)
+        if (result !== 'unconfirmed' || !c.seen) return result
+        for (let waited = 0; waited < 700; waited += 100) {
+          if (tookIt()) return 'sent'
+          await new Promise<void>(resolve => setTimeout(resolve, 100))
+        }
+        return tookIt() ? 'sent' : result
       })().catch(() => 'unconfirmed' as const)
       c.delivering = sending
       void sending.finally(() => { if (c.delivering === sending) c.delivering = undefined })
@@ -1264,6 +1284,27 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const ok = write(c, data)
       c.mirror?.poke()
       return ok
+    },
+
+    promptSeen(id, text, length, promptId, claudeSessionId) {
+      const c = chats.get(id)
+      if (!c || c.exited) return
+      // claude's own session id comes with every prompt: when it is not the chat's, a /clear or /resume moved the conversation to a new file.
+      if (typeof claudeSessionId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claudeSessionId)) {
+        const next = claudeSessionId === c.info.sessionId ? undefined : claudeSessionId
+        if (next !== c.claudeSid) {
+          c.claudeSid = next
+          log?.info(`chat ${id.slice(0, 8)}: claude is on ${next ? `a new session (${next.slice(0, 8)})` : "the chat's own session"} now`)
+          changed()
+        }
+      }
+      ;(c.seen ??= []).push({ norm: text.replace(/\s+/g, ''), cut: length > text.length, id: promptId, at: Date.now() })
+      if (c.seen.length > 30) c.seen.shift()
+    },
+
+    claudeSession(id) {
+      const c = chats.get(id)
+      return c && !c.exited ? c.claudeSid ?? null : null
     },
 
     draftMirror(id, client) {

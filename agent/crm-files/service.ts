@@ -1,4 +1,4 @@
-import { Readable } from 'node:stream'
+﻿import { Readable } from 'node:stream'
 import {
   blockedKind,
   CRM_FILES_MAX_UPLOAD,
@@ -52,6 +52,8 @@ export interface MountDriver {
   setAuto?(on: boolean): Promise<CrmMountStatus>
   /** o6e65 (Windows): how the drive is made (WinFsp, Windows' built-in WebDAV, or automatic). */
   setDriver?(via: CrmDriverChoice): Promise<CrmMountStatus>
+  /** S9b (Windows): "Save into the drive": the in-app drive takes saves (a save goes into the CRM), or not (the default). */
+  setSaves?(on: boolean): Promise<CrmMountStatus>
   /** o6e65 (Windows): open File Explorer on the drive, or on the waiting or recovered saves folder. Takes no path. */
   reveal?(what: CrmReveal): Promise<void>
 }
@@ -76,6 +78,8 @@ export interface CrmFilesOptions {
   /** S5: opens a folder in the PC's file manager (the "Open the folder" button). Left out = the button says it is not supported here. */
   openFolder?: (dir: string) => void
   log?: { info(m: string): void; warn(m: string): void }
+  /** oa2f8: the most one file may be now (the uploads' settings: the CRM's own limit, or the person's number). Left out: CRM_FILES_MAX_UPLOAD. The one-request upload and the drive's saves follow it. */
+  maxUpload?: () => number
 }
 
 /**
@@ -95,6 +99,11 @@ export interface CrmUploadBackend {
   finish(p: { kind: CrmUploadKind; target: string; name: string; type: string; size: number; key: string; driveId: string; url: string; lookFirst: boolean }): Promise<{ node: CrmNode; savedAs?: string }>
   /** The fetch used for Google (the session's parts and questions go through it). */
   fetch: typeof fetch
+  /**
+   * oa2f8: the limit for one file that the CRM's own upload token answer said (`maxFileSize`), should the CRM ever add it there; null while it does not. NO request is made for it: it
+   * is noted when the token is fetched anyway (an upload, a rights check). The agent puts no question of its own to the CRM (Lead, 11 Nov 2026: he approved real writes only).
+   */
+  crmLimit?(): number | null
 }
 
 /**
@@ -124,6 +133,13 @@ export async function readOrgId(client: Pick<CrmClient, 'request'>): Promise<str
   return null
 }
 
+/** oa2f8: the CRM's limit in its own words ("file_size must not exceed 524288000 bytes (500 MB)"), or null. */
+export function crmLimitFrom(text: string): number | null {
+  const m = /must not exceed (\d{1,16}) bytes/i.exec(text)
+  const n = m ? Number(m[1]) : Number.NaN
+  return Number.isSafeInteger(n) && n > 0 ? n : null
+}
+
 export interface CrmFilesService {
   status(): Promise<CrmFilesStatus>
   children(id: string): Promise<CrmChildren>
@@ -137,7 +153,7 @@ export interface CrmFilesService {
    * S5: a save made through a drive: the bytes are kept on this PC (the spool) and this returns at once; they go up in the background. It checks the rights first (a save the CRM would refuse is
    * refused now, not accepted and then parked). `target` = a CRM file to save over as a NEW VERSION; without it, a new file in the folder `parent`. Null when this agent keeps no spool.
    */
-  save: ((a: { parent: string; name: string; type: string; target?: string | null; body: Readable; size: number }) => Promise<{ how: 'new' | 'version'; entry: CrmSpoolEntry }>) | null
+  save: ((a: { parent: string; name: string; type: string; target?: string | null; body?: Readable; /** S9b: a finished file moved into the spool instead of a stream. */ from?: string; size: number }) => Promise<{ how: 'new' | 'version'; entry: CrmSpoolEntry }>) | null
   /** S5: the saves kept on this PC until the CRM has them (null when there is no spool). */
   spool: Spool | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
@@ -550,8 +566,14 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     const j: unknown = await r.json().catch(() => null)
     if (!isObject(j) || !text(j.accessToken)) throw new CrmFilesError(502, 'crm-down', 'The CRM gave no Google Drive upload token.')
     token = { accessToken: text(j.accessToken), folderId: text(j.folderId) || null, makePublic: j.makePublic === true, expiresAt: num(j.expiresAt) ?? now() + 10 * 60_000 }
+    // oa2f8: should the CRM ever say its limit here, it is kept (the uploads follow it).
+    const said = num(j.maxFileSize) ?? num(j.max_file_size) ?? num(j.maxUploadBytes)
+    if (said !== null && Number.isSafeInteger(said) && said > 0) tokenLimit = said
     return token
   }
+
+  /** oa2f8: the limit the CRM's upload token answer said, when it says one. */
+  let tokenLimit: number | null = null
 
   async function orgId(): Promise<string> {
     if (snap?.org) return snap.org
@@ -690,7 +712,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   function checkSize(size: number) {
     if (!Number.isFinite(size) || size < 0) throw new CrmFilesError(400, 'failed', 'The upload needs its size.')
-    if (size > CRM_FILES_MAX_UPLOAD) throw new CrmFilesError(413, 'toolarge', `A file is at most ${CRM_FILES_MAX_UPLOAD / 1024 / 1024} MB here.`)
+    const max = o.maxUpload?.() ?? CRM_FILES_MAX_UPLOAD
+    if (size > max) throw new CrmFilesError(413, 'toolarge', `A file is at most ${Math.round(max / 1024 / 1024)} MB here.`)
   }
 
   function needName(name: string) {
@@ -763,6 +786,9 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   const uploadBackend: CrmUploadBackend = {
     fetch: gfetch,
 
+    // What the token answer said, when it was fetched for the agent's own work; nothing is asked for it.
+    crmLimit: () => tokenLimit,
+
     async check(p) {
       if (p.kind === 'new') {
         needName(p.name)
@@ -825,6 +851,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       stop: () => withSpool(baseMount.stop()),
       setAuto: baseMount.setAuto ? on => withSpool(baseMount.setAuto!(on)) : undefined,
       setDriver: baseMount.setDriver ? via => withSpool(baseMount.setDriver!(via)) : undefined,
+      setSaves: baseMount.setSaves ? on => withSpool(baseMount.setSaves!(on)) : undefined,
       reveal: async what => {
         if (what === 'spool') {
           if (!spool || !o.openFolder) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
@@ -864,13 +891,13 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
           if (a.target) {
             const { node, project } = await findFile(a.target)
             await needRight(node, 'version', 'save a new version of this file')
-            const entry = await spool!.add({ kind: 'version', parent: node.parentId ?? a.parent, target: a.target, name: a.name, type: a.type, project: project?.name ?? null, body: a.body, size: a.size })
+            const entry = await spool!.add({ kind: 'version', parent: node.parentId ?? a.parent, target: a.target, name: a.name, type: a.type, project: project?.name ?? null, body: a.body, from: a.from, size: a.size })
             return { how: 'version' as const, entry }
           }
           asFolderParts(a.parent)
           const pn = await nodeOf(a.parent)
           await needRight(pn, 'upload', 'add files')
-          const entry = await spool!.add({ kind: 'new', parent: a.parent, name: a.name, type: a.type, project: pn.name, body: a.body, size: a.size })
+          const entry = await spool!.add({ kind: 'new', parent: a.parent, name: a.name, type: a.type, project: pn.name, body: a.body, from: a.from, size: a.size })
           return { how: 'new' as const, entry }
         }
       : null,

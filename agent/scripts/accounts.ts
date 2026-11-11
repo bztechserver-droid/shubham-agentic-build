@@ -7,6 +7,9 @@ import path from 'node:path'
 import { statePaths } from '../config.ts'
 import { createAccountsEmail } from '../agentic/accounts-email.ts'
 import { createAccountsImport } from '../agentic/accounts-import.ts'
+import { createAccountsCodebases } from '../agentic/accounts-codebases.ts'
+import { createCodebaseImport } from '../agentic/accounts-codebase-import.ts'
+import { createAccountsPlatforms } from '../agentic/accounts-platforms.ts'
 import { runCli, type AdminLogin, type Io } from '../agentic/accounts-cli.ts'
 import { createCrmProxy } from '../agentic/crmproxy.ts'
 
@@ -70,6 +73,9 @@ try {
     runSql,
     importer: args => createAccountsImport({ proxy, dir: paths.agent }).run(args),
     lister: person => createAccountsEmail({ dir: paths.agent }).list(person),
+    codebaseImporter: args => createCodebaseImport({ proxy, dir: paths.agent }).run(args),
+    codebaseLister: person => createAccountsCodebases({ dir: paths.agent }).list(person),
+    platformLister: person => createAccountsPlatforms({ dir: paths.agent }).list(person),
     crmSignedIn: () => proxy.session().signedIn,
     packageThere: () => loadPackage().then(() => true, () => false),
   })

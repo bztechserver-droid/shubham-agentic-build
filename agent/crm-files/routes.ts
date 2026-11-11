@@ -1,7 +1,7 @@
-import type { IncomingMessage, ServerResponse } from 'node:http'
+﻿import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
-import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmSpool, type CrmUploadStart } from '../../shared/crm-files.ts'
+import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 import type { CrmUploads } from './uploads.ts'
 
@@ -79,6 +79,7 @@ const METHODS: Record<string, string[]> = {
   mount: ['GET', 'POST'],
   unmount: ['POST'],
   'mount/auto': ['POST'],
+  'mount/saves': ['POST'],
   'mount/reveal': ['POST'],
   'mount/driver': ['POST'],
   spool: ['GET'],
@@ -95,6 +96,8 @@ const UPLOAD_METHODS: Record<string, string[]> = {
   'uploads/retry': ['POST'],
   'uploads/cancel': ['POST'],
   'uploads/clear': ['POST'],
+  // oa2f8: the size limit, the waiting folder, the warning line
+  'uploads/settings': ['GET', 'POST'],
 }
 
 /** A whole number of bytes from the query (an offset), or NaN. */
@@ -104,8 +107,10 @@ async function uploadRoute(up: CrmUploads, name: string, req: IncomingMessage, r
   switch (name) {
     case 'uploads': {
       const id = url.searchParams.get('id')
-      return send(res, 200, id ? up.get(id) : up.list())
+      return send(res, 200, id ? up.get(id) : await up.list())
     }
+    case 'uploads/settings':
+      return send(res, 200, (req.method ?? 'GET').toUpperCase() === 'POST' ? await up.setSettings((await readJson(req)) as CrmUploadSettingsChange) : await up.settings())
     case 'uploads/start':
       return send(res, 200, await up.begin((await readJson(req)) as unknown as CrmUploadStart))
     case 'uploads/part': {
@@ -202,6 +207,12 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
               if (typeof b.on !== 'boolean') throw new CrmFilesError(400, 'failed', 'on is needed (true or false).')
               if (!svc.mount.setAuto) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
               return send(res, 200, await svc.mount.setAuto(b.on))
+            }
+            case 'mount/saves': {
+              const b = await readJson(req)
+              if (typeof b.on !== 'boolean') throw new CrmFilesError(400, 'failed', 'on is needed (true or false).')
+              if (!svc.mount.setSaves) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              return send(res, 200, await svc.mount.setSaves(b.on))
             }
             case 'mount/driver': {
               const b = await readJson(req)

@@ -22,6 +22,11 @@ export interface SenderIO {
   onBlocked?(reason: DeliveryBlockReason): void
   /** Called once when the send ends, for sent/unconfirmed/gone and for a refusal that had to be relabelled. Diagnostics only. */
   report?(report: DeliveryReport): void
+  /**
+   * o655f (Stage 1): true once claude itself said it TOOK this exact text (its UserPromptSubmit hook, 10-110 ms after Enter). That is proof of
+   * submission by whoever pressed the Enter, so it ends the send as sent at once, before and instead of any screen reading or input check.
+   */
+  confirmed?(): boolean
 }
 export type SendResult = 'sent' | 'blocked' | 'unconfirmed' | 'gone'
 export interface SendOptions {
@@ -126,6 +131,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   let attemptedEnter = false
   for (let poll = 0; poll <= Math.ceil(maxSettleMs / settleMs); poll++) {
     await sleep(settleMs)
+    if (io.confirmed?.()) return finish('sent', 'confirmed')
     if (interrupted()) return finish('unconfirmed', why())
     if (expired()) return finish('unconfirmed', 'deadline')
     const lines = read()
@@ -137,6 +143,7 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   }
   if (!settled) return finish('unconfirmed', 'not-settled')
   for (let attempt = 0; attempt < tries; attempt++) {
+    if (io.confirmed?.()) return finish('sent', 'confirmed')
     if (interrupted()) return finish('unconfirmed', why())
     if (expired()) return finish('unconfirmed', 'deadline')
     const lines = read()
@@ -160,8 +167,11 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     let unchangedOwned = false
     for (let waited = 0; waited < 3000;) {
       const interval = Math.min(checkMs, 3000 - waited)
-      await sleep(interval)
+      // With claude's own word available it is looked for every 100 ms (the hook lands within about 110 ms), the box only every checkMs.
+      if (io.confirmed) for (let left = interval; left > 0; left -= 100) { await sleep(Math.min(100, left)); if (io.confirmed()) return finish('sent', 'confirmed') }
+      else await sleep(interval)
       waited += interval
+      if (io.confirmed?.()) return finish('sent', 'confirmed')
       if (interrupted()) return finish('unconfirmed', why())
       if (expired()) return finish('unconfirmed', 'deadline')
       if (io.gone?.()) return finish('unconfirmed', 'terminal-gone')

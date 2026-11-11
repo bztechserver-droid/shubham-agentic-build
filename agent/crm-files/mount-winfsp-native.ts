@@ -31,7 +31,9 @@ export interface NativeOptions {
    */
   markerFile?: string
   /** Tests: another worker (a fake), and the file system's answers about the letter. */
-  createWorker?: (data: { bufs: BridgeBuffers; letter: string; dll: string; label: string }) => WorkerLike
+  /** The "Save into the drive" setting, read when the drive starts. Left out = OFF: read-only, exactly as before the saves existed. */
+  writable?: () => boolean
+  createWorker?: (data: { bufs: BridgeBuffers; letter: string; dll: string; label: string; writable: boolean }) => WorkerLike
   exists?: (letter: string) => Promise<boolean>
   startMs?: number
   stopMs?: number
@@ -51,13 +53,14 @@ export function createWinNative(o: NativeOptions) {
   const cacheMs = o.cacheMs ?? 10_000
   const existsAsync = o.exists ?? ((l: string) => access(`${l}\\`).then(() => true, () => false))
   let worker: WorkerLike | null = null
+  let handlerNow: ReturnType<typeof createCrmFsHandler> | null = null
   let ready = false
   let exited = false
   let ending = false
   let starting: Promise<NativeStart> | null = null
   let remembered: { at: number; value: boolean } | null = null
 
-  const make = (data: { bufs: BridgeBuffers; letter: string; dll: string; label: string }): WorkerLike => new Worker(new URL('./winfsp-worker.ts', import.meta.url), { workerData: data }) as unknown as WorkerLike
+  const make = (data: { bufs: BridgeBuffers; letter: string; dll: string; label: string; writable: boolean }): WorkerLike => new Worker(new URL('./winfsp-worker.ts', import.meta.url), { workerData: data }) as unknown as WorkerLike
 
   const writeMarker = () => {
     if (!o.markerFile) return
@@ -103,12 +106,14 @@ export function createWinNative(o: NativeOptions) {
       remembered = null
       if (await answers()) return { ok: false, reason: CRM_FILES_REASONS.letterTaken.replace('Y:', letter), code: 'letter-taken' }
       const bufs = newBridgeBuffers()
-      const handler = createCrmFsHandler(o.service)
+      // Saves go into the CRM only when the person turned "Save into the drive" on AND the agent keeps a spool; otherwise the volume is declared read-only and every change is refused.
+      const writable = (o.writable?.() ?? false) && !!o.service()?.save
+      const handler = (handlerNow = createCrmFsHandler(o.service, { log: o.log, allowWrites: () => writable }))
       ready = false
       exited = false
       // From here until a clean end the marker says "the in-app drive is (being) served by this process".
       writeMarker()
-      const w = (worker = (o.createWorker ?? make)({ bufs, letter, dll, label: 'CRM files' }))
+      const w = (worker = (o.createWorker ?? make)({ bufs, letter, dll, label: 'CRM files', writable }))
       return await new Promise<NativeStart>(resolve => {
         let settled = false
         const settle = (r: NativeStart) => {
@@ -184,6 +189,9 @@ export function createWinNative(o: NativeOptions) {
     worker = null
     ending = false
     remembered = null
+    // The temporary copies of programs' little side files go with the drive (a save that was never moved into the spool stays where it is).
+    await handlerNow?.close().catch(() => undefined)
+    handlerNow = null
     removeMarker()
   }
 

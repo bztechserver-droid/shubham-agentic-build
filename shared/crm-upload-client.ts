@@ -1,4 +1,13 @@
-import { CRM_UPLOAD_PART, type CrmUpload, type CrmUploadList, type CrmUploadState } from './crm-files.ts'
+import {
+  CRM_UPLOAD_PART,
+  type CrmUpload,
+  type CrmUploadLimitFrom,
+  type CrmUploadList,
+  type CrmUploadSettingsChange,
+  type CrmUploadSettingsView,
+  type CrmUploadSpace,
+  type CrmUploadState,
+} from './crm-files.ts'
 
 // od0b1 (U1): the page's helper for the agent's uploads in parts (shared/crm-files.ts, /uploads/*). It sends each file to the agent in parts (CRM_UPLOAD_PART, 8 MiB), strictly in order,
 // `parallel` files at a time; a part that fails (the agent restarting, the Wi-Fi dropping) is sent again after a growing wait, from where the AGENT says it is; it reads the list while
@@ -84,6 +93,14 @@ export interface Uploader {
   refresh(): Promise<void>
   list(): UploadView[]
   subscribe(cb: (list: UploadView[]) => void): () => void
+  /** oa2f8: the waiting folder, its free space, what the uploads hold, the warning (from the last list read; null before the first, or from an older agent). Subscribers are told when it changes. */
+  space(): CrmUploadSpace | null
+  /** oa2f8: the most one file may be now, and where that comes from (from the last list read; null before the first). */
+  limit(): { maxSize: number; from: CrmUploadLimitFrom | null } | null
+  /** oa2f8: the uploads' settings (GET /uploads/settings). Rejects with CrmUploadError (404 from an older agent). */
+  settings(): Promise<CrmUploadSettingsView>
+  /** oa2f8: changes some of them. Rejects with the agent's reason (409 'conflict' while uploads wait in the folder). */
+  saveSettings(c: CrmUploadSettingsChange): Promise<CrmUploadSettingsView>
   /** Stops sending and polling (the agent keeps what it has). */
   dispose(): void
 }
@@ -184,6 +201,8 @@ export function crmUploader(o: UploaderOptions): Uploader {
   let active = 0
   let disposed = false
   let poll: ReturnType<typeof setTimeout> | null = null
+  let lastSpace: CrmUploadSpace | null = null
+  let lastLimit: { maxSize: number; from: CrmUploadLimitFrom | null } | null = null
 
   async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
     let res: Response
@@ -253,6 +272,9 @@ export function crmUploader(o: UploaderOptions): Uploader {
   async function refresh() {
     if (disposed) return
     const r = await call<CrmUploadList>('GET', '/uploads')
+    // oa2f8: the waiting folder's space and the limit in force (an older agent leaves them out).
+    lastSpace = r.space ?? null
+    lastLimit = typeof r.maxSize === 'number' ? { maxSize: r.maxSize, from: r.maxSizeFrom ?? null } : null
     const seen = new Set<string>()
     for (const u of r.uploads) {
       seen.add(u.id)
@@ -467,6 +489,19 @@ export function crmUploader(o: UploaderOptions): Uploader {
     subscribe(cb) {
       subs.add(cb)
       return () => void subs.delete(cb)
+    },
+
+    space: () => lastSpace,
+    limit: () => lastLimit,
+
+    settings: () => call<CrmUploadSettingsView>('GET', '/uploads/settings'),
+
+    async saveSettings(c) {
+      const v = await call<CrmUploadSettingsView>('POST', '/uploads/settings', c)
+      lastSpace = v.space
+      lastLimit = { maxSize: v.maxSize, from: v.maxSizeFrom }
+      void refresh().catch(() => undefined)
+      return v
     },
 
     dispose() {

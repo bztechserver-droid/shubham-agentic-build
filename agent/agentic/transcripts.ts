@@ -105,7 +105,9 @@ export function readTranscriptFile(file: string): ChatMessage[] {
     } catch {
       continue
     }
-    if (!isObject(row) || (row.type !== 'user' && row.type !== 'assistant') || row.isMeta === true) continue
+    // o655f (Stage 1): claude's own compaction summary is written as a user row WITHOUT isMeta (2.1.322); it is not a message anybody sent, so it is
+    // never counted as one (the heartbeat read it as an unanswered message and nudged a chat that had just compacted itself). chatview.ts skips the same rows.
+    if (!isObject(row) || (row.type !== 'user' && row.type !== 'assistant') || row.isMeta === true || row.isCompactSummary === true || row.isVisibleInTranscriptOnly === true) continue
     const msg = isObject(row.message) ? row.message : null
     if (!msg) continue
     const parts: string[] = []
@@ -191,7 +193,7 @@ const oneLine = (s: string) => {
 /** What the person typed first: the conversation's name when claude never titled it. */
 function firstPrompt(head: Record<string, unknown>[]): string | null {
   for (const row of head) {
-    if (row.type !== 'user' || row.isMeta === true || !isObject(row.message)) continue
+    if (row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true || row.isVisibleInTranscriptOnly === true || !isObject(row.message)) continue
     const c = row.message.content
     const t = typeof c === 'string' ? c : Array.isArray(c) ? c.map(p => (isObject(p) && p.type === 'text' && typeof p.text === 'string' ? p.text : '')).join(' ') : ''
     // Slash commands and reminders are claude's own wrapping, not the person's words.

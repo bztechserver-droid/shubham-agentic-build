@@ -4,7 +4,7 @@ import { mkdir, open, readdir, readFile, rename, rm, stat, statfs, truncate, wri
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import {
-  CRM_FILES_MAX_UPLOAD,
+  CRM_FILES_REASONS,
   CRM_UPLOAD_CHUNK,
   CRM_UPLOAD_MAX_PART,
   CRM_UPLOAD_PARALLEL,
@@ -14,12 +14,18 @@ import {
   type CrmFilesErrorCode,
   type CrmNode,
   type CrmUpload,
+  type CrmUploadCrmLimit,
   type CrmUploadKind,
+  type CrmUploadLimitFrom,
   type CrmUploadList,
+  type CrmUploadSettingsChange,
+  type CrmUploadSettingsView,
+  type CrmUploadSpace,
   type CrmUploadStart,
   type CrmUploadState,
 } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmUploadBackend } from './service.ts'
+import { checkDir, checkLimitMb, checkLowFreeMb, checkUsable, crmLimitFrom, defaultUploadSettings, limitOf, readUploadSettings, writeUploadSettings, type StoredUploadSettings } from './upload-settings.ts'
 
 // od0b1 (U1): uploads of any size the CRM takes, held by the AGENT, so a big file never has to go up in one request (the 50 MB WebDAV limit, a 5-minute request, a closed page).
 //
@@ -37,13 +43,17 @@ import { CrmFilesError, type CrmUploadBackend } from './service.ts'
 // folder, once the CRM has the file or the person cancels. The session address is a credential for that one upload: it is kept only in the journal, never logged, never given to a page.
 
 export interface CrmUploadsOptions {
-  /** The pending folder (the agent's own state folder): <id>.json (the journal) and <id>.part (the bytes). */
+  /** The pending folder (the agent's own state folder): <id>.json (the journal) and <id>.part (the bytes). With a settings file, this is the DEFAULT folder; the person may choose another. */
   dir: string
   backend: CrmUploadBackend
   log?: { info(m: string): void; warn(m: string): void }
   now?: () => number
-  /** The most one file may be: the CRM's own rule (500 MB) unless a test says otherwise. */
+  /** A fixed most one file may be (tests). Left out: the settings decide (the CRM's own limit where it said it, else the person's number, else 500 MB). */
   maxSize?: number
+  /** oa2f8: the settings file (crm-uploads.json: the size limit, the waiting folder, the warning line, what the CRM said its limit is). Left out (tests): the defaults, and no settings route. */
+  settingsFile?: string
+  /** oa2f8: folders the waiting folder may not be inside (the app's own folder: an update replaces it). */
+  notInside?: string[]
   /** Bytes per request to Google; a multiple of 256 KiB. */
   chunk?: number
   /** How many uploads go to Google at once. */
@@ -67,8 +77,15 @@ export interface CrmUploadsOptions {
 export interface CrmUploads {
   /** Reads the journal (uploads that were going on when the agent stopped) and carries on. Call once. */
   start(): Promise<void>
-  list(): CrmUploadList
+  /** oa2f8: async (the free space of the waiting folder's disk is read). */
+  list(): Promise<CrmUploadList>
   get(id: string): CrmUpload
+  /** oa2f8: the settings and what is in force now. */
+  settings(): Promise<CrmUploadSettingsView>
+  /** oa2f8: changes some settings. Throws CrmFilesError: 400 for a value that can not be used, 409 to move the folder while uploads wait in it. */
+  setSettings(c: CrmUploadSettingsChange): Promise<CrmUploadSettingsView>
+  /** oa2f8: the most one file may be now (the one-request upload follows it too). */
+  maxSize(): number
   /** Checks everything first (the CRM's rules, the size, the room on this PC's disk); nothing is sent yet. */
   begin(p: CrmUploadStart): Promise<CrmUpload>
   /** The next bytes of the file from the page, at `offset` (it must be where the upload is), `length` of them. */
@@ -137,6 +154,8 @@ interface Job {
 
 /** What only this process knows about an upload. */
 interface Live {
+  /** oa2f8: the waiting folder its files are in (the one in use when it began, or when the journal was read). */
+  dir: string
   /** The md5 of the first `hashAt` bytes, counted as the parts arrive (lost at a restart: then the file is read again at the end). */
   hash: Hash | null
   hashAt: number
@@ -228,10 +247,24 @@ class Permanent extends Error {
 }
 
 export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
-  const dir = o.dir
+  const defaultDir = o.dir
+  /** The waiting folder in use now (oa2f8: the settings may choose another; each upload keeps the one it began in, Live.dir). */
+  let dir = defaultDir
+  let settings: StoredUploadSettings = defaultUploadSettings()
   const backend = o.backend
   const now = o.now ?? Date.now
-  const maxSize = o.maxSize ?? CRM_FILES_MAX_UPLOAD
+  /** The limit the CRM's token answer said last (each new number is learned once; a later refusal of a record then wins until the token says another). */
+  let tokenSeen: number | null = null
+  /** The most one file may be now, and where that comes from. A number the CRM's token answer said (noted by the service, no request made) is learned here. */
+  const limitNow = (): { bytes: number; from: CrmUploadLimitFrom } => {
+    if (o.maxSize !== undefined) return { bytes: o.maxSize, from: 'default' }
+    const said = backend.crmLimit?.() ?? null
+    if (said && said !== tokenSeen) {
+      tokenSeen = said
+      void learnLimit(said, 'token')
+    }
+    return limitOf(settings)
+  }
   const chunk = o.chunk ?? CRM_UPLOAD_CHUNK
   if (!(chunk > 0 && chunk % CRM_UPLOAD_UNIT === 0)) throw new Error('The chunk must be a whole number of 256 KiB units.')
   const parallel = Math.max(1, o.parallel ?? CRM_UPLOAD_PARALLEL)
@@ -252,14 +285,14 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
   let closed = false
   let started: Promise<void> | null = null
 
-  const partOf = (id: string) => path.join(dir, `${id}.part`)
-  const journalOf = (id: string) => path.join(dir, `${id}.json`)
+  const partOf = (id: string) => path.join(lives.get(id)?.dir ?? dir, `${id}.part`)
+  const journalOf = (id: string) => path.join(lives.get(id)?.dir ?? dir, `${id}.json`)
   const short = (j: Job) => j.id.slice(0, 8)
 
-  function live(j: Job): Live {
+  function live(j: Job, where = dir): Live {
     let l = lives.get(j.id)
     if (!l) {
-      l = { hash: null, hashAt: 0, receiving: false, running: false, step: null, abort: null, stop: null, writing: Promise.resolve() }
+      l = { dir: where, hash: null, hashAt: 0, receiving: false, running: false, step: null, abort: null, stop: null, writing: Promise.resolve() }
       lives.set(j.id, l)
     }
     return l
@@ -455,6 +488,12 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
   function classify(e: unknown): Transient | Permanent {
     if (e instanceof Transient || e instanceof Permanent) return e
     if (e instanceof CrmFilesError) {
+      // oa2f8: the CRM refused the record for its size, and said its limit: that is learned (and kept), and this one stops with plain words.
+      const limit = e.status === 400 && !e.upstream ? crmLimitFrom(e.message) : null
+      if (limit) {
+        learnLimit(limit, 'refused')
+        return new Permanent('toolarge', CRM_UPLOAD_REASONS.tooLargeForCrm(limit))
+      }
       if (e.code === 'crm-signin') return new Transient('crm-signin', CRM_UPLOAD_REASONS.signIn)
       if (e.code === 'crm-down') return new Transient('crm-down', CRM_UPLOAD_REASONS.crmDown)
       if (e.upstream) return googleStatus(e.upstream.status, e.upstream.reason)
@@ -755,6 +794,17 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
   async function beginNow(p: CrmUploadStart): Promise<CrmUpload> {
     if (closed) throw new CrmFilesError(503, 'failed', 'The agent is stopping.')
     await (started ?? Promise.resolve())
+    // oa2f8: a change of the settings (the waiting folder) that is going on finishes first, and none starts while this one is being set up.
+    await changing
+    beginning++
+    try {
+      return await beginChecked(p)
+    } finally {
+      beginning--
+    }
+  }
+
+  async function beginChecked(p: CrmUploadStart): Promise<CrmUpload> {
     if (!isObject(p)) throw new CrmFilesError(400, 'failed', 'An upload needs kind, target, name and size.')
     const kind = p.kind === 'version' ? 'version' : p.kind === 'new' ? 'new' : null
     if (!kind) throw new CrmFilesError(400, 'failed', "kind must be 'new' or 'version'.")
@@ -770,14 +820,21 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
         return view(same)
       }
     }
-    if (p.size > maxSize) throw new CrmFilesError(413, 'toolarge', CRM_UPLOAD_REASONS.tooLarge(maxSize))
+    const limit = limitNow()
+    if (p.size > limit.bytes) throw new CrmFilesError(413, 'toolarge', limit.from === 'setting' ? CRM_UPLOAD_REASONS.tooLargeHere(limit.bytes) : CRM_UPLOAD_REASONS.tooLarge(limit.bytes))
     const held = [...jobs.values()].filter(j => !ENDED.includes(j.state)).length
     if (held >= maxHeld) throw new CrmFilesError(429, 'toomany', CRM_UPLOAD_REASONS.tooMany)
     const checked = await backend.check({ kind, target: p.target, name: p.name, type })
-    await mkdir(dir, { recursive: true })
+    // The folder in use now is the one this upload keeps (Live.dir).
+    const jdir = dir
+    try {
+      await mkdir(jdir, { recursive: true })
+    } catch {
+      throw new CrmFilesError(507, 'nospace', CRM_UPLOAD_REASONS.dirMissing(jdir))
+    }
     let still = 0
     for (const j of jobs.values()) if (!ENDED.includes(j.state)) still += j.size - j.received
-    const free = await freeBytes(dir).catch(() => Infinity)
+    const free = await freeBytes(jdir).catch(() => Infinity)
     if (free < p.size + still + reserve) throw new CrmFilesError(507, 'nospace', CRM_UPLOAD_REASONS.noSpace)
     const t = now()
     const j: Job = {
@@ -799,8 +856,14 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
       updatedAt: t,
       ...(p.size === 0 ? { md5: EMPTY_MD5 } : {}),
     }
-    await writeFile(partOf(j.id), '')
-    const l = live(j)
+    const l = live(j, jdir)
+    const part = partOf(j.id)
+    try {
+      await writeFile(part, '')
+    } catch (e) {
+      lives.delete(j.id)
+      throw (e as NodeJS.ErrnoException)?.code === 'ENOSPC' ? new CrmFilesError(507, 'nospace', CRM_UPLOAD_REASONS.noSpace) : e
+    }
     l.hash = createHash('md5')
     l.hashAt = 0
     jobs.set(j.id, j)
@@ -809,7 +872,7 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
     } catch (e) {
       jobs.delete(j.id)
       lives.delete(j.id)
-      await rm(partOf(j.id), { force: true }).catch(() => undefined)
+      await rm(part, { force: true }).catch(() => undefined)
       throw e
     }
     log?.info(`upload ${short(j)} started: ${kind === 'new' ? 'a new file' : 'a new version'} "${j.name}" (${sizeText(j.size)})`)
@@ -911,26 +974,137 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
   }
 
   async function forget(j: Job) {
+    // Its own two files, in the folder it was in (taken before its live part goes).
+    const journal = journalOf(j.id)
+    const part = partOf(j.id)
     jobs.delete(j.id)
     const l = lives.get(j.id)
     lives.delete(j.id)
     await l?.writing.catch(() => undefined)
-    await rm(journalOf(j.id), { force: true }).catch(() => undefined)
-    await rm(partOf(j.id), { force: true }).catch(() => undefined)
+    await rm(journal, { force: true }).catch(() => undefined)
+    await rm(part, { force: true }).catch(() => undefined)
   }
 
   function prune() {
     for (const j of [...jobs.values()]) if (ENDED.includes(j.state) && now() - j.updatedAt > keepEndedMs) void forget(j)
   }
 
+  // ---- oa2f8: the settings, the waiting folder's space, what the CRM said its limit is ------------------------------------------
+
+  /** Settings changes and what the CRM said, one after the other (each writes the settings file). */
+  let changing: Promise<unknown> = Promise.resolve()
+  /** Starts being set up now (the folder does not change under them). */
+  let beginning = 0
+  let wasLow = false
+  let freeSeen: { at: number; dir: string; free: number | null } | null = null
+
+  function queue<T>(work: () => Promise<T>): Promise<T> {
+    const p = changing.then(work)
+    changing = p.catch(() => undefined)
+    return p
+  }
+
+  async function space(): Promise<CrmUploadSpace> {
+    let held = 0
+    let coming = 0
+    for (const j of jobs.values()) {
+      if (ENDED.includes(j.state)) continue
+      held += j.received
+      coming += j.size - j.received
+    }
+    let free: number | null
+    if (freeSeen && freeSeen.dir === dir && now() - freeSeen.at < 2000) free = freeSeen.free
+    else {
+      free = await freeBytes(dir).then(
+        n => (Number.isFinite(n) && n >= 0 ? n : null),
+        () => null,
+      )
+      freeSeen = { at: now(), dir, free }
+    }
+    const lowFree = settings.lowFreeMb * 1024 * 1024
+    const low = free !== null && free - coming < lowFree
+    if (low && !wasLow) log?.warn(`uploads: low disk space for the waiting folder: ${sizeText(free ?? 0)} free, ${sizeText(coming)} still to come (the warning line is ${sizeText(lowFree)})`)
+    wasLow = low
+    const note = free === null ? CRM_UPLOAD_REASONS.dirMissing(dir) : low ? CRM_UPLOAD_REASONS.lowSpace(free) : null
+    return { dir, free, held, coming, lowFree, low, note }
+  }
+
+  async function settingsView(): Promise<CrmUploadSettingsView> {
+    const l = limitNow()
+    return { limitMb: settings.limitMb, dir: settings.dir, lowFreeMb: settings.lowFreeMb, defaultDir, maxSize: l.bytes, maxSizeFrom: l.from, crmLimit: settings.crmLimit, space: await space() }
+  }
+
+  async function writeSettings(next: StoredUploadSettings) {
+    if (o.settingsFile) await writeUploadSettings(o.settingsFile, next)
+    settings = next
+  }
+
+  /**
+   * What the CRM said its limit is (its refusal of a real record, or its token answer): in force AT ONCE (the next start is checked against it), then written in turn, and said once in
+   * the log when it is new. The agent never asks the CRM for it (Lead, 11 Nov 2026).
+   */
+  function learnLimit(bytes: number, how: CrmUploadCrmLimit['how']): Promise<void> {
+    const before = settings.crmLimit
+    settings = { ...settings, crmLimit: { bytes, at: now(), how } }
+    if (before?.bytes !== bytes) log?.info(`uploads: the CRM takes files up to ${sizeText(bytes)} (${how === 'refused' ? 'it said so when it refused a bigger one' : 'its upload token says so'})`)
+    // A write queued before close() is finished (close waits for it); none is queued after it (the agent is stopping; the CRM says it again next time).
+    const file = o.settingsFile
+    if (!file || closed) return Promise.resolve()
+    return queue(async () => {
+      await writeUploadSettings(file, settings)
+    }).catch(e => log?.warn(`uploads: the settings could not be written (${scrub(e instanceof Error ? e.message : String(e))})`))
+  }
+
+  const samePlace = (a: string, b: string) => (process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b))
+
+  function setSettings(c: CrmUploadSettingsChange): Promise<CrmUploadSettingsView> {
+    return queue(async () => {
+      if (!o.settingsFile) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+      if (!isObject(c)) throw new CrmFilesError(400, 'failed', 'The settings are an object.')
+      await (started ?? Promise.resolve())
+      const next: StoredUploadSettings = { ...settings }
+      if ('limitMb' in c) next.limitMb = checkLimitMb(c.limitMb)
+      if ('lowFreeMb' in c) next.lowFreeMb = checkLowFreeMb(c.lowFreeMb)
+      let move = false
+      if ('dir' in c) {
+        next.dir = checkDir(c.dir, defaultDir, o.notInside ?? [])
+        const to = next.dir ?? defaultDir
+        if (!samePlace(to, dir)) {
+          // Nothing is ever moved between folders: the folder changes only while no upload waits in the one in use.
+          const waiting = [...jobs.values()].filter(j => !ENDED.includes(j.state)).length
+          if (waiting > 0) throw new CrmFilesError(409, 'conflict', CRM_UPLOAD_REASONS.dirBusy(waiting))
+          if (beginning > 0) throw new CrmFilesError(409, 'busy', 'An upload is starting right now. Try again in a moment.')
+          await checkUsable(to)
+          if ([...jobs.values()].some(j => !ENDED.includes(j.state)) || beginning > 0) throw new CrmFilesError(409, 'busy', 'An upload is starting right now. Try again in a moment.')
+          move = true
+        }
+      }
+      const before = dir
+      // What the CRM said meanwhile (a refusal while this was checked) is kept.
+      next.crmLimit = settings.crmLimit
+      await writeSettings(next)
+      if (move) {
+        // The done and cancelled ones leave the list (their small notes are the agent's own, in the old folder), so nothing of the agent's is left behind there.
+        for (const j of [...jobs.values()]) if (ENDED.includes(j.state)) await forget(j)
+        dir = next.dir ?? defaultDir
+        freeSeen = null
+        wasLow = false
+        log?.info(`uploads: the waiting folder is now ${dir} (it was ${before})`)
+      }
+      return settingsView()
+    })
+  }
+
   // ---- the journal at the start -----------------------------------------------------------------------------------------------
 
   async function load() {
-    await mkdir(dir, { recursive: true })
     let names: string[] = []
     try {
+      await mkdir(dir, { recursive: true })
       names = await readdir(dir)
-    } catch {
+    } catch (e) {
+      // oa2f8: a chosen folder whose disk is not there now: the agent goes on (a new upload is refused with plain words, the page says why); what waits there is read at the next start.
+      log?.warn(`uploads: the waiting folder ${dir} can not be read (${scrub(e instanceof Error ? e.message : String(e))})`)
       return
     }
     for (const n of names) {
@@ -981,15 +1155,28 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
 
   return {
     async start() {
-      started ??= load().then(() => pump())
+      started ??= (async () => {
+        // oa2f8: the settings first (the waiting folder to read the journal from).
+        if (o.settingsFile) {
+          settings = await readUploadSettings(o.settingsFile)
+          dir = settings.dir ?? defaultDir
+        }
+        await load()
+        pump()
+      })()
       return started
     },
 
-    list() {
+    async list() {
       prune()
       const uploads = [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt).map(view)
-      return { uploads, maxSize, partSize: CRM_UPLOAD_PART, parallel }
+      const l = limitNow()
+      return { uploads, maxSize: l.bytes, maxSizeFrom: l.from, partSize: CRM_UPLOAD_PART, parallel, space: await space() }
     },
+
+    settings: () => settingsView(),
+    setSettings,
+    maxSize: () => limitNow().bytes,
 
     get: id => view(jobOf(id)),
 
@@ -1018,6 +1205,8 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
       }
       for (let i = 0; i < 100 && (running > 0 || [...lives.values()].some(l => l.receiving)); i++) await sleep(20)
       await Promise.all([...lives.values()].map(l => l.writing.catch(() => undefined)))
+      // oa2f8: and the settings file's writes (a limit the CRM said, a change): none is left half-way in the folder (its temp file) when the agent stops.
+      await changing.catch(() => undefined)
     },
   }
 }

@@ -282,6 +282,7 @@ export function combinePools(base: ChatPool, extra: ChatPool): ChatPool {
     info: sid => owner(sid).info(sid), live: () => [...base.live(), ...extra.live()], states: () => ({ ...base.states(), ...extra.states() }), byKey: key => extra.byKey(key) ?? base.byKey(key),
     attach: (sid, v) => owner(sid).attach(sid, v), input: (sid, d) => owner(sid).input(sid, d), resize: (sid, c, r) => owner(sid).resize(sid, c, r), read: (sid, n) => owner(sid).read(sid, n), screen: sid => owner(sid).screen(sid), asking: sid => owner(sid).asking(sid), drafting: sid => owner(sid).drafting(sid),
     deliver: async (sid, t, opt) => owner(sid).deliver?.(sid, t, opt) ?? 'unconfirmed',
+    promptSeen: (sid, t, n, id, cs) => owner(sid).promptSeen?.(sid, t, n, id, cs), claudeSession: sid => owner(sid).claudeSession?.(sid) ?? null,
     draftMirror: (sid, client) => owner(sid).draftMirror?.(sid, client) ?? null, mirrorTakeOut: sid => owner(sid).mirrorTakeOut?.(sid) ?? Promise.resolve('none' as const),
     generation: sid => owner(sid).generation?.(sid) ?? null,
     type: (sid, t, opt) => owner(sid).type(sid, t, opt), typeWhenReady: (sid, t, opt) => owner(sid).typeWhenReady(sid, t, opt), kill: (sid, why) => owner(sid).kill(sid, why), waitStopped: sid => base.waitStopped?.(sid) ?? Promise.resolve(), adopt: (a, p, r) => base.adopt(a, p, r), activity: sid => owner(sid).activity(sid), press: (sid, d) => owner(sid).press(sid, d), closeAll() { extra.closeAll(); base.closeAll() },

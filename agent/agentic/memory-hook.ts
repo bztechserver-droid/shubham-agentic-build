@@ -16,12 +16,12 @@ export function hookOutput(text: string): string {
 }
 
 /** The prompt from the hook's input; null when there is none. */
-export function promptOf(input: string): { prompt: string; sessionId: string | null } | null {
+export function promptOf(input: string): { prompt: string; sessionId: string | null; promptId: string | null } | null {
   try {
-    const ev = JSON.parse(input) as { prompt?: unknown; session_id?: unknown; hook_event_name?: unknown }
+    const ev = JSON.parse(input) as { prompt?: unknown; session_id?: unknown; prompt_id?: unknown; hook_event_name?: unknown }
     if (typeof ev.prompt !== 'string' || !ev.prompt.trim()) return null
     if (ev.hook_event_name !== undefined && ev.hook_event_name !== 'UserPromptSubmit') return null
-    return { prompt: ev.prompt, sessionId: typeof ev.session_id === 'string' ? ev.session_id : null }
+    return { prompt: ev.prompt, sessionId: typeof ev.session_id === 'string' ? ev.session_id : null, promptId: typeof ev.prompt_id === 'string' ? ev.prompt_id.slice(0, 80) : null }
   } catch {
     return null
   }
@@ -36,7 +36,9 @@ export async function recallFor(input: string, env: NodeJS.ProcessEnv, f: typeof
     const res = await f(`${url}/recall`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-sad-chat-key': key },
-      body: JSON.stringify({ prompt: p.prompt.slice(0, 20_000), sessionId: p.sessionId }),
+      // o655f (Stage 1): the same call tells the agent that claude TOOK this prompt (the exact text and claude's own prompt id), which is how a send
+      // is confirmed without reading the screen; the length says whether the text sent here was cut.
+      body: JSON.stringify({ prompt: p.prompt.slice(0, 20_000), sessionId: p.sessionId, promptId: p.promptId, promptLength: p.prompt.length }),
       signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
     })
     if (!res.ok) return ''

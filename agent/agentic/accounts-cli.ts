@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import type { CodebaseImportReport, CodebasesAnswer } from '../../shared/codebase-accounts.ts'
 import type { EmailAccountsAnswer, ImportReport } from '../../shared/email-accounts.ts'
+import type { PlatformsAnswer } from '../../shared/platform-accounts.ts'
 import { BAD_WORDS, CONFIG_FILE, KEY_FILE, PASS_FILE, WORDS, readAccountsDb, readAccountsKey, reasonOf } from './accounts-db.ts'
 import type { AccountsDbConfig } from './accounts-db.ts'
 import { SBSKRRT_OWNER } from './access.ts'
@@ -39,6 +41,11 @@ export interface CliDeps {
   importer: (args: { person: string; apply: boolean }) => Promise<ImportReport>
   /** The list as the page reads it (agent/agentic/accounts-email.ts). */
   lister: (person: string) => Promise<EmailAccountsAnswer>
+  /** orders o0e2a, oc2db: the same two for the Codebases tab ("check codebases", "copy codebases", "count codebases"). */
+  codebaseImporter?: (args: { person: string; apply: boolean }) => Promise<CodebaseImportReport>
+  codebaseLister?: (person: string) => Promise<CodebasesAnswer>
+  /** order o4029: "count platforms": the platform accounts the Accounts tab shows. */
+  platformLister?: (person: string) => Promise<PlatformsAnswer>
   /** Whether the CRM is signed in on this PC (the session's own words, never the session). */
   crmSignedIn: () => boolean
   /** Whether the postgres package can be loaded. */
@@ -49,7 +56,7 @@ export interface CliDeps {
 const PERSON = SBSKRRT_OWNER.id
 const REF = /^[a-z0-9]{20}$/
 const DEFAULT_HOST = 'aws-0-ap-south-1.pooler.supabase.com'
-export const SQL_FILES: Record<string, string> = { '0001': '0001_schema_and_login.sql', '0002': '0002_email_tables.sql', '0003': '0003_email_copy_from_crm.sql' }
+export const SQL_FILES: Record<string, string> = { '0001': '0001_schema_and_login.sql', '0002': '0002_email_tables.sql', '0003': '0003_email_copy_from_crm.sql', '0004': '0004_codebases.sql' }
 export const PLACEHOLDER = 'CHANGE-ME-TYPE-A-NEW-PASSWORD-HERE'
 
 const HELP = [
@@ -61,6 +68,7 @@ const HELP = [
   '  check             counts what the CRM has and what a copy would do. Writes nothing. Works even before the database is set up.',
   '  copy              the same check, then (after a typed "yes") copies the CRM\'s email accounts into the new database: encrypted passwords, idempotent, no deletes, counts only.',
   '  count             how many email accounts the new database holds (what the Email tab shows).',
+  '  check codebases | copy codebases | count codebases   the same three for the Codebases tab (the CRM\'s codebases and platform accounts; no .env and no password is ever copied: flags and counts only).',
 ].join('\n')
 
 const strip = (sql: string) => sql.split('\n').filter(l => !l.trim().startsWith('--')).join('\n')
@@ -95,6 +103,24 @@ export function reportLines(r: ImportReport): string[] {
   return out
 }
 
+export function codebaseReportLines(r: CodebaseImportReport): string[] {
+  const c = r.crm
+  const out = [
+    `The CRM has ${many(c.codebases, 'codebase')} (${c.live} live, ${c.retired} retired), ${c.withEnv} with a .env (${many(c.envVars, 'variable')}: counted, never copied), ${many(c.details, 'detail row')}, ${many(c.platforms, 'platform account')} with ${many(c.links, 'codebase link')}, about ${kb(c.bytes)}.`,
+  ]
+  if (c.hiddenValues > 0) out.push(`${many(c.hiddenValues, 'link or note')} looked like a secret and will be kept only as "hidden".`)
+  if (r.plan) {
+    const line = (what: string, p: { insert: number; update: number; unchanged: number; goneFromCrm: number }) =>
+      `${what}: a copy would add ${p.insert}, update ${p.update}, leave ${p.unchanged} as they are${p.goneFromCrm ? `, and flag ${p.goneFromCrm} that are gone from the CRM` : ''}.`
+    out.push(line('Codebases', r.plan.codebases), line('Platform accounts', r.plan.platforms))
+  } else if (r.planNote) out.push(r.planNote)
+  if (r.done) {
+    const w = (what: string, p: { inserted: number; updated: number; unchanged: number; flaggedGone: number }) => `${what}: ${p.inserted} new, ${p.updated} updated, ${p.unchanged} unchanged${p.flaggedGone ? `, ${p.flaggedGone} flagged as gone` : ''}`
+    out.push(`Written: ${w('codebases', r.done.codebases)}; ${w('platform accounts', r.done.platforms)} (${many(r.done.batches, 'batch', 'batches')}).`)
+  }
+  return out
+}
+
 export async function runCli(argv: string[], d: CliDeps): Promise<number> {
   const [cmd, ...rest] = argv
   const flags = new Set(rest.filter(a => a.startsWith('--')))
@@ -103,6 +129,72 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
   const rnd = d.random ?? randomBytes
   const yes = async (q: string) => (await d.io.ask(`${q} Type yes to go on: `)).trim().toLowerCase() === 'yes'
   const file = (n: string) => path.join(d.dir, n)
+
+  // order o4029: "count platforms": what the Accounts tab shows, as counts (the copy of the platform accounts is part of "copy codebases").
+  if (cmd === 'count' && args[0] === 'platforms') {
+    if (!d.platformLister) return say('The platform accounts list is not available in this build.'), 1
+    const a = await d.platformLister(PERSON)
+    if (!a.connected) {
+      say(a.message)
+      return 1
+    }
+    const rows = a.accounts
+    say(`${many(rows.length, 'platform account')} in the new database (${rows.filter(r => r.disabled).length} disabled); ${rows.filter(r => r.hasPassword).length} with a password stored (not shown, not copied); ${rows.filter(r => r.codebases.length === 0).length} with no codebase; ${rows.filter(r => !r.phone).length} with no phone; ${rows.filter(r => !r.inEmails).length} not in Emails; ${rows.filter(r => r.phone && !r.contactLinked).length} not in Contacts.`)
+    return 0
+  }
+
+  // orders o0e2a, oc2db: "check codebases", "copy codebases", "count codebases" (the Codebases tab's copy). Same rules as the email ones: check writes nothing, copy shows the counts and asks a typed "yes".
+  if ((cmd === 'check' || cmd === 'copy' || cmd === 'count') && args[0] === 'codebases') {
+    const importer = d.codebaseImporter
+    const lister = d.codebaseLister
+    if (cmd === 'count') {
+      if (!lister) return say('The codebases list is not available in this build.'), 1
+      const a = await lister(PERSON)
+      if (!a.connected) {
+        say(a.message)
+        return 1
+      }
+      const rows = a.codebases
+      const links = rows.reduce((n, r) => n + r.platforms.length, 0)
+      const hidden = rows.reduce((n, r) => n + Number(r.repoHidden || r.noteHidden) + r.details.filter(x => x.urlHidden || x.noteHidden).length, 0)
+      say(`${many(rows.length, 'codebase')} in the new database (${rows.filter(r => r.retired).length} retired); ${rows.reduce((n, r) => n + r.details.length, 0)} detail rows; ${links} platform links; ${rows.filter(r => r.hasEnv).length} with a .env noted (flag and count only); ${hidden} values kept only as hidden.`)
+      return 0
+    }
+    if (!importer) return say('The codebases copy is not available in this build.'), 1
+    let first: CodebaseImportReport
+    try {
+      first = await importer({ person: PERSON, apply: false })
+    } catch (e) {
+      say(`Could not check: ${e instanceof Error ? e.message : 'unknown error'}`)
+      return 1
+    }
+    for (const l of codebaseReportLines(first)) say(l)
+    if (cmd === 'check') {
+      say('Nothing was written anywhere.')
+      return 0
+    }
+    if (!first.plan) {
+      say('Not ready to copy yet (see above). Nothing was written.')
+      return 1
+    }
+    const todo = first.plan.codebases.insert + first.plan.codebases.update + first.plan.platforms.insert + first.plan.platforms.update
+    if (todo === 0 && first.plan.codebases.goneFromCrm + first.plan.platforms.goneFromCrm === 0) {
+      say('Everything is already there and unchanged. Nothing to copy.')
+      return 0
+    }
+    if (!(await yes(`Copy to the new database (${first.plan.codebases.insert + first.plan.platforms.insert} new, ${first.plan.codebases.update + first.plan.platforms.update} updated; no .env and no password is copied; the CRM is only read; nothing is deleted)?`))) {
+      say('Nothing was written.')
+      return 1
+    }
+    try {
+      for (const l of codebaseReportLines(await importer({ person: PERSON, apply: true }))) say(l)
+      say('Done. It is safe to run "copy codebases" again: what is already there is left alone.')
+      return 0
+    } catch (e) {
+      say(`The copy stopped: ${e instanceof Error ? e.message : 'unknown error'}`)
+      return 1
+    }
+  }
 
   switch (cmd) {
     case undefined:

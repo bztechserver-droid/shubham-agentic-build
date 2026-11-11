@@ -93,6 +93,10 @@ import { createFastSession, type FastSession } from './fast.ts'
 import { fastDenied } from './fast-tools.ts'
 import { readMemory } from './fast-gate.ts'
 import { FAST_TOOLS } from './fast-tools-list.ts'
+import { createOldFiles, createOldReaderStore, findOldRoot, notesPathOf, oldBrief, oldCall, oldRootCandidates, readNotes } from './old-reader.ts'
+import { OLD_TOOL_LABELS, OLD_TOOLS } from './old-reader-tools.ts'
+import type { OldReaderInfo } from '../../shared/old-reader.ts'
+import { OLD_SOCKET } from '../../shared/old-route.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
@@ -144,6 +148,9 @@ import { createCrmWrite } from './crm-write.ts'
 import { createCrmProxy } from './crmproxy.ts'
 import { createAccountsEmail } from './accounts-email.ts'
 import { createAccountsImport } from './accounts-import.ts'
+import { createAccountsCodebases } from './accounts-codebases.ts'
+import { createCodebaseImport } from './accounts-codebase-import.ts'
+import { createAccountsPlatforms } from './accounts-platforms.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
@@ -310,6 +317,9 @@ export interface AgenticOptions {
   fastAssistant?: boolean
   /** F-087: tests: the pieces of the fast host that would start a real claude, replaced. */
   fastHostDeps?: Partial<FastDeps>
+  /** Order o5007, tests: the old-app reader's folder (`root` null: not on this PC; left out: SAD_OLD_APP_DIR, old-reader.json's root, then
+   *  Desktop\Github\CRM\agentic-claude-manager-dev) and the pieces of its host that would start a real claude. */
+  oldReader?: { root?: string | null; hostDeps?: Partial<FastDeps> }
   /** F-021: the hub's PCs; left out, this PC is on its own. */
   team?: AgenticTeamLinks
   /** Tests: a fake node-pty (and a no-op tree kill: its pids are other processes'), a fake claude, and a scratch ~/.claude/projects. */
@@ -398,6 +408,8 @@ export interface Agentic {
   voiceMount: ApiMount
   /** F-087: the fast Assistant's warm process; undefined while the feature is off (the default). */
   fastHost?: FastHost
+  /** Order o5007: the old-app reader's warm process right now; undefined while it is switched off, its folder is not here, or this PC is a member. */
+  oldReaderHost(): FastHost | undefined
   /** F-087: hand-offs from the fast Assistant to the Orchestrator (the session in fast.ts uses it). */
   handoff: HandoffApi
   floors: FloorStore
@@ -519,6 +531,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-134: a Codex chat's conversation is its rollout file, read in Codex's format.
     fileOf: sid => isOpenCode(sid) ? openCode.file(sid) : codexRollout(sid),
     formatOf: sid => (isCodexSession(sid) ? CODEX_FORMAT : CLAUDE_FORMAT),
+    // o655f (Stage 1): after /clear or /resume claude goes on in a NEW session and a new file, in the same terminal: the chat view follows it.
+    successor: sid => chats.claudeSession?.(sid) ?? null,
   })
   // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
   const launched = new Map<string, { effort: string; at: string; ultracode: boolean }>()
@@ -699,6 +713,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const accountsEmail = createAccountsEmail({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // order o5c4d: the one-way copy of the CRM's email accounts into that database (reads the CRM with the PC's CRM sign-in, writes only to the new database, deletes nothing).
   const accountsImport = createAccountsImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // orders o0e2a, oc2db: the Accounts page's Codebases tab: its list (the codebases with their detail rows and platform accounts) and the one-way copy from the CRM (no secret is copied: flags and counts only).
+  const accountsCodebases = createAccountsCodebases({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // order o4029: the platform accounts for the Accounts page's "Accounts" tab (the CRM's Code > Accounts page), read from the same database. The copy above brings them in with the codebases.
+  const accountsPlatforms = createAccountsPlatforms({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  const codebaseImport = createCodebaseImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
   void crmFiles.resume().catch(() => undefined)
@@ -3223,9 +3242,69 @@ export function createAgentic(o: AgenticOptions): Agentic {
     },
     onProgress: p => fastSession!.progress(p.orderId, p.phase, p.sec, p.words),
   })
+  // Order o5007: the old-app reader (the /old page). The Alt+K path again, not a new transport: a second warm process of fast-host.ts and a
+  // session of fast.ts, the same frames (shared/fast.ts), with its own brief and four tools that only READ the old app's folder (old-reader.ts,
+  // checked here by the process's key in callTool). Hub only, while its switch is on (Settings › Old app reader: old-reader.json, on to start
+  // with) and the old app's folder is on this PC. The process starts when the page opens and ends 10 minutes after it was closed.
+  const oldStore = createOldReaderStore(path.join(o.dir, 'old-reader.json'))
+  const oldRoot = (): string | null =>
+    o.oldReader && 'root' in o.oldReader ? (o.oldReader.root ?? null) : findOldRoot(oldRootCandidates({ env: process.env.SAD_OLD_APP_DIR, configured: oldStore.configuredRoot(), home: os.homedir() }))
+  const oldFiles = createOldFiles({ root: oldRoot })
+  let oldHost: FastHost | undefined
+  let oldSession: FastSession | undefined
+  const oldLog = o.log?.child?.('old-reader')
+  // The host's own lines say "fast assistant"; this one is the old-app reader.
+  const oldLogger = oldLog ? { info: (m: string) => oldLog.info(m.replace(/fast assistant/g, 'old-app reader')), warn: (m: string) => oldLog.warn(m.replace(/fast assistant/g, 'old-app reader')) } : undefined
+  function startOldReader() {
+    if (oldHost || closing || mode() === 'member' || !oldStore.get().enabled || !oldFiles.root()) return
+    oldHost = createFastHost({
+      now: Date.now,
+      spawn: (file, args, so) => spawn(file, args, { cwd: so.cwd, env: so.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }),
+      claude: () => {
+        const c = o.claude ?? findClaude()
+        if (!c) return null
+        return /\.cmd$/i.test(c) ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/c', c] : [c]
+      },
+      env: () => librarianEnv(process.env, o.token?.() ?? null, o.credential?.() ?? null),
+      dir: path.join(o.dir, 'old-reader'),
+      toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
+      shim,
+      node: process.execPath,
+      toolset: 'old',
+      tools: () => OLD_TOOLS.map(t => `mcp__${MCP_SERVER_NAME}__${t.name}`),
+      // The Old App Reader chat's own map goes in too (old-reader.json's `notes`, else the INDEX.md its brief names), so most answers need no lookup.
+      brief: ctx => oldBrief({ root: oldFiles.root(), outline: oldFiles.outline(), notes: readNotes(oldStore.configuredNotes() ?? notesPathOf(floors.list().flatMap(f => f.agents))), history: ctx.history }),
+      toolLabel: name => OLD_TOOL_LABELS[name] ?? 'Looking',
+      onState: () => oldSession?.hostState({ state: oldHost?.state() ?? 'off' }),
+      context: () => [],
+      memory: readMemory,
+      kill: async (pid, startedAt) => {
+        await killTree(pid, { since: startedAt })
+      },
+      model: oldStore.get().model,
+      ...(oldLogger ? { log: oldLogger } : {}),
+      ...o.oldReader?.hostDeps,
+    })
+    oldSession = createFastSession({ host: oldHost, snapshot: () => '', ...(oldLogger ? { log: oldLogger } : {}) })
+  }
+  function stopOldReader(why: string) {
+    const s = oldSession
+    const h = oldHost
+    oldSession = undefined
+    oldHost = undefined
+    s?.close()
+    void h?.stop(why)
+  }
+  function oldInfo(): OldReaderInfo {
+    if (!oldHost) startOldReader()
+    const root = oldFiles.root()
+    return { settings: oldStore.get(), root, found: root !== null, files: root ? oldFiles.entries().length : null, serving: oldSession !== undefined }
+  }
+  startOldReader()
   const voiceTimer = setInterval(() => {
     if (mode() !== 'member') voice.tick()
     void fastHost?.tick()
+    void oldHost?.tick()
   }, 1000)
   voiceTimer.unref?.()
 
@@ -3315,6 +3394,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   async function callTool(key: string, name: string, rawArgs: unknown): Promise<string> {
     if (fastHost?.keyOwns(key)) return fastCall(name, rawArgs)
+    // Order o5007: the old-app reader's process: its four read-only tools on the old app's folder, nothing else (old-reader.ts).
+    if (oldHost?.keyOwns(key)) return oldCall(oldFiles, name, rawArgs)
     const me = chats.byKey(key)
     if (!me) throw apiError(401, "This chat's key isn't known: its terminal was closed or the agent restarted. Open the chat from the floor again.")
     if (mode() === 'member' && !isLocalSession(me.sessionId)) return request<string>(needHub(), 'tool', { sessionId: me.sessionId, name, arguments: rawArgs }).catch(error => {
@@ -4869,6 +4950,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Settings › Assistant: "Goals on mobile: use the API". Kept on the hub: a member's page asks the hub (not 'local').
     ['GET', /^\/assistant-settings$/, () => ({ settings: assistantSettings.get() })],
     ['PUT', /^\/assistant-settings$/, (_, r) => ({ settings: assistantSettings.set(r.body) })],
+    // Order o5007: Settings › Old app reader: the switch and the model (the hub's, so every device agrees) and the old app's folder it reads.
+    // Switched off, its process ends and its socket is refused (the /old page, its menu entry and Alt+O go too); on again, it is back.
+    ['GET', /^\/old\/settings$/, () => oldInfo()],
+    [
+      'PUT',
+      /^\/old\/settings$/,
+      (_, r) => {
+        const was = oldStore.get()
+        const now = oldStore.set(r.body)
+        if (!now.enabled && was.enabled) stopOldReader('switched off in Settings')
+        return oldInfo()
+      },
+    ],
     // Forwarded on members: an old hub must answer 404, rather than a new member promising safety for it.
     ['GET', /^\/engine-switch-capabilities$/, () => ({ version: 1, failClosed: true, homePcRouting: true })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
@@ -5060,6 +5154,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id), 'local'],
     // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
     ['POST', /^\/accounts\/email\/import$/, (_, r) => accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
+    // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).
+    // order o4029: the platform accounts (the CRM's Code > Accounts page) with their codebases; no password, only that one is stored. The owner's (POLICY).
+    ['GET', /^\/accounts\/platforms$/, (_, r) => accountsPlatforms.list(access.ownerOf(callerOf(r)).id), 'local'],
+    ['GET', /^\/accounts\/codebases$/, (_, r) => accountsCodebases.list(access.ownerOf(callerOf(r)).id), 'local'],
+    // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).
+    ['POST', /^\/accounts\/codebases\/import$/, (_, r) => codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
     [
       'GET',
@@ -5234,6 +5334,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const key = r.headers['x-sad-chat-key']
         if (typeof key !== 'string' || !key) throw apiError(401, 'Missing x-sad-chat-key')
         if (!isObject(r.body) || typeof r.body.prompt !== 'string') throw apiError(400, 'Expected {prompt}')
+        // o655f (Stage 1): claude's UserPromptSubmit hook is the proof that this chat TOOK the prompt (10-110 ms after Enter, with the exact text),
+        // so a send waiting on it is confirmed at once: no screen reading. Noted before the recall below, which may take seconds.
+        const info = chats.byKey(key)
+        if (info) chats.promptSeen?.(info.sessionId, r.body.prompt, typeof r.body.promptLength === 'number' ? r.body.promptLength : r.body.prompt.length, typeof r.body.promptId === 'string' ? r.body.promptId.slice(0, 80) : null, typeof r.body.sessionId === 'string' ? r.body.sessionId : null)
         return { text: await callTool(key, 'memory_recall', { prompt: r.body.prompt.slice(0, 20_000) }) }
       },
       'local',
@@ -5990,7 +6094,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         }
         return
       }
-      if (rest === '/ui' || rest === '/fast') {
+      // Order o5007: /old (the old-app reader) is the owner's, like the fast Assistant's.
+      if (rest === '/ui' || rest === '/fast' || rest === OLD_SOCKET) {
         if (!access.isAdmin(caller)) {
           o.auth?.deny(caller, 403, 'admin-only', where)
           throw authError(403, 'This is for the owner of this app.', 'admin-only')
@@ -6011,6 +6116,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (rest === '/ui') return ui.socket()
       // F-086/F-087: the fast Assistant's stream for the web page (shared/fast.ts); no host = off = no such socket.
       if (rest === '/fast') return fastSession?.socket('web') ?? null
+      // Order o5007: the old-app reader's stream (the same frames); switched off, its folder not here, or a member PC: no such socket.
+      if (rest === OLD_SOCKET) {
+        if (!oldSession) startOldReader()
+        return oldSession?.socket('web') ?? null
+      }
       if (rest === '/events')
         return (ws, caller) => {
           const c = caller ?? OPEN
@@ -6036,6 +6146,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     mount,
     voiceMount: voice.mount,
     fastHost,
+    oldReaderHost: () => oldHost,
     handoff,
     floors,
     chats,
@@ -6088,6 +6199,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       voice.close()
       fastSession?.close()
       void fastHost?.stop('the app is stopping')
+      stopOldReader('the app is stopping')
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
       clearInterval(toolsRefreshTimer)

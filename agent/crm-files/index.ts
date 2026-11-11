@@ -6,6 +6,8 @@ import type { CrmProxy } from '../agentic/crmproxy.ts'
 import { createWinMount } from './mount-win.ts'
 import { crmFilesMount } from './routes.ts'
 import { createCrmFiles, type CrmFilesService, type MountDriver } from './service.ts'
+import { CRM_FILES_MAX_UPLOAD } from '../../shared/crm-files.ts'
+import { UPLOAD_SETTINGS_FILE } from './upload-settings.ts'
 import { createCrmUploads, type CrmUploads } from './uploads.ts'
 
 // F-126: the CRM files module of the agent: the tree and its changes (service.ts), the page's routes (routes.ts), and the mount of this PC. On Windows the mount is crm-fs.exe through
@@ -86,9 +88,13 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
         })
       : null
   const driver = o.mountDriver ?? win ?? undefined
-  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log })
+  // oa2f8: the size limit is the uploads' setting (the CRM's own where it said it); the one-request upload and the drive's saves follow it too.
+  let uploadsRef: CrmUploads | null = null
+  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD })
   serviceRef = service
-  const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), backend: service.uploadBackend, log: o.log })
+  // oa2f8: the waiting folder is a setting (crm-uploads.json beside the default one); it may not be inside the app's own folder (an update replaces it).
+  const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), settingsFile: path.join(o.dir, UPLOAD_SETTINGS_FILE), notInside: [o.root], backend: service.uploadBackend, log: o.log })
+  uploadsRef = uploads
   return {
     service,
     uploads,

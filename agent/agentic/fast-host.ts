@@ -81,6 +81,8 @@ export interface FastDeps {
   node: string
   /** Names of the tools the process may call (the hub still decides by key); given to claude as --allowedTools. */
   tools(): string[]
+  /** Which list the MCP shim shows (SAD_TOOLSET): 'fast' (the default, the fast Assistant's) or 'old' (order o5007: the old-app reader's four read-only tools). */
+  toolset?: 'fast' | 'old'
   /** The brief's text, asked at every (re)start. */
   brief(ctx: BriefContext): string
   /** The orders not answered yet, one line each (for the brief). */
@@ -570,7 +572,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     const settings = path.join(deps.dir, 'settings.json')
     const files = [briefFile, mcpFile]
     writeFileSync(briefFile, deps.brief({ history: [...history], openOrders: deps.context() }), { mode: 0o600 })
-    writeFileSync(mcpFile, JSON.stringify({ mcpServers: { 'shubham-agentic': { type: 'stdio', command: deps.node, args: [deps.shim], env: { SAD_AGENTIC_URL: deps.toolsUrl(), SAD_AGENTIC_KEY: key, SAD_TOOLSET: 'fast', SAD_FAST_NAMES: names } } } }, null, 2), { mode: 0o600 })
+    writeFileSync(mcpFile, JSON.stringify({ mcpServers: { 'shubham-agentic': { type: 'stdio', command: deps.node, args: [deps.shim], env: { SAD_AGENTIC_URL: deps.toolsUrl(), SAD_AGENTIC_KEY: key, SAD_TOOLSET: deps.toolset ?? 'fast', SAD_FAST_NAMES: names } } } }, null, 2), { mode: 0o600 })
     writeFileSync(settings, JSON.stringify({ claudeMdExcludes: ['**/CLAUDE.md', '**/.claude/CLAUDE.md', '**/.claude/rules/**'], disableAllHooks: true }, null, 2))
     const args = [
       '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--replay-user-messages',

@@ -6,9 +6,11 @@ import { mountNative } from './winfsp-native.ts'
 // Messages TO the main thread: { type: 'ready' } once the letter is served, { type: 'error', message }, { type: 'stopped' }, { type: 'fs', ... } (the bridge's questions), { type: 'log', line }.
 // Message FROM it: { type: 'stop' }. When the worker or the whole agent ends, WinFsp takes the drive away with it (an in-process drive has no one to outlive).
 
-const { bufs, letter, dll, label } = workerData as { bufs: BridgeBuffers; letter: string; dll?: string; label?: string }
+const { bufs, letter, dll, label, writable } = workerData as { bufs: BridgeBuffers; letter: string; dll?: string; label?: string; writable?: boolean }
 const port = parentPort!
 const ops = createBridgeClient(port, bufs)
+// A drive whose agent keeps no spool takes no saves: it is read-only (the volume says so to WinFsp).
+if (!writable) ops.writes = undefined
 
 mountNative({ letter, ops, dll, label, log: line => port.postMessage({ type: 'log', line }) }).then(
   mount => {

@@ -54,6 +54,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/watchdog$/, OWNER],
   ['GET', /^\/accounts\/email$/, OWNER],
   ['POST', /^\/accounts\/email\/import$/, OWNER],
+  ['GET', /^\/accounts\/platforms$/, OWNER],
+  ['GET', /^\/accounts\/codebases$/, OWNER],
+  ['POST', /^\/accounts\/codebases\/import$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
   ['POST', /^\/fast\/names$/, OWNER],
   ['GET', /^\/heartbeat$/, OWNER],
@@ -84,6 +87,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // Settings › Assistant › "Goals on mobile: use the API": the owner's own setting, for the owner's own Assistant.
   ['GET', /^\/assistant-settings$/, OWNER],
   ['PUT', /^\/assistant-settings$/, OWNER],
+  // Order o5007: Settings › Old app reader (the switch, the model, the old app's folder it reads): the owner of the app only.
+  ['GET', /^\/old\/settings$/, OWNER],
+  ['PUT', /^\/old\/settings$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/tune$/, chat('owner')],
   ['GET', /^\/approvals$/, SIGNED],
   ['POST', /^\/approvals\/answer$/, SIGNED],
