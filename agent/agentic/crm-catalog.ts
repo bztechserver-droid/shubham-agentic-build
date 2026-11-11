@@ -27,6 +27,13 @@ const MONEY = /^(ledger|transactions|recurring-transactions|bank-statements|bank
 const NOT_READ = new Set(['email-accounts', 'vercel-accounts', 'ai', 'upload', 'christopher-usage', 'claude-subscriptions', 'model-settings', 'claude-access'])
 /** Who may do what in the CRM, and attendance: not changed from here. */
 const NOT_CHANGED = new Set(['members', 'users', 'hierarchy-access', 'user-hierarchy', 'join', 'claude-access', 'model-settings', 'attendance', 'claude-subscriptions', 'christopher-usage', 'christopher-builds'])
+/**
+ * Audit o322f: the same, wherever it sits in a path (not only as the collection): sharing a project with someone, a wiki page's or a knowledge group's
+ * permissions, a service team's members, a service's pillar people. Each of these changes who may see or edit something.
+ */
+const PEOPLE_PART = /^(share|permissions|members|pillar-people)$/
+/** Audit o322f: a merge removes records (POST /leads/merge-duplicates deletes the duplicate leads of the whole organisation): it is a delete. */
+const MERGE_PART = /(^|-)merge(-|$)/
 
 export type Why = 'delete' | 'money' | 'people' | 'secret' | 'unknown'
 export type Verdict = { ok: true; route: CrmRoute; kind: 'read' | 'write' } | { ok: false; route: CrmRoute | null; why: Why; reason: string }
@@ -88,10 +95,10 @@ export function judge(methodIn: string, path: string): Verdict {
     if (NOT_READ.has(route.collection) && !isMeRoute(route)) return no('secret')
     return { ok: true, route, kind: 'read' }
   }
-  if (method === 'DELETE') return no('delete')
+  if (method === 'DELETE' || route.segments.some(s => MERGE_PART.test(s))) return no('delete')
   if (route.segments.some(s => MONEY.test(s))) return no('money')
   if (NOT_READ.has(route.collection) && !isMeRoute(route)) return no('secret')
-  if (NOT_CHANGED.has(route.collection) || route.collection === '') return no('people')
+  if (NOT_CHANGED.has(route.collection) || route.collection === '' || route.segments.some(s => PEOPLE_PART.test(s))) return no('people')
   return { ok: true, route, kind: 'write' }
 }
 
@@ -132,6 +139,6 @@ export function describeCatalog(q: unknown, paths: unknown) {
     ...(out.length ? {} : { note: 'No collection has that in its name.' }),
     howTo:
       'crm_query takes a read path (GET); crm_write takes a change path (POST, PATCH or PUT). Paths are under /v1/org without that prefix, e.g. "leads" or "goals/<id>/comments"; ":id" is the thing\'s id (never a name). Most lists page with { page, limit } (limit up to 200; the reply says the total); projects pages with { limit, offset }.',
-    notOffered: { delete: 'any delete', money: 'ledger, transactions, recurring transactions, bank statements and accounts, invoices, invoice builders, scopes of work: read only', people: 'members, users, access, attendance: read only', secret: 'email accounts, Vercel accounts, AI, upload, usage and subscription costs, model settings: not read at all' },
+    notOffered: { delete: 'any delete, and any merge (a merge removes records)', money: 'ledger, transactions, recurring transactions, bank statements and accounts, invoices, invoice builders, scopes of work: read only', people: 'members, users, access, attendance, sharing and permissions (projects, wiki, knowledge groups), team members and pillar people: read only', secret: 'email accounts, Vercel accounts, AI, upload, usage and subscription costs, model settings: not read at all' },
   }
 }

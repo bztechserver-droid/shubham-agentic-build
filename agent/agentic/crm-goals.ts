@@ -73,10 +73,17 @@ export function dayOf(v: unknown, now: number): string {
 }
 
 const first = (s: string) => s.trim().toLowerCase()
+/** Audit o322f: a name matches where one of its words STARTS ("Ravi", "Pat", "ravi pa"), never inside a word ("Ali" is not Kalindi). */
+const startsAWord = (name: string, t: string) => {
+  const n = first(name)
+  return n.startsWith(t) || n.split(/[\s._-]+/).some(w => w.startsWith(t)) || n.includes(` ${t}`)
+}
 
 export function createCrmGoals(o: CrmGoalsOptions) {
   const now = o.now ?? Date.now
   const recent = new Map<string, { id: string; at: number }>()
+  /** Audit o322f: an add still on its way, by the same key: the same call made meanwhile (a retry while the first is out) waits for it instead of adding a second goal. */
+  const sending = new Map<string, Promise<Goal>>()
 
   /** One call to the CRM; its own words come back when it refuses, and nothing of the session ever does. */
   const crm = createCrmCall({ proxy: o.proxy, afterServerError: 'Check the goal on the Goals page before trying again.' })
@@ -100,7 +107,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     const byId = all.find(m => m.userId.toLowerCase() === t)
     if (byId) return byId.userId
     // Anyone whose name or username has these words; only one is that person. More than one is not guessed at, except a whole name that is exactly these words ("Ravi" when there is a "Ravi Kumar" too).
-    const part = all.filter(m => first(m.fullName).includes(t) || first(m.username).includes(t))
+    const part = all.filter(m => startsAWord(m.fullName, t) || startsAWord(m.username, t))
     if (part.length === 1) return part[0].userId
     const whole = part.filter(m => first(m.fullName) === t)
     if (whole.length === 1) return whole[0].userId
@@ -130,11 +137,12 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     const type = oneOf(args.targetType, ['organization', 'service', 'project'] as const, 'targetType')!
     if (type === 'organization') {
       if (args.targetId !== undefined || args.targetName !== undefined) throw apiError(400, 'organization (General) has no targetId or targetName')
-      return how === 'add' ? { target_type: 'organization' } : { target_type: 'organization', target_id: null, service_pillar: null }
+      return how === 'add' ? { target_type: 'organization' } : { target_type: 'organization', target_id: null, service_pillar: null, project_id: null }
     }
     const hit = await scopes.resolve(type, { id: args.targetId, name: args.targetName })
-    if (type === 'service') return { target_type: 'service', target_id: hit.targetId }
-    return how === 'add' ? { target_type: 'organization', project_id: hit.targetId } : { project_id: hit.targetId }
+    // Audit o322f: a move takes the goal OFF its old board too (the CRM keeps project_id, and a service's target, until they are sent), as the overlay's own category change does.
+    if (type === 'service') return how === 'add' ? { target_type: 'service', target_id: hit.targetId } : { target_type: 'service', target_id: hit.targetId, project_id: null }
+    return how === 'add' ? { target_type: 'organization', project_id: hit.targetId } : { target_type: 'organization', target_id: null, service_pillar: null, project_id: hit.targetId }
   }
 
   const named = (g: Pick<Goal, 'ownerId' | 'assigneeIds'>, all: readonly Member[]) =>
@@ -216,6 +224,11 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       for (const [k, v] of recent) if (t - v.at > DUPLICATE_MS) recent.delete(k)
       const same = recent.get(key)
       if (same) return json({ id: same.id, note: 'That goal was added a moment ago: it is the one on the Goals page.', page: `goals/${same.id}` })
+      const going = sending.get(key)
+      if (going) {
+        const first = await going
+        return json({ id: first.id, note: 'That goal was added a moment ago: it is the one on the Goals page.', page: `goals/${first.id}` })
+      }
       const body = {
         title,
         ...(description ? { description } : {}),
@@ -226,9 +239,19 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         ...(board ?? { target_type: 'organization' }),
         ...(parent ? { parent_goal_id: parent } : {}),
       }
-      const made = await crm<Goal>('POST', 'v1/org/goals', body)
-      if (!made || typeof made.id !== 'string') throw apiError(502, 'The CRM answered without the goal. Check the Goals page before adding it again.')
-      recent.set(key, { id: made.id, at: t })
+      const post = (async () => {
+        const got = await crm<Goal>('POST', 'v1/org/goals', body)
+        if (!got || typeof got.id !== 'string') throw apiError(502, 'The CRM answered without the goal. Check the Goals page before adding it again.')
+        recent.set(key, { id: got.id, at: t })
+        return got
+      })()
+      sending.set(key, post)
+      let made: Goal
+      try {
+        made = await post
+      } finally {
+        sending.delete(key)
+      }
       const all = await members().catch(() => [] as Member[])
       return json({ added: made.id, goal: card({ ...made, assigneeIds: made.assigneeIds ?? assignees, dueDate: made.dueDate ?? due }, all), by: who.name })
     },

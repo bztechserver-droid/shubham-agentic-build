@@ -1,8 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
-import { CRM_FILES_BASE, CRM_FILES_REASONS, type CrmFilesErrorCode } from '../../shared/crm-files.ts'
+import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
+import type { CrmUploads } from './uploads.ts'
 
 // F-126: the CRM files routes for the page, mounted at /agent-api/agentic/crm-files (shared/crm-files.ts says what each one takes and gives).
 // Every route is a "raw" one so the errors carry their `code` and bytes are streamed, never held whole. The guard (x-sad-token, no foreign Origin) is api.ts's, before any of this runs.
@@ -19,7 +20,9 @@ function send(res: ServerResponse, status: number, data: unknown) {
 
 function fail(res: ServerResponse, e: unknown) {
   if (res.headersSent) return void res.destroy()
-  if (e instanceof CrmFilesError) return send(res, e.status, { error: e.message, code: e.code })
+  // od0b1: a refusal of an upload part carries the upload as it is, so the page goes on from where the agent is.
+  const upload = (e as { upload?: unknown })?.upload
+  if (e instanceof CrmFilesError) return send(res, e.status, { error: e.message, code: e.code, ...(upload ? { upload } : {}) })
   const status = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : 500
   const code: CrmFilesErrorCode = status === 404 ? 'notfound' : 'failed'
   send(res, status, { error: e instanceof Error ? e.message : String(e), code })
@@ -75,9 +78,58 @@ const METHODS: Record<string, string[]> = {
   move: ['POST'],
   mount: ['GET', 'POST'],
   unmount: ['POST'],
+  'mount/auto': ['POST'],
+  'mount/reveal': ['POST'],
+  'mount/driver': ['POST'],
 }
 
-export function crmFilesMount(svc: CrmFilesService): ApiMount {
+/** od0b1: the uploads in parts (there only when the agent holds them: uploads.ts). */
+const UPLOAD_METHODS: Record<string, string[]> = {
+  uploads: ['GET'],
+  'uploads/start': ['POST'],
+  'uploads/part': ['PUT', 'POST'],
+  'uploads/pause': ['POST'],
+  'uploads/resume': ['POST'],
+  'uploads/retry': ['POST'],
+  'uploads/cancel': ['POST'],
+  'uploads/clear': ['POST'],
+}
+
+/** A whole number of bytes from the query (an offset), or NaN. */
+const count = (v: string | null): number => (v !== null && /^\d{1,16}$/.test(v) ? Number(v) : Number.NaN)
+
+async function uploadRoute(up: CrmUploads, name: string, req: IncomingMessage, res: ServerResponse, url: URL) {
+  switch (name) {
+    case 'uploads': {
+      const id = url.searchParams.get('id')
+      return send(res, 200, id ? up.get(id) : up.list())
+    }
+    case 'uploads/start':
+      return send(res, 200, await up.begin((await readJson(req)) as unknown as CrmUploadStart))
+    case 'uploads/part': {
+      const raw = req.headers['content-length']
+      const length = count(typeof raw === 'string' ? raw : null)
+      if (!Number.isFinite(length)) {
+        req.destroy()
+        throw new CrmFilesError(411, 'failed', 'A part must say its size (Content-Length).')
+      }
+      return send(res, 200, await up.receive(q(url, 'id'), count(url.searchParams.get('offset')), req, length))
+    }
+    case 'uploads/pause':
+      return send(res, 200, await up.pause(str((await readJson(req)).id, 'id')))
+    case 'uploads/resume':
+      return send(res, 200, await up.resume(str((await readJson(req)).id, 'id')))
+    case 'uploads/retry':
+      return send(res, 200, await up.retry(str((await readJson(req)).id, 'id')))
+    case 'uploads/cancel':
+      return send(res, 200, await up.cancel(str((await readJson(req)).id, 'id')))
+    case 'uploads/clear':
+      await up.clear(str((await readJson(req)).id, 'id'))
+      return send(res, 200, { ok: true })
+  }
+}
+
+export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMount {
   return {
     prefix: CRM_FILES_PREFIX,
     http: async () => {
@@ -85,12 +137,15 @@ export function crmFilesMount(svc: CrmFilesService): ApiMount {
     },
     raw: (rest, url) => {
       const name = rest.replace(/^\/+/, '').replace(/\/+$/, '')
-      if (!(name in METHODS)) return null
+      const isUpload = !!uploads && Object.hasOwn(UPLOAD_METHODS, name)
+      const allowed = Object.hasOwn(METHODS, name) ? METHODS[name] : isUpload ? UPLOAD_METHODS[name] : undefined
+      if (!allowed) return null
       return async (req, res) => {
         try {
           const method = (req.method ?? 'GET').toUpperCase()
           if (method === 'DELETE') return send(res, 405, { error: CRM_FILES_REASONS.noDelete, code: 'nodelete' satisfies CrmFilesErrorCode })
-          if (!METHODS[name].includes(method)) return send(res, 405, { error: `${method} is not allowed on ${name}`, code: 'failed' satisfies CrmFilesErrorCode })
+          if (!allowed.includes(method)) return send(res, 405, { error: `${method} is not allowed on ${name}`, code: 'failed' satisfies CrmFilesErrorCode })
+          if (uploads && isUpload) return await uploadRoute(uploads, name, req, res, url)
 
           switch (name) {
             case 'status':
@@ -135,6 +190,28 @@ export function crmFilesMount(svc: CrmFilesService): ApiMount {
               return send(res, 200, method === 'POST' ? await svc.mount.start() : await svc.mount.status())
             case 'unmount':
               return send(res, 200, await svc.mount.stop())
+            case 'mount/auto': {
+              const b = await readJson(req)
+              if (typeof b.on !== 'boolean') throw new CrmFilesError(400, 'failed', 'on is needed (true or false).')
+              if (!svc.mount.setAuto) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              return send(res, 200, await svc.mount.setAuto(b.on))
+            }
+            case 'mount/driver': {
+              const b = await readJson(req)
+              const via = CRM_DRIVER_CHOICES.find(v => v === b.via)
+              if (!via) throw new CrmFilesError(400, 'failed', "via must be 'auto', 'winfsp' or 'webdav'.")
+              if (!svc.mount.setDriver) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              return send(res, 200, await svc.mount.setDriver(via))
+            }
+            case 'mount/reveal': {
+              // Only one of three words; the agent knows where each is. No path from the request is ever used.
+              const b = await readJson(req)
+              const what = CRM_REVEALS.find(w => w === b.what)
+              if (!what) throw new CrmFilesError(400, 'failed', "what must be 'drive', 'pending' or 'recovered'.")
+              if (!svc.mount.reveal) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              await svc.mount.reveal(what)
+              return send(res, 200, { ok: true })
+            }
           }
         } catch (e) {
           fail(res, e)

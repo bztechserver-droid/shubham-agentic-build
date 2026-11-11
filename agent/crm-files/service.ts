@@ -1,11 +1,15 @@
 import { Readable } from 'node:stream'
 import {
+  blockedKind,
   CRM_FILES_MAX_UPLOAD,
   CRM_FILES_REASONS,
+  type CrmUploadKind,
   type CrmChildren,
   type CrmFilesErrorCode,
   type CrmFilesStatus,
+  type CrmDriverChoice,
   type CrmMountStatus,
+  type CrmReveal,
   type CrmNode,
   type CrmRights,
   type CrmVersion,
@@ -20,11 +24,14 @@ import {
 export class CrmFilesError extends Error {
   status: number
   code: CrmFilesErrorCode
-  constructor(status: number, code: CrmFilesErrorCode, message: string) {
+  /** od0b1: what Google Drive answered when it refused (its status, and its reason word when it gave one), so the uploads can tell a busy Google from a refusal. */
+  upstream?: { status: number; reason?: string }
+  constructor(status: number, code: CrmFilesErrorCode, message: string, upstream?: { status: number; reason?: string }) {
     super(message)
     this.name = 'CrmFilesError'
     this.status = status
     this.code = code
+    if (upstream) this.upstream = upstream
   }
 }
 
@@ -39,6 +46,12 @@ export interface MountDriver {
   status(): Promise<CrmMountStatus>
   start(): Promise<CrmMountStatus>
   stop(): Promise<CrmMountStatus>
+  /** o6e65 (Windows): mount by itself while the CRM is signed in, or not. */
+  setAuto?(on: boolean): Promise<CrmMountStatus>
+  /** o6e65 (Windows): how the drive is made (WinFsp, Windows' built-in WebDAV, or automatic). */
+  setDriver?(via: CrmDriverChoice): Promise<CrmMountStatus>
+  /** o6e65 (Windows): open File Explorer on the drive, or on the waiting or recovered saves folder. Takes no path. */
+  reveal?(what: CrmReveal): Promise<void>
 }
 
 export interface CrmFilesOptions {
@@ -54,12 +67,33 @@ export interface CrmFilesOptions {
   ttlMs?: number
 }
 
+/**
+ * od0b1: what the uploads in parts (uploads.ts) need of the CRM and of Google Drive: the same checks, the same key and folders, and the same record the one-request upload makes.
+ * The session address `open` gives is a credential for that one upload: it is kept in the agent's own state folder, never logged and never shown to a page.
+ */
+export interface CrmUploadBackend {
+  /** Checks a planned upload against the CRM now (throws CrmFilesError): rights, name, kind of file, a name already used. Gives the name and type the upload carries. */
+  check(p: { kind: CrmUploadKind; target: string; name: string; type: string }): Promise<{ name: string; type: string }>
+  /** Opens a resumable session in Google Drive for `size` bytes, in the CRM's folder for today, with the CRM's own key. */
+  open(name: string, type: string, size: number): Promise<{ session: string; key: string; mime: string }>
+  /**
+   * All the bytes are in Google Drive (`driveId`, `url`): the CRM's sharing policy, then the CRM record (a new file into `target`, or a new version of the file `target`).
+   * `lookFirst`: an earlier try may have landed without its answer reaching us, so the CRM is read first and a record with this key is taken as done (never a second one).
+   * A new file whose name was taken meanwhile is recorded as "name (2).ext" and `savedAs` says so.
+   */
+  finish(p: { kind: CrmUploadKind; target: string; name: string; type: string; size: number; key: string; driveId: string; url: string; lookFirst: boolean }): Promise<{ node: CrmNode; savedAs?: string }>
+  /** The fetch used for Google (the session's parts and questions go through it). */
+  fetch: typeof fetch
+}
+
 export interface CrmFilesService {
   status(): Promise<CrmFilesStatus>
   children(id: string): Promise<CrmChildren>
   node(id: string): Promise<CrmNode>
   /** The bytes of a file, streamed from the CRM (its /org/files/:id/raw); the caller pipes `stream` and must destroy it if the reader goes away. */
   file(id: string): Promise<{ stream: Readable; size: number | null; type: string; name: string }>
+  /** S9a: bytes [start, start + length) of a file by a ranged request to the CRM (fewer only at the end of the file); a CRM that ignores the range is read and cut. For the in-app WinFsp drive. */
+  fileBytes(id: string, start: number, length: number): Promise<Buffer>
   versions(id: string): Promise<CrmVersion[]>
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   version(id: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
@@ -67,6 +101,8 @@ export interface CrmFilesService {
   rename(id: string, name: string): Promise<CrmNode>
   move(id: string, to: string): Promise<CrmNode>
   mount: MountDriver
+  /** od0b1: for the uploads in parts (uploads.ts); not a route. */
+  uploadBackend: CrmUploadBackend
 }
 
 // ---- what the CRM sends -------------------------------------------------------------------------------------------------
@@ -496,8 +532,17 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     return `server-sided-s3/${org}/${d.getFullYear()}/${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${stem}${d.getTime()}${ext ? `.${ext}` : ''}`
   }
 
+  /** Google's reason word for a refusal ("rateLimitExceeded", "storageQuotaExceeded", ...), when its answer has one. Only that word is kept. */
+  async function googleReason(res: Response): Promise<string | undefined> {
+    const j: unknown = await res.json().catch(() => null)
+    const err = isObject(j) && isObject(j.error) ? j.error : null
+    const first = err && Array.isArray(err.errors) && isObject(err.errors[0]) ? text(err.errors[0].reason) : ''
+    const word = first || (err ? text(err.status) : '')
+    return /^[A-Za-z_]{1,64}$/.test(word) ? word : undefined
+  }
+
   async function gjson(res: Response, what: string): Promise<Record<string, unknown>> {
-    if (!res.ok) throw new CrmFilesError(502, 'failed', `Google Drive refused ${what} (${res.status}).`)
+    if (!res.ok) throw new CrmFilesError(502, 'failed', `Google Drive refused ${what} (${res.status}).`, { status: res.status, reason: await googleReason(res) })
     const j: unknown = await res.json().catch(() => null)
     return isObject(j) ? j : {}
   }
@@ -524,8 +569,12 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     return id
   }
 
-  /** Sends `stream` (exactly `size` bytes) to Drive; returns the key and the link the CRM record will keep. */
-  async function pushToDrive(name: string, type: string, stream: Readable, size: number): Promise<{ key: string; url: string }> {
+  /**
+   * Opens a resumable upload session in Drive for `size` bytes, as the CRM's own pages do: the CRM's token, its folder for today, its key in appProperties.path. The session address
+   * that comes back is a credential for this one upload (od0b1 keeps it in the agent's state folder, never in a log or a page). The answer at the end carries md5Checksum and size so the
+   * upload can be checked.
+   */
+  async function openDriveSession(name: string, type: string, size: number): Promise<{ key: string; mime: string; session: string }> {
     const t = await driveToken()
     const key = crmKey(await orgId(), name)
     const segs = key.split('/')
@@ -533,36 +582,56 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     for (const seg of segs.slice(0, -1)) parent = await driveFolder(t, parent, seg)
     const mime = type || EXT_MIME[extOf(name)] || 'application/octet-stream'
     const auth = { authorization: `Bearer ${t.accessToken}` }
-    const start = await gfetch(`${driveUpload}/files?uploadType=resumable&fields=id,webViewLink,webContentLink`, {
+    const start = await gfetch(`${driveUpload}/files?uploadType=resumable&fields=id,webViewLink,webContentLink,md5Checksum,size`, {
       method: 'POST',
       headers: { ...auth, 'content-type': 'application/json; charset=UTF-8', 'x-upload-content-type': mime, 'x-upload-content-length': String(size) },
       body: JSON.stringify({ name, mimeType: mime, appProperties: { path: key }, ...(parent ? { parents: [parent] } : {}) }),
     })
     if (!start.ok) {
       token = null
-      stream.destroy()
-      throw new CrmFilesError(502, 'failed', `Google Drive refused the upload (${start.status}).`)
+      throw new CrmFilesError(502, 'failed', `Google Drive refused the upload (${start.status}).`, { status: start.status, reason: await googleReason(start) })
     }
     const session = start.headers.get('location')
-    if (!session) {
-      stream.destroy()
-      throw new CrmFilesError(502, 'failed', 'Google Drive gave no upload session.')
+    if (!session) throw new CrmFilesError(502, 'failed', 'Google Drive gave no upload session.')
+    return { key, mime, session }
+  }
+
+  /** The bytes are all in Drive (`done` is Drive's answer to the last of them): its link, and the CRM's own sharing policy applied, as its pages do. */
+  async function driveDone(done: Record<string, unknown>): Promise<{ driveId: string; url: string }> {
+    const driveId = text(done.id)
+    if (!driveId) throw new CrmFilesError(502, 'failed', 'Google Drive returned no file id.')
+    const url = text(done.webViewLink) || text(done.webContentLink) || `https://drive.google.com/uc?id=${driveId}`
+    await sharePolicy(driveId)
+    return { driveId, url }
+  }
+
+  async function sharePolicy(driveId: string) {
+    const t = await driveToken().catch(() => null)
+    if (t?.makePublic) {
+      // Best effort, as the CRM's own pages do it: the file is already up. (This is the CRM's own policy for ITS files; the Common Drive backup never shares anything.)
+      const auth = { authorization: `Bearer ${t.accessToken}` }
+      await gfetch(`${driveApi}/files/${driveId}/permissions`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ role: 'reader', type: 'anyone' }) }).catch(() => undefined)
     }
-    const put = await gfetch(session, {
+  }
+
+  /** Sends `stream` (exactly `size` bytes) to Drive in ONE request; returns the key and the link the CRM record will keep. (The first way, kept: the page's single-request upload and the drive's saves.) */
+  async function pushToDrive(name: string, type: string, stream: Readable, size: number): Promise<{ key: string; url: string }> {
+    let opened: { key: string; mime: string; session: string }
+    try {
+      opened = await openDriveSession(name, type, size)
+    } catch (e) {
+      stream.destroy()
+      throw e
+    }
+    const put = await gfetch(opened.session, {
       method: 'PUT',
-      headers: { 'content-type': mime, 'content-length': String(size) },
+      headers: { 'content-type': opened.mime, 'content-length': String(size) },
       body: Readable.toWeb(stream) as unknown as ReadableStream,
       duplex: 'half',
     } as RequestInit)
     const done = await gjson(put, 'the upload')
-    const driveId = text(done.id)
-    if (!driveId) throw new CrmFilesError(502, 'failed', 'Google Drive returned no file id.')
-    const url = text(done.webViewLink) || text(done.webContentLink) || `https://drive.google.com/uc?id=${driveId}`
-    if (t.makePublic) {
-      // Best effort, as the CRM's own pages do it: the file is already up. (This is the CRM's own policy for ITS files; the Common Drive backup never shares anything.)
-      await gfetch(`${driveApi}/files/${driveId}/permissions`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ role: 'reader', type: 'anyone' }) }).catch(() => undefined)
-    }
-    return { key, url }
+    const { url } = await driveDone(done)
+    return { key: opened.key, url }
   }
 
   /** A refused upload's body: a small one is read and dropped so the answer reaches the sender; a big one is cut off. */
@@ -602,10 +671,102 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     return nodeOf(id)
   }
 
+  // ---- the CRM record of a file whose bytes are in Drive (the one-request upload and the uploads in parts) ---------------
+
+  async function recordNew(parent: string, name: string, type: string, size: number, sent: { key: string; url: string }): Promise<CrmNode> {
+    const { pid, gid } = asFolderParts(parent)
+    const body: Record<string, unknown> = { file_name: name, file_key: sent.key, file_url: sent.url, file_type: type || 'application/octet-stream', folder: 'projects', source: `project:${pid}`, group_id: gid }
+    // The CRM refuses a size of 0; an empty file goes up without one (as the old drive did).
+    if (size > 0) body.file_size = size
+    const r = await call('POST', 'org/files', 'this file', { json: body })
+    const rec: unknown = await r.json().catch(() => null)
+    invalidate(pid)
+    const newId = isObject(rec) ? text(rec.id) || (isObject(rec.file) ? text(rec.file.id) : '') : ''
+    if (!newId) return (await childrenOf(parent)).children.find(c => sameName(c.name, name)) ?? (await nodeOf(parent))
+    return await refreshed(fileId(newId))
+  }
+
+  async function recordVersion(id: string, type: string, size: number, sent: { key: string; url: string }): Promise<CrmNode> {
+    const { f, project } = await findFile(id)
+    const body: Record<string, unknown> = { file_name: f.fileName, file_key: sent.key, file_url: sent.url, file_type: type || f.fileType || 'application/octet-stream' }
+    if (size > 0) body.file_size = size
+    await call('POST', `org/files/${encodeURIComponent(f.id)}/version`, 'a new version of this file', { json: body })
+    invalidate(project?.id)
+    return await refreshed(id)
+  }
+
+  /** "name (2).ext", "name (3).ext", ...: the first that is free in `parent`. */
+  async function freeName(parent: string, name: string): Promise<string> {
+    const { children } = await childrenOf(parent)
+    const taken = (n: string) => children.some(c => sameName(c.name, n))
+    if (!taken(name)) return name
+    const dot = name.lastIndexOf('.')
+    const stem = dot > 0 ? name.slice(0, dot) : name
+    const ext = dot > 0 ? name.slice(dot) : ''
+    for (let i = 2; i < 1000; i++) {
+      const n = `${stem} (${i})${ext}`
+      if (n.length <= 255 && !taken(n)) return n
+    }
+    throw new CrmFilesError(409, 'conflict', `"${name}" is already there.`)
+  }
+
+  // ---- od0b1: what the uploads in parts use (uploads.ts) ----------------------------------------------------------------
+
+  const uploadBackend: CrmUploadBackend = {
+    fetch: gfetch,
+
+    async check(p) {
+      if (p.kind === 'new') {
+        needName(p.name)
+        const blocked = blockedKind(p.name, p.type)
+        if (blocked) throw new CrmFilesError(400, 'blocked', blocked)
+        asFolderParts(p.target)
+        await needRight(await nodeOf(p.target), 'upload', 'add files')
+        await needFree(p.target, p.name)
+        return { name: p.name.trim(), type: p.type }
+      }
+      if (p.name) needName(p.name)
+      const { f, node } = await findFile(p.target)
+      await needRight(node, 'version', 'save a new version of this file')
+      const name = p.name.trim() || f.fileName
+      const blocked = blockedKind(f.fileName, p.type || f.fileType || '')
+      if (blocked) throw new CrmFilesError(400, 'blocked', blocked)
+      return { name, type: p.type || f.fileType || '' }
+    },
+
+    open: (name, type, size) => openDriveSession(name, type, size),
+
+    async finish(p) {
+      await sharePolicy(p.driveId)
+      const sent = { key: p.key, url: p.url }
+      if (p.kind === 'version') {
+        if (p.lookFirst) {
+          // An earlier try may have landed: the CRM's file then already holds this key (a new version replaces the file's key).
+          invalidate()
+          const { f } = await findFile(p.target)
+          if (f.fileKey === p.key) return { node: await refreshed(p.target) }
+        }
+        return { node: await recordVersion(p.target, p.type, p.size, sent) }
+      }
+      if (p.lookFirst) {
+        invalidate()
+        const s = await load()
+        const landed = s.files.find(f => f.fileKey === p.key)
+        if (landed) return { node: await nodeOf(fileId(landed.id)) }
+      }
+      // Still allowed to add files here (the CRM is asked again: hours may have passed)?
+      await needRight(await nodeOf(p.target), 'upload', 'add files')
+      const name = await freeName(p.target, p.name)
+      const node = await recordNew(p.target, name, p.type, p.size, sent)
+      return name === p.name ? { node } : { node, savedAs: name }
+    },
+  }
+
   // ---- the service -----------------------------------------------------------------------------------------------------
 
   return {
     mount,
+    uploadBackend,
 
     async status() {
       const sess = client.session()
@@ -643,6 +804,42 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       }
     },
 
+    async fileBytes(id, start, length) {
+      const { f } = await findFile(id)
+      let r: Response
+      try {
+        r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/raw`, { headers: { range: `bytes=${start}-${start + length - 1}` } })
+      } catch (e) {
+        if ((e as Error)?.name === 'CrmNotSignedIn') throw new CrmFilesError(409, 'crm-signin', CRM_FILES_REASONS.signedOut)
+        throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
+      }
+      if (r.status === 206) {
+        const b = Buffer.from(await r.arrayBuffer())
+        return b.length > length ? b.subarray(0, length) : b
+      }
+      if (!r.ok || !r.body) throw await refusal(r, 'this file')
+      // The CRM answered the whole file (it ignored the range): read and drop what is before `start`, keep `length`, and stop reading.
+      const reader = r.body.getReader()
+      const out: Buffer[] = []
+      let seen = 0
+      let kept = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = Buffer.from(value)
+        const from = Math.max(0, start - seen)
+        seen += chunk.length
+        if (from < chunk.length) {
+          const part = chunk.subarray(from, from + (length - kept))
+          out.push(part)
+          kept += part.length
+        }
+        if (kept >= length) break
+      }
+      await reader.cancel().catch(() => undefined)
+      return Buffer.concat(out)
+    },
+
     async versions(id) {
       const { f } = await findFile(id)
       const j = await getJson(`org/files/${encodeURIComponent(f.id)}/versions`, 'the versions')
@@ -659,19 +856,12 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       try {
         checkSize(size)
         needName(name)
-        const { pid, gid } = asFolderParts(parent)
+        asFolderParts(parent)
         const pn = await nodeOf(parent)
         await needRight(pn, 'upload', 'add files')
         await needFree(parent, name)
         const sent = await pushToDrive(name, type, stream, size)
-        const body: Record<string, unknown> = { file_name: name, file_key: sent.key, file_url: sent.url, file_type: type || 'application/octet-stream', folder: 'projects', source: `project:${pid}`, group_id: gid }
-        if (size > 0) body.file_size = size
-        const r = await call('POST', 'org/files', 'this file', { json: body })
-        const rec: unknown = await r.json().catch(() => null)
-        invalidate(pid)
-        const newId = isObject(rec) ? text(rec.id) || (isObject(rec.file) ? text(rec.file.id) : '') : ''
-        if (!newId) return (await childrenOf(parent)).children.find(c => sameName(c.name, name)) ?? pn
-        return await refreshed(fileId(newId))
+        return await recordNew(parent, name, type, size, sent)
       } catch (e) {
         discard(stream, size)
         throw e
@@ -682,14 +872,10 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       try {
         checkSize(size)
         if (name) needName(name)
-        const { f, node, project } = await findFile(id)
+        const { f, node } = await findFile(id)
         await needRight(node, 'version', 'save a new version of this file')
         const sent = await pushToDrive(name || f.fileName, type || f.fileType || '', stream, size)
-        const body: Record<string, unknown> = { file_name: f.fileName, file_key: sent.key, file_url: sent.url, file_type: type || f.fileType || 'application/octet-stream' }
-        if (size > 0) body.file_size = size
-        await call('POST', `org/files/${encodeURIComponent(f.id)}/version`, 'a new version of this file', { json: body })
-        invalidate(project?.id)
-        return await refreshed(id)
+        return await recordVersion(id, type, size, sent)
       } catch (e) {
         discard(stream, size)
         throw e

@@ -65,6 +65,11 @@ export interface PortsOptions {
   /** Tests: a fake certificate fetch uses `run`; this swaps the gate (default startGate). */
   startGate?: typeof startGate
   upstreamHost?: string
+  /**
+   * Stable ports (order od91f, stable.ts): the ports this agent answers on as its own page at one PC's tab (never blocked as the app's), and the ones to share
+   * on Tailscale now. These are shared whatever the mode is (Off too), through the same gate, with the same rules; they are never in `chosen`.
+   */
+  stable?: { listening: () => number[]; shared: () => number[] }
 }
 
 export interface Ports {
@@ -180,9 +185,13 @@ export function createPorts(o: PortsOptions): Ports {
     appPorts: new Set([...o.appPorts(), wantedGatePort, ...(gate ? [gate.port] : [])]),
     appMarker: o.appMarker ?? null,
     pagePort: o.pagePort,
+    pagePorts: new Set(o.stable?.listening() ?? []),
     linux: platform === 'linux',
     selfUid: process.getuid?.(),
   })
+  /** Stable ports to share now (order od91f): they keep the gate on even with the mode Off. */
+  const stableShared = () => new Set(o.stable?.shared() ?? [])
+  const sharingOn = () => saved.mode !== 'off' || stableShared().size > 0
 
   const where = (): Where => ({ name: self?.dnsName ?? null, ip: self?.ips.find(i => /^\d+\./.test(i)) ?? null })
   const ipv4 = () => self?.ips.find(i => /^\d+\./.test(i)) ?? null
@@ -218,6 +227,7 @@ export function createPorts(o: PortsOptions): Ports {
 
   function portsView(): ListeningPort[] {
     const chosen = new Set(saved.chosen)
+    const stablePages = new Set(o.stable?.listening() ?? [])
     return listening.map(l => {
       const e = entries.find(x => x.port === l.port)
       const owner = e ? ownerOf(e) : null
@@ -228,7 +238,7 @@ export function createPorts(o: PortsOptions): Ports {
         pid: l.pid < 0 ? null : l.pid,
         sharedBy: owner === 'ours' ? 'ports' : owner,
         chosen: chosen.has(l.port),
-        appPage: l.port === o.pagePort,
+        appPage: l.port === o.pagePort || stablePages.has(l.port),
         blocked: blockFor(l),
       }
     })
@@ -259,7 +269,7 @@ export function createPorts(o: PortsOptions): Ports {
 
   function gateView(): PortsGate {
     const c = cert.info()
-    const agentTls = saved.tlsBy === 'agent' && saved.mode !== 'off'
+    const agentTls = saved.tlsBy === 'agent' && sharingOn()
     return {
       listening: gate !== null,
       port: gate?.port ?? null,
@@ -277,7 +287,7 @@ export function createPorts(o: PortsOptions): Ports {
   }
 
   function state(): PortsState {
-    if (!closed && !disabled && now() - lastScan > (saved.mode === 'off' ? IDLE_SCAN_MS : SCAN_EVERY_MS * 3)) void run()
+    if (!closed && !disabled && now() - lastScan > (sharingOn() ? SCAN_EVERY_MS * 3 : IDLE_SCAN_MS)) void run()
     return {
       available: unavailable === null,
       unavailable,
@@ -369,7 +379,10 @@ export function createPorts(o: PortsOptions): Ports {
 
   async function reconcile() {
     if (!self) return
-    const wantOn = saved.mode !== 'off'
+    const modeOn = saved.mode !== 'off'
+    // Stable ports (order od91f) are shared when their own setting says so, whatever the mode; they are this agent's own pages, so they need no settling or probe.
+    const extra = stableShared()
+    const wantOn = modeOn || extra.size > 0
     const ours = oursNow()
     if (!wantOn && ours.size === 0) {
       await stopTheGate()
@@ -386,6 +399,11 @@ export function createPorts(o: PortsOptions): Ports {
     if (wantOn) {
       for (const l of listening) {
         if (blockFor(l)) continue
+        if (extra.has(l.port)) {
+          desired.set(l.port, via)
+          continue
+        }
+        if (!modeOn) continue
         if (saved.mode === 'all' ? l.port > SHARE_MAX || !ALL_PROGRAMS.includes(programKey(procs.get(l.pid)?.name)) : !chosen.has(l.port)) continue
         const settled = (seen.get(l.port)?.n ?? 0) >= 2 && probes.has(`${l.port}:${l.pid}`)
         if (settled || ours.has(l.port)) desired.set(l.port, via)
@@ -498,7 +516,7 @@ export function createPorts(o: PortsOptions): Ports {
   function schedule() {
     if (timer || closed || disabled) return
     timer = setInterval(() => {
-      if (saved.mode !== 'off' || oursNow().size > 0) void run()
+      if (sharingOn() || oursNow().size > 0) void run()
     }, o.intervalMs ?? SCAN_EVERY_MS)
     timer.unref()
   }

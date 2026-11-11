@@ -142,6 +142,8 @@ import { createCrmGoals } from './crm-goals.ts'
 import { createCrmReads } from './crm-reads.ts'
 import { createCrmWrite } from './crm-write.ts'
 import { createCrmProxy } from './crmproxy.ts'
+import { createAccountsEmail } from './accounts-email.ts'
+import { createAccountsImport } from './accounts-import.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
@@ -373,6 +375,8 @@ export interface AgenticOptions {
   resumeGapMs?: number
   /** F-054: this PC's CRM session (crm-session.json, beside the agentic folder); tests give a scratch one. */
   crmSession?: string
+  /** order o4d14: how the Accounts page opens its database connection (accounts-db.ts); only tests give their own, so no test ever reaches a real database. */
+  accountsDbOpen?: typeof import('./accounts-db.ts').openAccountsDb
   /**
    * F-075: the chats' terminals live in the chat host (agent/chathost/), which outlives this agent: the chats
    * started here run there, the ones the agent before this one left running are taken over at start, and
@@ -690,6 +694,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const crmGoals = createCrmGoals({ proxy: crmProxy })
   const crmReads = createCrmReads({ proxy: crmProxy })
   const crmWrite = createCrmWrite({ proxy: crmProxy })
+  // order o57e2, o4d14: the Accounts page's Email tab, read from the NEW Supabase project (schema sad; db/accounts/README.md) through the login sad_app named in two files in this state folder. Nothing connects
+  // until Shubham has made those files himself; the answer says so in plain words.
+  const accountsEmail = createAccountsEmail({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // order o5c4d: the one-way copy of the CRM's email accounts into that database (reads the CRM with the PC's CRM sign-in, writes only to the new database, deletes nothing).
+  const accountsImport = createAccountsImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
   void crmFiles.resume().catch(() => undefined)
@@ -5023,6 +5032,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ],
     // Whether the CRM is signed in on THIS PC (the session is per PC, as Devices signs in): never the session itself.
     ['GET', /^\/crm\/session$/, (): CrmSessionInfo => crmProxy.session(), 'local'],
+    // order o57e2, o4d14: the email accounts for the Accounts page's Email tab, from the new Supabase project: address, note, switched off, where used. Never a password. The owner's (POLICY).
+    ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id), 'local'],
+    // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
+    ['POST', /^\/accounts\/email\/import$/, (_, r) => accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
     [
       'GET',

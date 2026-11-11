@@ -20,6 +20,10 @@ const MAX_XML = 256 * 1024
 const SIDE_MAX = 64 * 1024 * 1024
 
 export interface CrmDavOptions {
+  /** o6e65: 'windows' makes names legal for Windows (and tells apart names that differ only by case), for Windows' built-in WebDAV client; default 'linux'. */
+  names?: 'linux' | 'windows'
+  /** o6e65: the status a DELETE answers (default 403). Windows' client treats 403 as advice and fakes a local delete; the old app used 423 Locked there, which it shows as an error. */
+  deleteStatus?: number
   service(): CrmFilesService | null
   /** The time used for folders the CRM gives no time (the root, a category): fixed, so a file manager does not think they changed. */
   started?: number
@@ -48,23 +52,41 @@ export function legalName(name: string): string {
   return n === '' || n === '.' || n === '..' ? `_${n}` : n
 }
 
+/**
+ * o6e65: the CRM's name made legal for Windows: its forbidden characters (< > : " / \ | ? * and control characters) become '_', a trailing dot or space (Windows drops it) is cut, and a
+ * device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or without an extension) gets a '_' in front. The CRM's own name never changes; only what the drive shows.
+ */
+export function legalWindowsName(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  let n = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '')
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(n)) n = `_${n}`
+  return n === '' ? '_' : n
+}
+
 const idTail = (id: string) => (id.split(':').pop() ?? id).replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'x'
 
 /** The children under their names on the drive: legal, and unique (the first by id keeps the name, the others get " (<id>)" before the extension). */
-export function namesOf(children: CrmNode[]): Map<string, CrmNode> {
+export function namesOf(children: CrmNode[], legal: (name: string) => string = legalName, foldCase = false): Map<string, CrmNode> {
+  // Windows treats A.txt and a.txt as the same name: with foldCase they are told apart like any other two with one name.
   const groups = new Map<string, CrmNode[]>()
+  const shown = new Map<string, string>()
   for (const c of children) {
-    const n = legalName(c.name)
-    groups.set(n, [...(groups.get(n) ?? []), c])
+    const n = legal(c.name)
+    const key = foldCase ? n.toLowerCase() : n
+    if (!shown.has(key)) shown.set(key, n)
+    groups.set(key, [...(groups.get(key) ?? []), c])
   }
   const out = new Map<string, CrmNode>()
-  for (const [n, list] of groups) {
+  for (const [key, list] of groups) {
+    const n = shown.get(key) ?? key
     const sorted = [...list].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
     sorted.forEach((c, i) => {
-      if (i === 0) return void out.set(n, c)
-      const dot = c.isFolder ? -1 : n.lastIndexOf('.')
-      const stem = dot > 0 ? n.slice(0, dot) : n
-      const ext = dot > 0 ? n.slice(dot) : ''
+      // Each keeps its own legal name (names that differ only by case are told apart by id: the first keeps its own, the others get the id before the extension).
+      const own = foldCase ? legal(c.name) : n
+      if (i === 0) return void out.set(own, c)
+      const dot = c.isFolder ? -1 : own.lastIndexOf('.')
+      const stem = dot > 0 ? own.slice(0, dot) : own
+      const ext = dot > 0 ? own.slice(dot) : ''
       out.set(`${stem} (${idTail(c.id)})${ext}`, c)
     })
   }
@@ -152,6 +174,8 @@ export function createCrmDav(o: CrmDavOptions) {
   const sidesIn = (parentId: string) => [...sides].filter(([k]) => k.startsWith(`${parentId}\u0000`)).map(([k, v]) => ({ name: k.slice(parentId.length + 1), side: v }))
   const sideBytes = () => [...sides.values()].reduce((n, s) => n + s.bytes.length, 0)
   const locks = new Map<string, { token: string; owner: string; timeout: number }>()
+  const win = o.names === 'windows'
+  const kidsOf = (children: CrmNode[]) => (win ? namesOf(children, legalWindowsName, true) : namesOf(children))
 
   const svc = (): CrmFilesService => {
     const s = o.service()
@@ -167,7 +191,7 @@ export function createCrmDav(o: CrmDavOptions) {
       const name = parts[i]
       const last = i === parts.length - 1
       if (!node.isFolder) throw new CrmFilesError(404, 'notfound', 'Not found.')
-      const kids = namesOf((await s.children(node.id)).children)
+      const kids = kidsOf((await s.children(node.id)).children)
       const next = kids.get(name)
       if (!next) {
         if (!last) throw new CrmFilesError(404, 'notfound', 'Not found.')
@@ -248,7 +272,7 @@ export function createCrmDav(o: CrmDavOptions) {
         const self = nodeXml(parts, f.node, parts.at(-1) ?? 'CRM files')
         const depth = String(req.headers.depth ?? '1')
         if (!f.node.isFolder || depth === '0') return sendXml(res, 207, multistatus([self]))
-        const kids = namesOf((await svc().children(f.node.id)).children)
+        const kids = kidsOf((await svc().children(f.node.id)).children)
         const out = [self, ...[...kids].map(([n, k]) => nodeXml([...parts, n], k, n))]
         for (const { name, side } of sidesIn(f.node.id)) if (!kids.has(name)) out.push(sideXml([...parts, name], name, side))
         return sendXml(res, 207, multistatus(out))
@@ -348,7 +372,7 @@ export function createCrmDav(o: CrmDavOptions) {
         }
         if (f.kind === 'none') return send(res, 404, 'Not found.')
         o.log?.info(`crm drive: a delete of "${parts.at(-1) ?? ''}" was refused`)
-        return send(res, 403, CRM_FILES_REASONS.noDelete)
+        return send(res, o.deleteStatus ?? 403, CRM_FILES_REASONS.noDelete)
       }
 
       case 'MOVE':

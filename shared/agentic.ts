@@ -434,6 +434,12 @@ export type TerminalClientMessage =
   | { t: 'size'; cols: number; rows: number }
 
 export type TerminalServerMessage =
+  /**
+   * The size the chat's real terminal has NOW (columns x rows, already clamped by the agent): sent once when a viewer joins, before the
+   * replay, and again to every viewer each time the terminal really changes size. A page that does not know it ignores it; an agent
+   * that does not know it never sends it.
+   */
+  | { t: 'size'; cols: number; rows: number }
   /** What the terminal printed; the first one replays its recent screen. */
   | { t: 'out'; d: string }
   /** The claude process ended. */

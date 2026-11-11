@@ -63,6 +63,8 @@ export interface MemberLinksOptions {
   tailnetSuffix?: () => string | null
   /** F-114: the hub says what it shares on Tailscale (in its hello and in later 'ports' messages); an older hub says nothing. Given as it came: the receiver checks it. */
   onPorts?: (raw: unknown) => void
+  /** Stable ports (order od91f): the hub's table of every PC's four ports (its hello's `stable` and later 'stable' messages); an older hub says nothing. Given as it came. */
+  onStable?: (raw: unknown) => void
   version: string
   /** Stream kinds this end serves to the hub. */
   onOpen?: Record<string, OpenHandler>
@@ -263,6 +265,7 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
     // Bookkeeping last; neither of these throws.
     refreshHub(link.hello.hub)
     if (link.hello.ports !== undefined) o.onPorts?.(link.hello.ports)
+    if (link.hello.stable !== undefined) o.onStable?.(link.hello.stable)
     saveLastSeen()
     changed()
   }
@@ -296,6 +299,8 @@ export function createMemberLinks(o: MemberLinksOptions): MemberLinks {
       changed()
     } else if (msg.t === 'ports') {
       o.onPorts?.(msg.ports)
+    } else if (msg.t === 'stable') {
+      o.onStable?.(msg.stable)
     }
   }
 
@@ -427,6 +432,8 @@ export interface HubLinksOptions {
   onChange: () => void
   /** How long a new link may take to say hello (or pair-request). Default 10 s. */
   helloMs?: number
+  /** Stable ports (order od91f): a paired member said hello (its `stable` is the block it has saved; absent from an older member). Never throws into the link. */
+  onHello?: (id: string, hello: Control) => void
   log?: Logger
 }
 
@@ -532,6 +539,11 @@ export function createHubLinks(o: HubLinksOptions): HubLinks {
       rustdeskId: typeof hello.rustdeskId === 'string' ? hello.rustdeskId.slice(0, 32) : null,
       lastSeen: link.since,
     })
+    try {
+      o.onHello?.(record.id, hello)
+    } catch (e) {
+      log?.warn(`${name}'s hello: ${message(e)}`)
+    }
     o.onChange()
     return link
   }

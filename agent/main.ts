@@ -20,7 +20,7 @@ import { findCodex } from './codex/find.ts'
 import { createCodex } from './codex/index.ts'
 import { startRowWatch } from './claude/rowwatch.ts'
 import { loadUserEnv } from './claude/userenv.ts'
-import { loadConfig, loadOrCreateApiToken, updateConfig, type Config } from './config.ts'
+import { loadConfig, loadOrCreateApiToken, stableOf, updateConfig, type Config } from './config.ts'
 import { ensureChatHost } from './chathost/ensure.ts'
 import { answerPush, type HubSideOptions } from './connect.ts'
 import { createDeviceStore, normalizeHubAddress, type HubBundle } from './devices.ts'
@@ -48,6 +48,8 @@ import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts } from './ports/index.ts'
+import { scannersFor } from './ports/scan.ts'
+import { createStable } from './ports/stable.ts'
 import { createLinuxMount } from './crm-files/mount-linux.ts'
 import type { CrmFilesService } from './crm-files/service.ts'
 
@@ -142,6 +144,24 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   const tailnetName = createTailnetName({ up: () => tailnet() !== null, disabled: testNoRustdesk, onChange: () => changed() })
   // F-110: this PC's tailnet (its PCs), read only when a member's stored hub address fails; never in test mode.
   const tailnetPeers = createTailnetPeers({ disabled: testNoRustdesk, up: () => tailnet() !== null, onChange: () => changed() })
+  // Stable ports (order od91f): four fixed ports per PC (Chat 1, Chat 2, Screen, Updates), each the app's page at that PC's tab. The Server hands the
+  // blocks out (agent/ports/stable.ts). Off until switched on (Settings › Ports); never in test mode, nor with SAD_STABLE_PORTS=off.
+  let onStableChanged: () => void = () => {}
+  const scanners = testNoRustdesk ? null : scannersFor(process.platform)
+  const stable = createStable({
+    dir: path.join(paths.agent, 'ports'),
+    role,
+    self: { id: identity.id, name: () => config.name },
+    members: () => devices.members().map(m => ({ id: m.id, name: m.name })),
+    initial: stableOf(config),
+    save: next => void updateConfig({ stablePorts: { on: next.on, share: next.share, ...(next.block ?? {}) } }, { root: paths.root }),
+    pagePort: () => Number(process.env.SAD_UI_PORT) || 5173,
+    unavailable: process.env.SAD_STABLE_PORTS === 'off' ? 'Stable ports are off on this PC (SAD_STABLE_PORTS=off).' : testNoRustdesk ? 'Stable ports are off in test mode.' : null,
+    net: scanners?.net,
+    procs: scanners?.procs,
+    log: log.child('stable'),
+    onChange: () => onStableChanged(),
+  })
   // F-114: Ports - this PC's agent shares some or all of its listening ports on Tailscale, behind its own gate. Off until it is switched on. Never in test mode.
   let onPortsChanged: () => void = () => {}
   const portsMod = createPorts({
@@ -161,7 +181,26 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       onPortsChanged()
     },
     log: log.child('ports'),
+    stable: { listening: () => stable.listening(), shared: () => stable.shared() },
   })
+  // The stable ports changed: Ports shares or stops sharing them at once, and the Server tells every PC its new table.
+  let lastStableShare = ''
+  let lastStableTable = ''
+  onStableChanged = () => {
+    changed()
+    const share = `${stable.listening().join(',')}|${stable.shared().join(',')}`
+    if (share !== lastStableShare) {
+      lastStableShare = share
+      void portsMod.refresh().catch(() => undefined)
+    }
+    const table = stable.table()
+    const now = JSON.stringify(table)
+    if (hub && table && now !== lastStableTable) {
+      lastStableTable = now
+      hub.links.broadcast({ t: 'stable', stable: table })
+    }
+  }
+  const portsState = () => ({ ...portsMod.state(), stable: stable.state() })
   const timers: NodeJS.Timeout[] = []
   const every = (ms: number, fn: () => void) => timers.push(setInterval(fn, ms))
 
@@ -200,7 +239,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   /** F-021: a link, as the Agents section uses it: 'agentic' streams on it. */
   const linkPeer = (mux: Mux, id: string, name: string): LinkPeer => ({ id, name, token: mux, open: meta => mux.open('agentic', meta) })
   let screen = false
-  const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready })
+  // Stable ports (order od91f): a member's hello says which block it has saved, so a Server that lost its table gives it the same one back.
+  const hello = (): Control => ({ t: 'hello', id: identity.id, name: config.name, role, version: VERSION, rustdeskId, screen, appScreen: appScreen.status().ready, ...(role === 'member' ? { stableBlock: stable.mine() } : {}) })
   const claude = createClaudeSubscription({ paths, deviceId: identity.id, log: log.child('claude'), onChange: () => changed() })
   // F-118: who is signed in (agent/auth/). People sign in with their own CRM account (SAD_CRM_URL for another CRM). Break-glass: a file
   // <state>/agent/auth-off, or SAD_AUTH=off, makes everything as open as before whatever level is saved.
@@ -394,6 +434,11 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         return null
       }
     }
+    // Stable ports (order od91f): a PC paired, removed or renamed gets its block (or keeps it) at once.
+    const devicesChanged = () => {
+      stable.sync()
+      changed()
+    }
     const pairing = createPairingHub({
       devices,
       bundle,
@@ -402,16 +447,17 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
         const ts = tailnetListener.address()
         return [...(lan ? [lan.peer] : []), ...(ts ? [ts] : [])]
       },
-      onChange: changed,
+      onChange: devicesChanged,
       log: log.child('pairing'),
     })
     const links = createHubLinks({
       devices,
       pairing,
-      hello: () => ({ ...hello(), hub: bundleOrNull(), ports: portsMod.hello() }),
+      hello: () => ({ ...hello(), hub: bundleOrNull(), ports: portsMod.hello(), stable: stable.table() }),
       subnets,
       onOpen,
-      onChange: changed,
+      onChange: devicesChanged,
+      onHello: (id, h) => stable.offer(id, h.stableBlock),
       log: log.child('links'),
     })
 
@@ -578,6 +624,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       tailnetPeers: () => tailnetPeers.get(),
       tailnetSuffix: () => tailnetPeers.suffix(),
       onPorts: raw => void portsMod.setServer(raw),
+      onStable: raw => void stable.fromServer(raw),
       version: VERSION,
       onOpen,
       // Where the pinned hub's ID answered on the LAN: tried with its stored address.
@@ -636,7 +683,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       discovered: member && !devices.hub() ? member.discovery.list() : [],
       hubRefused: member?.links.refusal() ?? null,
       hubAddress: member?.links.manual() ?? null,
-      ports: portsMod.state(),
+      ports: portsState(),
       settings: { route, stayReachable },
       appScreen: appScreen.status(),
       claude: claude.status(),
@@ -760,10 +807,21 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       changed()
       return { ok: true, address: normal }
     },
-    portsSettings: req => portsMod.settings(req),
-    portShare: req => portsMod.share(req),
-    portUnshare: req => portsMod.unshare(req),
-    portsRefresh: () => portsMod.refresh(),
+    portsSettings: async req => ({ ...(await portsMod.settings(req)), stable: stable.state() }),
+    portShare: async req => ({ ...(await portsMod.share(req)), stable: stable.state() }),
+    portUnshare: async req => ({ ...(await portsMod.unshare(req)), stable: stable.state() }),
+    portsRefresh: async () => ({ ...(await portsMod.refresh()), stable: stable.state() }),
+    // Stable ports (order od91f): Ports shares or unshares them before the answer, so the page sees the result.
+    stableSettings: async req => {
+      await stable.settings(req)
+      await portsMod.refresh()
+      return portsState()
+    },
+    stableChange: async req => {
+      await stable.change(req)
+      await portsMod.refresh()
+      return portsState()
+    },
     cancelJoin: () => {
       needMember()
       join?.cancel()
@@ -891,6 +949,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   portsMod.start()
+  stable.start()
   void checkScreen()
   every(60_000, () => void checkScreen())
   // The CRM decides what Claude here runs on: asked at start and every hour while signed in.
@@ -910,6 +969,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     agentic?.close()
     auth.close()
     void portsMod.close()
+    void stable.close()
     appScreen.close(`The app on ${config.name} stopped`)
     join?.cancel()
     member?.discovery.stop()

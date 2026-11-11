@@ -32,6 +32,7 @@ import {
   type SettingsPatch,
 } from '../shared/agent-api.ts'
 import type { SwitchAutoRequest, SwitchPreview, SwitchRefreshRequest, SwitchRequest, SwitchResponse } from '../shared/claude-switch.ts'
+import { isBlock, type StableChangeRequest, type StableSettingsRequest } from '../shared/stable-ports.ts'
 import type { Auth } from './auth/index.ts'
 import { authRoute } from './auth/routes.ts'
 import { authError, isPageRequest, OPEN, type Caller } from './auth/types.ts'
@@ -103,6 +104,9 @@ export interface ApiActions {
   portShare(req: PortRequest): Promise<PortsState>
   portUnshare(req: PortRequest): Promise<PortsState>
   portsRefresh(): Promise<PortsState>
+  /** Stable ports (order od91f): the two switches, and (the Server only) a PC's four ports. Both answer the new PortsState; apiError 400/409 with the reason. */
+  stableSettings(req: StableSettingsRequest): Promise<PortsState>
+  stableChange(req: StableChangeRequest): Promise<PortsState>
   check(id: string): unknown
   screen(id: string): unknown
   /** A raw stream to that device's screen (its own through the app, or its RustDesk), or to this PC's own (F-014), for the in-app viewer; throws apiError when there is none. */
@@ -298,6 +302,24 @@ function portsSettingsRequest(body: unknown): PortsSettingsRequest {
     out.chosen = body.chosen as number[]
   }
   return out
+}
+
+function stableSettingsRequest(body: unknown): StableSettingsRequest {
+  if (!isObject(body)) throw apiError(400, 'Expected {on?: true|false, share?: true|false}')
+  const out: StableSettingsRequest = {}
+  for (const key of ['on', 'share'] as const) {
+    if (body[key] === undefined) continue
+    if (typeof body[key] !== 'boolean') throw apiError(400, `${key} must be true or false`)
+    out[key] = body[key]
+  }
+  return out
+}
+
+function stableChangeRequest(body: unknown): StableChangeRequest {
+  if (!isObject(body) || typeof body.pc !== 'string' || !/^[a-z2-7]{16}$/.test(body.pc) || !isBlock(body.ports)) {
+    throw apiError(400, "Expected {pc, ports: {chat1, chat2, screen, updates}}: the PC's 16-character ID and four port numbers")
+  }
+  return { pc: body.pc, ports: { chat1: body.ports.chat1, chat2: body.ports.chat2, screen: body.ports.screen, updates: body.ports.updates } }
 }
 
 function forgetRequest(body: unknown): ForgetHubRequest {
@@ -540,6 +562,8 @@ export function startApi(o: ApiOptions): Promise<Api> {
     ['POST', /^\/ports\/share$/, (_, body) => a.portShare(portRequest(body))],
     ['POST', /^\/ports\/unshare$/, (_, body) => a.portUnshare(portRequest(body))],
     ['POST', /^\/ports\/refresh$/, () => a.portsRefresh()],
+    ['POST', /^\/ports\/stable\/settings$/, (_, body) => a.stableSettings(stableSettingsRequest(body))],
+    ['POST', /^\/ports\/stable\/change$/, (_, body) => a.stableChange(stableChangeRequest(body))],
     ['POST', /^\/devices\/([^/]+)\/check$/, ([id]) => a.check(id)],
     ['POST', /^\/devices\/([^/]+)\/screen$/, ([id]) => a.screen(id)],
     ['POST', /^\/devices\/([^/]+)\/remove$/, ([id]) => a.remove(id)],

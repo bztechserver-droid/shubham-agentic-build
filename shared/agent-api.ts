@@ -3,6 +3,7 @@
 // agent/SPEC.md › Local API); the app reaches it through Vite's proxy at AGENT_API_PREFIX.
 
 import type { ClaudeSwitchInfo } from './claude-switch.ts'
+import type { StablePortsState } from './stable-ports.ts'
 
 export const AGENT_API_PREFIX = '/agent-api'
 
@@ -491,6 +492,12 @@ export interface PortsState {
    * once (`sudo tailscale set --operator=$USER`), since only Tailscale's operator (or root) may use `tailscale serve` and `tailscale cert` on Linux.
    */
   tailscaleRights?: { text: string; command: string } | null
+  /**
+   * Stable ports (order od91f, shared/stable-ports.ts): every PC's four fixed ports (Chat 1, Chat 2, Screen, Updates), how this PC answers on them, and the two
+   * switches. Absent from an older agent. Changed through POST /ports/stable/settings {on?, share?} and (the Server only) POST /ports/stable/change {pc, ports};
+   * both answer the new PortsState.
+   */
+  stable?: StablePortsState
 }
 
 /** POST /ports/settings: any of the three; answers the new PortsState. 400 for a bad port, mode or tlsBy. A blocked port in `chosen` is 409 (the text says why). */

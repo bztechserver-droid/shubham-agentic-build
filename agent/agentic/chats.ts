@@ -912,6 +912,8 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return null
       c.viewers.add(viewer)
       c.lastSeen = Date.now()
+      // The size the replay was drawn for comes first, so the page can lay its screen out before it paints it.
+      viewer.send({ t: 'size', cols: c.size.cols, rows: c.size.rows })
       if (c.buffer.length) viewer.send({ t: 'out', d: c.buffer.join('') })
       return () => {
         c.viewers.delete(viewer)
@@ -942,6 +944,17 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         c.size = { cols: w, rows: h }
       } catch {
         // Exited meanwhile.
+        return
+      }
+      // Every viewer is told what the terminal really is now, so one that did not ask for this size does not draw a 178-column screen in
+      // 51 columns. Sent before the redraw the new size makes. A size message is no keystroke: it never touches `inputEpoch`, so a send
+      // in flight is not aborted by it (the sender reads `c.screen`, which was resized together with the pty just above).
+      for (const v of c.viewers) {
+        try {
+          v.send({ t: 'size', cols: w, rows: h })
+        } catch {
+          // That page is gone; its detach follows.
+        }
       }
     },
 

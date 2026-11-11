@@ -49,6 +49,8 @@ export function createCrmWrite(o: CrmWriteOptions) {
   const now = o.now ?? Date.now
   const crm = createCrmCall({ proxy: o.proxy, afterServerError: 'Look in the CRM (crm_query) before trying again: it may have gone through.' })
   const recent = new Map<string, { at: number; reply: string }>()
+  /** Audit o322f: a POST still on its way, by the same key: the same POST made meanwhile (a retry while the first is out) waits for its answer instead of making a second record. */
+  const sending = new Map<string, Promise<string>>()
 
   return {
     async write(args: Record<string, unknown>): Promise<string> {
@@ -74,20 +76,31 @@ export function createCrmWrite(o: CrmWriteOptions) {
       const key = method === 'POST' ? JSON.stringify([method, path, body ?? null]) : null
       const same = key ? recent.get(key) : undefined
       if (same) return JSON.stringify({ note: 'The same thing was sent a moment ago and was not sent again.', first: JSON.parse(same.reply) }, null, 2)
-      const made = await crm<unknown>(method, `v1/org${path}`, body ?? {})
-      const reply = JSON.stringify(
-        {
-          done: true,
-          method,
-          path,
-          ...(isObject(made) && typeof made.id === 'string' ? { id: made.id } : {}),
-          result: summarise(made),
-        },
-        null,
-        2,
-      )
-      if (key) recent.set(key, { at: t, reply })
-      return reply
+      const going = key ? sending.get(key) : undefined
+      if (going) return JSON.stringify({ note: 'The same thing was sent a moment ago and was not sent again.', first: JSON.parse(await going) }, null, 2)
+      const work = (async () => {
+        const made = await crm<unknown>(method, `v1/org${path}`, body ?? {})
+        const reply = JSON.stringify(
+          {
+            done: true,
+            method,
+            path,
+            ...(isObject(made) && typeof made.id === 'string' ? { id: made.id } : {}),
+            result: summarise(made),
+          },
+          null,
+          2,
+        )
+        if (key) recent.set(key, { at: t, reply })
+        return reply
+      })()
+      if (!key) return work
+      sending.set(key, work)
+      try {
+        return await work
+      } finally {
+        sending.delete(key)
+      }
     },
   }
 }

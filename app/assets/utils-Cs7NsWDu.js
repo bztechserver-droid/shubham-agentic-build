@@ -1,0 +1,1 @@
+import{r as e,t}from"./bundle-mjs-D3jwbddg.js";var n=t({extend:{classGroups:{"font-size":[{text:[`display-mega`,`display-xl`,`display-lg`,`display-md`,`display-sm`,`title-md`,`title-sm`,`body-md`,`body-sm`,`caption`,`code`,`code-sm`,`button`,`nav`,`tab`]}]}}});function r(...t){return n(e(t))}export{r as t};

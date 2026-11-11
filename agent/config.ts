@@ -36,6 +36,18 @@ export interface ConfigFile {
   tailnetSearch?: boolean
   /** On mains power, stay out of a sleep that cuts the network, for Control (agent/screen/power.ts). Default true. */
   stayReachable: boolean
+  /** Stable ports (order od91f): this PC's own four (as the Server gave them) and its two switches; agent/ports/stable.ts. Missing = off, none yet. */
+  stablePorts?: StablePortsConfig
+}
+
+/** Stable ports (order od91f): `on` = this PC answers on its stable ports, `share` = also on Tailscale; the four ports come all together or not at all. */
+export interface StablePortsConfig {
+  on: boolean
+  share: boolean
+  chat1?: number
+  chat2?: number
+  screen?: number
+  updates?: number
 }
 
 /** config.json with the SAD_*_PORT overrides applied. The overrides are never written back. */
@@ -85,6 +97,8 @@ export type ConfigPatch = Partial<Omit<ConfigFile, 'ports' | 'lanAddress'>> & {
   ports?: Partial<Ports>
   /** null removes the pin. */
   lanAddress?: string | null
+  /** Order od91f: replaces the whole stablePorts object. */
+  stablePorts?: StablePortsConfig
 }
 
 type Env = Record<string, string | undefined>
@@ -202,7 +216,30 @@ function validate(raw: unknown, file: string): ConfigFile {
     if (typeof raw.stayReachable !== 'boolean') throw bad('stayReachable', 'true or false')
     out.stayReachable = raw.stayReachable
   }
+  if (raw.stablePorts !== undefined) {
+    const s = raw.stablePorts
+    if (!isObject(s)) throw bad('stablePorts', 'an object')
+    for (const key of ['on', 'share'] as const) if (s[key] !== undefined && typeof s[key] !== 'boolean') throw bad(`stablePorts.${key}`, 'true or false')
+    const stable: StablePortsConfig = { on: s.on === true, share: s.share === true }
+    const keys = ['chat1', 'chat2', 'screen', 'updates'] as const
+    if (keys.some(k => s[k] !== undefined)) {
+      for (const k of keys) {
+        const v = s[k]
+        if (!isPort(v)) throw bad(`stablePorts.${k}`, 'a port number (1-65535); the four ports go together')
+        stable[k] = v
+      }
+    }
+    out.stablePorts = stable
+  }
   return out
+}
+
+/** Order od91f: config.json's stablePorts as the stable-ports module takes it (agent/ports/stable.ts StableConfig). */
+export function stableOf(c: Pick<ConfigFile, 'stablePorts'>): { on: boolean; share: boolean; block: { chat1: number; chat2: number; screen: number; updates: number } | null } {
+  const s = c.stablePorts
+  if (!s) return { on: false, share: false, block: null }
+  const block = s.chat1 !== undefined && s.chat2 !== undefined && s.screen !== undefined && s.updates !== undefined ? { chat1: s.chat1, chat2: s.chat2, screen: s.screen, updates: s.updates } : null
+  return { on: s.on, share: s.share, block }
 }
 
 // Written whole to a temp name, then renamed, so a reader never sees half a file.

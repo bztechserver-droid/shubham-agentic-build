@@ -52,6 +52,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/stop$/, SIGNED],
   ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, SIGNED],
   ['GET', /^\/watchdog$/, OWNER],
+  ['GET', /^\/accounts\/email$/, OWNER],
+  ['POST', /^\/accounts\/email\/import$/, OWNER],
   ['GET', /^\/fast\/names$/, OWNER],
   ['POST', /^\/fast\/names$/, OWNER],
   ['GET', /^\/heartbeat$/, OWNER],

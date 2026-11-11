@@ -23,6 +23,24 @@
 //   GET  /mount                         -> CrmMountStatus
 //   POST /mount    {}                   -> CrmMountStatus   (start the drive)
 //   POST /unmount  {}                   -> CrmMountStatus
+//   POST /mount/auto   { on: boolean }  -> CrmMountStatus   (o6e65: mount the drive by itself while the CRM is signed in; ON by default, OFF is the old press-Start way)
+//   POST /mount/driver { via: 'auto' | 'native' | 'winfsp' | 'webdav' } -> CrmMountStatus   (o6e65: how the Windows drive is made; Automatic uses the in-app WinFsp drive (S9a, read-only for now) and falls back to the WinFsp program, then to the built-in WebDAV)
+//   POST /mount/reveal { what: 'drive' | 'pending' | 'recovered' } -> { ok: true }   (o6e65: open File Explorer on one of THREE fixed places; no path is ever taken from the request)
+//
+// od0b1 (U1): uploads of ANY size the CRM takes, in parts, held by the AGENT (no WebDAV in the way, no 5-minute single request). The page sends the file to this PC in parts; the agent
+// keeps them in its pending folder (<agent state>/crm-uploads) and sends them on to Google Drive in CRM_UPLOAD_CHUNK pieces through ONE resumable session (the CRM's own way), with retries,
+// a cap on how many go at once, pause/resume, and it carries on after a restart (Google says how far it got). At the end it checks Google's size and md5 against its own, then makes the
+// CRM record (a new file, or a new version) exactly as the one-request upload above does. The page can close once the bytes are on this PC. No file is ever deleted: cancel ends the
+// upload and drops only the agent's own copy. shared/crm-upload-client.ts is the page's helper for these routes.
+//   GET  /uploads                      -> CrmUploadList         (every upload the agent holds, newest first; done/cancelled ones stay a day)
+//   GET  /uploads?id=<id>              -> CrmUpload
+//   POST /uploads/start  CrmUploadStart -> CrmUpload            (everything is checked FIRST: rights, name, kind of file, size, room on this PC's disk; nothing is sent yet)
+//   PUT  /uploads/part?id=<id>&offset=<n>  body = the next bytes of the file (Content-Length, 1..CRM_UPLOAD_MAX_PART) -> CrmUpload
+//                                         409 'offset' { upload } when offset is not where the agent is (go on from upload.received); 409 'paused' when paused; 409 'busy' while a part is still arriving
+//   POST /uploads/pause  { id }        -> CrmUpload    POST /uploads/resume { id } -> CrmUpload
+//   POST /uploads/retry  { id }        -> CrmUpload    (a failed one: from where Google has it; after a checksum mismatch, from the start)
+//   POST /uploads/cancel { id }        -> CrmUpload    (stops it; the agent's copy is dropped; nothing in the CRM or Google Drive is touched)
+//   POST /uploads/clear  { id }        -> { ok: true } (forgets a done or cancelled one)
 // Errors are { error: <plain sentence>, code } with the status below. A CRM that is not signed in is 409 'crm-signin' (not 401: 401 is this app's own sign-in, F-118).
 
 export const CRM_FILES_BASE = '/agentic/crm-files'
@@ -105,14 +123,33 @@ export interface CrmMountStatus {
   /** Plain sentence for the person when something stops it; null when all is well. */
   reason: string | null
   /** A machine word for the reason, so the page can show the right button: */
-  reasonCode: null | 'driver-missing' | 'crm-signin' | 'letter-taken' | 'host-missing' | 'no-desktop' | 'unsupported' | 'failed'
+  reasonCode: null | 'driver-missing' | 'crm-signin' | 'letter-taken' | 'host-missing' | 'no-desktop' | 'unsupported' | 'webclient' | 'failed'
   /** The driver installer is known and could be offered (with the person's yes). False when none is pinned for this PC yet. */
   installable: boolean
   /** Writes are on (always true for the first build; Shubham asked for the old drive's rights). Delete is never on. */
   writable: boolean
   /** Saves that are still waiting to go up (the old drive kept a pending folder). */
   waiting: number
+  /** o6e65: the drive mounts by itself while the CRM is signed in (the old app did). Left out where the PC has no such thing (Linux). */
+  autoMount?: boolean
+  /** o6e65: where the drive keeps a save until the CRM has it, and where one that could not be put back is kept (never deleted): shown to the person. Windows only. */
+  pendingDir?: string
+  recoveredDir?: string
+  /** S9a2: when (ISO time) the in-app drive was found to have stopped the agent (its marker was still there at the agent's start). While set, the in-app way is OFF (Automatic uses the other ways) until the person chooses In-app or Automatic again. */
+  inAppCrash?: string
+  /** o6e65 (S4, Windows): which way the drive is (or would be) made: the drive program through WinFsp, or Windows' own WebDAV client (nothing to install, no program of ours). */
+  mountVia?: CrmVia
+  /** o6e65: what the person chose: 'auto' (WinFsp, and the built-in WebDAV where the drive program cannot run or WinFsp is missing), or one of the two. */
+  driverChoice?: CrmDriverChoice
 }
+
+export type CrmVia = 'native' | 'winfsp' | 'webdav'
+export type CrmDriverChoice = 'auto' | CrmVia
+export const CRM_DRIVER_CHOICES: readonly CrmDriverChoice[] = ['auto', 'native', 'winfsp', 'webdav']
+
+/** o6e65: the three places the agent will open in File Explorer (and nothing else): the drive itself, the waiting saves, the recovered saves. */
+export type CrmReveal = 'drive' | 'pending' | 'recovered'
+export const CRM_REVEALS: readonly CrmReveal[] = ['drive', 'pending', 'recovered']
 
 export interface CrmFilesStatus {
   /** The CRM is signed in on this PC. */
@@ -124,7 +161,26 @@ export interface CrmFilesStatus {
   mount: CrmMountStatus
 }
 
-export type CrmFilesErrorCode = 'crm-signin' | 'forbidden' | 'notfound' | 'conflict' | 'nodelete' | 'toolarge' | 'badname' | 'crm-down' | 'driver-missing' | 'unsupported' | 'failed'
+export type CrmFilesErrorCode =
+  | 'crm-signin'
+  | 'forbidden'
+  | 'notfound'
+  | 'conflict'
+  | 'nodelete'
+  | 'toolarge'
+  | 'badname'
+  | 'crm-down'
+  | 'driver-missing'
+  | 'unsupported'
+  | 'failed'
+  // od0b1 (uploads in parts): the part is not where the upload is (409, the answer carries { upload }), it is paused (409), a part is still arriving (409), the CRM does not take this kind of file (400),
+  // this PC's disk has no room for it (507), the agent holds too many uploads (429).
+  | 'offset'
+  | 'paused'
+  | 'busy'
+  | 'blocked'
+  | 'nospace'
+  | 'toomany'
 
 /** The statuses: crm-signin 409, forbidden 403, notfound 404, conflict 409 (a name already used in that folder: nothing changed), nodelete 405, toolarge 413, badname 400, crm-down 502. */
 export const CRM_FILES_REASONS = {
@@ -137,6 +193,118 @@ export const CRM_FILES_REASONS = {
   unsupported: 'The CRM drive is for Windows and Linux PCs.',
   noDelete: 'CRM files are never deleted from here. Delete them in the CRM itself.',
   crmDown: 'The CRM did not answer. Try again in a moment.',
+  noFolder: 'That folder does not exist yet: nothing has been saved through the drive.',
+  notMounted: 'The drive is not mounted.',
+} as const
+
+// ---- od0b1 (U1): uploads in parts, held by the agent ------------------------------------------------------------------
+
+/** Google's unit: every piece of a resumable upload but the last is a whole number of these (256 KiB). */
+export const CRM_UPLOAD_UNIT = 256 * 1024
+/** What the agent sends to Google in one request (16 MiB: a multiple of CRM_UPLOAD_UNIT; Google asks for at least 8 MiB for speed). A broken line costs at most this much. */
+export const CRM_UPLOAD_CHUNK = 16 * 1024 * 1024
+/** What the page sends to the agent in one request by default (8 MiB); any size from 1 byte up to CRM_UPLOAD_MAX_PART is taken. */
+export const CRM_UPLOAD_PART = 8 * 1024 * 1024
+export const CRM_UPLOAD_MAX_PART = 64 * 1024 * 1024
+/** How many uploads go to Google at the same time (the rest wait their turn). */
+export const CRM_UPLOAD_PARALLEL = 3
+
+/**
+ * Where an upload is:
+ *   receiving  the page is still sending the file to this PC (what is here already goes on to Google)
+ *   waiting    waiting for its turn, or for its next try after a broken line (`note`, `retryAt`)
+ *   sending    going to Google Drive now
+ *   saving     all in Google Drive; the CRM is being told (its record, or the new version)
+ *   paused     stopped by the person; resume carries on where it was
+ *   failed     stopped for a reason in `note` (a retry may fix it); the bytes are kept on this PC
+ *   done       in the CRM (`node`); the agent's copy is gone
+ *   cancelled  stopped for good by the person; the agent's copy is gone; nothing was changed in the CRM
+ */
+export type CrmUploadState = 'receiving' | 'waiting' | 'sending' | 'saving' | 'paused' | 'failed' | 'done' | 'cancelled'
+
+export type CrmUploadKind = 'new' | 'version'
+
+export interface CrmUploadStart {
+  /** 'new': a new file into `target` (a project or one of its groups); 'version': a new version of the file `target`. */
+  kind: CrmUploadKind
+  target: string
+  /** The file's name (a new version keeps the CRM's own name for the record). */
+  name: string
+  type?: string
+  size: number
+  /** The page's file's lastModified (ms), kept so the same file can be matched after a reload. */
+  lastModified?: number
+  /** A key the page makes once per file: the same start sent twice (a retried request) gives the same upload. */
+  clientKey?: string
+}
+
+export interface CrmUpload {
+  id: string
+  kind: CrmUploadKind
+  target: string
+  name: string
+  type: string
+  size: number
+  lastModified?: number
+  clientKey?: string
+  /** Bytes this PC has of the file. */
+  received: number
+  /** Bytes Google Drive has. */
+  sent: number
+  state: CrmUploadState
+  /** A plain sentence when it waits for a reason or failed; null when all is well. */
+  note: string | null
+  /** A machine word for the note (a CrmFilesErrorCode, or 'network' / 'google' / 'integrity' / 'copy-gone'). */
+  code?: string
+  /** While it waits after a broken line: when the next try is (ms since 1970). */
+  retryAt?: number
+  /** done: how the copy in Google Drive was checked: its md5 matched ('md5'), or Google gave none and its size matched ('size'). */
+  checked?: 'md5' | 'size'
+  /** done: the file in the CRM. */
+  node?: CrmNode
+  /** done, when the name was taken meanwhile: the name the CRM keeps it under ("Report (2).pdf"). */
+  savedAs?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface CrmUploadList {
+  uploads: CrmUpload[]
+  /** The most one file may be (the CRM's own rule), the part size the agent likes, how many go at once. */
+  maxSize: number
+  partSize: number
+  parallel: number
+}
+
+/** The kinds of file the CRM's backend refuses to record (sam-crm-be middleware/fileValidation.js, 11 Nov 2026): refused BEFORE any byte goes up. */
+export const CRM_BLOCKED_EXTENSIONS: readonly string[] = ['.exe', '.bat', '.cmd', '.com', '.msi', '.scr', '.pif', '.vbs', '.vbe', '.js', '.ws', '.wsf', '.wsc', '.wsh', '.ps1', '.ps2', '.psc1', '.psc2', '.reg', '.inf', '.lnk']
+export const CRM_BLOCKED_TYPES: readonly string[] = ['application/x-msdownload', 'application/x-executable', 'application/x-dosexec', 'application/x-msdos-program', 'text/x-sh', 'text/x-shellscript']
+
+/** Why the CRM would refuse this file's kind, or null. (Its own check, done here first so a 400 MB upload is not sent only to be refused.) */
+export function blockedKind(name: string, type?: string): string | null {
+  const dot = name.lastIndexOf('.')
+  const ext = dot === -1 ? '' : name.slice(dot).trim().toLowerCase()
+  if (ext && CRM_BLOCKED_EXTENSIONS.includes(ext)) return `The CRM does not take ${ext} files.`
+  if (type && CRM_BLOCKED_TYPES.includes(type.trim().toLowerCase())) return `The CRM does not take files of the type ${type.trim()}.`
+  return null
+}
+
+export const CRM_UPLOAD_REASONS = {
+  tooLarge: (max: number) => `A file is at most ${Math.round(max / 1024 / 1024)} MB in the CRM (its own rule).`,
+  noSpace: 'This PC does not have room for that file in its waiting folder. Free some disk space and start again.',
+  tooMany: 'This PC is holding too many uploads. Let some finish (or cancel some) first.',
+  paused: 'That upload is paused. Resume it first.',
+  busy: 'A part of that upload is still arriving. Wait for it.',
+  ended: 'That upload has ended.',
+  gone: 'That upload is not known (it may have ended a while ago).',
+  network: 'The line to Google Drive broke. Trying again.',
+  google: 'Google Drive did not take it. Trying again.',
+  googleRefused: 'Google Drive refused the upload.',
+  crmDown: 'The CRM did not answer. Trying again.',
+  signIn: 'The CRM is not signed in on this PC. It carries on once it is.',
+  integrity: 'The copy in Google Drive does not match this file (its checksum differs), so the CRM was not told. Retry sends it again.',
+  copyGone: "This PC's copy of the file is gone. Upload it again.",
+  needFile: 'The page was closed before the whole file reached this PC. Pick the same file again to go on.',
 } as const
 
 // ---- fixtures, for the page's tests and for a mock (fake names only) -------------------------------------------------
@@ -159,9 +327,11 @@ export const CRM_FILES_FIXTURE: CrmNode[] = [
   { id: 'file:66666666-6666-4666-8666-666666666666', kind: 'file', name: 'INV-2026-114.pdf', parentId: 'cat:invoices', isFolder: false, size: 91_377, type: 'application/pdf', createdAt: '2026-10-30T11:11:00.000Z', modifiedAt: '2026-10-30T11:11:00.000Z', versions: 1, rights: READ },
 ]
 
-export const CRM_MOUNT_FIXTURE: Record<'ready' | 'running' | 'winfspMissing' | 'signedOut' | 'linuxNoGvfs' | 'linuxNoDesktop', CrmMountStatus> = {
-  ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0 },
-  running: { supported: true, driver: 'installed', driverName: 'WinFsp', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 2 },
+export const CRM_MOUNT_FIXTURE: Record<'ready' | 'running' | 'native' | 'webdav' | 'winfspMissing' | 'signedOut' | 'linuxNoGvfs' | 'linuxNoDesktop', CrmMountStatus> = {
+  ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0, autoMount: true, mountVia: 'winfsp', driverChoice: 'auto', pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
+  running: { supported: true, driver: 'installed', driverName: 'WinFsp', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 2, autoMount: true, pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
+  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto' },
+  webdav: { supported: true, driver: 'installed', driverName: 'Windows WebDAV (built in)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: false, writable: true, waiting: 0, autoMount: true, mountVia: 'webdav', driverChoice: 'auto' },
   winfspMissing: { supported: true, driver: 'missing', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.winfspMissing, reasonCode: 'driver-missing', installable: true, writable: true, waiting: 0 },
   signedOut: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.signedOut, reasonCode: 'crm-signin', installable: true, writable: true, waiting: 0 },
   linuxNoGvfs: { supported: true, driver: 'missing', driverName: 'GNOME Files (gvfs)', running: false, mounted: false, where: 'Files › CRM files', reason: CRM_FILES_REASONS.gvfsMissing, reasonCode: 'driver-missing', installable: false, writable: true, waiting: 0 },

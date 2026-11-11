@@ -36,6 +36,8 @@ export interface BlockContext {
   appMarker: string | null
   /** The app's own page port (SAD_UI_PORT, 5173): the one app port that may be shared like any page (Lead, 5 Nov). Its page server forwards /agent-api, so sharing it lets every device of the tailnet use this PC's app. */
   pagePort: number
+  /** Stable ports (order od91f): the ports this agent answers on as the app's page at one PC's tab. Shared like the page port, never blocked as the app's. */
+  pagePorts?: ReadonlySet<number>
   /** F-116: the agent runs on Linux, where the system's own ports are told by their account (uid) and their service names. */
   linux?: boolean
   /** F-116: the agent's own account (Linux). When it is not root, its own sockets never count as the system's, whatever its number. */
@@ -146,7 +148,7 @@ export function blockOf(l: Listen, procs: ReadonlyMap<number, Proc>, ctx: BlockC
   if (l.port < 1024) return block('low')
   if (RESERVED.includes(l.port)) return block('reserved')
   // By process first. The port number is only the fallback for a process that cannot be identified: a dev server that happens to sit on an app port is not the app.
-  if (l.port !== ctx.pagePort && (isAppProcess(l.pid, procs, ctx) || (unidentified(proc) && (ctx.appPorts.has(l.port) || RUSTDESK_PORTS.includes(l.port))))) return block('app')
+  if (l.port !== ctx.pagePort && !ctx.pagePorts?.has(l.port) && (isAppProcess(l.pid, procs, ctx) || (unidentified(proc) && (ctx.appPorts.has(l.port) || RUSTDESK_PORTS.includes(l.port))))) return block('app')
   if (proc && TAILSCALE_NAMES.has(proc.name)) return block('tailscale')
   if (WINDOWS_PORTS.has(l.port) || l.pid === 4 || l.pid === 0 || (proc && WINDOWS_NAMES.has(proc.name))) return block('windows')
   // F-116: on Linux, a socket of a system account (root, a service's own account, nobody) or a known system service.
