@@ -49,6 +49,8 @@ export interface SpoolSender {
   version(id: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   /** The file or folder of that name in the folder, or null. A new save of a name that is already a CRM file becomes a new version of it (as the drive did when the save was direct). */
   find(parent: string, name: string): Promise<CrmNode | null>
+  /** S7: why this save is kept on this PC only (a .driveignore rule matches), or null when it goes to the CRM. Asked before every send and again by `reconsider`. */
+  ignored?(job: { kind: 'new' | 'version'; parent: string; target: string | null; name: string }): Promise<string | null>
 }
 
 export interface SpoolOptions {
@@ -57,6 +59,8 @@ export interface SpoolOptions {
   now?: () => number
   retryMs?: number[]
   maxBytes?: number
+  /** S7: how often (ms) the .driveignore rules are asked again about every save (default: never; the service sets 60 s). */
+  reconsiderMs?: number
   /** Something left the spool (it is in the CRM now): the listing of the CRM should be read again. */
   onChange?: () => void
   log?: { info(m: string): void; warn(m: string): void }
@@ -76,6 +80,8 @@ export interface SaveRequest {
   size: number
   /** S9b: kept but not to be sent: the CRM would refuse it (a right that went away while the file was open). It is listed as refused with these words, until the person says Try again. */
   parked?: string
+  /** S7: kept on this PC only because a .driveignore rule matches (these words). Never sent, never deleted; listed as ignored. */
+  ignored?: string
 }
 
 export interface Spool {
@@ -83,7 +89,16 @@ export interface Spool {
   /** Keeps the bytes (all of them, or it throws and keeps nothing) and returns at once; the worker sends them. */
   add(r: SaveRequest): Promise<CrmSpoolEntry>
   list(): CrmSpoolEntry[]
+  /** Saves that wait to go to the CRM (the ones kept here by a .driveignore rule are not waiting for anything). */
   count(): number
+  /** S7: saves kept on this PC only by a .driveignore rule. */
+  keptHere(): number
+  /** S6: every save kept for a project (its folders too), whatever state it is in. */
+  forProject(pid: string): CrmSpoolEntry[]
+  /** S6: access to a project came back: its REFUSED saves get these words (they are never sent by themselves: the person says Try again). Returns how many were changed. */
+  noteProject(pid: string, reason: string): number
+  /** S7: asks the rules again about every save that is not going up now: one that now matches is kept here, one that no longer matches is queued. Returns how many changed. */
+  reconsider(): Promise<number>
   /** A new file waiting in that folder under that name. */
   pendingNew(parent: string, name: string): CrmSpoolEntry | null
   pendingIn(parent: string): CrmSpoolEntry[]
@@ -126,7 +141,7 @@ const isJob = (v: unknown): v is Job => {
   const j = v as Record<string, unknown>
   return (
     typeof j.id === 'string' && ID.test(j.id) && (j.kind === 'new' || j.kind === 'version') && typeof j.parent === 'string' && typeof j.name === 'string' && typeof j.file === 'string' && j.file !== '' && !/[\\/]/.test(j.file) &&
-    typeof j.size === 'number' && Number.isFinite(j.size) && j.size >= 0 && typeof j.createdAt === 'string' && (j.state === 'waiting' || j.state === 'unreachable' || j.state === 'refused')
+    typeof j.size === 'number' && Number.isFinite(j.size) && j.size >= 0 && typeof j.createdAt === 'string' && (j.state === 'waiting' || j.state === 'unreachable' || j.state === 'refused' || j.state === 'ignored')
   )
 }
 
@@ -142,6 +157,7 @@ export function createSpool(o: SpoolOptions): Spool {
   let running: Promise<void> | null = null
   let closed = false
   let started = false
+  let reconsiderTimer: ReturnType<typeof setInterval> | null = null
 
   const folderOf = (id: string) => path.join(dir, id)
   const noteOf = (id: string) => path.join(folderOf(id), SPOOL_JOURNAL)
@@ -191,7 +207,7 @@ export function createSpool(o: SpoolOptions): Spool {
     const seen = new Set<string>()
     let wait: number | null = null
     for (const j of ordered()) {
-      if (j.state === 'refused') continue
+      if (j.state === 'refused' || j.state === 'ignored') continue
       const k = keyOf(j)
       const blocked = seen.has(k)
       seen.add(k)
@@ -236,6 +252,15 @@ export function createSpool(o: SpoolOptions): Spool {
     sending.add(j.id)
     let stream: Readable | null = null
     try {
+      // A .driveignore rule that matches keeps it on this PC: nothing is sent, nothing is counted as a failure.
+      const why = o.send.ignored ? await o.send.ignored({ kind: j.kind, parent: j.parent, target: j.target, name: j.name }).catch(() => null) : null
+      if (why) {
+        j.state = 'ignored'
+        j.reason = why
+        j.nextAt = Number.MAX_SAFE_INTEGER
+        persist(j)
+        return
+      }
       const file = path.join(folderOf(j.id), j.file)
       const st = statSync(file)
       if (st.size !== j.size) throw new CrmFilesError(400, 'failed', 'The kept copy of this save is damaged (its size is not what was saved). It is kept; nothing was sent.')
@@ -335,9 +360,9 @@ export function createSpool(o: SpoolOptions): Spool {
       createdAt: new Date(now()).toISOString(),
       file,
       attempts: 0,
-      state: r.parked ? 'refused' : 'waiting',
-      reason: r.parked ?? null,
-      nextAt: r.parked ? Number.MAX_SAFE_INTEGER : 0,
+      state: r.ignored ? 'ignored' : r.parked ? 'refused' : 'waiting',
+      reason: r.ignored ?? r.parked ?? null,
+      nextAt: r.ignored || r.parked ? Number.MAX_SAFE_INTEGER : 0,
     }
     try {
       persist(j)
@@ -347,7 +372,7 @@ export function createSpool(o: SpoolOptions): Spool {
     }
     // A newer save of the same document that has not started to go up replaces the older one (the same name in the same folder, or the same file).
     for (const old of [...jobs.values()]) {
-      if (keyOf(old) === keyOf(j) && (old.state === 'waiting' || old.state === 'unreachable') && !sending.has(old.id)) {
+      if (keyOf(old) === keyOf(j) && (old.state === 'waiting' || old.state === 'unreachable' || old.state === 'ignored') && !sending.has(old.id)) {
         jobs.delete(old.id)
         rmSync(folderOf(old.id), { recursive: true, force: true })
       }
@@ -361,7 +386,49 @@ export function createSpool(o: SpoolOptions): Spool {
     dir,
     add,
     list: () => ordered().map(entryOf),
-    count: () => jobs.size,
+    count: () => [...jobs.values()].filter(j => j.state !== 'ignored').length,
+    keptHere: () => [...jobs.values()].filter(j => j.state === 'ignored').length,
+    forProject: pid => ordered().filter(j => j.parent === `proj:${pid}` || j.parent.startsWith(`grp:${pid}:`)).map(entryOf),
+    noteProject(pid, reason) {
+      let n = 0
+      for (const j of jobs.values()) {
+        if (j.state !== 'refused' || !(j.parent === `proj:${pid}` || j.parent.startsWith(`grp:${pid}:`)) || j.reason === reason) continue
+        j.reason = reason
+        try {
+          persist(j)
+        } catch {
+          // kept in memory
+        }
+        n++
+      }
+      return n
+    },
+    async reconsider() {
+      if (!o.send.ignored) return 0
+      let changed = 0
+      for (const j of [...jobs.values()]) {
+        if (sending.has(j.id) || j.state === 'refused') continue
+        const why = await o.send.ignored({ kind: j.kind, parent: j.parent, target: j.target, name: j.name }).catch(() => undefined)
+        if (why === undefined) continue // the rules could not be read: nothing changes on a guess
+        if (why && j.state !== 'ignored') {
+          j.state = 'ignored'
+          j.reason = why
+          j.nextAt = Number.MAX_SAFE_INTEGER
+        } else if (!why && j.state === 'ignored') {
+          j.state = 'waiting'
+          j.reason = null
+          j.nextAt = 0
+        } else continue
+        changed++
+        try {
+          persist(j)
+        } catch {
+          // kept in memory
+        }
+      }
+      if (changed) kick()
+      return changed
+    },
     pendingNew(parent, name) {
       const j = ordered().find(x => x.kind === 'new' && x.parent === parent && x.name.toLowerCase() === name.toLowerCase())
       return j ? entryOf(j) : null
@@ -394,7 +461,7 @@ export function createSpool(o: SpoolOptions): Spool {
     },
     retarget(id, to) {
       const j = jobs.get(id)
-      if (!j || j.kind !== 'new' || sending.has(id) || j.state === 'refused') return false
+      if (!j || j.kind !== 'new' || sending.has(id) || j.state === 'refused' || j.state === 'ignored') return false
       j.kind = 'version'
       j.target = to.target
       j.name = to.name
@@ -415,7 +482,7 @@ export function createSpool(o: SpoolOptions): Spool {
       let n = 0
       for (const j of jobs.values()) {
         if (id && j.id !== id) continue
-        if (sending.has(j.id)) continue
+        if (sending.has(j.id) || j.state === 'ignored') continue
         j.state = 'waiting'
         j.reason = null
         j.nextAt = 0
@@ -431,6 +498,10 @@ export function createSpool(o: SpoolOptions): Spool {
     },
     start() {
       started = true
+      if (o.reconsiderMs && !reconsiderTimer) {
+        reconsiderTimer = setInterval(() => void this.reconsider().catch(() => undefined), o.reconsiderMs)
+        reconsiderTimer.unref?.()
+      }
       kick()
     },
     async settled() {
@@ -446,6 +517,8 @@ export function createSpool(o: SpoolOptions): Spool {
     },
     async close() {
       closed = true
+      if (reconsiderTimer) clearInterval(reconsiderTimer)
+      reconsiderTimer = null
       if (timer) clearTimeout(timer)
       timer = null
       await running?.catch(() => undefined)

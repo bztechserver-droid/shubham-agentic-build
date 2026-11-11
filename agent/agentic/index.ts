@@ -62,6 +62,7 @@ import {
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
 import { deliveryBlockWords, diagnosticWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
+import { readDraftClear, readDraftView } from '../../shared/chat-draft.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
 import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
@@ -365,6 +366,8 @@ export interface AgenticOptions {
   currentBuild?: () => string | null
   /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
   orderReplies?: boolean
+  /** Order-reply carrier (11 Nov), tests: shorter waits for claude's report of a typed reply and before a reply that was not taken is typed again. */
+  orderReplyWaits?: { confirmMs: number; retypeAfterMs: number[] }
   /**
    * The Assistant's chat is restarted (its conversation resumes) when the tool list its MCP process was given is not the one now, so a new tool reaches a chat that
    * was running at an Update. On; SAD_ASSISTANT_TOOLS_REFRESH=0, or an assistant-tools-refresh.off file in this folder, switches it off. Tests set it.
@@ -2682,6 +2685,34 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return r === true
   }
 
+  /** o4743: the running chat a draft question is about, after the access check (the same as typing in it); where it runs is `pcId`. */
+  function draftTarget(id: string, agentId: string, r: Parameters<typeof callerOf>[0]): { sessionId: string; pcId: string } {
+    const agent = agentOf(floorOf(id), agentId)
+    access.needChat(callerOf(r), agent, 'type', 'draft')
+    const sessionId = agent.sessionId, live = sessionId ? whereAll()[sessionId] : undefined
+    if (!sessionId || !live) throw apiError(409, "This chat isn't running, so it has no input line.")
+    if (switchFences.blocked(sessionId)) throw apiError(409, 'This chat is changing engines. Try again when it has finished.')
+    return { sessionId, pcId: live.id }
+  }
+  const olderPc = (e: unknown) => (e as { code?: string })?.code === 'unknown-op' || /this PC doesn't do draft-/i.test(message(e))
+  async function draftAt(id: string, agentId: string, r: Parameters<typeof callerOf>[0], op: 'draft-read'): Promise<unknown> {
+    const t = draftTarget(id, agentId, r)
+    if (t.pcId === self().id) return chats.draftView?.(t.sessionId) ?? null
+    const link = team?.member(t.pcId)
+    if (!link) throw apiError(409, 'That chat runs on another PC that is not connected right now. Open the terminal there.')
+    try { return readDraftView(await request<unknown>(link, op, { sessionId: t.sessionId }, 5000)) }
+    catch (e) { throw apiError(409, olderPc(e) ? 'That chat runs on a PC with an older build that cannot show its input line from here. Open the terminal.' : 'That PC did not answer. Open the terminal.') }
+  }
+  async function clearDraftAt(id: string, agentId: string, r: Parameters<typeof callerOf>[0]): Promise<unknown> {
+    const t = draftTarget(id, agentId, r)
+    log?.info(`chat ${t.sessionId.slice(0, 8)}: clear the input line asked from the page (${callerOf(r).person ? `person ${callerOf(r).person!.id}` : 'app'})`)
+    if (t.pcId === self().id) return chats.clearDraft?.(t.sessionId) ?? { result: 'unsupported', draft: null }
+    const link = team?.member(t.pcId)
+    if (!link) throw apiError(409, 'That chat runs on another PC that is not connected right now. Open the terminal there.')
+    try { return readDraftClear(await request<unknown>(link, 'draft-clear', { sessionId: t.sessionId }, 8000)) }
+    catch (e) { throw apiError(409, olderPc(e) ? 'That chat runs on a PC with an older build that cannot clear its input line from here. Open the terminal.' : 'That PC did not answer. Open the terminal.') }
+  }
+
   /** F-193: before an agent's message the live mirror's own text is taken out of the line (and typed back after it); while he types: refused (409). */
   async function mirrorYields(sid: string) {
     const r = await (chats.mirrorTakeOut?.(sid) ?? Promise.resolve('none'))
@@ -2869,6 +2900,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (w && (atPrompt(assistantSid) || hasDraft(assistantSid))) return false
       return w ? typeInto({ sessionId: assistantSid, id: w.id }, body).catch(() => false) : false
     },
+    // Order-reply carrier (11 Nov): a typed reply is in only when the Assistant's claude reports it took exactly that text (its UserPromptSubmit hook).
+    taken: (assistantSid, body, since) => chats.promptTaken?.(assistantSid, body, since) ?? null,
+    ...(o.orderReplyWaits ? { waits: o.orderReplyWaits } : {}),
   })
   function orderReplies(): boolean {
     return o.orderReplies ?? !(process.env.SAD_ORDER_REPLIES === '0' || existsSync(path.join(o.dir, 'order-replies.off')))
@@ -5263,6 +5297,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { ok: true, sent: true }
       },
     ],
+    // o4743: what the chat's input line holds as the draft check reads it (the page's "Inspect terminal"), and one tap that clears an unsent
+    // draft there (Ctrl+U / Ctrl+K, never Esc or Ctrl+C; nothing is sent). Whoever may type in the chat; a chat on another PC is asked over the link.
+    ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/draft$/, async ([id, agentId], r) => ({ draft: await draftAt(id, agentId, r, 'draft-read') })],
+    ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/draft\/clear$/, ([id, agentId], r) => clearDraftAt(id, agentId, r)],
     ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries$/, () => ({ version: 1, idempotent: true, expectedSessionId: true, receipts: true })],
     ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries\/([^/]+)$/, ([id, agentId, messageId], r) => {
       const receipt = messageReceipts.lookup(messageId, deliveryActor(r), id, agentId)
@@ -5745,6 +5783,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const t = chats.read(raw.sessionId, typeof raw.lines === 'number' ? raw.lines : 100)
             if (t === null) throw apiError(404, "That chat isn't running here")
             return t
+          })
+        // o4743: the hub asks what this PC's chat holds in its input line, and asks it to clear an unsent draft there.
+        case 'draft-read':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')
+            const v = chats.draftView?.(raw.sessionId) ?? null
+            if (!v) throw apiError(404, "That chat isn't running here")
+            return v
+          })
+        case 'draft-clear':
+          return answer(raw => {
+            if (!isObject(raw) || typeof raw.sessionId !== 'string') throw apiError(400, 'Expected {sessionId}')
+            const current = bySession(raw.sessionId)
+            if (current) assertPcControlTarget(current.floor, self().id, {})
+            return chats.clearDraft?.(raw.sessionId) ?? { result: 'unsupported', draft: null }
           })
         case 'screen':
           // What its screen shows now (Approvals reads a prompt from this, not from the scroll-back).

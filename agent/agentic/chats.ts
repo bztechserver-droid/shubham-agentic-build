@@ -9,6 +9,9 @@ import type { DeliveryBlockReason, DeliveryCause, DeliveryMark } from '../../sha
 import * as cxs from '../codex/screen.ts'
 import { sendToCodex, type DeliveryReport, type SendOptions, type SendResult } from '../codex/sender.ts'
 import { ANY_CLAUDE_CHIP_RE, isOwnedClaudeChip } from './claude-paste.ts'
+import { classifyBox } from './draft-reading.ts'
+import { isDraftKind, MAX_DRAFT_SHOWN, type ClearResult, type DraftKind, type DraftView } from '../../shared/chat-draft.ts'
+import { unwrapPaste } from './chatview.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, readTurnState, type Screen } from './screen.ts'
@@ -117,6 +120,25 @@ export function backgroundWork(lines: readonly string[]): string | null {
 const PASTE_START = '\u001b[200~'
 const PASTE_END = '\u001b[201~'
 
+/**
+ * A prompt as words only, for comparing what was sent with what claude's UserPromptSubmit hook said it took (o655f Stage 1). PROVEN on
+ * 2.1.322 with his account's settings (11 Nov, C:\saw\carrier-20261111\logs\probe-real.log): a long paste (3+ lines or over 800 characters)
+ * reaches the hook WRAPPED, `\n\n<pasted_content id="530a">\n the words \n</pasted_content id="530a">\n`, so claude's own pair is taken off
+ * first (chatview.ts unwrapPaste); a prompt the hook cut at 20,000 characters has lost its closing tag, so then the opening one goes too.
+ * Then no whitespace at all.
+ */
+export function squashPrompt(text: string, cut = false): string {
+  const bare = unwrapPaste(text)
+  return (cut ? bare.replace(/<pasted_content id="[^"]*">/g, '') : bare).replace(/\s+/g, '')
+}
+
+/** Did claude take exactly `sent` (paste markers off) as a prompt since `since`, by its hook's reports? One rule for a send's confirmation and an order's reply. */
+export function promptTook(seen: readonly { norm: string; cut: boolean; at: number }[] | undefined, sent: string, since: number): boolean {
+  if (!seen?.length) return false
+  const want = squashPrompt(sent.split(PASTE_END).join(''))
+  return seen.some(p => p.at >= since && (p.norm === want || (p.cut && p.norm !== '' && want.startsWith(p.norm))))
+}
+
 export interface StartChat {
   /** Backend-owned managed launch; never accepted directly from an HTTP body. */
   bridge?: { descriptorFile: string; runId: string; binding: import('../../shared/chat-execution.ts').ExecutionSnapshot; wrapperPath: string }
@@ -197,14 +219,23 @@ export interface ChatPool {
   asking(sessionId: string): boolean
   /** Is there unsent text in its idle input box (Shubham is typing there)? Anything pasted would join it. False when it isn't running here. */
   drafting(sessionId: string): boolean
+  /** o4743: exactly what the input line holds, as the draft check reads it (what "Inspect terminal" shows); null when it isn't running here. */
+  draftView?(sessionId: string): DraftView | null
+  /** o4743: clears an unsent draft from its input line with Ctrl+U / Ctrl+K (never Esc or Ctrl+C); nothing is sent. */
+  clearDraft?(sessionId: string): Promise<{ result: ClearResult; draft: DraftView | null }>
   /**
    * Pastes `text` and presses Enter (send_to_chat); false when it isn't running. `refuseDraft`: types NOTHING and answers false
    * when the idle input box holds unsent text of Shubham's (the paste would join it and one Enter would send both); a grey
    * suggestion is not a draft.
    */
   type(sessionId: string, text: string, opt?: { refuseDraft?: boolean }): boolean
-  /** o655f (Stage 1): claude's UserPromptSubmit hook reported that this chat took 	ext (length: its full length, when the text here was cut) as prompt promptId; a send waiting for exactly that text is confirmed. */
+  /** o655f (Stage 1): claude's UserPromptSubmit hook reported that this chat took `text` (length: its full length, when the text here was cut) as prompt promptId; a send waiting for exactly that text is confirmed. */
   promptSeen?(sessionId: string, text: string, length: number, promptId: string | null, claudeSessionId?: string | null): void
+  /**
+   * Order-reply carrier (11 Nov): did claude take exactly `text` as a prompt since `since` (ms), by its own hook (promptSeen)? The same rule as a
+   * send's confirmation (promptTook). null: it cannot say (not running here, or its hook has not spoken since the chat started here).
+   */
+  promptTaken?(sessionId: string, text: string, since: number): boolean | null
   /** o655f (Stage 1): the session id claude is on now for this chat when it differs from the chat's own (/clear, /resume), else null. */
   claudeSession?(sessionId: string): string | null
   /** Await actual input acceptance; legacy type() only reports scheduling. */
@@ -304,6 +335,10 @@ export interface ChatPoolOptions {
   env?: NodeJS.ProcessEnv
   /** Ends a process and its children, given when it started. Tests with a fake pty, whose pid is some other process's, pass a no-op. */
   treeKill?: (pid: number, startedAt?: number) => void
+  /** o4743, tests: how long the second look at an "unsent draft" waits (default 150 ms). */
+  draftRecheckMs?: number
+  /** o4743, tests: how long one paste waits for its line to read clear before the next one goes in (default 4000 ms). */
+  pasteSettleMs?: number
   /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
   settings?: string
   /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
@@ -356,6 +391,8 @@ interface Chat {
   state: ChatState
   carry: string
   buffer: string[]
+  /** o178e: the size the terminal had while each piece of uffer was printed (null: not known, a replay given by the chat host). Same length as uffer. */
+  sizes: ({ cols: number; rows: number } | null)[]
   bytes: number
   viewers: Set<Viewer>
   exited: boolean
@@ -380,11 +417,16 @@ interface Chat {
   /** F-193: the live mirror of its input line (made when a chat box first asks), until when the old direct paste is in flight, and when a person last typed in it. */
   mirror?: InputMirror
   pastingUntil?: number
+  /** o4743: the paste in flight (one at a time per chat) and how many wait behind it. */
+  pasteChain?: Promise<void>
+  pasteQueued?: number
   /** o655f (Stage 1): the prompts claude said it TOOK (its UserPromptSubmit hook): the text with its whitespace squashed, whether that text was cut, its prompt id, when. The last 30. */
   seen?: { norm: string; cut: boolean; id: string | null; at: number }[]
   /** o655f (Stage 1): the session id claude says it is on NOW when it is not the chat's own (after /clear or /resume claude starts a new session and a new file). */
   claudeSid?: string
   typedAt?: number
+  /** o4743: the last input that reached the terminal: when, what kind (never the words) and from where; for the log only. */
+  lastInput?: { at: number; kind: string; via: 'page' | 'app' }
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
@@ -431,28 +473,64 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
    * those cells blanked (Screen.typedLines); what is left is what a person typed. Anything pasted now would join a draft,
    * and the Enter would send both as one message.
    */
-  function boxComposer(lines: string[], typed: string[] = lines): string | null {
+  /** o4743: the lowest input box classified (draft-reading.ts: typed text, a chip, Claude's grey suggestion, one of its hint lines); null when none is drawn. */
+  function readBox(lines: string[], typed: string[] = lines) {
     const box = inputBox(lines)
     if (!box) return null
-    const text = [typed[box.start].replace(/^\s*❯/, ''), ...typed.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
-    // A pasted-text chip ("[Pasted text #3 +4 lines]") is real input in whatever colour the TUI draws it, never a grey suggestion: a box
-    // holding one is never empty, even where the typed-cells view blanked it.
-    if (typed !== lines) {
-      const raw = [lines[box.start].replace(/^\s*❯/, ''), ...lines.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
-      if (ANY_CLAUDE_CHIP_RE.test(raw)) return raw
-    }
-    return /^Try "/.test(text) ? '' : text
+    const join = (rows: string[]) => [rows[box.start].replace(/^\s*❯/, ''), ...rows.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
+    return { ...classifyBox(join(lines), join(typed)), rows: box.end - box.start }
   }
-  const boxText = (lines: string[], typed = lines) => boxComposer(lines, typed) ?? ''
-  function draftOnScreen(c: Chat): boolean {
+  function boxComposer(lines: string[], typed: string[] = lines): string | null {
+    const r = readBox(lines, typed)
+    return r === null ? null : r.text
+  }
+  /** o4743: what the input line holds right now (the draft check, the "Inspect terminal" panel and the clear all read this one thing). */
+  interface DraftReading { kind: DraftKind; text: string; ignored: string; rows: number }
+  const reading = (kind: DraftKind, text = '', ignored = '', rows = 0): DraftReading => ({ kind, text, ignored, rows })
+  function draftReading(c: Chat): DraftReading {
     try {
-      if (c.engine === 'codex') return !menuOnScreen(c) && cxs.draftText(c.screen.lines()) !== ''
-      if (menuOnScreen(c) || boxText(c.screen.lines(), c.screen.typedLines()) === '') return false
+      if (c.engine === 'codex') {
+        if (menuOnScreen(c)) return reading('menu')
+        const t = cxs.draftText(c.screen.lines())
+        return t === '' ? reading('none') : reading('typed', t, '', 1)
+      }
+      if (menuOnScreen(c)) return reading('menu')
+      const r = readBox(c.screen.lines(), c.screen.typedLines())
+      if (r === null) return reading('no-box')
       // F-193: the live mirror's own text counts as his draft only while he types in a chat box (20 s); otherwise another message takes
       // it out of the line and the mirror types it back after (paste, deliver).
-      return !c.mirror?.owned() || c.mirror.typing()
+      if ((r.kind === 'typed' || r.kind === 'chip') && c.mirror?.owned() && !c.mirror.typing()) return reading('mirror', r.text, '', r.rows)
+      return reading(r.kind, r.text, r.ignored, r.rows)
     } catch {
-      return false
+      return reading('unreadable')
+    }
+  }
+  const draftOnScreen = (c: Chat) => isDraftKind(draftReading(c).kind)
+  /** o4743: a terminal input told apart for the log (never its content): Enter, a focus report, another escape sequence, a control key, text. */
+  const inputKind = (d: string) => (d.includes('\r') ? 'enter' : d === '\u001b[I' || d === '\u001b[O' ? 'focus report' : d.startsWith('\u001b') ? 'escape sequence' : d.length === 1 && d < ' ' ? 'control key' : 'text')
+  const DRAFT_RECHECK_MS = o.draftRecheckMs ?? 150
+  /**
+   * o4743: a refusal for "an unsent draft" needs the same answer twice, 150 ms apart: a screen read in the middle of a redraw (the box
+   * half drawn, a line just printed) is not a draft. Null when the second look does not agree.
+   */
+  async function draftHolds(c: Chat): Promise<DraftReading | null> {
+    await new Promise<void>(resolve => setTimeout(resolve, DRAFT_RECHECK_MS))
+    if (c.exited) return null
+    const second = draftReading(c)
+    return isDraftKind(second.kind) ? second : null
+  }
+  const draftViewOf = (c: Chat, r: DraftReading): DraftView => {
+    const busy = !!c.delivering || !!c.pasteChain || (c.pastingUntil ?? 0) > Date.now()
+    const draft = isDraftKind(r.kind)
+    return {
+      kind: r.kind,
+      draft,
+      text: draft ? r.text.slice(0, MAX_DRAFT_SHOWN) : '',
+      ignored: r.ignored.slice(0, MAX_DRAFT_SHOWN),
+      chars: r.text.length,
+      rows: r.rows,
+      busy,
+      clearable: draft && !busy && c.engine === 'claude' && !c.info.execution,
     }
   }
 
@@ -715,8 +793,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     keys.set(c.key, c)
     pty.onData(data => {
       c.buffer.push(data)
+      c.sizes.push({ cols: c.size.cols, rows: c.size.rows })
       c.bytes += data.length
-      while (c.bytes > MAX_BUFFER_BYTES && c.buffer.length > 1) c.bytes -= c.buffer.shift()!.length
+      while (c.bytes > MAX_BUFFER_BYTES && c.buffer.length > 1) {
+        c.bytes -= c.buffer.shift()!.length
+        c.sizes.shift()
+      }
       c.screen.write(data)
       noteState(c, data)
       c.lastOutputAt = Date.now()
@@ -817,19 +899,59 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     }
     return pasteNow(c, text)
   }
-  function pasteNow(c: Chat, text: string) {
-    if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false
+  /**
+   * o4743 (11 Nov, from Agent 4's data): two messages pasted 20 ms apart into one line sat there unsent for seven minutes (the Enter of the
+   * first one was lost, and a draft nobody typed then blocked his own sends). So ONE paste and its Enter at a time per chat: the next waits
+   * for its turn, which is when the line reads clear after the Enter (bounded: PASTE_SETTLE_MS, so nothing waits for ever; a stuck line is then
+   * joined exactly as before). Order is kept. Still one Enter per message, no retry.
+   */
+  const PASTE_SETTLE_MS = o.pasteSettleMs ?? 4000
+  const PASTE_QUEUE_MAX = 20
+  function pasteOne(c: Chat, text: string): Promise<void> | null {
+    if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return null
     c.lastActive = Date.now()
     // F-193: the live mirror types nothing while this paste and its Enter are on their way, then looks again (and types its text back).
     c.pastingUntil = Date.now() + 1500
-    setTimeout(() => {
-      setTimeout(() => c.mirror?.delivered(null, false), 1300).unref()
-      if (blocked(c)) {
-        log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: it began to ask a question just after a message was pasted; Enter was not pressed`)
-        return
-      }
-      write(c, '\r')
-    }, 300).unref()
+    return new Promise<void>(resolve => {
+      setTimeout(() => {
+        setTimeout(() => c.mirror?.delivered(null, false), 1300).unref()
+        if (blocked(c)) {
+          log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: it began to ask a question just after a message was pasted; Enter was not pressed`)
+          resolve()
+          return
+        }
+        write(c, '\r')
+        // The next message goes in when the line reads clear again (or the bound ends).
+        const until = Date.now() + PASTE_SETTLE_MS
+        const look = () => {
+          if (c.exited || Date.now() >= until || !draftOnScreen(c)) return resolve()
+          setTimeout(look, 100).unref()
+        }
+        setTimeout(look, 100).unref()
+      }, 300).unref()
+    })
+  }
+  function trackPaste(c: Chat, p: Promise<void>) {
+    const chain: Promise<void> = p.catch(() => {}).finally(() => { if (c.pasteChain === chain) c.pasteChain = undefined })
+    c.pasteChain = chain
+  }
+  function pasteNow(c: Chat, text: string) {
+    if (c.pasteChain) {
+      if ((c.pasteQueued ?? 0) >= PASTE_QUEUE_MAX) return false
+      c.pasteQueued = (c.pasteQueued ?? 0) + 1
+      const turn = c.pasteChain.then((): Promise<void> | void => {
+        c.pasteQueued = Math.max(0, (c.pasteQueued ?? 1) - 1)
+        if (c.exited) return
+        // A question or a send of the checked kind came up while it waited: it goes in when the chat is at its prompt, never into either.
+        if (blocked(c) || c.delivering) { typeWhenReady(c.info.sessionId, text); return }
+        return pasteOne(c, text) ?? undefined
+      })
+      trackPaste(c, turn)
+      return true
+    }
+    const first = pasteOne(c, text)
+    if (!first) return false
+    trackPaste(c, first)
     return true
   }
 
@@ -992,6 +1114,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         state: 'idle',
         carry: '',
         buffer: [],
+        sizes: [],
         bytes: 0,
         viewers: new Set(),
         exited: false,
@@ -1038,7 +1161,20 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       c.lastSeen = Date.now()
       // The size the replay was drawn for comes first, so the page can lay its screen out before it paints it.
       viewer.send({ t: 'size', cols: c.size.cols, rows: c.size.rows })
-      if (c.buffer.length) viewer.send({ t: 'out', d: c.buffer.join('') })
+      // o178e: the replay goes as one message per run of equal size, oldest first (the last run is at the size the terminal has now), each saying the
+      // size the terminal had while it printed it, so the page can lay each stretch out as it was. A replay with no sizes (the chat host's) goes as it is.
+      const sameSize = (a: { cols: number; rows: number } | null, b: { cols: number; rows: number } | null) => a === b || (!!a && !!b && a.cols === b.cols && a.rows === b.rows)
+      let run: { d: string; size: { cols: number; rows: number } | null } | null = null
+      const sendRun = (r: NonNullable<typeof run>) => viewer.send(r.size ? { t: 'out', d: r.d, size: { cols: r.size.cols, rows: r.size.rows } } : { t: 'out', d: r.d })
+      for (let i = 0; i < c.buffer.length; i++) {
+        const size = c.sizes[i] ?? null
+        if (run && sameSize(run.size, size)) run.d += c.buffer[i]
+        else {
+          if (run) sendRun(run)
+          run = { d: c.buffer[i], size }
+        }
+      }
+      if (run) sendRun(run)
       return () => {
         c.viewers.delete(viewer)
         c.lastSeen = Date.now()
@@ -1051,6 +1187,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       c.lastSeen = Date.now()
       c.inputEpoch = (c.inputEpoch ?? 0) + 1
       c.typedAt = Date.now()
+      c.lastInput = { at: c.typedAt, kind: inputKind(data), via: 'page' }
       const ok = write(c, data)
       c.mirror?.poke()
       return ok
@@ -1106,6 +1243,38 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       return !!c && !c.exited && draftOnScreen(c)
     },
 
+    draftView(id) {
+      const c = chats.get(id)
+      return c && !c.exited ? draftViewOf(c, draftReading(c)) : null
+    },
+
+    async clearDraft(id) {
+      const c = chats.get(id)
+      const view = (): DraftView | null => (c && !c.exited ? draftViewOf(c, draftReading(c)) : null)
+      if (!c || c.exited) return { result: 'gone', draft: null }
+      if (c.engine !== 'claude' || c.info.execution) return { result: 'unsupported', draft: view() }
+      // Never while a send or a paste of ours is in flight, and never at a question: Ctrl+U there would edit or answer something else.
+      if (c.delivering || c.pasteChain || (c.pastingUntil ?? 0) > Date.now()) return { result: 'busy', draft: view() }
+      if (menuOnScreen(c) || dialogAbove(c)) return { result: 'menu', draft: view() }
+      if (!draftOnScreen(c)) return { result: 'nothing', draft: view() }
+      // Ctrl+U (kills to the line start) and Ctrl+K (to its end), one after the other, until the line reads clear: Claude Code 2.1.322 takes a
+      // line break with each, so a run of them empties a long or multi-line draft. Never Esc and never Ctrl+C. A chip takes Backspace.
+      const keys = ['\x15', '\x0b', '\x15', '\x0b', '\x15', '\x0b', '\x7f', '\x15', '\x0b', '\x7f']
+      let cleared = false
+      for (const key of keys) {
+        if (c.exited) return { result: 'gone', draft: null }
+        if (c.delivering) return { result: 'busy', draft: view() }
+        c.inputEpoch = (c.inputEpoch ?? 0) + 1
+        c.typedAt = Date.now()
+        write(c, key)
+        c.mirror?.poke()
+        await new Promise<void>(resolve => setTimeout(resolve, DRAFT_RECHECK_MS))
+        if (!draftOnScreen(c)) { cleared = true; break }
+      }
+      log?.info(`chat ${c.info.sessionId.slice(0, 8)}: the input line was cleared from the page (${cleared ? 'now empty' : 'some text is left'})`)
+      return { result: cleared ? 'cleared' : 'partly', draft: view() }
+    },
+
     asking(id) {
       const c = chats.get(id)
       return !!c && !c.exited && blocked(c)
@@ -1141,7 +1310,22 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const preTyped = opt?.human === true && !!m && m.holds(text)
       const takeOut = !preTyped && !!m && m.owned()
       if (takeOut && opt?.human !== true && m!.typing()) return refuse('draft')
-      if (!preTyped && !takeOut && draftOnScreen(c)) return refuse('draft')
+      if (!preTyped && !takeOut) {
+        const first = draftReading(c)
+        if (isDraftKind(first.kind)) {
+          // o4743: a refusal needs the same answer twice (a read in the middle of a redraw is not a draft), and it says in the log what the line held
+          // (a kind and counts, never the words).
+          const held = await draftHolds(c)
+          if (c.exited) return 'gone'
+          if (held) {
+            log?.info(`chat ${c.info.sessionId.slice(0, 8)}: send refused, the input line holds ${held.kind} (${held.text.length} characters, ${held.rows} rows)`)
+            return refuse('draft')
+          }
+          // The second look found the line clear: nothing else may have started a send meanwhile.
+          if (c.delivering) return refuse('unresolved-send')
+          if (blocked(c)) return refuse('menu')
+        }
+      }
       const epoch = c.inputEpoch ?? 0
       const pasted = text.split(PASTE_END).join('')
       const sending = (async (): Promise<SendResult> => {
@@ -1161,8 +1345,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
         const sendStart = Date.now()
         // o655f (Stage 1): claude's own word that it took exactly this text (its UserPromptSubmit hook, noted by promptSeen) since this send began.
-        const expectedNorm = pasted.replace(/\s+/g, '')
-        const tookIt = () => !!c.seen?.some(p => p.at >= began && (p.norm === expectedNorm || (p.cut && expectedNorm.startsWith(p.norm))))
+        const tookIt = () => promptTook(c.seen, pasted, began)
         const result = await sendToCodex({
           confirmed: tookIt,
           write: data => data !== PASTE_END && ((c.inputEpoch ?? 0) !== epoch || opt?.guard?.() === false) ? false : write(c, data),
@@ -1201,6 +1384,13 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       })().catch(() => 'unconfirmed' as const)
       c.delivering = sending
       void sending.finally(() => { if (c.delivering === sending) c.delivering = undefined })
+      // o4743: when a send does not end as sent, the log says what the input line held and what the last terminal input was (kinds and counts only,
+      // never any words): it is how a false unconfirmed is explained afterwards (20:13 and 21:36 on 11 Nov: both messages had reached Claude).
+      void sending.then(r => {
+        if (r === 'sent' || c.exited) return
+        const line = draftReading(c), last = c.lastInput
+        log?.info(`chat ${c.info.sessionId.slice(0, 8)}: send ended ${r}: the input line holds ${line.kind} (${line.text.length || line.ignored.length} characters, ${line.rows} rows); last terminal input ${last ? `${Date.now() - last.at} ms ago: ${last.kind} from ${last.via === 'page' ? 'a page terminal' : 'the app'}` : 'none'}`)
+      })
       // F-193: the live mirror learns what was submitted (his own send: never typed back; another message: the mirror's text goes back in).
       if (m) void sending.then(r => m.delivered(r === 'sent' ? text : null, opt?.human === true))
       if (opt?.waitForOutcome) return sending
@@ -1246,6 +1436,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         state: 'idle',
         carry: '',
         buffer: replay ? [replay] : [],
+        sizes: replay ? [null] : [],
         bytes: replay.length,
         viewers: new Set(),
         exited: false,
@@ -1281,6 +1472,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return false
       c.inputEpoch = (c.inputEpoch ?? 0) + 1
       c.typedAt = Date.now()
+      c.lastInput = { at: c.typedAt, kind: inputKind(data), via: 'app' }
       const ok = write(c, data)
       c.mirror?.poke()
       return ok
@@ -1298,8 +1490,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           changed()
         }
       }
-      ;(c.seen ??= []).push({ norm: text.replace(/\s+/g, ''), cut: length > text.length, id: promptId, at: Date.now() })
+      ;(c.seen ??= []).push({ norm: squashPrompt(text, length > text.length), cut: length > text.length, id: promptId, at: Date.now() })
       if (c.seen.length > 30) c.seen.shift()
+    },
+
+    promptTaken(id, text, since) {
+      const c = chats.get(id)
+      if (!c || c.exited || !c.seen) return null
+      return promptTook(c.seen, text, since)
     },
 
     claudeSession(id) {

@@ -128,6 +128,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/runs$/, SIGNED],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/say$/, chat('type')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/say-direct$/, chat('type')],
+  // o4743: what the input line holds, and one tap that clears an unsent draft there.
+  ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/draft$/, chat('type')],
+  ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/draft\/clear$/, chat('type')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries$/, chat('type')],
   ['GET', /^\/floors\/([^/]+)\/agents\/([^/]+)\/deliveries\/([^/]+)$/, chat('type')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/share$/, chat('owner')],

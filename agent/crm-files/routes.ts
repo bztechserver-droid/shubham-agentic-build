@@ -1,7 +1,7 @@
 ﻿import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
-import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
+import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmRemovedProject, type CrmSpool, type CrmUploadSettingsChange, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 import type { CrmUploads } from './uploads.ts'
 
@@ -80,9 +80,14 @@ const METHODS: Record<string, string[]> = {
   unmount: ['POST'],
   'mount/auto': ['POST'],
   'mount/saves': ['POST'],
+  'mount/letter': ['POST'],
+  'mount/letters': ['GET'],
   'mount/reveal': ['POST'],
   'mount/driver': ['POST'],
   spool: ['GET'],
+  removed: ['GET'],
+  'removed/dismiss': ['POST'],
+  ignore: ['GET', 'POST'],
   'spool/retry': ['POST'],
 }
 
@@ -134,6 +139,11 @@ async function uploadRoute(up: CrmUploads, name: string, req: IncomingMessage, r
       await up.clear(str((await readJson(req)).id, 'id'))
       return send(res, 200, { ok: true })
   }
+}
+
+/** S6: the projects whose access was removed, with how many saves are still kept for each. */
+function removedOf(svc: CrmFilesService): { removed: CrmRemovedProject[] } {
+  return { removed: (svc.lostAccess?.list() ?? []).map(p => ({ id: p.id, name: p.name, since: p.since, saves: svc.spool?.forProject(p.id).length ?? 0 })) }
 }
 
 /** The waiting list; an agent without a spool has an empty one (and no folder). */
@@ -208,6 +218,16 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
               if (!svc.mount.setAuto) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
               return send(res, 200, await svc.mount.setAuto(b.on))
             }
+            case 'mount/letters': {
+              if (!svc.mount.letters) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              return send(res, 200, await svc.mount.letters())
+            }
+            case 'mount/letter': {
+              const b = await readJson(req)
+              if (typeof b.letter !== 'string') throw new CrmFilesError(400, 'failed', 'letter is needed (for example "Z:").')
+              if (!svc.mount.setLetter) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              return send(res, 200, await svc.mount.setLetter(b.letter))
+            }
             case 'mount/saves': {
               const b = await readJson(req)
               if (typeof b.on !== 'boolean') throw new CrmFilesError(400, 'failed', 'on is needed (true or false).')
@@ -220,6 +240,23 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
               if (!via) throw new CrmFilesError(400, 'failed', "via must be 'auto', 'winfsp' or 'webdav'.")
               if (!svc.mount.setDriver) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
               return send(res, 200, await svc.mount.setDriver(via))
+            }
+            case 'removed':
+              return send(res, 200, removedOf(svc))
+            case 'removed/dismiss': {
+              const b = await readJson(req)
+              if (!svc.lostAccess) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              if (!svc.lostAccess.dismiss(str(b.id, 'id'))) throw new CrmFilesError(404, 'notfound', 'That project is not in the Access removed folder.')
+              return send(res, 200, removedOf(svc))
+            }
+            case 'ignore': {
+              if (!svc.ignore) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              if (method === 'POST') {
+                const b = await readJson(req)
+                if (typeof b.defaults !== 'boolean') throw new CrmFilesError(400, 'failed', 'defaults is needed (true or false).')
+                svc.ignore.setDefaults(b.defaults)
+              }
+              return send(res, 200, { defaults: svc.ignore.defaults(), keptHere: svc.spool?.keptHere() ?? 0 })
             }
             case 'spool':
               return send(res, 200, spoolOf(svc))

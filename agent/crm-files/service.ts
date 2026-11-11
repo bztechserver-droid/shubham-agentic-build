@@ -15,6 +15,12 @@ import {
   type CrmSpoolEntry,
   type CrmVersion,
 } from '../../shared/crm-files.ts'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { createReadStream } from 'node:fs'
+import { open as openFile } from 'node:fs/promises'
+import { createIgnoreRules, type IgnoreRules } from './ignore-rules.ts'
+import { createRemovedIndex, type RemovedProject } from './removed.ts'
 import { createSpool, type Spool } from './spool.ts'
 
 // F-126: the CRM's files as a tree, for the page, for the Linux mount (in process) and for the Windows host's bridge. The CRM's own RECORDS decide what is a file and where it is
@@ -54,6 +60,10 @@ export interface MountDriver {
   setDriver?(via: CrmDriverChoice): Promise<CrmMountStatus>
   /** S9b (Windows): "Save into the drive": the in-app drive takes saves (a save goes into the CRM), or not (the default). */
   setSaves?(on: boolean): Promise<CrmMountStatus>
+  /** S2 (Windows): the drive letter: choose another free one (Y: by default). */
+  setLetter?(letter: string): Promise<CrmMountStatus>
+  /** S2 (Windows): the letter in use and the free ones. */
+  letters?(): Promise<{ current: string; free: string[] }>
   /** o6e65 (Windows): open File Explorer on the drive, or on the waiting or recovered saves folder. Takes no path. */
   reveal?(what: CrmReveal): Promise<void>
 }
@@ -74,7 +84,7 @@ export interface CrmFilesOptions {
    */
   spoolDir?: string
   /** S5: the spool's own timings and cap (tests). */
-  spool?: { retryMs?: number[]; maxBytes?: number; autoStart?: boolean }
+  spool?: { retryMs?: number[]; maxBytes?: number; autoStart?: boolean; reconsiderMs?: number }
   /** S5: opens a folder in the PC's file manager (the "Open the folder" button). Left out = the button says it is not supported here. */
   openFolder?: (dir: string) => void
   log?: { info(m: string): void; warn(m: string): void }
@@ -156,6 +166,10 @@ export interface CrmFilesService {
   save: ((a: { parent: string; name: string; type: string; target?: string | null; body?: Readable; /** S9b: a finished file moved into the spool instead of a stream. */ from?: string; size: number }) => Promise<{ how: 'new' | 'version'; entry: CrmSpoolEntry }>) | null
   /** S5: the saves kept on this PC until the CRM has them (null when there is no spool). */
   spool: Spool | null
+  /** S6: the projects whose access was removed (null when there is no spool). */
+  lostAccess: { list(): RemovedProject[]; dismiss(id: string): boolean } | null
+  /** S7: the .driveignore rules (null when there is no spool). `defaults`: the built-in list of editor and system files (~$*, *.tmp, Thumbs.db, desktop.ini, .DS_Store, node_modules, *.crdownload) is on (the default). */
+  ignore: { defaults(): boolean; setDefaults(on: boolean): void; rules: IgnoreRules } | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   version(id: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   folder(parent: string, name: string): Promise<CrmNode>
@@ -237,6 +251,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   const now = o.now ?? Date.now
   const ttl = o.ttlMs ?? 10_000
   const gfetch = o.fetch ?? fetch
+  // S6: the projects whose access was removed, kept next to the spool.
+  const removedIndex = o.spoolDir ? createRemovedIndex({ file: path.join(path.dirname(o.spoolDir), 'crm-removed-projects.json'), now, log: o.log }) : null
   const driveApi = o.driveApi ?? 'https://www.googleapis.com/drive/v3'
   const driveUpload = o.driveUpload ?? 'https://www.googleapis.com/upload/drive/v3'
   const client = o.client
@@ -351,6 +367,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         })
       }
       const s: Snapshot = { at: now(), files, projects, org: snap?.org ?? null }
+      // S6: a project the CRM used to list and no longer does (twice, 30 s apart) has its access removed; one that is listed again is back, and its refused saves say so.
+      for (const pid of removedIndex?.observe([...projects.values()].map(p => ({ id: p.id, name: p.name }))).returned ?? []) spool?.noteProject(pid, 'Access to this project came back. It is kept here and was not sent by itself: press Try again to send it.')
       snap = s
       return s
     })().finally(() => (loading = null))
@@ -451,7 +469,52 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     return { parent: g ? grpId(pid, g.id) : projId(pid), pid }
   }
 
+  // ---- S6: the "Access removed" folder: one folder per project the CRM stopped listing, holding what is still on this PC for it (saves that never reached the CRM) and a README. Read only.
+  const GONE_ROOT = 'gone:root'
+  const GONE_NAME = 'Access removed'
+  const readmeText = (name: string) =>
+    `Access to the project "${name}" was removed in the CRM (the CRM no longer lists it for your account).\r\n\r\nThis folder holds what is still on this PC for it: saves made through the drive that never reached the CRM. Nothing here is deleted.\r\n\r\nOn the CRM files page, Dismiss forgets this folder (the saves stay kept on this PC). If access comes back, the project returns to its place and these saves are offered again: you press Try again to send them.\r\n`
+  const keptFor = (pid: string): CrmSpoolEntry[] => spool?.forProject(pid) ?? []
+  const goneRootNode = (n: number): CrmNode => ({ id: GONE_ROOT, kind: 'category', name: GONE_NAME, parentId: 'root', isFolder: true, childCount: n, rights: NO })
+  const goneIso = (ms: number) => new Date(ms).toISOString()
+  const readmeNode = (p: RemovedProject): CrmNode => ({ id: `gone:readme:${p.id}`, kind: 'file', name: 'README.txt', parentId: `gone:${p.id}`, isFolder: false, size: Buffer.byteLength(readmeText(p.name)), type: 'text/plain', createdAt: goneIso(p.since), modifiedAt: goneIso(p.since), versions: 1, rights: NO })
+  const keptNode = (e: CrmSpoolEntry, pid: string): CrmNode => ({ id: `kept:${e.id}`, kind: 'file', name: e.name, parentId: `gone:${pid}`, isFolder: false, size: e.size, type: 'application/octet-stream', createdAt: e.since, modifiedAt: e.since, versions: 1, rights: NO })
+
+  async function goneChildren(id: string): Promise<{ node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }> {
+    const gone = removedIndex?.list() ?? []
+    const crumbs = [{ id: 'root', name: ROOT.name }, { id: GONE_ROOT, name: GONE_NAME }]
+    if (id === GONE_ROOT) {
+      if (gone.length === 0) throw new CrmFilesError(404, 'notfound', 'There is no such folder.')
+      const kids = gone.map((p): CrmNode => ({ id: `gone:${p.id}`, kind: 'project', name: p.name, parentId: GONE_ROOT, isFolder: true, childCount: 1 + keptFor(p.id).length, createdAt: goneIso(p.since), rights: NO }))
+      return { node: goneRootNode(kids.length), children: kids.sort(byName), path: crumbs.slice(0, 2) }
+    }
+    if (id.startsWith('gone:readme:') || id.startsWith('kept:')) throw new CrmFilesError(400, 'failed', 'That is a file, not a folder.')
+    const pid = id.slice('gone:'.length)
+    const p = gone.find(x => x.id === pid)
+    if (!p) throw new CrmFilesError(404, 'notfound', 'That project is not in the Access removed folder.')
+    const kids = [readmeNode(p), ...keptFor(pid).map(e => keptNode(e, pid))]
+    const node: CrmNode = { id, kind: 'project', name: p.name, parentId: GONE_ROOT, isFolder: true, childCount: kids.length, createdAt: goneIso(p.since), rights: NO }
+    return { node, children: kids.sort(byName), path: [...crumbs, { id, name: p.name }] }
+  }
+
+  /** A file of the Access removed folder: its node and where its bytes are. */
+  function goneFile(id: string): { node: CrmNode; bytes?: Buffer; path?: string } | null {
+    if (id.startsWith('gone:readme:')) {
+      const p = (removedIndex?.list() ?? []).find(x => x.id === id.slice('gone:readme:'.length))
+      return p ? { node: readmeNode(p), bytes: Buffer.from(readmeText(p.name), 'utf8') } : null
+    }
+    if (id.startsWith('kept:')) {
+      for (const p of removedIndex?.list() ?? []) {
+        const e = keptFor(p.id).find(x => `kept:${x.id}` === id)
+        const f = e ? spool?.fileOf(e.id) : null
+        if (e && f) return { node: keptNode(e, p.id), path: f.path }
+      }
+    }
+    return null
+  }
+
   async function childrenOf(id: string): Promise<{ node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }> {
+    if (id.startsWith('gone:') || id.startsWith('kept:')) return goneChildren(id)
     const s = await load()
     const mayUp = s.projects.size > 0 && [...s.projects.values()].some(p => p.writable) ? await mayUpload() : false
     const crumbs: { id: string; name: string }[] = [{ id: 'root', name: ROOT.name }]
@@ -468,6 +531,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         childCount: t === 'projects' ? s.projects.size + (s.files.some(f => f.folder === 'projects' && !pidOf(f)) ? 1 : 0) : s.files.filter(f => f.folder === t).length,
         rights: NO,
       }))
+      const gone = removedIndex?.list() ?? []
+      if (gone.length > 0) kids.push(goneRootNode(gone.length))
       return { node: { ...ROOT, childCount: kids.length }, children: kids.sort(byName), path: crumbs }
     }
 
@@ -545,6 +610,11 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   }
 
   async function nodeOf(id: string): Promise<CrmNode> {
+    if (id.startsWith('gone:readme:') || id.startsWith('kept:')) {
+      const g = goneFile(id)
+      if (!g) throw new CrmFilesError(404, 'notfound', 'That file is not there any more.')
+      return g.node
+    }
     if (id.startsWith('file:')) return (await findFile(id)).node
     return (await childrenOf(id)).node
   }
@@ -852,6 +922,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       setAuto: baseMount.setAuto ? on => withSpool(baseMount.setAuto!(on)) : undefined,
       setDriver: baseMount.setDriver ? via => withSpool(baseMount.setDriver!(via)) : undefined,
       setSaves: baseMount.setSaves ? on => withSpool(baseMount.setSaves!(on)) : undefined,
+      setLetter: baseMount.setLetter ? l => withSpool(baseMount.setLetter!(l)) : undefined,
+      letters: baseMount.letters ? () => baseMount.letters!() : undefined,
       reveal: async what => {
         if (what === 'spool') {
           if (!spool || !o.openFolder) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
@@ -863,14 +935,31 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     }
   }
 
+  // S7: the .driveignore rules; the built-in defaults are a setting (on unless switched off), kept next to the spool.
+  const ignoreFile = o.spoolDir ? path.join(o.spoolDir, 'ignore-settings.json') : null
+  let ignoreDefaults = true
+  try {
+    if (ignoreFile && existsSync(ignoreFile)) ignoreDefaults = (JSON.parse(readFileSync(ignoreFile, 'utf8')) as { defaults?: unknown }).defaults !== false
+  } catch {
+    // unreadable: the default (on)
+  }
+  const rules = createIgnoreRules({ source: () => service, defaults: () => ignoreDefaults, log: o.log })
+
   if (o.spoolDir) {
     spool = createSpool({
       dir: o.spoolDir,
       retryMs: o.spool?.retryMs,
       maxBytes: o.spool?.maxBytes,
+      reconsiderMs: o.spool?.reconsiderMs ?? 60_000,
       log: o.log,
-      onChange: () => invalidate(),
+      onChange: () => {
+        invalidate()
+        // A file reached the CRM: it may be a .driveignore. Read the rules again, and ask them again about what waits.
+        rules.invalidate()
+        void spool?.reconsider().catch(() => undefined)
+      },
       send: {
+        ignored: job => rules.reason(job.parent, job.name, false),
         upload: (parent, name, type, stream, size) => service.upload(parent, name, type, stream, size),
         version: (id, name, type, stream, size) => service.version(id, name, type, stream, size),
         find: async (parent, name) => (await childrenOf(parent)).children.find(c => sameName(c.name, name)) ?? null,
@@ -884,6 +973,23 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   const service: CrmFilesService = {
     mount,
     spool,
+    lostAccess: removedIndex ? { list: () => removedIndex.list(), dismiss: id => removedIndex.dismiss(id) } : null,
+    ignore: spool
+      ? {
+          rules,
+          defaults: () => ignoreDefaults,
+          setDefaults(on) {
+            ignoreDefaults = on
+            try {
+              if (ignoreFile) writeFileSync(ignoreFile, JSON.stringify({ defaults: on }))
+            } catch (e) {
+              o.log?.warn(`crm drive: could not save the ignore setting (${e instanceof Error ? e.message : String(e)})`)
+            }
+            rules.invalidate()
+            void spool?.reconsider().catch(() => undefined)
+          },
+        }
+      : null,
     save: spool
       ? async a => {
           checkSize(a.size)
@@ -891,13 +997,16 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
           if (a.target) {
             const { node, project } = await findFile(a.target)
             await needRight(node, 'version', 'save a new version of this file')
-            const entry = await spool!.add({ kind: 'version', parent: node.parentId ?? a.parent, target: a.target, name: a.name, type: a.type, project: project?.name ?? null, body: a.body, from: a.from, size: a.size })
+            // S7: a file a .driveignore rule matches is kept on this PC only (a file already in the CRM stays there; its new saves stay here).
+            const why = await rules.reason(node.parentId ?? a.parent, node.name, false)
+            const entry = await spool!.add({ kind: 'version', parent: node.parentId ?? a.parent, target: a.target, name: a.name, type: a.type, project: project?.name ?? null, body: a.body, from: a.from, size: a.size, ignored: why ?? undefined })
             return { how: 'version' as const, entry }
           }
           asFolderParts(a.parent)
           const pn = await nodeOf(a.parent)
           await needRight(pn, 'upload', 'add files')
-          const entry = await spool!.add({ kind: 'new', parent: a.parent, name: a.name, type: a.type, project: pn.name, body: a.body, from: a.from, size: a.size })
+          const why = await rules.reason(a.parent, a.name, false)
+          const entry = await spool!.add({ kind: 'new', parent: a.parent, name: a.name, type: a.type, project: pn.name, body: a.body, from: a.from, size: a.size, ignored: why ?? undefined })
           return { how: 'new' as const, entry }
         }
       : null,
@@ -921,6 +1030,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     node: nodeOf,
 
     async file(id) {
+      const g = id.startsWith('gone:readme:') || id.startsWith('kept:') ? goneFile(id) : null
+      if (g) return { stream: g.path ? createReadStream(g.path) : Readable.from([g.bytes ?? Buffer.alloc(0)]), size: g.node.size ?? 0, type: g.node.type ?? 'application/octet-stream', name: g.node.name }
       const { f } = await findFile(id)
       let r: Response
       try {
@@ -940,6 +1051,18 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     },
 
     async fileBytes(id, start, length) {
+      const g = id.startsWith('gone:readme:') || id.startsWith('kept:') ? goneFile(id) : null
+      if (g) {
+        if (g.bytes) return g.bytes.subarray(start, start + length)
+        const fh = await openFile(g.path as string, 'r')
+        try {
+          const out = Buffer.alloc(length)
+          const { bytesRead } = await fh.read(out, 0, length, start)
+          return out.subarray(0, bytesRead)
+        } finally {
+          await fh.close()
+        }
+      }
       const { f } = await findFile(id)
       let r: Response
       try {
@@ -976,6 +1099,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     },
 
     async versions(id) {
+      if (id.startsWith('gone:readme:') || id.startsWith('kept:')) return []
       const { f } = await findFile(id)
       const j = await getJson(`org/files/${encodeURIComponent(f.id)}/versions`, 'the versions')
       const arr = Array.isArray(j) ? j : isObject(j) && Array.isArray(j.versions) ? j.versions : []

@@ -21,9 +21,13 @@ export const claudeCollapses = (pasted: string) => normalize(pasted).length > CL
 
 /** Is `box` (the whole input box, whitespace squashed) exactly the chip our own paste produces? */
 export function isOwnedClaudeChip(box: string, pasted: string): boolean {
-  if (!claudeCollapses(pasted)) return false
   const m = CLAUDE_CHIP_RE.exec(box.trim())
   if (!m) return false
   const lines = breaks(pasted)
-  return lines === 0 ? m[2] === undefined : m[2] !== undefined && Number(m[2]) === lines
+  // o4743 (11 Nov 2026): the "more than 2 line breaks" limit is the tall-terminal rule: a terminal of 11 rows or fewer collapses a paste with FEWER breaks
+  // (Agent 4's probe of 2.1.322), and then "[Pasted text #27 +2 lines]" held his two-break message and the sender never owned it (it waited 26 s, the
+  // message stayed unsent). A chip that carries a line count is owned when that count is exactly the breaks of OUR paste, whatever limit made it. A chip
+  // without a count (no breaks) still needs a paste Claude would collapse by length.
+  if (lines > 0) return m[2] !== undefined && Number(m[2]) === lines
+  return claudeCollapses(pasted) && m[2] === undefined
 }

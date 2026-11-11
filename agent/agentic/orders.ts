@@ -12,7 +12,9 @@ import { writeAtomic } from '../config.ts'
 //   - a reply is never an order: it opens none, and is never relayed back to the agent;
 //   - an Assistant message that is only an acknowledgement ("ok", "thanks") opens no order;
 //   - only the Assistant's own messages open orders (an agent writing to the Assistant does not);
-//   - replies go to the Assistant's chat only, never broadcast.
+//   - replies go to the Assistant's chat only, never broadcast;
+//   - a reply typed into the Assistant's chat is IN only when that chat's claude reports it took exactly that text (its own hook);
+//     one that is not taken is typed again a few times after growing waits, never while a report may still come, never after one came.
 
 /**
  * The overlay chat, by its OLD NAME: the agent called Assistant on the floor called Assistant. F-086: the hub no longer decides by this (it
@@ -122,6 +124,11 @@ export interface Order {
   pending?: string
   /** Delivery was tried this many times. */
   tries?: number
+  /** Order-reply carrier (11 Nov): when the reply was FIRST typed into the Assistant's chat; claude's hook reporting it at any time since means it is in. */
+  typedAt?: number
+  /** When it was typed last, and how many times in all (a reply that chat did not take is typed again after a growing wait, a few times). */
+  lastTypedAt?: number
+  typings?: number
 }
 
 /** What the app can see of a target's transcript for one order. */
@@ -166,8 +173,20 @@ export interface OrderDeps {
   stateOf(sessionId: string): ChatNow
   /** The target's transcript, for this order. */
   scan(sessionId: string, orderId: string): Scan
-  /** Types `text` into the Assistant's chat; false when that chat isn't running. For a hand-off (`from` is FAST_FROM) it is the fast Assistant's return path instead: nothing is typed anywhere. */
+  /**
+   * Types `text` into the Assistant's chat; false when nothing was typed (that chat isn't running, or a question or unsent text in its box).
+   * True only says it was typed: whether it was TAKEN is `taken` (below). For a hand-off (`from` is FAST_FROM) it is the fast Assistant's
+   * return path instead: nothing is typed anywhere, and true means it was taken.
+   */
   deliver(assistantSessionId: string, text: string, order: Order): Promise<boolean>
+  /**
+   * Order-reply carrier (11 Nov): did the Assistant's claude take exactly `text` as a prompt since `since` (its own UserPromptSubmit hook,
+   * chats.ts promptTaken)? null: that chat cannot say (not on this PC, or its hook has not spoken since it started here): then a typed
+   * reply counts as delivered, as before. Without this dep every typed reply counts as delivered (the old rule).
+   */
+  taken?(assistantSessionId: string, text: string, since: number): boolean | null
+  /** Tests: shorter waits than CONFIRM_MS and RETYPE_AFTER_MS. */
+  waits?: { confirmMs: number; retypeAfterMs: number[] }
   /** F-087: told of a hand-off's progress (10 s, 60 s, then every 5 minutes). */
   progress?(p: OrderProgress): void
   /** F-087: the words the target chat's spinner shows now ("Cooking…"), when it shows any. */
@@ -187,6 +206,15 @@ export const KEEP_REPLY_MS = 60 * 60_000
 export const REPLY_MAX = 3500
 const IDLE_TICKS = 2
 const SCAN_EVERY_MS = 3000
+/**
+ * Order-reply carrier (11 Nov, Lead's order after the reply to o36cc was typed at 22:07:03, logged "delivered" and never reached the
+ * Assistant): a typed reply is IN only when the Assistant's claude reports it took exactly that text (its hook: 0.1-1.0 s after Enter,
+ * 3.9 s for a chat's first prompt, 0.4-0.5 s for one typed while it was busy; probe-real.log). This long after the last typing, with that
+ * chat resting (not working, not asking), no report means it was not taken.
+ */
+export const CONFIRM_MS = 15_000
+/** A reply that was not taken is typed again after these waits (from its last typing), then given up. Never while a report may still come. */
+export const RETYPE_AFTER_MS = [30_000, 2 * 60_000, 5 * 60_000]
 
 export interface Orders {
   /** The id for a message the Assistant is about to send, or null when it is no order (an acknowledgement, a reply, to itself). */
@@ -210,6 +238,10 @@ export function createOrders(deps: OrderDeps): Orders {
   const idle = new Map<string, number>()
   const lastScan = new Map<string, number>()
   let busy = false
+  // Order-reply carrier: claude's reports are kept in memory, so a reply typed before this agent started cannot be confirmed by them.
+  const startedAt = deps.now()
+  const confirmMs = deps.waits?.confirmMs ?? CONFIRM_MS
+  const retypeAfterMs = deps.waits?.retypeAfterMs ?? RETYPE_AFTER_MS
 
   function save() {
     if (!deps.file) return
@@ -225,9 +257,47 @@ export function createOrders(deps: OrderDeps): Orders {
     return `${REPLY_PREFIX}${o.to.agent} on ${o.to.floor} to order ${o.id}] ${body || '(no written answer; see its conversation)'}`
   }
 
+  /** One reply per order: it is gone the moment its reply is in (or given up). Log lines carry ids and counts, never the words. */
+  function close(o: Order, line: string, warn = false) {
+    orders = orders.filter(x => x.id !== o.id)
+    idle.delete(o.id)
+    lastScan.delete(o.id)
+    if (warn) deps.log?.warn(line)
+    else deps.log?.info(line)
+    save()
+  }
+
+  /** Order-reply carrier: did the Assistant's claude take the typed reply? null: that cannot be said (a hand-off, no `taken` dep, or that chat cannot say). */
+  const tookReply = (o: Order) => (o.from === FAST_FROM || !deps.taken || o.typedAt === undefined || !o.pending ? null : deps.taken(o.from, o.pending, o.typedAt))
+
   async function finish(o: Order, text: string) {
     o.pending ??= o.cancelled ? `${REPLY_PREFIX}${o.to.agent} on ${o.to.floor} to order ${o.id}] (cancelled: Shubham stopped it)` : reply(o, text)
+    const who = `order ${o.id}: ${o.to.agent} on ${o.to.floor} answered`
+    if (o.typedAt !== undefined) {
+      // Typed already: IN the moment claude's hook reports it, whenever that comes, and never typed again after that.
+      const took = tookReply(o)
+      if (took === true) return close(o, `${who}, reply delivered (the Assistant's claude reported it taken${(o.typings ?? 1) > 1 ? `; typing ${o.typings}` : ''})`)
+      const last = o.lastTypedAt ?? o.typedAt
+      if (deps.now() - o.at > GIVE_UP_MS + KEEP_REPLY_MS) return close(o, `${who}; its reply was never reported taken by the Assistant's chat: dropped`, true)
+      // Working or asking: a reply typed meanwhile waits in claude's queue and is reported when it is taken. Nothing is typed again then.
+      const st = deps.stateOf(o.from)
+      if (st === 'running' || st === 'question') {
+        idle.set(o.id, 0)
+        return
+      }
+      const n = (idle.get(o.id) ?? 0) + 1
+      idle.set(o.id, n)
+      if (n < IDLE_TICKS || deps.now() - last < confirmMs) return
+      // That chat cannot say (its hook is silent, it is not running here, or the typing was before this agent started): the old rule,
+      // typed = delivered. Nothing is ever typed twice on a guess.
+      if (took === null || last < startedAt) return close(o, `${who}, reply delivered (typed; that chat cannot confirm it)`)
+      // Not taken (lost on the way: a line cleared, an Enter that did not land). Typed again after a growing wait, a few times, then given up.
+      const k = o.typings ?? 1
+      if (k > retypeAfterMs.length) return close(o, `${who}; its reply was typed ${k} times into the Assistant's chat and never taken: given up (the answer stays in ${o.to.agent}'s conversation)`, true)
+      if (deps.now() - last < retypeAfterMs[k - 1]) return
+    }
     o.tries = (o.tries ?? 0) + 1
+    const at = deps.now()
     let sent = false
     try {
       sent = await deps.deliver(o.from, o.pending, o)
@@ -235,13 +305,20 @@ export function createOrders(deps: OrderDeps): Orders {
       sent = false
     }
     if (sent) {
-      // One reply per order: it is gone the moment its reply is in.
-      orders = orders.filter(x => x.id !== o.id)
-      idle.delete(o.id)
-      lastScan.delete(o.id)
-      deps.log?.info(`order ${o.id}: ${o.to.agent} on ${o.to.floor} answered, reply delivered`)
+      // A hand-off's return path, or no way to know: in as soon as it is handed over (the old rule).
+      if (o.from === FAST_FROM || !deps.taken) return close(o, `${who}, reply delivered`)
+      if (o.typedAt !== undefined) deps.log?.warn(`order ${o.id}: its reply was not taken by the Assistant's chat ${Math.round((at - (o.lastTypedAt ?? o.typedAt)) / 1000)} s after it was typed; typed again (typing ${(o.typings ?? 1) + 1} of ${retypeAfterMs.length + 1})`)
+      else deps.log?.info(`order ${o.id}: its reply was typed into the Assistant's chat; it is in once that chat's claude reports it`)
+      o.typedAt ??= at
+      o.lastTypedAt = at
+      o.typings = (o.typings ?? 0) + 1
+      idle.set(o.id, 0)
       save()
-    } else if (deps.now() - o.at > GIVE_UP_MS + KEEP_REPLY_MS) {
+      return
+    }
+    // Nothing typed (not running, a question, or text in its box, a false one included): it waits, and is never counted as delivered.
+    if (o.tries === 1) deps.log?.info(`order ${o.id}: its reply waits: the Assistant's chat cannot be typed into now (not running, a question, or text in its box)`)
+    if (deps.now() - o.at > GIVE_UP_MS + KEEP_REPLY_MS) {
       orders = orders.filter(x => x.id !== o.id)
       save()
     }

@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { access } from 'node:fs/promises'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir, uptime } from 'node:os'
@@ -69,22 +70,50 @@ const defaultOpen = (folder: string) => {
   c.unref()
 }
 
+/** A drive letter the person may choose: D: to Z: (A:, B: and C: are the system's). */
+const LETTER = /^[D-Z]:$/i
+
 const WINFSP_DLL = 'C:\\Program Files (x86)\\WinFsp\\bin\\winfsp-x64.dll'
 
-export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Promise<void>; close(): Promise<void>; setAuto(on: boolean): Promise<CrmMountStatus>; setDriver(via: CrmDriverChoice): Promise<CrmMountStatus>; setSaves(on: boolean): Promise<CrmMountStatus>; reveal(what: CrmReveal): Promise<void> } {
-  const letter = (o.letter ?? DEFAULT_LETTER).toUpperCase()
+export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Promise<void>; close(): Promise<void>; setAuto(on: boolean): Promise<CrmMountStatus>; setDriver(via: CrmDriverChoice): Promise<CrmMountStatus>; setSaves(on: boolean): Promise<CrmMountStatus>; setLetter(letter: string): Promise<CrmMountStatus>; letters(): Promise<{ current: string; free: string[] }>; reveal(what: CrmReveal): Promise<void> } {
+  // S2: the drive letter: Y: unless the person chose another (remembered in crm-drive.json, applied when the drive starts); a letter given to this function (tests) wins.
+  let letter = (o.letter ?? DEFAULT_LETTER).toUpperCase()
   const platform = o.platform ?? process.platform
   const spawn = o.spawn ?? nodeSpawn
   const driveExists = o.driveExists ?? ((l: string) => existsSync(`${l}\\`))
   const dll = o.winfspDll ?? WINFSP_DLL
   const stateFile = path.join(o.dir, 'crm-drive.json')
+  if (!o.letter) {
+    try {
+      const j = JSON.parse(readFileSync(stateFile, 'utf8')) as { letter?: unknown }
+      if (typeof j.letter === 'string' && LETTER.test(j.letter)) letter = j.letter.toUpperCase()
+    } catch {
+      // none remembered: Y:
+    }
+  }
   const waitMs = o.waitMs ?? 15_000
   const watchMs = o.watchMs ?? 15_000
-  const tag = letter.replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'Y'
+  let tag = letter.replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'Y'
   const hostState = o.hostState ?? path.join(process.env.LOCALAPPDATA || path.join(homedir(), 'AppData', 'Local'), 'ChristopherOS', 'crm-fs')
-  const pendingDir = path.join(hostState, `pending-${tag}`)
-  const recoveredDir = path.join(hostState, `recovered-${tag}`)
+  let pendingDir = path.join(hostState, `pending-${tag}`)
+  let recoveredDir = path.join(hostState, `recovered-${tag}`)
   const openFolder = o.openFolder ?? defaultOpen
+  /** Does anything hold this letter? Asked the way that cannot hang (async, 800 ms: no answer counts as held). */
+  const letterTaken = async (l: string): Promise<boolean> => {
+    if (o.driveExists) return o.driveExists(l)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        access(`${l}\\`).then(() => true, () => false),
+        new Promise<boolean>(resolve => {
+          timer = setTimeout(() => resolve(true), 800)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
   let timer: ReturnType<typeof setInterval> | null = null
   let autoTries = 0
   let child: ChildProcess | null = null
@@ -97,24 +126,24 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
   /** S9a: the in-app WinFsp drive could not start here (WinFsp missing, a letter taken, a failure): in automatic mode the other ways are used from then on. */
   let nativeBroken = false
   let nativeFailure: { reason: string; code: CrmMountStatus['reasonCode'] } | null = null
-  const native =
-    (o.native !== undefined ? o.native : null) ?? (o.native === undefined && o.service && platform === 'win32' ? createWinNative({ letter, service: o.service, log: o.log, writable: () => readState().saves === true, markerFile: path.join(o.dir, INAPP_MARKER), exists: o.driveExists ? async l => o.driveExists!(l) : undefined }) : null)
-  const dav =
-    o.dav ??
-    (o.service && platform === 'win32'
-      ? createWinDav({ letter, service: o.service, log: o.log, run: o.davRun, driveExists: o.driveExists, exists: o.driveExists ? async l => o.driveExists!(l) : undefined, trace: o.davTrace })
-      : null)
+  // The two ways that live in this process are made for the current letter; choosing another letter makes them again (only the ones made here, not a stand-in given by a test).
+  const makeNative = () => (o.service && platform === 'win32' ? createWinNative({ letter, service: o.service, log: o.log, writable: () => readState().saves === true, markerFile: path.join(o.dir, INAPP_MARKER), exists: o.driveExists ? async l => o.driveExists!(l) : undefined }) : null)
+  const makeDav = () => (o.service && platform === 'win32' ? createWinDav({ letter, service: o.service, log: o.log, run: o.davRun, driveExists: o.driveExists, exists: o.driveExists ? async l => o.driveExists!(l) : undefined, trace: o.davTrace }) : null)
+  const madeNative = o.native === undefined
+  const madeDav = o.dav === undefined
+  let native = (o.native !== undefined ? o.native : null) ?? (madeNative ? makeNative() : null)
+  let dav = o.dav ?? (madeDav ? makeDav() : null)
 
   // What the person chose, kept across restarts: on (true: started by hand and left on; false: stopped on purpose; nothing: never touched) and auto (mount by itself; ON unless false).
-  const readState = (): { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string; saves?: boolean } => {
+  const readState = (): { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string; saves?: boolean; letter?: string } => {
     try {
-      const j = JSON.parse(readFileSync(stateFile, 'utf8')) as { on?: unknown; auto?: unknown; via?: unknown; crashed?: unknown; saves?: unknown }
-      return { saves: typeof j.saves === 'boolean' ? j.saves : undefined, crashed: typeof j.crashed === 'string' ? j.crashed : undefined, on: typeof j.on === 'boolean' ? j.on : undefined, auto: typeof j.auto === 'boolean' ? j.auto : undefined, via: j.via === 'native' || j.via === 'winfsp' || j.via === 'webdav' || j.via === 'auto' ? j.via : undefined }
+      const j = JSON.parse(readFileSync(stateFile, 'utf8')) as { on?: unknown; auto?: unknown; via?: unknown; crashed?: unknown; saves?: unknown; letter?: unknown }
+      return { letter: typeof j.letter === 'string' ? j.letter : undefined, saves: typeof j.saves === 'boolean' ? j.saves : undefined, crashed: typeof j.crashed === 'string' ? j.crashed : undefined, on: typeof j.on === 'boolean' ? j.on : undefined, auto: typeof j.auto === 'boolean' ? j.auto : undefined, via: j.via === 'native' || j.via === 'winfsp' || j.via === 'webdav' || j.via === 'auto' ? j.via : undefined }
     } catch {
       return {}
     }
   }
-  const remember = (patch: { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string | undefined; saves?: boolean }) => {
+  const remember = (patch: { on?: boolean; auto?: boolean; via?: CrmDriverChoice; crashed?: string | undefined; saves?: boolean; letter?: string }) => {
     try {
       mkdirSync(o.dir, { recursive: true })
       const tmp = `${stateFile}.tmp`
@@ -202,6 +231,7 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
       // the in-app drive takes saves only when the person turned "Save into the drive" on (OFF by default) and the agent keeps a spool (S9b: a save is kept on this PC and goes up by itself); otherwise it is read-only, and the page says so
       writable: way !== 'native' || (readState().saves === true && !!o.service?.()?.save),
       saveInto: native ? readState().saves === true : undefined,
+      driveLetter: platform === 'win32' && (native || dav) ? letter : undefined,
       waiting: platform === 'win32' && way === 'winfsp' ? waiting() : 0,
       autoMount: autoOn(),
       pendingDir: way === 'winfsp' ? pendingDir : undefined,
@@ -408,6 +438,42 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
         await start({ auto: readState().on !== true }).catch(() => undefined)
       }
       return status()
+    },
+    /**
+     * S2: the drive letter. Y: unless the person chose another one that is FREE: a letter something else holds (a disk, a network drive, another mapping) is never used. Applied now: a drive that is up is
+     * taken down and brought up on the new letter.
+     */
+    async setLetter(next: string) {
+      const l = next.trim().toUpperCase()
+      if (!LETTER.test(l)) throw new CrmFilesError(400, 'failed', 'A drive letter is D: to Z:.')
+      if (!(native || dav)) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+      if (l === letter) return status()
+      if (await letterTaken(l)) throw new CrmFilesError(409, 'failed', CRM_FILES_REASONS.letterTaken.replace('Y:', l))
+      const was = anyAlive()
+      if (was) await end()
+      remember({ letter: l })
+      letter = l
+      tag = letter.replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'Y'
+      pendingDir = path.join(hostState, `pending-${tag}`)
+      recoveredDir = path.join(hostState, `recovered-${tag}`)
+      if (madeNative) native = makeNative()
+      if (madeDav) dav = makeDav()
+      hostBlocked = false
+      nativeBroken = false
+      autoTries = 0
+      if (was || (shouldRun() && o.signedIn())) await start({ auto: readState().on !== true }).catch(() => undefined)
+      return status()
+    },
+    /** S2: the letter in use and the ones that are free right now (D: to Z:, none of them held by anything). */
+    async letters() {
+      const free: string[] = []
+      await Promise.all(
+        'DEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(async c => {
+          const l = `${c}:`
+          if (l !== letter && !(await letterTaken(l))) free.push(l)
+        }),
+      )
+      return { current: letter, free: free.sort() }
     },
     /** o6e65 (S4): how the drive is made: WinFsp, Windows' built-in WebDAV, or automatic. Changing it takes the drive down and, if it should be up, brings it up the new way. Without the WebDAV side only WinFsp exists. */
     async setDriver(next: CrmDriverChoice) {

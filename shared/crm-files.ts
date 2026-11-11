@@ -24,10 +24,16 @@
 //   POST /mount    {}                   -> CrmMountStatus   (start the drive)
 //   POST /unmount  {}                   -> CrmMountStatus
 //   POST /mount/auto   { on: boolean }  -> CrmMountStatus   (o6e65: mount the drive by itself while the CRM is signed in; ON by default, OFF is the old press-Start way)
+//   GET  /mount/letters                 -> { current: "Y:", free: ["D:", ...] }   (S2: the letter in use and the free ones, D: to Z:)
+//   POST /mount/letter { letter: "Z:" } -> CrmMountStatus   (S2: choose another FREE letter; a letter something else holds is refused with 409; the drive restarts on the new one)
 //   POST /mount/saves  { on: boolean }  -> CrmMountStatus   (S9b: "Save into the drive": whether the in-app drive takes saves into the CRM; OFF by default = read-only; applied by restarting the drive)
 //   POST /mount/driver { via: 'auto' | 'native' | 'winfsp' | 'webdav' } -> CrmMountStatus   (o6e65: how the Windows drive is made; Automatic uses the in-app WinFsp drive (S9a, read-only for now) and falls back to the WinFsp program, then to the built-in WebDAV)
 //   POST /mount/reveal { what: 'drive' | 'pending' | 'recovered' } -> { ok: true }   (o6e65: open File Explorer on one of THREE fixed places; no path is ever taken from the request)
 //   GET  /spool                         -> { entries: CrmSpoolEntry[], dir }   (o6e65 S5: saves kept on this PC until the CRM has them: the waiting list)
+//   GET  /removed                       -> { removed: CrmRemovedProject[] }   (S6: projects whose access was removed; the drive shows them in an "Access removed" folder with what is still on this PC for them)
+//   POST /removed/dismiss { id }        -> the same   (forget one entry; nothing is deleted)
+//   GET  /ignore                        -> { defaults: boolean, keptHere: number }   (S7: the built-in .driveignore defaults are on; how many saves are kept on this PC only by a rule)
+//   POST /ignore { defaults: boolean }  -> the same   (switch the built-in defaults: ~$*, *.tmp, Thumbs.db, desktop.ini, .DS_Store, node_modules, *.crdownload)
 //   POST /spool/retry  { id?: string }  -> { entries, retried }   (try one waiting save again now, or all of them when no id; a refused one is tried again too)
 //
 // od0b1 (U1): uploads of ANY size the CRM takes, in parts, held by the AGENT (no WebDAV in the way, no 5-minute single request). The page sends the file to this PC in parts; the agent
@@ -150,6 +156,8 @@ export interface CrmMountStatus {
   driverChoice?: CrmDriverChoice
   /** S9b: the "Save into the drive" setting of the in-app drive: false (the default) = read-only; true = a save, a copy or a drag into the drive is saved into the CRM. Left out where there is no in-app drive. */
   saveInto?: boolean
+  /** S2: the drive letter in use ("Y:" unless the person chose another); left out where this PC has no drive of ours. */
+  driveLetter?: string
 }
 
 export type CrmVia = 'native' | 'winfsp' | 'webdav'
@@ -157,9 +165,9 @@ export type CrmDriverChoice = 'auto' | CrmVia
 export const CRM_DRIVER_CHOICES: readonly CrmDriverChoice[] = ['auto', 'native', 'winfsp', 'webdav']
 
 /** o6e65 (S5): where a kept save is: 'waiting' (its turn has not come, or it was just kept), 'sending' (going up now), 'unreachable' (the CRM or the internet is not there; it is tried again by itself), 'refused' (the CRM said no for good: no right, the folder is gone, the name is taken; it is kept, never deleted). */
-export type CrmSpoolState = 'waiting' | 'sending' | 'unreachable' | 'refused'
+export type CrmSpoolState = 'waiting' | 'sending' | 'unreachable' | 'refused' | 'ignored'
 
-/** One save kept on this PC until the CRM has it (the waiting list of the page; the number "waiting" everywhere is the length of this list). */
+/** One save kept on this PC until the CRM has it (the waiting list of the page; the number "waiting" everywhere is the length of this list, without the ignored ones). S7: 'ignored' = a .driveignore rule (or the built-in list of editor and system files) keeps it on this PC only: it is never sent to the CRM and never deleted. */
 export interface CrmSpoolEntry {
   id: string
   /** 'new' = a new file in a folder; 'version' = a new version of a CRM file. */
@@ -175,6 +183,16 @@ export interface CrmSpoolEntry {
   reason: string | null
   /** How many times sending it failed. */
   attempts: number
+}
+
+/** S6: a project whose access was removed (the CRM stopped listing it for this account): shown in the "Access removed" folder of the drive and on the page until dismissed. */
+export interface CrmRemovedProject {
+  id: string
+  name: string
+  /** When it was found removed (ms since 1970). */
+  since: number
+  /** How many saves for it are still kept on this PC. */
+  saves: number
 }
 
 export interface CrmSpool {
@@ -441,7 +459,7 @@ const CRM_SPOOL_FIXTURE_DIR = 'C:\\Users\\you\\AppData\\Local\\shubham-agentic\\
 export const CRM_MOUNT_FIXTURE: Record<'ready' | 'running' | 'native' | 'webdav' | 'winfspMissing' | 'signedOut' | 'linuxNoGvfs' | 'linuxNoDesktop', CrmMountStatus> = {
   ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0, autoMount: true, mountVia: 'winfsp', driverChoice: 'auto', pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   running: { supported: true, driver: 'installed', driverName: 'WinFsp', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 2, autoMount: true, pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
-  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto', saveInto: false, spoolDir: CRM_SPOOL_FIXTURE_DIR },
+  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', driveLetter: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto', saveInto: false, spoolDir: CRM_SPOOL_FIXTURE_DIR },
   webdav: { supported: true, driver: 'installed', driverName: 'Windows WebDAV (built in)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: false, writable: true, waiting: 0, autoMount: true, mountVia: 'webdav', driverChoice: 'auto', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   winfspMissing: { supported: true, driver: 'missing', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.winfspMissing, reasonCode: 'driver-missing', installable: true, writable: true, waiting: 0 },
   signedOut: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.signedOut, reasonCode: 'crm-signin', installable: true, writable: true, waiting: 0 },
