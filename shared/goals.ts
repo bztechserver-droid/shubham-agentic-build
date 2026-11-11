@@ -19,6 +19,8 @@ export interface Goal {
   /** 'YYYY-MM-DD', or an ISO time, or null. */
   dueDate: string | null
   targetType?: string | null
+  /** The product/service (target type "service") or hierarchy node the goal is aimed at. */
+  targetId?: string | null
   servicePillar?: string | null
   projectId?: string | null
   isDisabled: boolean
@@ -44,6 +46,12 @@ export interface Member {
   userId: string
   fullName: string
   username: string
+}
+
+/** A product/service or a project a goal can be aimed at: what the CRM calls it, and its id. */
+export interface Aim {
+  id: string
+  name: string
 }
 
 export const STATUS_WORDS: Record<GoalStatus, string> = { todo: 'To do', done: 'Done', abandoned: 'Abandoned' }
@@ -171,4 +179,12 @@ export function owners(goals: readonly Goal[], members: readonly Member[]): { id
     for (const id of assigneesOf(g)) count.set(id, (count.get(id) ?? 0) + (isOpen(g) ? 1 : 0))
   }
   return [...count].map(([id, open]) => ({ id, name: members.find(m => m.userId === id)?.fullName ?? 'Someone', open })).sort((a, b) => b.open - a.open || a.name.localeCompare(b.name))
+}
+
+/** The calendar day after a day key ("2026-11-30" gives "2026-12-01"). */
+export function nextDayKey(key: string): string {
+  const [y, m, d] = key.split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d + 1))
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())}`
 }

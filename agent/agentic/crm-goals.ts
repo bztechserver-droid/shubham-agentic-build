@@ -1,6 +1,8 @@
 import { isMine, normaliseStatus, rankGoals, assigneesOf, dueDay, type Goal, type Member } from '../../shared/goals.ts'
 import { apiError } from '../api.ts'
-import { CrmNotSignedIn, type CrmProxy } from './crmproxy.ts'
+import { createCrmCall } from './crm-call.ts'
+import { createCrmScopes } from './crm-scopes.ts'
+import type { CrmProxy } from './crmproxy.ts'
 
 // The CRM's goals as tools for the chats of the app's owner (crm_whoami, crm_members, crm_goals, crm_goal_add, crm_goal_update). They
 // replace the scyramp-ai-ship crm_ tools one for one where the CRM Goals page needs them, on the CRM's own routes (sam-crm-be orgRoutes:
@@ -20,7 +22,6 @@ const MAX_DESCRIPTION = 5000
 /** The same goal added again within this long, by this server, is the one already added (a retry, a chat repeating itself). */
 const DUPLICATE_MS = 10 * 60_000
 
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const json = (v: unknown) => JSON.stringify(v, null, 2)
 
 export interface CrmGoalsOptions {
@@ -78,24 +79,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
   const recent = new Map<string, { id: string; at: number }>()
 
   /** One call to the CRM; its own words come back when it refuses, and nothing of the session ever does. */
-  async function crm<T>(method: string, sub: string, body?: unknown): Promise<T> {
-    let res: Response
-    try {
-      res = await o.proxy.request(method, sub, body === undefined ? {} : { json: body })
-    } catch (e) {
-      if (e instanceof CrmNotSignedIn) throw apiError(409, 'The CRM is not signed in on this PC: sign in from the CRM page, or Devices. Nothing was changed.')
-      if (isObject(e) && typeof e.status === 'number') throw e
-      throw apiError(502, "The CRM can't be reached right now. Nothing was changed.")
-    }
-    const data: unknown = await res.json().catch(() => null)
-    if (res.ok) return data as T
-    const said = isObject(data) && typeof data.error === 'string' ? data.error : null
-    if (res.status === 401) throw apiError(409, 'The CRM sign-in on this PC has ended: sign in again from the CRM page, or Devices. Nothing was changed.')
-    if (res.status === 403) throw apiError(403, `The CRM refused: ${said ?? "this person may not do that there"}`)
-    if (res.status === 404) throw apiError(404, said ?? 'The CRM does not have that')
-    if (res.status === 400 || res.status === 422) throw apiError(400, `The CRM refused: ${said ?? 'it did not accept that'}`)
-    throw apiError(502, `The CRM answered ${res.status}${said ? `: ${said}` : ''}. Check the goal on the Goals page before trying again.`)
-  }
+  const crm = createCrmCall({ proxy: o.proxy, afterServerError: 'Check the goal on the Goals page before trying again.' })
 
   async function me(): Promise<Person> {
     const r = await crm<{ user?: { id?: string; fullName?: string; username?: string } }>('GET', 'v1/auth/me')
@@ -129,6 +113,28 @@ export function createCrmGoals(o: CrmGoalsOptions) {
     if (!list.length) return []
     const all = await members()
     return [...new Set(list.map(x => person(x, who, all)))]
+  }
+
+  const scopes = createCrmScopes({ crm })
+
+  /**
+   * The board a goal is put on, in the CRM's own fields (what its Goals page sends): a service is target_type "service" + target_id, a project is
+   * project_id, General is target_type "organization". The board must be one the CRM lists (by id, or by a name that is exactly one board's).
+   * Not asked for: null, and a new goal stays General, a changed one stays where it is.
+   */
+  async function boardOf(args: Record<string, unknown>, how: 'add' | 'update'): Promise<Record<string, unknown> | null> {
+    if (args.targetType === undefined) {
+      if (args.targetId !== undefined || args.targetName !== undefined) throw apiError(400, 'targetId and targetName need targetType (organization, service or project)')
+      return null
+    }
+    const type = oneOf(args.targetType, ['organization', 'service', 'project'] as const, 'targetType')!
+    if (type === 'organization') {
+      if (args.targetId !== undefined || args.targetName !== undefined) throw apiError(400, 'organization (General) has no targetId or targetName')
+      return how === 'add' ? { target_type: 'organization' } : { target_type: 'organization', target_id: null, service_pillar: null }
+    }
+    const hit = await scopes.resolve(type, { id: args.targetId, name: args.targetName })
+    if (type === 'service') return { target_type: 'service', target_id: hit.targetId }
+    return how === 'add' ? { target_type: 'organization', project_id: hit.targetId } : { project_id: hit.targetId }
   }
 
   const named = (g: Pick<Goal, 'ownerId' | 'assigneeIds'>, all: readonly Member[]) =>
@@ -203,8 +209,9 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       }
       const who = await me()
       const assignees = args.assignees === undefined ? [who.id] : await people(args.assignees, who)
+      const board = await boardOf(args, 'add')
       // The same goal sent twice in minutes is the one that is there: no second goal in the company's CRM for a retry.
-      const key = JSON.stringify([who.id, title.toLowerCase(), assignees, due, parent ?? null])
+      const key = JSON.stringify([who.id, title.toLowerCase(), assignees, due, parent ?? null, board])
       const t = now()
       for (const [k, v] of recent) if (t - v.at > DUPLICATE_MS) recent.delete(k)
       const same = recent.get(key)
@@ -216,7 +223,7 @@ export function createCrmGoals(o: CrmGoalsOptions) {
         priority,
         due_date: due,
         assignee_ids: assignees,
-        target_type: 'organization',
+        ...(board ?? { target_type: 'organization' }),
         ...(parent ? { parent_goal_id: parent } : {}),
       }
       const made = await crm<Goal>('POST', 'v1/org/goals', body)
@@ -243,7 +250,9 @@ export function createCrmGoals(o: CrmGoalsOptions) {
       if (priority) body.priority = priority
       if (args.dueDate !== undefined) body.due_date = args.dueDate === null || (typeof args.dueDate === 'string' && !args.dueDate.trim()) ? null : dayOf(args.dueDate, now())
       if (args.assignees !== undefined) body.assignee_ids = await people(args.assignees, await me())
-      if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees')
+      const board = await boardOf(args, 'update')
+      if (board) Object.assign(body, board)
+      if (!Object.keys(body).length) throw apiError(400, 'Nothing to change: send at least one of title, description, status, priority, dueDate, assignees, targetType')
       const got = await crm<Goal>('PATCH', `v1/org/goals/${id}`, body)
       const all = await members().catch(() => [] as Member[])
       return json({ updated: id, goal: card(got, all) })

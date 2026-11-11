@@ -136,6 +136,8 @@ import { createAccess, policyKey, ruleOf, SBSKRRT_OWNER, type Need, type Rule } 
 import { createFileTaskStore, taskId, taskPatch, taskText } from './tasks.ts'
 import { checkCrm, createCrmStore, crmAddress, crmMode } from './crm.ts'
 import { createCrmGoals } from './crm-goals.ts'
+import { createCrmReads } from './crm-reads.ts'
+import { createCrmWrite } from './crm-write.ts'
 import { createCrmProxy } from './crmproxy.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
@@ -222,6 +224,11 @@ const NEEDS_SERVER = new Set([
   'crm_goals',
   'crm_goal_add',
   'crm_goal_update',
+  'crm_scopes',
+  'crm_board',
+  'crm_catalog',
+  'crm_query',
+  'crm_write',
 ])
 
 /** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory, his CRM sign-in): the owner of the app's chats only. */
@@ -231,6 +238,11 @@ const ADMIN_TOOLS = new Set([
   'crm_goals',
   'crm_goal_add',
   'crm_goal_update',
+  'crm_scopes',
+  'crm_board',
+  'crm_catalog',
+  'crm_query',
+  'crm_write',
   'task_add',
   'task_list',
   'task_update',
@@ -659,6 +671,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const crmProxy = createCrmProxy({ file: o.crmSession ?? path.join(o.dir, '..', 'crm-session.json') })
   // The CRM's goals as tools for the owner's chats (crm_goals, crm_goal_add, ...): on the same PC session.
   const crmGoals = createCrmGoals({ proxy: crmProxy })
+  const crmReads = createCrmReads({ proxy: crmProxy })
+  const crmWrite = createCrmWrite({ proxy: crmProxy })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
   void crmFiles.resume().catch(() => undefined)
@@ -3533,6 +3547,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'crm_goal_update': {
         const out = await crmGoals.update(args)
         log?.info(`${agent.name} changed a CRM goal`)
+        return out
+      }
+      // The rest of the CRM, read only (crm-reads.ts): the boards, one board's cards, what the CRM has, and any of it that may be read.
+      case 'crm_scopes':
+        return crmReads.scopes(args)
+      case 'crm_board':
+        return crmReads.board(args)
+      case 'crm_catalog':
+        return crmReads.catalog(args)
+      case 'crm_query':
+        return crmReads.query(args)
+      // A production write to anything else in the CRM the tools do not have a name for (crm-write.ts keeps out deletes, money and people's access): the log says only that one was made.
+      case 'crm_write': {
+        const out = await crmWrite.write(args)
+        log?.info(`${agent.name} wrote to the CRM`)
         return out
       }
       // F-070: the overlay assistant's hands. Only that agent: nobody else moves Shubham's screen.
