@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-DePvh3-m.js";import{c as t}from"./navigation-9PCEI_87.js";var n=e();function r({href:e,children:r,onClick:i,...a}){let o=t();return(0,n.jsx)(`a`,{href:e,onClick:t=>{i?.(t),t.defaultPrevented||t.metaKey||t.ctrlKey||t.shiftKey||t.altKey||t.button!==0||(t.preventDefault(),o.push(e))},...a,children:r})}export{r as t};

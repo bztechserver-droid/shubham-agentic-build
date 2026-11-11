@@ -97,6 +97,33 @@ export interface CrmUploadBackend {
   fetch: typeof fetch
 }
 
+/**
+ * oa2f8: the CRM organisation of the account signed in on this PC (the first part of the CRM's file key, server-sided-s3/<org>/...), or null when the CRM does not say. GET org/me answers
+ * { organization: { id } } (sam-crm-be orgController.getMyOrg; the CRM's own pages read it there); an older answer of v1/auth/me with { organization: { organizationId | id } } is read too.
+ * The CRM's v1/auth/me of today answers { user } only: reading only that broke every upload against the real CRM (found by the first real upload, 11 Nov 2026).
+ * Throws what the client throws (not signed in, no answer).
+ */
+export async function readOrgId(client: Pick<CrmClient, 'request'>): Promise<string | null> {
+  const idOf = (j: unknown): string | null => {
+    const o = typeof j === 'object' && j !== null ? (j as { organization?: unknown }).organization : null
+    if (typeof o !== 'object' || o === null) return null
+    const { id, organizationId } = o as { id?: unknown; organizationId?: unknown }
+    const v = typeof organizationId === 'string' && organizationId ? organizationId : typeof id === 'string' && id ? id : null
+    // It becomes a folder name and a part of the key: nothing but a plain id.
+    return v && /^[A-Za-z0-9_-]{1,80}$/.test(v) ? v : null
+  }
+  for (const sub of ['org/me', 'v1/auth/me']) {
+    const r = await client.request('GET', sub)
+    if (!r.ok) {
+      await r.body?.cancel().catch(() => undefined)
+      continue
+    }
+    const id = idOf(await r.json().catch(() => null))
+    if (id) return id
+  }
+  return null
+}
+
 export interface CrmFilesService {
   status(): Promise<CrmFilesStatus>
   children(id: string): Promise<CrmChildren>
@@ -528,9 +555,11 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   async function orgId(): Promise<string> {
     if (snap?.org) return snap.org
-    const j = await getJson('v1/auth/me', 'who you are')
-    const m = isObject(j) && isObject(j.organization) ? j.organization : null
-    const id = m ? text(m.organizationId) || text(m.id) : ''
+    // oa2f8: GET org/me says it (organization.id), as the CRM's own pages read it; the CRM's v1/auth/me answers { user } only (found by the first real upload, 11 Nov 2026).
+    const id = await readOrgId(client).catch((e: unknown) => {
+      if ((e as Error)?.name === 'CrmNotSignedIn') throw new CrmFilesError(409, 'crm-signin', CRM_FILES_REASONS.signedOut)
+      throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
+    })
     if (!id) throw new CrmFilesError(502, 'failed', 'The CRM did not say which organisation this account is in.')
     if (snap) snap.org = id
     return id

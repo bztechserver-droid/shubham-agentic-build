@@ -105,10 +105,13 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
       }
     },
     close: async () => {
+      // S9a4 (Lead): the drive's own close is STARTED first (synchronously) and waited for last. Its first act, on Windows, is to remove the in-app drive's marker; the uploads and the spool
+      // below can wait for a part or a send still in flight, and the agent may exit before they are done, and a marker left behind is read at the next start as a crash that switches the drive off.
+      const driveClosing = (async () => (win ?? o.mountDriver)?.close?.())()
+      driveClosing.catch(() => undefined)
       await uploads.close().catch(() => undefined)
       await service.spool?.close().catch(() => undefined)
-      await service.spool?.close().catch(() => undefined)
-      await (win ?? o.mountDriver)?.close?.()
+      await driveClosing
     },
   }
 }

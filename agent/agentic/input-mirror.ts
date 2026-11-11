@@ -31,6 +31,13 @@ export const MIRROR_TYPING_MS = 20_000
 export const MIRROR_FENCE_MS = 10_000
 /** The mirror's own text taken out for another message must be typed back within this, or the mirror stops (the chat box keeps it). */
 export const MIRROR_RESTORE_MS = 20_000
+/**
+ * A take-out that no message follows (its paste was refused right after: a question came up, his own send was on its way): once nothing
+ * holds keys and the line is still empty, his text goes back at once, looked at this long after the take-out and then every UNUSED_POLL_MS.
+ * Lead, 11 Nov: "after a take-out, if the paste is then refused, type his words back at once".
+ */
+export const MIRROR_UNUSED_MS = 400
+const UNUSED_POLL_MS = 200
 
 /** What may be typed: line breaks as \n, a tab as four spaces (Claude does the same to a paste), no control or direction-override characters. */
 export function mirrorText(s: string): string {
@@ -199,6 +206,8 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
    */
   let guard = false
   let restoreTimer: ReturnType<typeof setTimeout> | null = null
+  /** Looks whether a message followed the take-out at all (MIRROR_UNUSED_MS). */
+  let unusedTimer: ReturnType<typeof setTimeout> | null = null
   let lastSetAt = -Infinity
   /** His own send of this (whitespace-free) text was just submitted; `sealed`: his chat box said so, so no late copy can follow. */
   let sent: { key: string; until: number; sealed: boolean } | null = null
@@ -215,6 +224,20 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
   let pumping = false
   /** A kick while the worker runs: it looks once more before it rests. */
   let again = false
+  /**
+   * The mirror's own keys are on their way or being read back (an edit, a clean-up, a take-out): the line is between two states. Not
+   * `pumping`: the worker also runs a moment after its last job (its idle tail), and a message pasted right after a take-out answered must not
+   * be refused for that (live in build 1923, 11 Nov evening: every agent message to a chat with an open mirror was refused).
+   */
+  let editing = 0
+  async function editingWhile<T>(fn: () => Promise<T>): Promise<T> {
+    editing++
+    try {
+      return await fn()
+    } finally {
+      editing--
+    }
+  }
   async function pump(): Promise<void> {
     if (disposed) return
     if (pumping) {
@@ -414,7 +437,7 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
     const want = desired
     const by = asker
     if (tooLong(want) || modeStart(want)) {
-      await removeOwn()
+      await editingWhile(removeOwn)
       if (desired === want) applied = true
       return true
     }
@@ -423,7 +446,7 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
       paused = hold
       return false
     }
-    const r = await apply(want)
+    const r = await editingWhile(() => apply(want))
     if (r === 'paused') {
       paused ??= 'busy'
       return false
@@ -499,6 +522,48 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
   function clearRestore() {
     if (restoreTimer) clearTimeout(restoreTimer)
     restoreTimer = null
+    if (unusedTimer) clearTimeout(unusedTimer)
+    unusedTimer = null
+  }
+  /** Another message went in after the mirror's text was taken out (or none came): typed back, only into an empty line (the guard), by the worker. */
+  function giveBack() {
+    heldOut = false
+    if (unusedTimer) clearTimeout(unusedTimer)
+    unusedTimer = null
+    void exclusive(async () => {
+      await sleep(settleMs)
+      const b = host.read()
+      if (b && b.text === '' && !b.chip) {
+        model = ''
+        modelEpoch = host.epoch()
+      }
+      paused = null
+      applied = false
+      schedule()
+    }, undefined)
+  }
+  /**
+   * After a take-out: if nothing holds keys (no delivery on its way, no question) and the line is still empty, no message followed it (the
+   * caller's paste was refused): his text goes back now instead of after MIRROR_RESTORE_MS. A message on its way holds keys ('delivering')
+   * until delivered() gives back; one stuck in the line makes it not empty: both wait as before.
+   */
+  function watchUnused(since: number) {
+    const check = () => {
+      unusedTimer = null
+      if (disposed || !heldOut) return
+      const b = host.read()
+      if (host.hold() === null && b && b.text === '' && !b.chip) {
+        host.log?.(`input mirror: nothing followed a take-out; typed back (taken out ${counts.takenOut})`)
+        giveBack()
+        return
+      }
+      if (now() - since < restoreMs) {
+        unusedTimer = setTimeout(check, UNUSED_POLL_MS)
+        ;(unusedTimer as { unref?: () => void }).unref?.()
+      }
+    }
+    unusedTimer = setTimeout(check, MIRROR_UNUSED_MS)
+    ;(unusedTimer as { unref?: () => void }).unref?.()
   }
   function fenceEnds() {
     if (fenceTimer) clearTimeout(fenceTimer)
@@ -539,7 +604,7 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
           desired = null
           applied = true
           skipped = null
-          void exclusive(removeOwn, undefined)
+          void exclusive(() => editingWhile(removeOwn), undefined)
           return
         }
       } else if (sent && !sent.sealed && now() < sent.until && key !== '' && sent.key.startsWith(key)) {
@@ -580,11 +645,11 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
 
     typing: () => !off() && now() - lastSetAt < MIRROR_TYPING_MS,
 
-    busy: () => !off() && pumping,
+    busy: () => !off() && editing > 0,
 
     takeOut(force = false) {
       if (off() || disposed) return Promise.resolve('none' as TakeOut)
-      return exclusive(async (): Promise<TakeOut> => {
+      return exclusive(() => editingWhile(async (): Promise<TakeOut> => {
         const b = host.read()
         if (!b || (b.text === '' && !b.chip)) return 'none'
         if (heldOut || !ownedBox(b)) return 'foreign'
@@ -629,8 +694,9 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
           tellState()
         }, restoreMs)
         ;(restoreTimer as { unref?: () => void }).unref?.()
+        watchUnused(now())
         return 'taken'
-      }, 'none')
+      }), 'none')
     },
 
     delivered(submitted, human) {
@@ -656,19 +722,7 @@ export function createInputMirror(host: MirrorHost, o: MirrorOptions = {}): Inpu
         schedule()
         return
       }
-      // Another message went in after the mirror's text was taken out: typed back, only into an empty line (the guard), by the worker.
-      heldOut = false
-      void exclusive(async () => {
-        await sleep(settleMs)
-        const b = host.read()
-        if (b && b.text === '' && !b.chip) {
-          model = ''
-          modelEpoch = host.epoch()
-        }
-        paused = null
-        applied = false
-        schedule()
-      }, undefined)
+      giveBack()
     },
 
     holds(text) {

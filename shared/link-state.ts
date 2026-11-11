@@ -28,8 +28,11 @@ export interface LinkAnswer {
   recheckInMs: number | null
 }
 
-/** `offlineSince`: when the browser last said it went offline (null: it is online). */
-export function linkState(channels: Iterable<ChannelReport>, offlineSince: number | null, now: number): LinkAnswer {
+/**
+ * `offlineSince`: when the browser last said it went offline (null: it is online). `signAfterMs`: how long a channel is down before it counts (order ob8ca:
+ * the quiet sign waits longer just after the app came back, src/lib/live; everywhere else it is SIGN_AFTER_MS, as before).
+ */
+export function linkState(channels: Iterable<ChannelReport>, offlineSince: number | null, now: number, signAfterMs = SIGN_AFTER_MS): LinkAnswer {
   let wait: number | null = null
   const due = (since: number, after: number) => {
     const left = since + after - now
@@ -42,7 +45,7 @@ export function linkState(channels: Iterable<ChannelReport>, offlineSince: numbe
   for (const c of channels) {
     // 'closed' is a channel that ended on purpose (a chat that finished): not a broken link.
     if (c.status !== 'connecting' && c.status !== 'waiting') continue
-    if (!due(c.since, SIGN_AFTER_MS)) continue
+    if (!due(c.since, signAfterMs)) continue
     if (c.everOpen) return { state: 'reconnecting', recheckInMs: null }
     down = 'connecting'
   }

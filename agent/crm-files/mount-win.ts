@@ -429,6 +429,15 @@ export function createWinMount(o: WinMountOptions): MountDriver & { resume(): Pr
     },
     /** At the agent's end: the host goes with it; the choices are kept for the next start. */
     async close() {
+      // S9a4: the agent is shutting down cleanly (an Update, a restart): the in-app drive's marker is removed FIRST and synchronously. The rest of this waits (the bridge, the drive's thread, up to
+      // seconds) and the process may exit before it is done; the marker must not outlive a clean shutdown, or the next start takes it for a crash and switches the drive off.
+      if (native) {
+        try {
+          rmSync(path.join(o.dir, INAPP_MARKER), { force: true })
+        } catch {
+          // a marker that cannot be removed only keeps the in-app way off: the safe side
+        }
+      }
       if (timer) clearInterval(timer)
       timer = null
       const c = child

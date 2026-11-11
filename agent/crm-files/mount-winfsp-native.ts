@@ -162,6 +162,9 @@ export function createWinNative(o: NativeOptions) {
 
   /** Ends the drive: a "stop" message (WinFsp stops its dispatcher and removes the letter), then the thread ends; a thread that does not answer in time is terminated. */
   async function end(): Promise<void> {
+    // S9a4: a CLEAN end begins here, so the marker goes NOW, before any wait: the agent may exit while the drive's thread is still being asked to stop (an Update does), and a marker left behind
+    // would be read at the next start as a crash. A real native fault ends the process without ever reaching this, so the marker is still there to be found.
+    removeMarker()
     const w = worker
     if (!w) return
     ending = true

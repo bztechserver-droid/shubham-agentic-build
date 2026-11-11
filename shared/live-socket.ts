@@ -13,6 +13,18 @@
 // The ping is a text message {"t":"ping","n":N} that the agent (agent/ws-live.ts) answers with
 // {"t":"pong","n":N} on every socket it serves. ANY message counts as life, so a busy socket is
 // never pinged. An agent that doesn't answer (older) costs one needless reconnect per check.
+//
+// Order ob8ca (Shubham: "every time I am opening this app, there is a reconnecting"), the quick way
+// (deps.quick(), Settings › Chats › Live link; the way before stays the other choice):
+//   a page that was frozen  Chrome itself closes a frozen page's sockets as it comes back (measured,
+//                           Chrome 157): a new socket at once, no question first
+//   hidden a long time      (30 s and more) the old socket gets 1.2 s to answer the check, not 3.5 s
+//   the drop of a wake-up   the first drop within 3 s of the page coming back reconnects at once,
+//                           not after the 250 ms backoff (failures after it back off as before)
+//   who goes first          a browser lets ONE WebSocket handshake to a server run at a time
+//                           (RFC 6455 4.1, measured), so those reconnects are spaced by priority: the
+//                           chat on screen (0), the floors (1), the rest (2), 40 ms apart
+//   a quicker heartbeat     a ping after 10 s of silence, 5 s to answer (the way before: 20 s and 8 s)
 
 /** WebSocket.OPEN. */
 export const OPEN = 1
@@ -35,13 +47,15 @@ export interface LiveDeps {
   random(): number
   /** False while the page is hidden: nothing is pinged then (timers are throttled and nobody looks). */
   visible(): boolean
+  /** Order ob8ca: true = the quick way (the top of this file); false or missing = the way before. Read at every decision, so a change applies at once. */
+  quick?(): boolean
 }
 
 /** connecting: a socket is opening. open. waiting: between two attempts. closed: stopped, for good or until reconnect(). */
 export type LiveStatus = 'connecting' | 'open' | 'waiting' | 'closed'
 
 /** How an attempt ended: the socket closed, or it never opened in time, or it stopped answering. */
-export type DropWhy = 'closed' | 'connect-timeout' | 'no-answer'
+export type DropWhy = 'closed' | 'connect-timeout' | 'no-answer' | 'stale'
 
 export interface Drop {
   code: number
@@ -71,14 +85,26 @@ export interface LiveOptions {
   heartbeat?: false | { everyMs?: number; replyMs?: number; resumeReplyMs?: number }
   backoffMs?: readonly number[]
   connectTimeoutMs?: number
+  /** Order ob8ca: who reconnects first when they all do at once (the quick way): 0 the chat on screen, 1 the floors, 2 the rest (the default). */
+  priority?: number
+}
+
+/** What the page knows as it comes back (src/lib/live). */
+export interface WakeInfo {
+  /** How long it was hidden (ms); 0 or missing: it was not. */
+  hiddenMs?: number
+  /** It was frozen (Page Lifecycle: 'freeze', then 'resume'). */
+  frozen?: boolean
+  /** Another channel to the same server has just found its link dead: this one is checked quickly too. */
+  suspect?: boolean
 }
 
 export interface Live {
   readonly status: LiveStatus
   /** Sends if the socket is open; false otherwise. Nothing is queued: a message is the caller's to keep. */
   send(text: string): boolean
-  /** The page is back, or the network is: reconnect now when down, check the link when up. */
-  wake(): void
+  /** The page is back, or the network is: reconnect now when down, check the link when up (the quick way: a new socket at once after a freeze). */
+  wake(info?: WakeInfo): void
   /** "Try again": drop whatever there is and connect now, the backoff forgotten. */
   reconnect(): void
   /** Stops for good. */
@@ -90,6 +116,15 @@ export interface Live {
 // reconnect at once: src/lib/live/guard.ts.)
 export const BACKOFF_MS: readonly number[] = [250, 500, 1000, 2000, 3000, 5000]
 export const HEARTBEAT = { everyMs: 20_000, replyMs: 8000, resumeReplyMs: 3500 }
+/** Order ob8ca, the quick way: a link that died without a sound is found within 15 s while the page is in front (the way before: up to 28 s). */
+export const QUICK_HEARTBEAT = { everyMs: 10_000, replyMs: 5000, resumeReplyMs: 3500 }
+/** The quick way: hidden this long, the old socket gets QUICK_CHECK_MS to answer (a phone's is as good as dead by then; a computer's answers at once). */
+export const STALE_AFTER_MS = 30_000
+export const QUICK_CHECK_MS = 1200
+/** The quick way: the first drop this soon after the page came back reconnects at once. */
+export const WAKE_WINDOW_MS = 3000
+/** The quick way: between two priorities' reconnects, so the browser's one-at-a-time handshakes follow them. */
+export const STAGGER_MS = 40
 export const CONNECT_TIMEOUT_MS = 10_000
 /** A handshake older than this when the page comes back is hung on a dead path: start again. */
 const STUCK_MS = 2000
@@ -100,8 +135,12 @@ const isPong = (s: string) => s.charCodeAt(0) === 123 && s.startsWith('{"t":"pon
 
 export function openLive(o: LiveOptions, d: LiveDeps): Live {
   const backoff = o.backoffMs?.length ? o.backoffMs : BACKOFF_MS
-  const beat = o.heartbeat === false ? null : { ...HEARTBEAT, ...o.heartbeat }
+  const quick = () => d.quick?.() === true
+  /** Read each time: the quick way's numbers or the way before's, under whatever the channel set itself. */
+  const beatNow = () => (o.heartbeat === false ? null : { ...(quick() ? QUICK_HEARTBEAT : HEARTBEAT), ...o.heartbeat })
   const connectTimeout = o.connectTimeoutMs ?? CONNECT_TIMEOUT_MS
+  /** The quick way: when the page came back, until its first drop has been reconnected at once. */
+  let wokeAt: number | null = null
 
   interface Attempt {
     socket: WebSocketLike
@@ -151,6 +190,8 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
     }
   }
   const jitter = (ms: number) => Math.round(ms * (0.8 + 0.4 * d.random()))
+  /** The quick way's "at once": the channel's place in the queue, and a little jitter. */
+  const stagger = () => Math.max(0, o.priority ?? 2) * STAGGER_MS + Math.floor(d.random() * 20)
 
   /** The attempt is over; the next one is planned (or none, when `retry` says this was final). */
   const over = (drop: Drop, why: DropWhy) => {
@@ -165,9 +206,16 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
       return
     }
     // A link found dead was fine a moment ago: try at once, not after a backoff.
-    if (why === 'no-answer') attempt = 0
+    if (why === 'no-answer' || why === 'stale') attempt = 0
+    // The quick way: the first drop that comes with the page coming back (Chrome closing a frozen page's sockets, a check that failed) is reconnected at once.
+    const ofWake = quick() && wokeAt !== null && d.now() - wokeAt <= WAKE_WINDOW_MS
+    if (ofWake) {
+      wokeAt = null
+      attempt = 0
+    }
     const step = Math.min(attempt++, backoff.length - 1)
-    const delay = why === 'no-answer' ? Math.floor(d.random() * 250) : jitter(backoff[step])
+    const now = ofWake || (quick() && (why === 'no-answer' || why === 'stale'))
+    const delay = now ? stagger() : why === 'no-answer' ? Math.floor(d.random() * 250) : jitter(backoff[step])
     setStatus('waiting')
     o.onDrop?.({ ...drop, why, retryInMs: delay })
     if (stopped) return
@@ -217,6 +265,7 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
   const scheduleBeat = () => {
     stopTimer(beatTimer)
     beatTimer = null
+    const beat = beatNow()
     if (!beat || !cur?.opened) return
     const idle = d.now() - lastRx
     const wait = probeDeadline !== null || idle >= beat.everyMs ? beat.everyMs : beat.everyMs - idle
@@ -224,6 +273,7 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
   }
   const onBeat = () => {
     beatTimer = null
+    const beat = beatNow()
     if (!beat || !cur?.opened) return
     if (d.visible() && probeDeadline === null && d.now() - lastRx >= beat.everyMs) ping(beat.replyMs)
     scheduleBeat()
@@ -288,8 +338,9 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
     }
   }
 
-  function wake() {
+  function wake(info: WakeInfo = {}) {
     if (stopped || ended) return
+    if (quick()) wokeAt = d.now()
     if (retryTimer !== null) {
       stopTimer(retryTimer)
       retryTimer = null
@@ -306,7 +357,11 @@ export function openLive(o: LiveOptions, d: LiveDeps): Live {
       }
       return
     }
-    if (beat) ping(beat.resumeReplyMs)
+    // The quick way: the browser closes a frozen page's sockets as it comes back, so a new one now rather than a question first.
+    if (quick() && info.frozen) return abandon(a, 4004, 'stale', 'stale')
+    const beat = beatNow()
+    if (!beat) return
+    ping(quick() && (info.suspect || (info.hiddenMs ?? 0) >= STALE_AFTER_MS) ? Math.min(QUICK_CHECK_MS, beat.resumeReplyMs) : beat.resumeReplyMs)
   }
 
   function reconnect() {

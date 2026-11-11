@@ -457,8 +457,12 @@ export type TerminalServerMessage =
    * that does not know it never sends it.
    */
   | { t: 'size'; cols: number; rows: number }
-  /** What the terminal printed; the first one replays its recent screen. */
-  | { t: 'out'; d: string }
+  /**
+   * What the terminal printed; the first one replays its recent screen. o178e: a REPLAY message may carry `size`, the size the terminal had while it printed `d` (one message per run of
+   * output at one size, oldest first, the last one at the size the terminal has now): the page lays the replay out at those sizes in order, as a terminal that had been open all along. A message
+   * without it is drawn at the size the page already has (an agent that never sends it).
+   */
+  | { t: 'out'; d: string; size?: { cols: number; rows: number } }
   /** The claude process ended. */
   | { t: 'exit'; code: number | null }
   /** F-193: only on a `mode=draft` socket. */

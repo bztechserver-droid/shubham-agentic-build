@@ -458,7 +458,9 @@ export function createCrmUploads(o: CrmUploadsOptions): CrmUploads {
       if (e.code === 'crm-signin') return new Transient('crm-signin', CRM_UPLOAD_REASONS.signIn)
       if (e.code === 'crm-down') return new Transient('crm-down', CRM_UPLOAD_REASONS.crmDown)
       if (e.upstream) return googleStatus(e.upstream.status, e.upstream.reason)
-      if (e.code === 'failed' && e.status >= 500) return new Transient('google', CRM_UPLOAD_REASONS.google)
+      // oa2f8: an answer that is not what the agent needs (the CRM's or Google's) is waited for like a busy line, but with its OWN words: the first real test showed "Google Drive did not
+      // take it" for a CRM answer that had no organisation in it.
+      if (e.code === 'failed' && e.status >= 500) return new Transient('failed', `${scrub(e.message).replace(/\.?$/, '.')} Trying again.`)
       return new Permanent(e.code, scrub(e.message))
     }
     const code = (e as NodeJS.ErrnoException)?.code

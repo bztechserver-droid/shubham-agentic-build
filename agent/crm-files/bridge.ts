@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { CrmClient } from './service.ts'
+import { readOrgId, type CrmClient } from './service.ts'
 
 // F-126: the CRM bridge for the Windows drive host (crm-fs.exe). The host is the old agentic-claude-manager's CRM Files drive and talks to "the manager" at /api/crm-proxy/... ; here that is
 // this agent, on a loopback port of its own that lives only while the drive runs, behind a secret that is new every run (the host gets it in its environment, never on a command line
@@ -42,11 +42,8 @@ export async function startBridge(o: BridgeOptions): Promise<Bridge> {
   async function orgId(): Promise<string | null> {
     if (org) return org
     try {
-      const r = await o.client.request('GET', 'v1/auth/me')
-      if (!r.ok) return null
-      const j = (await r.json()) as { organization?: { organizationId?: unknown; id?: unknown } | null }
-      const id = j.organization?.organizationId ?? j.organization?.id
-      if (typeof id === 'string' && id) org = id
+      // oa2f8: GET org/me says it (organization.id); the CRM's v1/auth/me of today answers { user } only (service.ts readOrgId reads both).
+      org = await readOrgId(o.client)
     } catch {
       // no answer: the host asks again
     }

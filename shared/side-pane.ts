@@ -27,6 +27,6 @@ export const paneBlockedReason = (openInMain: boolean): string | null => (openIn
 /** The words on the pin button for one agent, by what the pane is showing: the button shows it when the agent is not in the pane's view, and takes it away when it is. */
 export function pinWords(agentName: string, inView: boolean): { label: string; title: string } {
   return inView
-    ? { label: `Unpin ${agentName} from the side pane`, title: 'Unpin from the side pane' }
-    : { label: `Open ${agentName} in the side pane`, title: 'Pin to the side pane' }
+    ? { label: `Unpin ${agentName} from the Assistant`, title: 'Unpin from the Assistant' }
+    : { label: `Open ${agentName} in the Assistant`, title: 'Pin to the Assistant' }
 }
