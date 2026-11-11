@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-Ctz2MpMW.js";function t(){e(`/goals`)}export{t as default};

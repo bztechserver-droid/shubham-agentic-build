@@ -22,6 +22,8 @@ export interface Goal {
   servicePillar?: string | null
   projectId?: string | null
   isDisabled: boolean
+  /** When the goal was created (an ISO time; the CRM's goals table has created_at and its list sends every column). Absent: the sort "Date added" puts the goal last. */
+  createdAt?: string
   updatedAt?: string
 }
 
