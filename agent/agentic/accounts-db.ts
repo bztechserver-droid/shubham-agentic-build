@@ -33,7 +33,8 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 export function readAccountsDb(dir: string): ConfigRead {
   let raw: unknown
   try {
-    raw = JSON.parse(readFileSync(path.join(dir, CONFIG_FILE), 'utf8'))
+    // A file saved by Windows PowerShell or Notepad may start with a byte-order mark: not part of the JSON.
+    raw = JSON.parse(readFileSync(path.join(dir, CONFIG_FILE), 'utf8').replace(/^﻿/, ''))
   } catch (e) {
     return { ok: false, bad: (e as NodeJS.ErrnoException)?.code === 'ENOENT' ? null : 'file' }
   }

@@ -189,6 +189,8 @@ export function createAccountsImport(o: AccountsImportOptions) {
           if (isObject(e) && typeof e.status === 'number') throw e
           const { reason, code } = reasonOf(e)
           o.log?.warn(`accounts import: ${reason} (${code})`)
+          // The reading login may not write until 0003 has been run: said plainly, and nothing was changed (the first write, the run's own line, is what is refused).
+          if (args.apply && code === '42501') throw apiError(409, 'The database refused a write (42501): either db/accounts/0003_email_copy_from_crm.sql has not been run yet, or a row broke the database rules. What was copied before stays; the copy can be run again.')
           // A check still answers with what the CRM has (that is the part that did not need the new database); a copy says what failed.
           if (!args.apply) {
             report.plan = null
@@ -207,13 +209,20 @@ export function createAccountsImport(o: AccountsImportOptions) {
 
 async function writeOne(tx: Tx, person: string, key: Buffer, r: CrmEmail, mac: string | null, hash: string): Promise<void> {
   const enc = r.password === null ? null : encryptPassword(key, r.password)
-  const saved: Row[] = await tx`
+  // UPDATE first, then INSERT when there was nothing to update. (Not "insert ... on conflict do update set x = excluded.x": reading excluded.password_enc needs the right to SELECT that column, which the
+  // app's login deliberately does not have: the database refuses it. An update with the new values as parameters needs only the right to update.)
+  const changed: Row[] = await tx`
+    update sad.account_email set source_hash = ${hash}, address = ${r.address}, recovery_email = ${r.recoveryEmail}, phone = ${r.phone}, description = ${r.description}, has_password = ${r.password !== null},
+      password_enc = ${enc}, password_mac = ${mac}, is_disabled = ${r.isDisabled}, created_by_name = ${r.createdByName}, source_created_at = ${r.sourceCreatedAt}, source_updated_at = ${r.sourceUpdatedAt},
+      last_seen_at = now(), gone_from_source = false, gone_at = null, updated_at = now()
+    where owner_id = ${person} and source = 'crm' and source_id = ${r.sourceId}
+    returning id::text as id`
+  const saved: Row[] =
+    changed.length > 0
+      ? changed
+      : await tx`
     insert into sad.account_email (owner_id, source, source_id, source_hash, address, recovery_email, phone, description, has_password, password_enc, password_mac, is_disabled, created_by_name, source_created_at, source_updated_at, last_seen_at, gone_from_source, gone_at)
     values (${person}, 'crm', ${r.sourceId}, ${hash}, ${r.address}, ${r.recoveryEmail}, ${r.phone}, ${r.description}, ${r.password !== null}, ${enc}, ${mac}, ${r.isDisabled}, ${r.createdByName}, ${r.sourceCreatedAt}, ${r.sourceUpdatedAt}, now(), false, null)
-    on conflict (owner_id, source, source_id) where source_id is not null do update set
-      source_hash = excluded.source_hash, address = excluded.address, recovery_email = excluded.recovery_email, phone = excluded.phone, description = excluded.description, has_password = excluded.has_password,
-      password_enc = excluded.password_enc, password_mac = excluded.password_mac, is_disabled = excluded.is_disabled, created_by_name = excluded.created_by_name, source_created_at = excluded.source_created_at,
-      source_updated_at = excluded.source_updated_at, last_seen_at = now(), gone_from_source = false, gone_at = null, updated_at = now()
     returning id::text as id`
   const emailId = String(saved[0]?.id)
   const present = await tx`select source_id::text as source_id from sad.account_email_use where email_id = ${emailId} and gone_from_source = false and source_id is not null`

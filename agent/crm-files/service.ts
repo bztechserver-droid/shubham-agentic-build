@@ -12,8 +12,10 @@ import {
   type CrmReveal,
   type CrmNode,
   type CrmRights,
+  type CrmSpoolEntry,
   type CrmVersion,
 } from '../../shared/crm-files.ts'
+import { createSpool, type Spool } from './spool.ts'
 
 // F-126: the CRM's files as a tree, for the page, for the Linux mount (in process) and for the Windows host's bridge. The CRM's own RECORDS decide what is a file and where it is
 // (files, file_groups, file_versions), not the Google Drive folders. The tree is the one the old agentic-claude-manager drive built:
@@ -65,6 +67,15 @@ export interface CrmFilesOptions {
   driveUpload?: string
   /** How long a listing of the CRM is reused (ms). */
   ttlMs?: number
+  /**
+   * o6e65 (S5): where saves made through a drive are kept (spooled) until the CRM has them. Left out = no spool: a save through a drive goes to the CRM directly, as before. Tests give a made-up folder.
+   */
+  spoolDir?: string
+  /** S5: the spool's own timings and cap (tests). */
+  spool?: { retryMs?: number[]; maxBytes?: number; autoStart?: boolean }
+  /** S5: opens a folder in the PC's file manager (the "Open the folder" button). Left out = the button says it is not supported here. */
+  openFolder?: (dir: string) => void
+  log?: { info(m: string): void; warn(m: string): void }
 }
 
 /**
@@ -95,6 +106,13 @@ export interface CrmFilesService {
   /** S9a: bytes [start, start + length) of a file by a ranged request to the CRM (fewer only at the end of the file); a CRM that ignores the range is read and cut. For the in-app WinFsp drive. */
   fileBytes(id: string, start: number, length: number): Promise<Buffer>
   versions(id: string): Promise<CrmVersion[]>
+  /**
+   * S5: a save made through a drive: the bytes are kept on this PC (the spool) and this returns at once; they go up in the background. It checks the rights first (a save the CRM would refuse is
+   * refused now, not accepted and then parked). `target` = a CRM file to save over as a NEW VERSION; without it, a new file in the folder `parent`. Null when this agent keeps no spool.
+   */
+  save: ((a: { parent: string; name: string; type: string; target?: string | null; body: Readable; size: number }) => Promise<{ how: 'new' | 'version'; entry: CrmSpoolEntry }>) | null
+  /** S5: the saves kept on this PC until the CRM has them (null when there is no spool). */
+  spool: Spool | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   version(id: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
   folder(parent: string, name: string): Promise<CrmNode>
@@ -185,7 +203,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     start: async () => noMount.status(),
     stop: async () => noMount.status(),
   }
-  const mount = o.mountDriver ?? noMount
+  const baseMount = o.mountDriver ?? noMount
+  let spool: Spool | null = null
 
   // ---- talking to the CRM ----------------------------------------------------------------------------------------------
 
@@ -762,10 +781,70 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     },
   }
 
+  // ---- S5: the spool and what it adds to the mount's words ---------------------------------------------------------------
+
+  /** The mount's status with the waiting saves counted in and the spool's folder named; reveal also knows the spool's folder. */
+  const mount: MountDriver = spool_decorate()
+  function spool_decorate(): MountDriver {
+    const withSpool = async (m: Promise<CrmMountStatus>): Promise<CrmMountStatus> => {
+      const st = await m
+      return spool ? { ...st, waiting: (st.waiting ?? 0) + spool.count(), spoolDir: spool.dir } : st
+    }
+    return {
+      status: () => withSpool(baseMount.status()),
+      start: () => withSpool(baseMount.start()),
+      stop: () => withSpool(baseMount.stop()),
+      setAuto: baseMount.setAuto ? on => withSpool(baseMount.setAuto!(on)) : undefined,
+      setDriver: baseMount.setDriver ? via => withSpool(baseMount.setDriver!(via)) : undefined,
+      reveal: async what => {
+        if (what === 'spool') {
+          if (!spool || !o.openFolder) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+          return o.openFolder(spool.dir)
+        }
+        if (!baseMount.reveal) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+        return baseMount.reveal(what)
+      },
+    }
+  }
+
+  if (o.spoolDir) {
+    spool = createSpool({
+      dir: o.spoolDir,
+      retryMs: o.spool?.retryMs,
+      maxBytes: o.spool?.maxBytes,
+      log: o.log,
+      onChange: () => invalidate(),
+      send: {
+        upload: (parent, name, type, stream, size) => service.upload(parent, name, type, stream, size),
+        version: (id, name, type, stream, size) => service.version(id, name, type, stream, size),
+        find: async (parent, name) => (await childrenOf(parent)).children.find(c => sameName(c.name, name)) ?? null,
+      },
+    })
+    if (o.spool?.autoStart !== false) spool.start()
+  }
+
   // ---- the service -----------------------------------------------------------------------------------------------------
 
-  return {
+  const service: CrmFilesService = {
     mount,
+    spool,
+    save: spool
+      ? async a => {
+          checkSize(a.size)
+          needName(a.name)
+          if (a.target) {
+            const { node, project } = await findFile(a.target)
+            await needRight(node, 'version', 'save a new version of this file')
+            const entry = await spool!.add({ kind: 'version', parent: node.parentId ?? a.parent, target: a.target, name: a.name, type: a.type, project: project?.name ?? null, body: a.body, size: a.size })
+            return { how: 'version' as const, entry }
+          }
+          asFolderParts(a.parent)
+          const pn = await nodeOf(a.parent)
+          await needRight(pn, 'upload', 'add files')
+          const entry = await spool!.add({ kind: 'new', parent: a.parent, name: a.name, type: a.type, project: pn.name, body: a.body, size: a.size })
+          return { how: 'new' as const, entry }
+        }
+      : null,
     uploadBackend,
 
     async status() {
@@ -929,4 +1008,5 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       return refreshed(id)
     },
   }
+  return service
 }

@@ -31,6 +31,11 @@ export interface SendOptions {
   maxSettleMs?: number
   /** Entire native transaction budget. Tool callers independently bound their confirmation wait. */
   timeoutMs?: number
+  /**
+   * F-193: the words are already in the box, typed there by the live mirror (or by him in the terminal): nothing is pasted, the box must
+   * hold exactly them, and only the settle, Enter and read-back steps run. A box holding anything else is refused as a draft.
+   */
+  preTyped?: boolean
 }
 const normalized = (s: string) => s.replace(/\s+/g, '')
 
@@ -63,8 +68,16 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   if (io.interrupted?.()) return blocked('input-changed')
   const initial = input(before)
   if (!initial) return blocked('composer-unavailable')
-  if (initial.text) return blocked('draft')
   const pasted = text.split(PASTE_END).join('')
+  if (o.preTyped) {
+    if (!pasted.trim()) return blocked('empty-message')
+    if (!initial.text || initial.collapsed || normalized(initial.text) !== normalized(pasted)) return blocked('draft')
+    if (expired()) return blockedWith('preflight-failed', 'deadline')
+    if (interrupted()) return blockedWith('input-changed', why())
+    mark('pasted')
+    return submitOwned()
+  }
+  if (initial.text) return blocked('draft')
   if (!pasted.trim()) return blocked('empty-message')
   if (expired()) return blockedWith('preflight-failed', 'deadline')
   if (io.beforeInput && !(await io.beforeInput('paste').catch(() => false))) return blocked('authorization-revoked')
@@ -96,6 +109,10 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
   }
   if (!io.write(PASTE_END)) return finish('gone', 'write-refused')
   mark('pasted')
+  return submitOwned()
+
+  /** From the words in the box (pasted above, or already typed: preTyped) to a confirmed submit: settle, Enter, read back. */
+  async function submitOwned(): Promise<SendResult> {
   const expected = normalized(pasted)
   const currentOwned = (lines: string[]) => {
     const full = input(lines)
@@ -164,4 +181,5 @@ export async function sendToCodex(io: SenderIO, text: string, o: SendOptions = {
     if (!unchangedOwned) return finish('unconfirmed', 'box-unreadable-after-enter')
   }
   return finish('unconfirmed', 'enter-attempts-exhausted')
+  }
 }

@@ -432,6 +432,23 @@ export type AgenticEvent =
 export type TerminalClientMessage =
   | { t: 'in'; d: string }
   | { t: 'size'; cols: number; rows: number }
+  /**
+   * F-193, only on a socket opened with `&mode=draft`: the chat box's whole text, for the terminal's input line to equal (never keys).
+   * `seq` rises with every message of this socket; `base`: the `line` of the last report this chat box saw (text typed in the terminal
+   * after that is never overwritten); `seal`: this exact text is being sent now (a late copy of it is never typed back).
+   */
+  | { t: 'draft-set'; seq: number; text: string; base: number; seal?: boolean }
+
+/** F-193: how the terminal input line's mirror stands (agent/agentic/input-mirror.ts). */
+export type DraftMirrorState = 'synced' | 'syncing' | 'paused' | 'stopped' | 'too-long' | 'unsupported' | 'off'
+/**
+ * F-193, agent to a `mode=draft` socket: what the terminal's input line holds. `from`: 'hello' (on joining), 'mirror' (a chat box's text,
+ * typed and read back: `seq` is that socket's, or null for another device's), 'terminal' (typed there, or sent: read off the screen, where a
+ * line break and a wrap look alike, so `exact` is false). `chip`: it holds a "[Pasted text #N]" block (never taken into a chat box).
+ * `line` counts the line's changes (a chat box sends it back as `base`). Only a 'terminal' report in state synced/syncing may be taken
+ * into a chat box; paused/stopped ones only say where the mirror stands.
+ */
+export interface DraftReport { t: 'draft'; v: 1; text: string; from: 'hello' | 'mirror' | 'terminal'; seq: number | null; exact: boolean; chip: boolean; state: DraftMirrorState; line: number; reason?: string }
 
 export type TerminalServerMessage =
   /**
@@ -444,6 +461,8 @@ export type TerminalServerMessage =
   | { t: 'out'; d: string }
   /** The claude process ended. */
   | { t: 'exit'; code: number | null }
+  /** F-193: only on a `mode=draft` socket. */
+  | DraftReport
 
 // F-062: what a chat really runs on, for the three chips every chat shows (model, effort, PC).
 

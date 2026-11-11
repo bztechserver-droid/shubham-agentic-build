@@ -12,6 +12,7 @@ import { ANY_CLAUDE_CHIP_RE, isOwnedClaudeChip } from './claude-paste.ts'
 import type { Logger } from '../log.ts'
 import { killTree as killProcessTree } from '../proc-tree.ts'
 import { createScreen, readTurnState, type Screen } from './screen.ts'
+import { createInputMirror, type InputMirror, type MirrorBox, type MirrorClient, type TakeOut } from './input-mirror.ts'
 
 // F-018: the agents' Claude Code chats. Each is the interactive claude TUI in a pseudo-terminal
 // (node-pty, ConPTY on Windows), as agentic-claude-manager runs them (server/lib/terminal.js):
@@ -220,6 +221,10 @@ export interface ChatPool {
   activity(sessionId: string): ChatActivity | null
   /** F-083: raw keys into the terminal for the app's own use (the watchdog dismissing a harmless menu); unlike input() it is not Shubham looking at the chat. */
   press(sessionId: string, data: string): boolean
+  /** F-193: a chat box's live mirror of a Claude chat's input line (a terminal socket with mode=draft); null when it isn't running here. */
+  draftMirror?(sessionId: string, client: MirrorClient): { set(seq: number, text: string, base: number, seal?: boolean): void; detach(): void } | null
+  /** F-193: before another message goes in, the live mirror's own text is taken out of the line and typed back after it (input-mirror.ts). */
+  mirrorTakeOut?(sessionId: string): Promise<TakeOut>
   closeAll(): void
 }
 
@@ -235,6 +240,8 @@ export interface DeliveryOptions {
   authorize?: (phase: 'paste' | 'submit') => Promise<boolean>
   /** Diagnostics only: once, when the send ends, which branch ended it and when each step happened. Never any text. */
   onReport?: (report: DeliveryReport) => void
+  /** F-193: his own send from a chat box (not an agent's message): words already in the line are submitted with Enter only. */
+  human?: boolean
 }
 
 export interface ChatActivity {
@@ -306,6 +313,8 @@ export interface ChatPoolOptions {
   keep?: (sessionId: string) => boolean
   /** F-083: how long a chat may sit idle and unwatched before it is stopped (IDLE_REAP_MS), and how often that is looked at (REAP_EVERY_MS); tests shorten both. */
   idleReapMs?: number
+  /** F-193: the agent-side switch for the live mirror (input-mirror.off, SAD_INPUT_MIRROR=0): true = off, every page keeps the old way. */
+  mirrorOff?: () => boolean
   reapEveryMs?: number
 }
 
@@ -364,6 +373,10 @@ interface Chat {
   delivering?: Promise<SendResult>
   generation?: string
   inputEpoch?: number
+  /** F-193: the live mirror of its input line (made when a chat box first asks), until when the old direct paste is in flight, and when a person last typed in it. */
+  mirror?: InputMirror
+  pastingUntil?: number
+  typedAt?: number
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
@@ -426,10 +439,91 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function draftOnScreen(c: Chat): boolean {
     try {
       if (c.engine === 'codex') return !menuOnScreen(c) && cxs.draftText(c.screen.lines()) !== ''
-      return !menuOnScreen(c) && boxText(c.screen.lines(), c.screen.typedLines()) !== ''
+      if (menuOnScreen(c) || boxText(c.screen.lines(), c.screen.typedLines()) === '') return false
+      // F-193: the live mirror's own text counts as his draft only while he types in a chat box (20 s); otherwise another message takes
+      // it out of the line and the mirror types it back after (paste, deliver).
+      return !c.mirror?.owned() || c.mirror.typing()
     } catch {
       return false
     }
+  }
+
+  /**
+   * F-193: inputBox for the live mirror only (the sender keeps inputBox): Claude's "/" or "@" list draws its chosen item indented
+   * ("  ❯ src/a.ts") right under the box's bottom rule; then the box is the complete one whose bottom rule is right above that item. A newest
+   * candidate that is not such an item gives null, exactly as inputBox: nothing older is ever taken.
+   */
+  function mirrorInputBox(lines: string[]): { start: number; end: number } | null {
+    const box = inputBox(lines)
+    if (box) return box
+    for (let j = lines.length - 1; j >= 2; j--) {
+      if (!RULE_LINE_RE.test(lines[j - 1]) || !INPUT_LINE_RE.test(lines[j])) continue
+      if (!/^\s+❯/.test(lines[j])) return null
+      for (let i = j - 2; i >= 1 && j - 1 - i <= MAX_COMPOSER_ROWS; i--) {
+        if (RULE_LINE_RE.test(lines[i])) return null
+        if (RULE_LINE_RE.test(lines[i - 1]) && INPUT_LINE_RE.test(lines[i]) && !/^\s+❯/.test(lines[i])) return { start: i, end: j - 1 }
+      }
+      return null
+    }
+    return null
+  }
+  /** F-193: the input box as the live mirror reads it: typed text, a chip in it, its rows, and whether the parked cursor is after the text. */
+  function mirrorBox(c: Chat): MirrorBox | null {
+    try {
+      const lines = c.screen.lines()
+      const typed = c.screen.typedLines()
+      const box = mirrorInputBox(lines)
+      if (!box) return null
+      // As boxComposer: a chip is real input in whatever colour; Claude's grey placeholder is not.
+      const join = (rows: string[]) => [rows[box.start].replace(/^\s*❯/, ''), ...rows.slice(box.start + 1, box.end)].join(' ').replace(/\s+/g, ' ').trim()
+      const raw = join(lines)
+      const typedText = join(typed)
+      const text = ANY_CLAUDE_CHIP_RE.test(raw) ? raw : /^Try "/.test(typedText) ? '' : typedText
+      let last = box.start
+      for (let r = box.end - 1; r >= box.start; r--) {
+        if ((r === box.start ? typed[r].replace(/^\s*❯/, '') : typed[r]).trim()) {
+          last = r
+          break
+        }
+      }
+      const at = c.screen.cursor()
+      const width = typed[last].replace(/\s+$/, '').length
+      return { text, chip: ANY_CLAUDE_CHIP_RE.test(text), rows: box.end - box.start, atEnd: at.y >= box.start && at.y < box.end ? at.y > last || (at.y === last && at.x >= width) : null }
+    } catch {
+      return null
+    }
+  }
+  /**
+   * F-193: a dialog Claude 2.1.322 draws ABOVE its still visible input box (the /model picker: options with "❯ 1.", a footer "... Esc to
+   * cancel"), which menuSeen takes for quoted text. Seen here as: a menu footer in the last two lines above the box and an option under the
+   * cursor in the twelve above it. Unreadable counts as a dialog.
+   */
+  function dialogAbove(c: Chat): boolean {
+    try {
+      const lines = c.screen.lines()
+      const box = mirrorInputBox(lines)
+      if (!box) return false
+      const above: string[] = []
+      for (let i = box.start - 2; i >= 0 && above.length < 12; i--) if (lines[i].trim()) above.push(lines[i])
+      return above.slice(0, 2).some(l => MENU_FOOTER_RE.test(l)) && above.some(l => OPTION_UNDER_CURSOR_RE.test(l))
+    } catch {
+      return true
+    }
+  }
+  /** F-193: the chat's live mirror, made when a chat box first asks for it (input-mirror.ts). */
+  function mirrorOf(c: Chat): InputMirror {
+    c.mirror ??= createInputMirror(
+      {
+        write: data => write(c, data),
+        read: () => mirrorBox(c),
+        hold: () => (c.exited ? 'gone' : c.delivering || (c.pastingUntil ?? 0) > Date.now() ? 'delivering' : menuSeen(c) !== false || dialogAbove(c) ? 'menu' : null),
+        epoch: () => c.inputEpoch ?? 0,
+        quietMs: () => Date.now() - Math.max(c.lastOutputAt, c.typedAt ?? 0),
+        log: line => log?.info(`chat ${c.info.sessionId.slice(0, 8)}: ${line}`),
+      },
+      { off: () => o.mirrorOff?.() === true, unsupported: () => (c.engine !== 'claude' ? c.engine : c.info.execution ? 'codex-in-claude' : null) },
+    )
+    return c.mirror
   }
   /** Whether a menu is on the live screen; null when the screen cannot be read. */
   function menuSeen(c: Chat): boolean | null {
@@ -583,6 +677,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function finish(c: Chat, code: number | null) {
     if (c.exited) return
     c.exited = true
+    c.mirror?.dispose()
     keys.delete(c.key)
     if (chats.get(c.info.sessionId) === c) chats.delete(c.info.sessionId)
     try {
@@ -619,6 +714,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       c.lastOutputAt = Date.now()
       if (c.state === 'running') c.lastActive = c.lastOutputAt
       answerGates(c, data)
+      c.mirror?.poke()
       for (const v of c.viewers) {
         try {
           v.send({ t: 'out', d: data })
@@ -697,9 +793,29 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       void sendCodex(c, text)
       return true
     }
+    // F-193: never pasted after the live mirror's own text (one Enter would send both): it is taken out first, this message goes in, and the
+    // mirror types it back after. While he types in a chat box (20 s) the message is refused; one that cannot be typed now waits for its turn.
+    const m = c.mirror
+    if (m && (m.busy() || m.owned())) {
+      // Mid-edit the line is between two states (real Claude, 11 Nov: a paste then joined his words): refused like a draft he is typing.
+      if (m.busy() || m.typing()) return false
+      void m.takeOut().then(r => {
+        if ((r === 'taken' || r === 'none') && !blocked(c) && !c.delivering && pasteNow(c, text)) return
+        log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: a message waits: the live mirror's text could not be taken out of the input line (${r})`)
+        if (r === 'taken') m.delivered(null, false)
+        typeWhenReady(c.info.sessionId, text, { holdForDraft: true })
+      })
+      return true
+    }
+    return pasteNow(c, text)
+  }
+  function pasteNow(c: Chat, text: string) {
     if (!write(c, PASTE_START + text.split(PASTE_END).join('') + PASTE_END)) return false
     c.lastActive = Date.now()
+    // F-193: the live mirror types nothing while this paste and its Enter are on their way, then looks again (and types its text back).
+    c.pastingUntil = Date.now() + 1500
     setTimeout(() => {
+      setTimeout(() => c.mirror?.delivered(null, false), 1300).unref()
       if (blocked(c)) {
         log?.warn(`chat ${c.info.sessionId.slice(0, 8)}: it began to ask a question just after a message was pasted; Enter was not pressed`)
         return
@@ -926,7 +1042,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c) return false
       c.lastSeen = Date.now()
       c.inputEpoch = (c.inputEpoch ?? 0) + 1
-      return write(c, data)
+      c.typedAt = Date.now()
+      const ok = write(c, data)
+      c.mirror?.poke()
+      return ok
     },
 
     resize(id, cols, rows) {
@@ -1006,12 +1125,25 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         finally { clearTimeout(timer) }
       }
       if (c.delivering) return refuse('unresolved-send')
-      if (draftOnScreen(c)) return refuse('draft')
+      // F-193: his own Send never presses Enter into a dialog drawn above the box (Enter there would choose in it).
+      if (opt?.human === true && dialogAbove(c)) return refuse('menu')
+      // F-193: his own Send when the line already holds exactly his words (the live mirror typed them, or he did there): Enter only. The
+      // mirror's own older text is taken out first (for another agent's message only when he has not typed for 20 s). Else as before.
+      const m = c.mirror
+      const preTyped = opt?.human === true && !!m && m.holds(text)
+      const takeOut = !preTyped && !!m && m.owned()
+      if (takeOut && opt?.human !== true && m!.typing()) return refuse('draft')
+      if (!preTyped && !takeOut && draftOnScreen(c)) return refuse('draft')
       const epoch = c.inputEpoch ?? 0
       const pasted = text.split(PASTE_END).join('')
       const sending = (async (): Promise<SendResult> => {
         const began = Date.now(), deadline = began + (o.codexSend?.timeoutMs ?? 96_000)
         const interruptCause = () => (c.inputEpoch ?? 0) !== epoch ? 'terminal-input' as const : 'guard-revoked' as const
+        if (takeOut) {
+          const out = await m!.takeOut(opt?.human === true)
+          // Nothing of the message is typed yet: a refusal, safe to send again.
+          if (out !== 'taken' && out !== 'none') { opt?.onBlocked?.('draft'); return 'blocked' }
+        }
         while (opt?.waitUntilReady && boxComposer(c.screen.lines(), c.screen.typedLines()) === null && !blocked(c) && Date.now() < deadline) {
           if (c.exited) return 'gone'
           // Nothing of the message is typed yet: a refusal, safe to send again, not an unconfirmed send.
@@ -1045,10 +1177,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           beforeInput: opt?.authorize,
           onBlocked: opt?.onBlocked,
           report: r => offsetReport(opt, r, sendStart - began),
-        }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()) })
+        }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()), preTyped })
       })().catch(() => 'unconfirmed' as const)
       c.delivering = sending
       void sending.finally(() => { if (c.delivering === sending) c.delivering = undefined })
+      // F-193: the live mirror learns what was submitted (his own send: never typed back; another message: the mirror's text goes back in).
+      if (m) void sending.then(r => m.delivered(r === 'sent' ? text : null, opt?.human === true))
       if (opt?.waitForOutcome) return sending
       let timer: ReturnType<typeof setTimeout> | undefined
       try { return await Promise.race([sending, new Promise<SendResult>(resolve => { timer = setTimeout(() => resolve('unconfirmed'), 18_000) })]) }
@@ -1126,7 +1260,23 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const c = chats.get(id)
       if (!c || c.exited) return false
       c.inputEpoch = (c.inputEpoch ?? 0) + 1
-      return write(c, data)
+      c.typedAt = Date.now()
+      const ok = write(c, data)
+      c.mirror?.poke()
+      return ok
+    },
+
+    draftMirror(id, client) {
+      const c = chats.get(id)
+      if (!c || c.exited) return null
+      const m = mirrorOf(c)
+      const detach = m.attach(client)
+      return { set: (seq, text, base, seal) => m.set(client, seq, text, base, seal), detach }
+    },
+
+    mirrorTakeOut(id) {
+      const c = chats.get(id)
+      return c && !c.exited && c.mirror ? c.mirror.takeOut() : Promise.resolve('none' as const)
     },
 
     closeAll() {

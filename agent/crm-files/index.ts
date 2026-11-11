@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { ApiMount } from '../api.ts'
@@ -53,6 +54,15 @@ export function hostSha256(root: string): string | undefined {
   }
 }
 
+/** S5: the PC's file manager on a folder (the spool's), where this PC has one. */
+function openFolderHere(dir: string) {
+  const cmd = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'linux' ? 'xdg-open' : null
+  if (!cmd) throw new Error('This PC cannot open a folder from here.')
+  const c = spawn(cmd, [dir], { detached: true, stdio: 'ignore' })
+  c.on('error', () => undefined)
+  c.unref()
+}
+
 export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
   const client = {
     request: o.proxy.request.bind(o.proxy),
@@ -76,7 +86,7 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
         })
       : null
   const driver = o.mountDriver ?? win ?? undefined
-  const service = createCrmFiles({ client, mountDriver: driver })
+  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log })
   serviceRef = service
   const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), backend: service.uploadBackend, log: o.log })
   return {
@@ -96,6 +106,8 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
     },
     close: async () => {
       await uploads.close().catch(() => undefined)
+      await service.spool?.close().catch(() => undefined)
+      await service.spool?.close().catch(() => undefined)
       await (win ?? o.mountDriver)?.close?.()
     },
   }

@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
+import { createReadStream } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { CRM_FILES_MAX_UPLOAD, CRM_FILES_REASONS, type CrmNode } from '../../shared/crm-files.ts'
+import { CRM_FILES_MAX_UPLOAD, CRM_FILES_REASONS, type CrmNode, type CrmSpoolEntry } from '../../shared/crm-files.ts'
 import { driveType } from '../drive/mime.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 
@@ -161,8 +162,10 @@ const multistatus = (r: string[]) => `<?xml version="1.0" encoding="utf-8"?>\n<D
 
 /** What a request path is: a CRM node, a side file, or nothing yet (with the folder it would be in). */
 type Found =
-  | { kind: 'node'; node: CrmNode; parent: CrmNode | null; parts: string[] }
+  | { kind: 'node'; node: CrmNode; parent: CrmNode | null; parts: string[]; /** S5: a newer save of this file that is kept on this PC and not in the CRM yet. */ spooled: CrmSpoolEntry | null }
   | { kind: 'side'; side: Side; parent: CrmNode; name: string; parts: string[] }
+  /** S5: a NEW file saved here that is kept on this PC and not in the CRM yet (it shows in the folder, can be read, and goes up by itself). */
+  | { kind: 'spooled'; entry: CrmSpoolEntry; parent: CrmNode; name: string; parts: string[] }
   | { kind: 'none'; parent: CrmNode; name: string; parts: string[] }
 
 const ALLOW = 'OPTIONS, GET, HEAD, PUT, MKCOL, MOVE, COPY, PROPFIND, PROPPATCH, LOCK, UNLOCK'
@@ -176,6 +179,8 @@ export function createCrmDav(o: CrmDavOptions) {
   const locks = new Map<string, { token: string; owner: string; timeout: number }>()
   const win = o.names === 'windows'
   const kidsOf = (children: CrmNode[]) => (win ? namesOf(children, legalWindowsName, true) : namesOf(children))
+
+  const pendingNewIn = (parentId: string): CrmSpoolEntry[] => o.service()?.spool?.pendingIn(parentId) ?? []
 
   const svc = (): CrmFilesService => {
     const s = o.service()
@@ -195,13 +200,15 @@ export function createCrmDav(o: CrmDavOptions) {
       const next = kids.get(name)
       if (!next) {
         if (!last) throw new CrmFilesError(404, 'notfound', 'Not found.')
+        const kept = pendingNewIn(node.id).find(e => (win ? e.name.toLowerCase() === name.toLowerCase() : e.name === name))
+        if (kept) return { kind: 'spooled', entry: kept, parent: node, name, parts }
         const side = sides.get(sideKey(node.id, name))
         return side ? { kind: 'side', side, parent: node, name, parts } : { kind: 'none', parent: node, name, parts }
       }
       parent = node
       node = next
     }
-    return { kind: 'node', node, parent, parts }
+    return { kind: 'node', node, parent, parts, spooled: node.isFolder ? null : (s.spool?.pendingVersion(node.id) ?? null) }
   }
 
   const timeOf = (n: CrmNode) => {
@@ -210,15 +217,15 @@ export function createCrmDav(o: CrmDavOptions) {
   }
   const etagOf = (n: CrmNode) => `"${n.id.replace(/[^A-Za-z0-9:_-]/g, '')}-${timeOf(n)}-${n.size ?? ''}"`
 
-  function nodeXml(parts: string[], n: CrmNode, name: string): string {
-    const when = new Date(timeOf(n))
+  function nodeXml(parts: string[], n: CrmNode, name: string, kept: CrmSpoolEntry | null = null): string {
+    const when = new Date(kept ? Date.parse(kept.since) || timeOf(n) : timeOf(n))
     const created = new Date(Date.parse(n.createdAt ?? '') || timeOf(n))
     const props = [
       `<D:displayname>${esc(name)}</D:displayname>`,
       `<D:resourcetype>${n.isFolder ? '<D:collection/>' : ''}</D:resourcetype>`,
       `<D:creationdate>${created.toISOString()}</D:creationdate>`,
       `<D:getlastmodified>${when.toUTCString()}</D:getlastmodified>`,
-      ...(n.isFolder ? [] : [`<D:getcontentlength>${n.size ?? 0}</D:getcontentlength>`, `<D:getcontenttype>${esc(n.type || 'application/octet-stream')}</D:getcontenttype>`, `<D:getetag>${etagOf(n)}</D:getetag>`]),
+      ...(n.isFolder ? [] : [`<D:getcontentlength>${kept ? kept.size : (n.size ?? 0)}</D:getcontentlength>`, `<D:getcontenttype>${esc(n.type || 'application/octet-stream')}</D:getcontenttype>`, `<D:getetag>${kept ? `"kept-${kept.id}"` : etagOf(n)}</D:getetag>`]),
       '<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>',
     ]
     return `<D:response><D:href>${hrefOf(parts, n.isFolder)}</D:href><D:propstat><D:prop>${props.join('')}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`
@@ -238,6 +245,42 @@ export function createCrmDav(o: CrmDavOptions) {
     return `<D:response><D:href>${hrefOf(parts, false)}</D:href><D:propstat><D:prop>${props.join('')}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`
   }
 
+  /** S5: a new file kept on this PC, as a listing shows it (its own size and time). */
+  function keptXml(parts: string[], name: string, e: CrmSpoolEntry): string {
+    const when = new Date(Date.parse(e.since) || started)
+    const props = [
+      `<D:displayname>${esc(name)}</D:displayname>`,
+      '<D:resourcetype></D:resourcetype>',
+      `<D:creationdate>${when.toISOString()}</D:creationdate>`,
+      `<D:getlastmodified>${when.toUTCString()}</D:getlastmodified>`,
+      `<D:getcontentlength>${e.size}</D:getcontentlength>`,
+      `<D:getcontenttype>${esc(driveType(name).type)}</D:getcontenttype>`,
+      `<D:getetag>"kept-${e.id}"</D:getetag>`,
+    ]
+    return `<D:response><D:href>${hrefOf(parts, false)}</D:href><D:propstat><D:prop>${props.join('')}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`
+  }
+
+  /** S5: reads a kept copy back through the drive (a save is readable at once, before the CRM has it), with ranges. */
+  function serveKept(req: IncomingMessage, res: ServerResponse, method: string, type: string, e: CrmSpoolEntry): void | Promise<void> {
+    const f = o.service()?.spool?.fileOf(e.id)
+    if (!f) return send(res, 404, 'Not found.')
+    const head: Record<string, string | number> = { 'Content-Type': type, ETag: `"kept-${e.id}"`, 'Last-Modified': new Date(f.mtime).toUTCString(), 'Accept-Ranges': 'bytes' }
+    if (method === 'HEAD') {
+      res.writeHead(200, { ...head, 'Content-Length': f.size })
+      return void res.end()
+    }
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? ''))
+    if (range && (range[1] || range[2])) {
+      const start = range[1] ? Number(range[1]) : Math.max(0, f.size - Number(range[2]))
+      const end = range[1] && range[2] ? Math.min(Number(range[2]), f.size - 1) : f.size - 1
+      if (start > end || start >= f.size) return send(res, 416, '', { 'Content-Range': `bytes */${f.size}` })
+      res.writeHead(206, { ...head, 'Content-Length': end - start + 1, 'Content-Range': `bytes ${start}-${end}/${f.size}` })
+      return pipeline(createReadStream(f.path, { start, end }), res).catch(() => undefined)
+    }
+    res.writeHead(200, { ...head, 'Content-Length': f.size })
+    return pipeline(createReadStream(f.path), res).catch(() => undefined)
+  }
+
   const lengthOf = (req: IncomingMessage): number | null => {
     const v = req.headers['content-length']
     if (v === undefined) return null
@@ -248,6 +291,9 @@ export function createCrmDav(o: CrmDavOptions) {
   /** A file into a folder: a new version if the name is a CRM file there, otherwise a new file. */
   async function save(parent: CrmNode, name: string, target: CrmNode | null, body: Readable, size: number): Promise<'new' | 'version'> {
     const type = driveType(name).type
+    const s = svc()
+    // S5: with a spool the bytes are kept on this PC and this returns at once; they go up by themselves.
+    if (s.save) return (await s.save({ parent: parent.id, name: target ? target.name : name, type: target ? target.type || type : type, target: target?.id ?? null, body, size })).how
     if (target) {
       await svc().version(target.id, target.name, target.type || type, body, size)
       return 'version'
@@ -269,11 +315,14 @@ export function createCrmDav(o: CrmDavOptions) {
         const f = await find(parts)
         if (f.kind === 'none') return send(res, 404, 'Not found.')
         if (f.kind === 'side') return sendXml(res, 207, multistatus([sideXml(parts, f.name, f.side)]))
-        const self = nodeXml(parts, f.node, parts.at(-1) ?? 'CRM files')
+        if (f.kind === 'spooled') return sendXml(res, 207, multistatus([keptXml(parts, f.name, f.entry)]))
+        const self = nodeXml(parts, f.node, parts.at(-1) ?? 'CRM files', f.spooled)
         const depth = String(req.headers.depth ?? '1')
         if (!f.node.isFolder || depth === '0') return sendXml(res, 207, multistatus([self]))
         const kids = kidsOf((await svc().children(f.node.id)).children)
-        const out = [self, ...[...kids].map(([n, k]) => nodeXml([...parts, n], k, n))]
+        const spool = o.service()?.spool
+        const out = [self, ...[...kids].map(([n, k]) => nodeXml([...parts, n], k, n, k.isFolder ? null : (spool?.pendingVersion(k.id) ?? null)))]
+        for (const e of pendingNewIn(f.node.id)) if (![...kids.keys()].some(k => (win ? k.toLowerCase() === e.name.toLowerCase() : k === e.name))) out.push(keptXml([...parts, e.name], e.name, e))
         for (const { name, side } of sidesIn(f.node.id)) if (!kids.has(name)) out.push(sideXml([...parts, name], name, side))
         return sendXml(res, 207, multistatus(out))
       }
@@ -303,8 +352,10 @@ export function createCrmDav(o: CrmDavOptions) {
           res.writeHead(200, { 'Content-Type': driveType(f.name).type, 'Content-Length': f.side.bytes.length, 'Last-Modified': new Date(f.side.mtime).toUTCString() })
           return void res.end(method === 'HEAD' ? undefined : f.side.bytes)
         }
+        if (f.kind === 'spooled') return serveKept(req, res, method, driveType(f.name).type, f.entry)
         const n = f.node
         if (n.isFolder) return send(res, 200, method === 'HEAD' ? '' : 'A folder of the CRM files.')
+        if (f.spooled) return serveKept(req, res, method, n.type || driveType(n.name).type, f.spooled)
         const head: Record<string, string | number> = { 'Content-Type': n.type || 'application/octet-stream', ETag: etagOf(n), 'Last-Modified': new Date(timeOf(n)).toUTCString(), 'Accept-Ranges': 'bytes' }
         if (method === 'HEAD') {
           res.writeHead(200, { ...head, ...(n.size !== undefined ? { 'Content-Length': n.size } : {}) })
@@ -344,7 +395,7 @@ export function createCrmDav(o: CrmDavOptions) {
         const size = lengthOf(req)
         if (size === null) return send(res, 411, 'Send the size of the file (Content-Length).')
         if (size > CRM_FILES_MAX_UPLOAD) return send(res, 413, `A file is at most ${CRM_FILES_MAX_UPLOAD / 1024 / 1024} MB here.`)
-        if (size === 0 && f.kind !== 'node') {
+        if (size === 0 && f.kind !== 'node' && f.kind !== 'spooled') {
           // Files' "New Document", or a program that makes the file before it writes: kept here until it has something in it.
           const existed = f.kind === 'side'
           sides.set(sideKey(parent.id, name), { bytes: Buffer.alloc(0), mtime: Date.now(), pending: true })
@@ -353,7 +404,7 @@ export function createCrmDav(o: CrmDavOptions) {
         const how = await save(parent, name, f.kind === 'node' ? f.node : null, req, size)
         if (f.kind === 'side') sides.delete(sideKey(parent.id, name))
         o.log?.info(`crm drive: ${how === 'version' ? 'a new version of' : 'a new file'} "${name}"`)
-        return send(res, how === 'version' ? 204 : 201)
+        return send(res, how === 'version' || f.kind === 'spooled' ? 204 : 201)
       }
 
       case 'MKCOL': {
@@ -388,7 +439,7 @@ export function createCrmDav(o: CrmDavOptions) {
         const fromParent = from.parent
         if (from.kind === 'node' && to.kind === 'node' && from.node.id === to.node.id) return send(res, 403, 'That is the same place.')
         // A CRM file is never replaced by a move or a copy (it would mean deleting it), except a program's own save: its side file moved over the document.
-        if (to.kind === 'node' && !(from.kind === 'side' && method === 'MOVE' && !to.node.isFolder)) return send(res, 412, 'That name is already used there; nothing is replaced here.')
+        if ((to.kind === 'node' || to.kind === 'spooled') && !(from.kind === 'side' && method === 'MOVE' && (to.kind === 'spooled' || !to.node.isFolder))) return send(res, 412, 'That name is already used there; nothing is replaced here.')
 
         if (from.kind === 'side') {
           if (isSideName(toName) || (from.side.pending && to.kind !== 'node')) {
@@ -401,6 +452,15 @@ export function createCrmDav(o: CrmDavOptions) {
           return send(res, to.kind === 'none' ? 201 : 204)
         }
 
+        if (from.kind === 'spooled') {
+          // A save kept on this PC: it can be renamed or moved while it waits (a program's own save does that), not copied or replaced.
+          if (method === 'COPY') return send(res, 403, 'That save is still on its way to the CRM. Copy it when it is there.')
+          if (isSideName(toName)) return send(res, 403, 'A CRM file is not renamed to a name programs use for their own files.')
+          if (to.kind === 'side') sides.delete(sideKey(toParent.id, toName))
+          const ok = svc().spool?.rename(from.entry.id, { parent: toParent.id, name: toName, project: toParent.name })
+          if (!ok) return send(res, 409, 'That save is going up to the CRM right now. Try again in a moment.')
+          return send(res, 201)
+        }
         const n = from.node
         if (method === 'COPY') {
           if (n.isFolder) return send(res, 403, 'Folders are not copied here. Copy the files in them.')

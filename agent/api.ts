@@ -614,8 +614,16 @@ export function startApi(o: ApiOptions): Promise<Api> {
     if (untrack) socket.once('close', untrack)
   }
 
-  /** F-018: the mount whose prefix this path is under. */
-  const mountOf = (path: string) => o.mounts?.find(m => path.startsWith(`${AGENT_API_PREFIX}${m.prefix}/`))
+  /**
+   * F-018: the mount whose prefix this path is under. The LONGEST such prefix wins, whatever the order of the list: a mount inside another's space
+   * ("/agentic/crm-files" inside "/agentic", F-126) is reached even when the wider one comes first (the first match used to win, so the CRM files'
+   * routes were never reached). Two mounts with the same prefix: the first, as before. Used by the HTTP routes and the WebSockets alike.
+   */
+  const mountOf = (path: string): ApiMount | undefined => {
+    let best: ApiMount | undefined
+    for (const m of o.mounts ?? []) if (path.startsWith(`${AGENT_API_PREFIX}${m.prefix}/`) && (!best || m.prefix.length > best.prefix.length)) best = m
+    return best
+  }
 
   // F-159: private request-derived context; never serialize a thrown object's arbitrary body.
   const executionFailures = new WeakMap<IncomingMessage, { phase: ExecutionPhase; intentId?: string }>()

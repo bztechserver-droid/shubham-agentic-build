@@ -3,14 +3,15 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Shubham Agentic, build 2026.11.11-1840",
+  "description": "Shubham Agentic, build 2026.11.11-1923",
   "scripts": {
     "start": "node agent/main.ts --app app"
   },
   "dependencies": {
     "koffi": "2.16.3",
     "node-pty": "1.2.0-beta.12",
-    "protobufjs": "8.8.1"
+    "protobufjs": "8.8.1",
+    "postgres": "3.4.8"
   },
   "engines": {
     "node": ">=22.22"

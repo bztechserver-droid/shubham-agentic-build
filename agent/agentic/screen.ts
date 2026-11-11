@@ -21,6 +21,8 @@ export interface Screen {
    * (the first letter of a suggestion) is blanked too; on a line without any it stays (a draft with the cursor in it).
    */
   typedLines(): string[]
+  /** F-193: where the terminal cursor is (column, row from 0). Claude Code 2.1.322 parks it at its input cursor, hidden or not. */
+  cursor(): { x: number; y: number }
 }
 
 // A cell is its character, plus one of these when it was printed dim or grey (GHOST) or in reverse video (INVERSE). The marks ride along
@@ -321,6 +323,9 @@ export function createScreen(cols0 = 120, rows0 = 32): Screen {
     },
     lines() {
       return cells.map(r => unmark(r.join('')).replace(/\s+$/, ''))
+    },
+    cursor() {
+      return { x, y }
     },
     typedLines() {
       return cells.map(r => {

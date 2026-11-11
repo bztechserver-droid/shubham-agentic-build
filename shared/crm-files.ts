@@ -26,6 +26,8 @@
 //   POST /mount/auto   { on: boolean }  -> CrmMountStatus   (o6e65: mount the drive by itself while the CRM is signed in; ON by default, OFF is the old press-Start way)
 //   POST /mount/driver { via: 'auto' | 'native' | 'winfsp' | 'webdav' } -> CrmMountStatus   (o6e65: how the Windows drive is made; Automatic uses the in-app WinFsp drive (S9a, read-only for now) and falls back to the WinFsp program, then to the built-in WebDAV)
 //   POST /mount/reveal { what: 'drive' | 'pending' | 'recovered' } -> { ok: true }   (o6e65: open File Explorer on one of THREE fixed places; no path is ever taken from the request)
+//   GET  /spool                         -> { entries: CrmSpoolEntry[], dir }   (o6e65 S5: saves kept on this PC until the CRM has them: the waiting list)
+//   POST /spool/retry  { id?: string }  -> { entries, retried }   (try one waiting save again now, or all of them when no id; a refused one is tried again too)
 //
 // od0b1 (U1): uploads of ANY size the CRM takes, in parts, held by the AGENT (no WebDAV in the way, no 5-minute single request). The page sends the file to this PC in parts; the agent
 // keeps them in its pending folder (<agent state>/crm-uploads) and sends them on to Google Drive in CRM_UPLOAD_CHUNK pieces through ONE resumable session (the CRM's own way), with retries,
@@ -135,6 +137,8 @@ export interface CrmMountStatus {
   /** o6e65: where the drive keeps a save until the CRM has it, and where one that could not be put back is kept (never deleted): shown to the person. Windows only. */
   pendingDir?: string
   recoveredDir?: string
+  /** o6e65 (S5): the folder where saves are kept on this PC until the CRM has them (the spool). Present when this agent keeps them; `waiting` counts them (and the old host's, when that way is used). */
+  spoolDir?: string
   /** S9a2: when (ISO time) the in-app drive was found to have stopped the agent (its marker was still there at the agent's start). While set, the in-app way is OFF (Automatic uses the other ways) until the person chooses In-app or Automatic again. */
   inAppCrash?: string
   /** o6e65 (S4, Windows): which way the drive is (or would be) made: the drive program through WinFsp, or Windows' own WebDAV client (nothing to install, no program of ours). */
@@ -147,9 +151,36 @@ export type CrmVia = 'native' | 'winfsp' | 'webdav'
 export type CrmDriverChoice = 'auto' | CrmVia
 export const CRM_DRIVER_CHOICES: readonly CrmDriverChoice[] = ['auto', 'native', 'winfsp', 'webdav']
 
-/** o6e65: the three places the agent will open in File Explorer (and nothing else): the drive itself, the waiting saves, the recovered saves. */
-export type CrmReveal = 'drive' | 'pending' | 'recovered'
-export const CRM_REVEALS: readonly CrmReveal[] = ['drive', 'pending', 'recovered']
+/** o6e65 (S5): where a kept save is: 'waiting' (its turn has not come, or it was just kept), 'sending' (going up now), 'unreachable' (the CRM or the internet is not there; it is tried again by itself), 'refused' (the CRM said no for good: no right, the folder is gone, the name is taken; it is kept, never deleted). */
+export type CrmSpoolState = 'waiting' | 'sending' | 'unreachable' | 'refused'
+
+/** One save kept on this PC until the CRM has it (the waiting list of the page; the number "waiting" everywhere is the length of this list). */
+export interface CrmSpoolEntry {
+  id: string
+  /** 'new' = a new file in a folder; 'version' = a new version of a CRM file. */
+  kind: 'new' | 'version'
+  name: string
+  /** The project (or folder) it goes to, when known. */
+  project: string | null
+  size: number
+  /** When it was saved (ISO time). */
+  since: string
+  state: CrmSpoolState
+  /** Plain words for why it is not in the CRM yet; null while all is well. */
+  reason: string | null
+  /** How many times sending it failed. */
+  attempts: number
+}
+
+export interface CrmSpool {
+  entries: CrmSpoolEntry[]
+  /** The folder on this PC where the kept saves are (the "Open the folder" button opens it). */
+  dir: string
+}
+
+/** o6e65: the places the agent will open in File Explorer (and nothing else): the drive itself, the old host's waiting saves, its recovered saves, and (S5) the folder of saves kept by this agent. */
+export type CrmReveal = 'drive' | 'pending' | 'recovered' | 'spool'
+export const CRM_REVEALS: readonly CrmReveal[] = ['drive', 'pending', 'recovered', 'spool']
 
 export interface CrmFilesStatus {
   /** The CRM is signed in on this PC. */
@@ -327,11 +358,13 @@ export const CRM_FILES_FIXTURE: CrmNode[] = [
   { id: 'file:66666666-6666-4666-8666-666666666666', kind: 'file', name: 'INV-2026-114.pdf', parentId: 'cat:invoices', isFolder: false, size: 91_377, type: 'application/pdf', createdAt: '2026-10-30T11:11:00.000Z', modifiedAt: '2026-10-30T11:11:00.000Z', versions: 1, rights: READ },
 ]
 
+const CRM_SPOOL_FIXTURE_DIR = 'C:\\Users\\you\\AppData\\Local\\shubham-agentic\\agent\\agentic\\crm-spool'
+
 export const CRM_MOUNT_FIXTURE: Record<'ready' | 'running' | 'native' | 'webdav' | 'winfspMissing' | 'signedOut' | 'linuxNoGvfs' | 'linuxNoDesktop', CrmMountStatus> = {
-  ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0, autoMount: true, mountVia: 'winfsp', driverChoice: 'auto', pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
+  ready: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 0, autoMount: true, mountVia: 'winfsp', driverChoice: 'auto', pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   running: { supported: true, driver: 'installed', driverName: 'WinFsp', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: true, waiting: 2, autoMount: true, pendingDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\pending-Y', recoveredDir: 'C:\\Users\\you\\AppData\\Local\\ChristopherOS\\crm-fs\\recovered-Y' },
-  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto' },
-  webdav: { supported: true, driver: 'installed', driverName: 'Windows WebDAV (built in)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: false, writable: true, waiting: 0, autoMount: true, mountVia: 'webdav', driverChoice: 'auto' },
+  native: { supported: true, driver: 'installed', driverName: 'WinFsp (inside the app)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: true, writable: false, waiting: 0, autoMount: true, mountVia: 'native', driverChoice: 'auto', spoolDir: CRM_SPOOL_FIXTURE_DIR },
+  webdav: { supported: true, driver: 'installed', driverName: 'Windows WebDAV (built in)', running: true, mounted: true, where: 'Y:', reason: null, reasonCode: null, installable: false, writable: true, waiting: 0, autoMount: true, mountVia: 'webdav', driverChoice: 'auto', spoolDir: CRM_SPOOL_FIXTURE_DIR },
   winfspMissing: { supported: true, driver: 'missing', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.winfspMissing, reasonCode: 'driver-missing', installable: true, writable: true, waiting: 0 },
   signedOut: { supported: true, driver: 'installed', driverName: 'WinFsp', running: false, mounted: false, where: 'Y:', reason: CRM_FILES_REASONS.signedOut, reasonCode: 'crm-signin', installable: true, writable: true, waiting: 0 },
   linuxNoGvfs: { supported: true, driver: 'missing', driverName: 'GNOME Files (gvfs)', running: false, mounted: false, where: 'Files › CRM files', reason: CRM_FILES_REASONS.gvfsMissing, reasonCode: 'driver-missing', installable: false, writable: true, waiting: 0 },

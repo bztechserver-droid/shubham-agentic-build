@@ -1129,12 +1129,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
   /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
   const startCause = new Map<string, string>()
+  let mirrorOffAt = 0
+  let mirrorOffNow = false
+  /** F-193: the live mirror is switched off on this PC (SAD_INPUT_MIRROR=0, or the file input-mirror.off beside check-agent-messages.on). */
+  function inputMirrorOff(): boolean {
+    if (Date.now() - mirrorOffAt > 2000) {
+      mirrorOffAt = Date.now()
+      mirrorOffNow = process.env.SAD_INPUT_MIRROR === '0' || existsSync(path.join(o.dir, '..', 'input-mirror.off'))
+    }
+    return mirrorOffNow
+  }
   const poolOptions: ChatPoolOptions = {
     addDirs: [uploads.dir],
     // F-083: a chat with an open order or unfinished work is never ended for being idle.
     keep: sid => workOf(sid) !== null,
     idleReapMs: o.idleReapMs,
     reapEveryMs: o.reapEveryMs,
+    // F-193: the live mirror's agent-side switch: SAD_INPUT_MIRROR=0 or the file <state>/agent/input-mirror.off (looked at every 2 s at most).
+    mirrorOff: inputMirrorOff,
     onEnded: e => {
       void executionService?.runtime.ended(e.sessionId)
       approvalNativeRuntimes.delete(e.sessionId)
@@ -2625,7 +2637,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!joinsDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         // Nothing was typed by the confirmed sender. Send the old direct way, joining the unsent text.
         log?.info(`chat ${c.sessionId.slice(0, 8)}: the box holds unsent text; the message is typed the old direct way after it (no receipt)`)
-        if (c.id === self().id) return chats.type(c.sessionId, body)
+        if (c.id === self().id) {
+          await mirrorYields(c.sessionId)
+          return chats.type(c.sessionId, body)
+        }
         const peerLink = team?.member(c.id)
         if (!peerLink) return false
         return (await request<boolean | 'draft'>(peerLink, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)) === true
@@ -2637,12 +2652,21 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (delivery === 'pending') throw Object.assign(apiError(409, `Delivery is still in progress${diagnostic ? ` (receipt ${diagnostic.id})` : ''}; the tool's observation window ended, not the native send. Wait for this same operation and inspect the destination; never resend or automatically press Enter.`), { code: 'delivery-pending' })
       throw Object.assign(apiError(409, 'Delivery is not confirmed; the one pending message may already have been submitted, may still complete, or may remain in the composer. Inspect the destination; do not automatically press Enter or resend.'), { code: 'delivery-unconfirmed' })
     }
-    if (c.id === self().id) return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
+    if (c.id === self().id) {
+      await mirrorYields(c.sessionId)
+      return chats.type(c.sessionId, body, refuseDraft ? { refuseDraft: true } : undefined)
+    }
     const link = team?.member(c.id)
     if (!link) return false
     const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(() => false)
     if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
     return r === true
+  }
+
+  /** F-193: before an agent's message the live mirror's own text is taken out of the line (and typed back after it); while he types: refused (409). */
+  async function mirrorYields(sid: string) {
+    const r = await (chats.mirrorTakeOut?.(sid) ?? Promise.resolve('none'))
+    if (r === 'typing' || r === 'failed') throw apiError(409, draftWords(sid))
   }
 
   const logDeliveryBlock = (sid: string | null, reason: DeliveryBlockReason) => log?.warn(`chat ${sid?.slice(0, 8) ?? 'unbound'}: delivery blocked (${reason})`)
@@ -2716,7 +2740,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (!generation) { reason = 'runtime-unavailable'; return refuse() }
       if (!valid()) return refuse()
       bind(sessionId, generation, false)
-      const state = await chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize, onBlocked: code => { reason ??= code }, onReport: report => note(report) }) ?? 'unconfirmed'
+      const state = await chats.deliver?.(sessionId, body, { refuseDraft: true, waitUntilReady: true, waitForOutcome: true, guard: valid, authorize, human: owner !== 'agent-message', onBlocked: code => { reason ??= code }, onReport: report => note(report) }) ?? 'unconfirmed'
       return state === 'blocked' ? refuse() : state
     })
   }
@@ -5657,7 +5681,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
             // A caller that is not the person typing (an agent's message, a broadcast, a nudge) asks for the draft check: this PC knows its own screens.
             if (raw.refuseDraft === true && chats.drafting(raw.sessionId)) return 'draft'
             if (raw.confirmDelivery === true) return confirmedDelivery(raw.sessionId, raw.text, raw.refuseDraft === true).then(delivery => ({ delivery }))
-            return chats.type(raw.sessionId, raw.text, raw.refuseDraft === true ? { refuseDraft: true } : undefined)
+            // F-193: the live mirror's own text out of the line first (typed back after); while he types: refused as a draft.
+            return (chats.mirrorTakeOut?.(raw.sessionId) ?? Promise.resolve('none')).then(r => r === 'typing' || r === 'failed' ? 'draft' as const : chats.type(raw.sessionId as string, raw.text as string, raw.refuseDraft === true ? { refuseDraft: true } : undefined))
           })
         case 'sessions':
           return answer(raw => ownSessions(pageOf(isObject(raw) ? raw : {})))
@@ -5717,6 +5742,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         try { requireRunningEngine(engineFor(current.agent), running.engine) }
         catch { ws.sendText(JSON.stringify({ t: 'exit', code: null })); return ws.close(1008, 'Saved and running engines disagree; reconcile the conversation first.') }
       }
+      // F-193: a chat box's live mirror of the input line: no replay, no output, never a size; only for someone who may type.
+      if (query.get('mode') === 'draft') return draftSocket(sid, ws, typing)
       const detach = chats.attach(sid, { send: m => ws.sendText(JSON.stringify(m)) })
       // F-023: running on another of the hub's PCs: its terminal, used from here over the link.
       if (!detach && remoteTerminal(sid, ws, typing)) return
@@ -5739,6 +5766,26 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }
 
+  /** F-193: one draft-set from a page or the link; anything else is dropped. */
+  const draftSetOf = (m: unknown) => isObject(m) && m.t === 'draft-set' && typeof m.text === 'string' && m.text.length <= 20_000 && Number.isSafeInteger(m.seq) && Number.isSafeInteger(m.base) ? { seq: m.seq as number, text: m.text, base: m.base as number, seal: m.seal === true } : null
+  /** F-193: a chat box's mirror of a chat's input line, here or on the chat's PC (over the link, as its terminal is). */
+  function draftSocket(sid: string, ws: WsSocket, typing: () => boolean) {
+    if (!typing()) return ws.close(1008, 'Only someone who may type in this chat gets its draft.')
+    const mirror = chats.draftMirror?.(sid, { send: m => { if (typing()) ws.sendText(JSON.stringify(m)) } }) ?? null
+    if (!mirror) {
+      if (remoteTerminal(sid, ws, typing, 'draft')) return
+      ws.sendText(JSON.stringify({ t: 'exit', code: null }))
+      return ws.close(1000, "That chat isn't running")
+    }
+    ws.onText(raw => {
+      if (!typing() || switchFences.blocked(sid)) return
+      let d: ReturnType<typeof draftSetOf> = null
+      try { d = draftSetOf(JSON.parse(raw)) } catch { return }
+      if (d) mirror.set(d.seq, d.text, d.base, d.seal)
+    })
+    ws.onClose(mirror.detach)
+  }
+
   /** F-050: the chat view's feed for one session (chatview.ts): the end of its conversation, then what it grows by. */
   function chatSocket(query: URLSearchParams) {
     const sid = query.get('session') ?? ''
@@ -5755,7 +5802,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
    * carries the same messages the page's socket does, one JSON line each; it keeps running
    * there, and what is typed here goes to it. False when it isn't running on a PC within reach.
    */
-  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true): boolean {
+  function remoteTerminal(sid: string, ws: WsSocket, typing: () => boolean = () => true, as?: 'draft'): boolean {
     const w = whereAll()[sid]
     if (!w || w.id === self().id) return false
     let link: LinkPeer
@@ -5784,7 +5831,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       s => {
         if (closed) return void s.destroy()
         stream = s
-        writeLine(s, { sessionId: sid, ...(expected ? { expectedEngine: engineFor(expected.agent) } : {}) })
+        writeLine(s, { sessionId: sid, ...(expected ? { expectedEngine: engineFor(expected.agent) } : {}), ...(as ? { mode: as } : {}) })
         for (const raw of early.splice(0)) relayLine(s, raw)
         readLines(s, m => ws.sendText(JSON.stringify(m)))
         s.on('close', () => !closed && ws.close(1000, `The link to ${link.name} closed`))
@@ -5822,6 +5869,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function serveTerminal(stream: Duplex, from?: { id: string; name: string }) {
     let sid: string | null = null
     let detach: (() => void) | null = null
+    let draft: { set(seq: number, text: string, base: number, seal?: boolean): void } | null = null
     let relay: Duplex | null = null
     let early: Record<string, unknown>[] | null = null
     const ended = () => {
@@ -5839,6 +5887,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
           if (current && raw.expectedEngine !== undefined) requireRunningEngine(engineFor(current.agent), raw.expectedEngine as RuntimeEngine)
           if (current && running) requireRunningEngine(engineFor(current.agent), running.engine)
         } catch { return ended() }
+        // F-193: a chat box's live mirror of the input line, asked over the link (an older PC ignores mode and the page falls back).
+        if (raw.mode === 'draft') {
+          const m = chats.draftMirror?.(sid, { send: r => void writeLine(stream, r) }) ?? null
+          if (m) {
+            draft = m
+            detach = m.detach
+            return
+          }
+        }
         detach = chats.attach(sid, { send: m => void writeLine(stream, m) })
         if (detach) return
         const w = from && mode() === 'hub' ? whereAll()[sid] : undefined
@@ -5852,7 +5909,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
           s => {
             if (stream.destroyed) return void s.destroy()
             relay = s
-            writeLine(s, { sessionId: asked, ...(expectedEngine ? { expectedEngine } : {}) })
+            writeLine(s, { sessionId: asked, ...(expectedEngine ? { expectedEngine } : {}), ...(raw.mode === 'draft' ? { mode: 'draft' } : {}) })
             for (const m of early!.splice(0)) writeLine(s, m)
             readLines(s, m => void writeLine(stream, m))
             s.on('close', () => stream.end())
@@ -5867,6 +5924,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!legacySidAllowed(sid)) return ended()
         if (relay) writeLine(relay, raw)
         else early.push(raw)
+        return
+      }
+      if (draft) {
+        const d = draftSetOf(raw)
+        if (d && !switchFences.blocked(sid)) draft.set(d.seq, d.text, d.base, d.seal)
         return
       }
       if (raw.t === 'in' && typeof raw.d === 'string') chats.input(sid, raw.d)

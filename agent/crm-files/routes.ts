@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
 import type { ApiMount } from '../api.ts'
-import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmUploadStart } from '../../shared/crm-files.ts'
+import { CRM_DRIVER_CHOICES, CRM_FILES_BASE, CRM_FILES_REASONS, CRM_REVEALS, type CrmFilesErrorCode, type CrmSpool, type CrmUploadStart } from '../../shared/crm-files.ts'
 import { CrmFilesError, type CrmFilesService } from './service.ts'
 import type { CrmUploads } from './uploads.ts'
 
@@ -81,6 +81,8 @@ const METHODS: Record<string, string[]> = {
   'mount/auto': ['POST'],
   'mount/reveal': ['POST'],
   'mount/driver': ['POST'],
+  spool: ['GET'],
+  'spool/retry': ['POST'],
 }
 
 /** od0b1: the uploads in parts (there only when the agent holds them: uploads.ts). */
@@ -127,6 +129,11 @@ async function uploadRoute(up: CrmUploads, name: string, req: IncomingMessage, r
       await up.clear(str((await readJson(req)).id, 'id'))
       return send(res, 200, { ok: true })
   }
+}
+
+/** The waiting list; an agent without a spool has an empty one (and no folder). */
+function spoolOf(svc: CrmFilesService): CrmSpool {
+  return { entries: svc.spool?.list() ?? [], dir: svc.spool?.dir ?? '' }
 }
 
 export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMount {
@@ -203,11 +210,20 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
               if (!svc.mount.setDriver) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
               return send(res, 200, await svc.mount.setDriver(via))
             }
+            case 'spool':
+              return send(res, 200, spoolOf(svc))
+            case 'spool/retry': {
+              const b = await readJson(req)
+              if (!svc.spool) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+              if (b.id !== undefined && typeof b.id !== 'string') throw new CrmFilesError(400, 'failed', 'id must be a text.')
+              const retried = svc.spool.retry(typeof b.id === 'string' && b.id ? b.id : undefined)
+              return send(res, 200, { ...spoolOf(svc), retried })
+            }
             case 'mount/reveal': {
-              // Only one of three words; the agent knows where each is. No path from the request is ever used.
+              // Only one of four words; the agent knows where each is. No path from the request is ever used.
               const b = await readJson(req)
               const what = CRM_REVEALS.find(w => w === b.what)
-              if (!what) throw new CrmFilesError(400, 'failed', "what must be 'drive', 'pending' or 'recovered'.")
+              if (!what) throw new CrmFilesError(400, 'failed', "what must be 'drive', 'pending', 'recovered' or 'spool'.")
               if (!svc.mount.reveal) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
               await svc.mount.reveal(what)
               return send(res, 200, { ok: true })
