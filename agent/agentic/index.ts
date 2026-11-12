@@ -161,6 +161,7 @@ import { createAccountsEmail } from './accounts-email.ts'
 import { createAccountsEmailWrite } from './accounts-email-write.ts'
 import { createAccountsPlatformWrite } from './accounts-platform-write.ts'
 import { createAccountsCodebaseWrite } from './accounts-codebase-write.ts'
+import { createAccountsDatabases } from './accounts-databases.ts'
 import { createAccountsImport } from './accounts-import.ts'
 import { createAccountsCodebases } from './accounts-codebases.ts'
 import { createCodebaseTabs } from './codebase-tabs.ts'
@@ -769,6 +770,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const accountsPlatformWrite = createAccountsPlatformWrite({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // Codebase details slice: a codebase's details edit (the owner's only).
   const accountsCodebaseWrite = createAccountsCodebaseWrite({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // Databases section (order oba25): the two fixed databases and their pings (the owner's only).
+  const accountsDatabases = createAccountsDatabases({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // order o5c4d: the one-way copy of the CRM's email accounts into that database (reads the CRM with the PC's CRM sign-in, writes only to the new database, deletes nothing).
   const accountsImport = createAccountsImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // orders o0e2a, oc2db: the Accounts page's Codebases tab: its list (the codebases with their detail rows and platform accounts) and the one-way copy from the CRM (no secret is copied: flags and counts only).
@@ -5431,6 +5434,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.remove(access.ownerOf(callerOf(r)).id, id), 'local'],
     // Codebase details slice: the codebase's details (owner only).
     ['PUT', /^\/accounts\/codebases\/([^/]+)$/, ([id], r) => accountsCodebaseWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    // Add codebase: a codebase made in the app (the owner's only; nothing is written to the CRM).
+    ['POST', /^\/accounts\/codebases$/, (_, r) => accountsCodebaseWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
+    // Databases section: the two fixed databases (owner only); a ping checks one and says what it checked.
+    ['GET', /^\/accounts\/databases$/, (_, r) => accountsDatabases.list(access.ownerOf(callerOf(r)).id), 'local'],
+    ['POST', /^\/accounts\/databases\/([^/]+)\/ping$/, ([key], r) => accountsDatabases.ping(access.ownerOf(callerOf(r)).id, key), 'local'],
     // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
     ['POST', /^\/accounts\/email\/import$/, (_, r) => accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).

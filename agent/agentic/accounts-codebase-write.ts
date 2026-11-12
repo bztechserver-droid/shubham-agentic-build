@@ -46,6 +46,16 @@ export function createAccountsCodebaseWrite(o: AccountsCodebaseWriteOptions) {
   }
 
   return {
+    /** A codebase made in the app (source 'app'): the owner's, in this database only. Nothing is written to the CRM. */
+    async create(person: string, raw: unknown): Promise<{ id: string }> {
+      const v: CodebaseEditInput = need(checkCodebaseEdit(raw))
+      return run(person, async tx => {
+        const made: Row[] = await tx`insert into sad.account_codebase (owner_id, source, name, repo_url, local_path, description, stack, owner_name, is_disabled)
+          values (${person}, 'app', ${v.name}, ${v.repoUrl}, ${v.localPath}, ${v.description}, ${v.stack}, ${v.ownerName}, ${v.retired}) returning id::text as id`
+        return { id: String(made[0]?.id) }
+      })
+    },
+
     async update(person: string, id: string, raw: unknown): Promise<{ ok: true }> {
       if (!UUID.test(id)) throw apiError(400, 'That codebase id is not valid.')
       const v: CodebaseEditInput = need(checkCodebaseEdit(raw))

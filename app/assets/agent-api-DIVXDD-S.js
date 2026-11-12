@@ -1,0 +1,1 @@
+var e=`/agent-api`,t=e=>e?.os??`windows`;export{t as n,e as t};

@@ -53,6 +53,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, SIGNED],
   ['GET', /^\/watchdog$/, OWNER],
   ['GET', /^\/accounts\/email$/, OWNER],
+  // Databases section: the two fixed databases and their pings (the owner's only).
+  ['GET', /^\/accounts\/databases$/, OWNER],
+  ['POST', /^\/accounts\/databases\/([^/]+)\/ping$/, OWNER],
+  // Add codebase: a codebase made in the app (the owner's only).
+  ['POST', /^\/accounts\/codebases$/, OWNER],
   // Codebase details slice: the codebase's details (the owner's only).
   ['PUT', /^\/accounts\/codebases\/([^/]+)$/, OWNER],
   // Accounts edit slice: the platform accounts edit and soft delete (the owner's only).
