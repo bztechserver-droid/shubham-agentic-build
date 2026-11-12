@@ -97,6 +97,12 @@ import { FAST_TOOLS } from './fast-tools-list.ts'
 import { createOldFiles, createOldReaderStore, findOldRoot, notesPathOf, oldBrief, oldCall, oldRootCandidates, readNotes } from './old-reader.ts'
 import { OLD_TOOL_LABELS, OLD_TOOLS } from './old-reader-tools.ts'
 import type { OldReaderInfo } from '../../shared/old-reader.ts'
+// Order o7f34: the efficient route's API answers: the saved key (encrypted here), the API host, and the router that picks the Claude login or the API.
+import { createModelKeyStore } from './model-key.ts'
+import { createApiFastHost } from './api-host.ts'
+import { createSourceRouter } from './source-router.ts'
+import { ApiFailure, apiWords, testKey, type ToolSpec } from './anthropic-api.ts'
+import { API_MODEL_IDS } from '../../shared/api-prices.ts'
 import { OLD_SOCKET } from '../../shared/old-route.ts'
 import { librarianEnv } from './librarian.ts'
 import { killTree } from '../proc-tree.ts'
@@ -153,6 +159,7 @@ import { createCrmProxy } from './crmproxy.ts'
 import { createAccountsEmail } from './accounts-email.ts'
 import { createAccountsImport } from './accounts-import.ts'
 import { createAccountsCodebases } from './accounts-codebases.ts'
+import { createCodebaseTabs } from './codebase-tabs.ts'
 import { createCodebaseImport } from './accounts-codebase-import.ts'
 import { createAccountsPlatforms } from './accounts-platforms.ts'
 import { savedViewsRequest } from './views.ts'
@@ -323,7 +330,8 @@ export interface AgenticOptions {
   fastHostDeps?: Partial<FastDeps>
   /** Order o5007, tests: the old-app reader's folder (`root` null: not on this PC; left out: SAD_OLD_APP_DIR, old-reader.json's root, then
    *  Desktop\Github\CRM\agentic-claude-manager-dev) and the pieces of its host that would start a real claude. */
-  oldReader?: { root?: string | null; hostDeps?: Partial<FastDeps> }
+  /** `anthropicFetch` (tests): the fetch the API answers and the key test use; left out, the real API. */
+  oldReader?: { root?: string | null; hostDeps?: Partial<FastDeps>; anthropicFetch?: (url: string, init: RequestInit) => Promise<Response> }
   /** F-021: the hub's PCs; left out, this PC is on its own. */
   team?: AgenticTeamLinks
   /** Tests: a fake node-pty (and a no-op tree kill: its pids are other processes'), a fake claude, and a scratch ~/.claude/projects. */
@@ -751,6 +759,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const accountsImport = createAccountsImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // orders o0e2a, oc2db: the Accounts page's Codebases tab: its list (the codebases with their detail rows and platform accounts) and the one-way copy from the CRM (no secret is copied: flags and counts only).
   const accountsCodebases = createAccountsCodebases({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // Order ocf00: the Codebases modal's tabs (BE, FE, Deployment, Database and Environment variables), the same database and the owner's rows only.
+  const codebaseTabs = createCodebaseTabs({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // order o4029: the platform accounts for the Accounts page's "Accounts" tab (the CRM's Code > Accounts page), read from the same database. The copy above brings them in with the codebases.
   const accountsPlatforms = createAccountsPlatforms({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   const codebaseImport = createCodebaseImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
@@ -3367,6 +3377,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // checked here by the process's key in callTool). Hub only, while its switch is on (Settings › Old app reader: old-reader.json, on to start
   // with) and the old app's folder is on this PC. The process starts when the page opens and ends 10 minutes after it was closed.
   const oldStore = createOldReaderStore(path.join(o.dir, 'old-reader.json'))
+  // Order o7f34: the Anthropic API key (Settings › Old app reader): encrypted on this Server, never sent back.
+  const modelKeys = createModelKeyStore(o.dir)
+  const oldBriefFor = (ctx: { history: { role: 'user' | 'assistant'; text: string }[] }) =>
+    oldBrief({ root: oldFiles.root(), outline: oldFiles.outline(), notes: readNotes(oldStore.configuredNotes() ?? notesPathOf(floors.list().flatMap(f => f.agents))), history: ctx.history })
+  const oldApiTools: ToolSpec[] = OLD_TOOLS.map(t => ({ name: t.name, description: t.description, input_schema: t.inputSchema }))
   const oldRoot = (): string | null =>
     o.oldReader && 'root' in o.oldReader ? (o.oldReader.root ?? null) : findOldRoot(oldRootCandidates({ env: process.env.SAD_OLD_APP_DIR, configured: oldStore.configuredRoot(), home: os.homedir() }))
   const oldFiles = createOldFiles({ root: oldRoot })
@@ -3377,7 +3392,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const oldLogger = oldLog ? { info: (m: string) => oldLog.info(m.replace(/fast assistant/g, 'old-app reader')), warn: (m: string) => oldLog.warn(m.replace(/fast assistant/g, 'old-app reader')) } : undefined
   function startOldReader() {
     if (oldHost || closing || mode() === 'member' || !oldStore.get().enabled || !oldFiles.root()) return
-    oldHost = createFastHost({
+    const claudeOld = createFastHost({
       now: Date.now,
       spawn: (file, args, so) => spawn(file, args, { cwd: so.cwd, env: so.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }),
       claude: () => {
@@ -3393,7 +3408,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       toolset: 'old',
       tools: () => OLD_TOOLS.map(t => `mcp__${MCP_SERVER_NAME}__${t.name}`),
       // The Old App Reader chat's own map goes in too (old-reader.json's `notes`, else the INDEX.md its brief names), so most answers need no lookup.
-      brief: ctx => oldBrief({ root: oldFiles.root(), outline: oldFiles.outline(), notes: readNotes(oldStore.configuredNotes() ?? notesPathOf(floors.list().flatMap(f => f.agents))), history: ctx.history }),
+      brief: oldBriefFor,
       toolLabel: name => OLD_TOOL_LABELS[name] ?? 'Looking',
       onState: () => oldSession?.hostState({ state: oldHost?.state() ?? 'off' }),
       context: () => [],
@@ -3404,6 +3419,24 @@ export function createAgentic(o: AgenticOptions): Agentic {
       model: oldStore.get().model,
       ...(oldLogger ? { log: oldLogger } : {}),
       ...o.oldReader?.hostDeps,
+    })
+    // Order o7f34: the API twin (no process; its tools are the same read-only functions, run here) and the router that picks between them.
+    const apiOld = createApiFastHost({
+      now: Date.now,
+      keys: modelKeys,
+      ...(o.oldReader?.anthropicFetch ? { fetch: o.oldReader.anthropicFetch } : {}),
+      brief: oldBriefFor,
+      tools: oldApiTools,
+      runTool: async (name, input) => oldCall(oldFiles, name, input),
+      label: name => OLD_TOOL_LABELS[name] ?? 'Looking',
+      ...(oldLogger ? { log: oldLogger } : {}),
+    })
+    oldHost = createSourceRouter({
+      claude: claudeOld,
+      api: apiOld,
+      preferred: () => oldStore.get().source,
+      fallback: () => oldStore.get().fallback,
+      ...(oldLogger ? { log: oldLogger } : {}),
     })
     oldSession = createFastSession({ host: oldHost, snapshot: () => '', ...(oldLogger ? { log: oldLogger } : {}) })
   }
@@ -3418,7 +3451,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function oldInfo(): OldReaderInfo {
     if (!oldHost) startOldReader()
     const root = oldFiles.root()
-    return { settings: oldStore.get(), root, found: root !== null, files: root ? oldFiles.entries().length : null, serving: oldSession !== undefined }
+    return { settings: oldStore.get(), root, found: root !== null, files: root ? oldFiles.entries().length : null, serving: oldSession !== undefined, apiKey: modelKeys.status() }
   }
   startOldReader()
   const voiceTimer = setInterval(() => {
@@ -5091,6 +5124,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return oldInfo()
       },
     ],
+    // Order o7f34: the Anthropic API key for the efficient route. Saved here, encrypted; the answer says only whether one is saved and when (the
+    // key is never sent back, never logged, and no error names it). Test makes one tiny call with it and says the plain result.
+    ['PUT', /^\/old\/api-key$/, (_, r) => (modelKeys.set(isObject(r.body) ? r.body.key : undefined), oldInfo())],
+    ['DELETE', /^\/old\/api-key$/, () => (modelKeys.clear(), oldInfo())],
+    [
+      'POST',
+      /^\/old\/api-key\/test$/,
+      async () => {
+        const key = modelKeys.use()
+        if (!key) throw apiError(409, 'No API key is saved yet. Save one first.')
+        try {
+          const t = await testKey({ key, model: API_MODEL_IDS.haiku, ...(o.oldReader?.anthropicFetch ? { fetch: o.oldReader.anthropicFetch } : {}) })
+          return { ok: true, ms: t.ms, message: `The API answered in ${(t.ms / 1000).toFixed(1)} s.` }
+        } catch (e) {
+          if (e instanceof ApiFailure) return { ok: false, ms: null, message: apiWords(e.kind) }
+          throw e
+        }
+      },
+    ],
     // Forwarded on members: an old hub must answer 404, rather than a new member promising safety for it.
     ['GET', /^\/engine-switch-capabilities$/, () => ({ version: 1, failClosed: true, homePcRouting: true })],
     // F-067: the long-press menu: an agent's model, effort and ultracode, applied now to a chat that waits.
@@ -5288,6 +5340,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/accounts\/codebases$/, (_, r) => accountsCodebases.list(access.ownerOf(callerOf(r)).id), 'local'],
     // The copy from the CRM, counts only back; apply false (the default) only counts and compares. The owner's (POLICY).
     ['POST', /^\/accounts\/codebases\/import$/, (_, r) => codebaseImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
+    // Order ocf00: the codebase tabs. The owner's only (POLICY); every write is checked by the database's rules too (codebase-tabs.ts).
+    ['GET', /^\/accounts\/codebases\/([^/]+)\/tabs$/, ([id], r) => codebaseTabs.read(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['PUT', /^\/accounts\/codebases\/([^/]+)\/sections\/([^/]+)$/, ([id, section], r) => codebaseTabs.setSection(access.ownerOf(callerOf(r)).id, id, section, isObject(r.body) ? r.body.description : undefined), 'local'],
+    ['POST', /^\/accounts\/codebases\/([^/]+)\/links$/, ([id], r) => codebaseTabs.addLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    ['PUT', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.updateLink(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    ['DELETE', /^\/accounts\/links\/([^/]+)$/, ([id], r) => codebaseTabs.deleteLink(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/codebases\/([^/]+)\/subsets$/, ([id], r) => codebaseTabs.addSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined), 'local'],
+    ['PUT', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => codebaseTabs.renameSubset(access.ownerOf(callerOf(r)).id, id, isObject(r.body) ? r.body.name : undefined), 'local'],
+    ['DELETE', /^\/accounts\/subsets\/([^/]+)$/, ([id], r) => codebaseTabs.deleteSubset(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/subsets\/([^/]+)\/vars$/, ([id], r) => codebaseTabs.addVar(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    ['PUT', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => codebaseTabs.updateVar(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    ['DELETE', /^\/accounts\/vars\/([^/]+)$/, ([id], r) => codebaseTabs.deleteVar(access.ownerOf(callerOf(r)).id, id), 'local'],
+    ['POST', /^\/accounts\/vars\/([^/]+)\/reveal$/, ([id], r) => codebaseTabs.reveal(access.ownerOf(callerOf(r)).id, id), 'local'],
     // F-050: the chat view. History pages and previews read this PC's copy of a conversation.
     [
       'GET',

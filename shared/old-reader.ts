@@ -1,5 +1,5 @@
 import { parseFrame } from './assistant.ts'
-import { FAST_MODELS, type FastModel, type FastServerFrame, type FastState } from './fast.ts'
+import { FAST_MODELS, type AnswerSource, type FastModel, type FastServerFrame, type FastState } from './fast.ts'
 
 // Order o5007 (Shubham, 11 Nov 2026): "a route ... which is very fast in replying, like Alt+K in it; I will only ask it basic questions". A
 // question box about the OLD app (Agentic Claude Manager, Christopher OS), answered by a warm model process that can only READ the old app's
@@ -22,8 +22,13 @@ export interface OldReaderSettings {
   enabled: boolean
   /** Fast (Haiku) or thorough (Sonnet). */
   model: FastModel
+  /** Order o7f34: who answers first: the Claude login (the Server's subscription) or the saved API key. */
+  source: AnswerSource
+  /** Order o7f34: when the Claude login path is down, answer with the API key (when one is saved). */
+  fallback: boolean
 }
-export const DEFAULT_OLD_READER: OldReaderSettings = { enabled: true, model: 'haiku' }
+export const DEFAULT_OLD_READER: OldReaderSettings = { enabled: true, model: 'haiku', source: 'subscription', fallback: true }
+export const ANSWER_SOURCES: readonly AnswerSource[] = ['subscription', 'api']
 
 /** What a file or a page says, repaired: anything not understood is the default. */
 export function parseOldReaderSettings(raw: unknown): OldReaderSettings {
@@ -31,6 +36,8 @@ export function parseOldReaderSettings(raw: unknown): OldReaderSettings {
   return {
     enabled: typeof r.enabled === 'boolean' ? r.enabled : DEFAULT_OLD_READER.enabled,
     model: (FAST_MODELS as readonly unknown[]).includes(r.model) ? (r.model as FastModel) : DEFAULT_OLD_READER.model,
+    source: (ANSWER_SOURCES as readonly unknown[]).includes(r.source) ? (r.source as AnswerSource) : DEFAULT_OLD_READER.source,
+    fallback: typeof r.fallback === 'boolean' ? r.fallback : DEFAULT_OLD_READER.fallback,
   }
 }
 
@@ -43,6 +50,8 @@ export interface OldReaderInfo {
   files: number | null
   /** The socket is served right now (switched on, the folder found, and this PC is the hub). */
   serving: boolean
+  /** Order o7f34: the Anthropic API key: whether one is saved, and when. The key itself is never sent. */
+  apiKey: { saved: boolean; savedAt: number | null }
 }
 
 // --- the paths an answer cites, as chips ----------------------------------------------------------------------------------
@@ -135,9 +144,22 @@ export interface OldTurn {
   /** From the question to its first word, ms. */
   firstMs: number | null
   model: FastModel | null
+  /** Order o7f34: who wrote it (the Claude login or the API key); null when it did not say (an answer kept before this). */
+  source: AnswerSource | null
+  /** What the API charged for it (API answers only); null otherwise. */
+  costUsd: number | null
   paths: CitedPath[]
   status: 'done' | 'stopped' | 'error'
   error?: string
+}
+
+/** The last finished answer from each source, newest first in the list the page keeps: what the footer shows, and what Compare asks again. */
+export function lastBySource(list: readonly OldTurn[]): Partial<Record<AnswerSource, OldTurn>> {
+  const out: Partial<Record<AnswerSource, OldTurn>> = {}
+  for (const t of list) {
+    if (t.source && t.status === 'done' && t.ms !== null && !out[t.source]) out[t.source] = t
+  }
+  return out
 }
 
 const str = (v: unknown): v is string => typeof v === 'string'
@@ -168,6 +190,8 @@ export function parseHistory(raw: unknown): OldTurn[] {
       ms: num(o.ms) ? o.ms : null,
       firstMs: num(o.firstMs) ? o.firstMs : null,
       model: o.model === 'haiku' || o.model === 'sonnet' ? o.model : null,
+      source: o.source === 'api' || o.source === 'subscription' ? o.source : null,
+      costUsd: num(o.costUsd) ? o.costUsd : null,
       paths,
       status,
       ...(status === 'error' && str(o.error) ? { error: o.error.slice(0, 300) } : {}),
@@ -231,6 +255,8 @@ function finish(v: OldView, at: number, status: OldTurn['status'], text: string,
     ms: v.startedAt !== null ? Math.max(0, at - v.startedAt) : null,
     firstMs: v.firstAt !== null && v.startedAt !== null ? Math.max(0, v.firstAt - v.startedAt) : null,
     model: v.model,
+    source: null,
+    costUsd: null,
     paths: citedPaths(a),
     status,
     ...(error ? { error } : {}),
@@ -266,8 +292,12 @@ export function reduceOld(v: OldView, e: OldEvent): OldView {
           return { ...v, answer: v.answer + f.text, phase: 'answering', tool: null, firstAt: v.firstAt ?? e.at }
         case 'tool':
           return f.id === v.turn ? { ...v, tool: f.label } : v
-        case 'done':
-          return f.id === v.turn ? finish(v, e.at, f.cancelled ? 'stopped' : 'done', f.text) : v
+        case 'done': {
+          if (f.id !== v.turn) return v
+          const next = finish(v, e.at, f.cancelled ? 'stopped' : 'done', f.text)
+          // Order o7f34: the answer says which source wrote it (the footer times each source by it).
+          return next.last ? { ...next, last: { ...next.last, source: f.source ?? null, costUsd: f.source === 'api' && typeof f.costUsd === 'number' ? f.costUsd : null } } : next
+        }
         case 'error':
           if (f.id !== undefined && f.id !== v.turn) return v
           return v.turn ? finish(v, e.at, 'error', v.answer, oldErrorWords(f.status, f.message)) : { ...v, error: oldErrorWords(f.status, f.message) }
@@ -302,3 +332,16 @@ export function oldStatusLine(v: OldView): string {
       return v.reason ?? 'Not available right now'
   }
 }
+
+// --- who answers (the efficient route) -------------------------------------------------------------------------------------
+
+export const SOURCE_OPTIONS: { value: AnswerSource; label: string }[] = [
+  { value: 'subscription', label: 'Subscription (Claude login)' },
+  { value: 'api', label: 'API key' },
+]
+
+/** The name an answer's source is given on the page, or null when it did not say. */
+export const sourceName = (s: AnswerSource | null): string | null => (s === 'api' ? 'API key' : s === 'subscription' ? 'Claude login' : null)
+
+/** The other source: what Compare asks on. Null when the last answer did not say which source wrote it. */
+export const otherSource = (s: AnswerSource | null): AnswerSource | null => (s === 'api' ? 'subscription' : s === 'subscription' ? 'api' : null)

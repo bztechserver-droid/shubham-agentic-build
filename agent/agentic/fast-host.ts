@@ -4,6 +4,7 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { supervise, type Running, type Supervisor } from '../guard/supervisor.ts'
+import type { AnswerSource } from '../../shared/fast.ts'
 import { createMemoryGate, type GateView, type MemSample, type MemoryGate } from './fast-gate.ts'
 
 // F-087: the fast Assistant's process. It is NOT a chat: no terminal, no floor, no transcript file. One hidden
@@ -47,13 +48,15 @@ export type FastFrame =
   | { t: 'delta'; id: string; text: string }
   | { t: 'flush'; id: string }
   | { t: 'tool'; id: string; name: string; label: string }
-  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean; ttftMs?: number }
+  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean; ttftMs?: number; source?: AnswerSource }
   | { t: 'error'; id: string; status: number; message: string }
 
 export interface FastAsk {
   id: string
   text: string
   model?: FastModel
+  /** Order o7f34: which answerer (source-router.ts); left out, the router decides. */
+  source?: AnswerSource
   /** The live page snapshot: put in front of the turn only when it differs from the last one this process was given. */
   snapshot?: string
 }
@@ -109,6 +112,8 @@ export interface FastDeps {
 
 export interface FastStatus {
   state: FastHostState
+  /** Order o7f34: which answerer this status is for (the router sets it); left out for the Claude path alone. */
+  source?: AnswerSource
   /** Why it is paused or unavailable, as a sentence. */
   reason: string | null
   model: FastModel

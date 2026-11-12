@@ -7,6 +7,8 @@
 
 export const FAST_MODELS = ['haiku', 'sonnet'] as const
 export type FastModel = (typeof FAST_MODELS)[number]
+/** Order o7f34: who answers a question of the efficient route: the Claude login (the Server's subscription) or the saved API key. */
+export type AnswerSource = 'subscription' | 'api'
 
 /** An ask is at most this many characters; a frame at most MAX_FRAME_BYTES (4 bytes a character, plus the rest). */
 export const MAX_TEXT = 2000
@@ -41,7 +43,7 @@ export type FastClientFrame =
   /** Claim the Assistant. One owner at a time: a second client taking it makes the first get state 'taken-over'. `resume` (a reconnect) does not take it from another. */
   | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean }
   /** A question or an order. `via` says how it was given (voice answers are written for the ear). `thorough` asks for Sonnet for this turn. A new ask while one runs cuts the old one off (it ends with done {cancelled}). */
-  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean }
+  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean; source?: AnswerSource }
   /** Barge-in: stop turn `id` now (what is already spoken stays said). */
   | { t: 'cancel'; id: string }
   /** The client is done: the Assistant is released (the hub keeps the process warm for a while). */
@@ -65,7 +67,8 @@ export type FastServerFrame =
   /** The Assistant is using a tool: a short label to show or say ("Opening that"). */
   | { t: 'tool'; id: string; name: string; label: string }
   /** The turn is over. `text` is everything it said. `cancelled` when an ask or a cancel cut it off. */
-  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean }
+  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean; source?: AnswerSource }
+  // (costUsd: what the API charged for the answer; the Claude login's figure is not what Shubham pays, so the page shows it for the API only.)
   | { t: 'error'; id?: string; status: number; message: string }
   /** The Assistant handed the ask to the Orchestrator: `line` is a one-line description of the request for a card ("Asked the Orchestrator: publish the build"); what the Assistant SAYS about it arrives as ordinary delta frames. `orderId` tracks it (it is also an ask id for Chris: GET /voice/ask/<orderId>). */
   | { t: 'handoff'; id: string; orderId: string; line: string }
@@ -107,7 +110,9 @@ export function parseClientFrame(raw: string): FastParse {
       const text = v.text.replace(/\s+/g, ' ').trim()
       if (!text) return bad('There is nothing to ask.')
       if (text.length > MAX_TEXT) return bad(`That is longer than ${MAX_TEXT} characters.`, 413)
-      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}) } }
+      // Order o7f34: which answerer (the efficient route's compare button and its setting); left out, the server decides.
+      if (v.source !== undefined && v.source !== 'subscription' && v.source !== 'api') return bad("source is 'subscription' or 'api'.")
+      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}), ...(v.source ? { source: v.source } : {}) } }
     }
     case 'cancel':
       return isId(v.id) ? { ok: true, frame: { t: 'cancel', id: v.id } } : bad('cancel needs the id of the ask.')

@@ -34,7 +34,8 @@ export function parseFrame(raw: unknown): FastServerFrame | null {
     case 'tool':
       return str(f.id) && str(f.label) ? { t: 'tool', id: f.id, name: str(f.name) ? f.name : '', label: f.label.slice(0, 60) } : null
     case 'done':
-      return str(f.id) ? { t: 'done', id: f.id, text: str(f.text) ? f.text : '', cancelled: f.cancelled === true ? true : undefined } : null
+      // Order o7f34: which answerer wrote it (the efficient route labels and times each answer by it); left out for the Assistant.
+      return str(f.id) ? { t: 'done', id: f.id, text: str(f.text) ? f.text : '', cancelled: f.cancelled === true ? true : undefined, ...(f.source === 'api' || f.source === 'subscription' ? { source: f.source } : {}), ...(num(f.costUsd) ? { costUsd: f.costUsd } : {}) } : null
     case 'error':
       return str(f.message) ? { t: 'error', id: str(f.id) ? f.id : undefined, status: num(f.status) ? f.status : 500, message: f.message } : null
     case 'handoff':

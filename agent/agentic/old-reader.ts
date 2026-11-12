@@ -553,13 +553,16 @@ export function createOldReaderStore(file: string): OldReaderStore {
     configuredRoot: () => root,
     configuredNotes: () => notes,
     set(patch) {
-      if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) throw apiError(400, 'Expected {enabled?, model?}')
+      if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) throw apiError(400, 'Expected {enabled?, model?, source?, fallback?}')
       const p = patch as Record<string, unknown>
-      for (const k of Object.keys(p)) if (k !== 'enabled' && k !== 'model') throw apiError(400, `Unknown setting: ${k.slice(0, 40)}`)
+      const known = ['enabled', 'model', 'source', 'fallback']
+      for (const k of Object.keys(p)) if (!known.includes(k)) throw apiError(400, `Unknown setting: ${k.slice(0, 40)}`)
       if (p.enabled !== undefined && typeof p.enabled !== 'boolean') throw apiError(400, 'enabled is true or false')
       if (p.model !== undefined && p.model !== 'haiku' && p.model !== 'sonnet') throw apiError(400, 'model is haiku or sonnet')
+      if (p.source !== undefined && p.source !== 'subscription' && p.source !== 'api') throw apiError(400, "source is 'subscription' or 'api'")
+      if (p.fallback !== undefined && typeof p.fallback !== 'boolean') throw apiError(400, 'fallback is true or false')
       const next = parseOldReaderSettings({ ...now, ...p })
-      if (next.enabled !== now.enabled || next.model !== now.model) {
+      if (JSON.stringify(next) !== JSON.stringify(now)) {
         now = next
         writeAtomic(file, `${JSON.stringify({ ...now, ...(root ? { root } : {}), ...(notes ? { notes } : {}) }, null, 2)}\n`)
       }

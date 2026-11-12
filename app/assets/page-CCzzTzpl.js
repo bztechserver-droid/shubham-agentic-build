@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-GJybbap3.js";function t(){e(`/goals`)}export{t as default};
