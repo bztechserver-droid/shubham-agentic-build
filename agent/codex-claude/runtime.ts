@@ -15,11 +15,11 @@ import type { ExecutionStartRequest } from '../agentic/execution-coordinator.ts'
 import { requireBridgeCapability, requireBridgeRuntimeProof, type BridgeActualRuntimeProof, type BridgeLeaseRequest, type BridgeRuntimePins, type BridgeTargetCapability, type CodexBridgeLease } from './contract.ts'
 import { bridgeConversationKey, fromResponses, providerFailureSummary, reasoningTag, recordedProviderFailure, responseUsage, sendResponses, toResponses, type ProviderProgress, type ProviderFailureSummary } from './adapter.ts'
 import { assertPrivatePath, openExecutionStorage, writePrivateAtomic } from './storage.ts'
-import { CUT_HEADER, RUN_VERDICT_HEADER, readChildConfig, type BridgeChildConfig } from './child.ts'
+import { CUT_HEADER, RUN_VERDICT_HEADER, readChildConfig, requestDigest, type BridgeChildConfig } from './child.ts'
 import { probeClaudeHarness } from './probe.ts'
 import { BridgeOwnership, BridgeRetirementWork } from './ownership.ts'
 import { openMessage, pendingMessages, BRIDGE_REQUEST_TIMEOUT_MS } from './messages-stream.ts'
-import { CLAUDE_CODE_ENDED, endedByClaudeCode, keepsRunOpen, requestFailureSummary, type OpenReason, type RequestPhase } from './request-failure.ts'
+import { CLAUDE_CODE_ENDED, endedByClaudeCode, keepsRunOpen, requestFailureSummary, UnconfirmedRequests, type OpenReason, type RequestPhase } from './request-failure.ts'
 import { advanceRunState, proofProcessesGone, runArtifacts, stateNow, type RunState } from './run-state.ts'
 import { CAPABILITY_RENEW_CHECK_MS, renewalDue } from './capability-renewal.ts'
 import { BRIDGE_REQUIREMENTS as REQUIRED } from './requirements.ts'
@@ -71,6 +71,8 @@ export interface BridgeRuntimeOptions {
 export function createBridgeRuntime(o: BridgeRuntimeOptions) {
   const runs = new Map<string, RunRecord>(), dispatch = new Map<string, Extract<ExecutionStartRequest, { kind: 'bridge' }>['dispatchProvider']>()
   const lifetime = new AbortController(), knownBrokerLeases = new Set<string>(), retirementWork = new BridgeRetirementWork()
+  /** Requests whose reply failed unconfirmed: never sent again (request-failure.ts keepsRunOpen 'provider-unconfirmed'). */
+  const unconfirmed = new UnconfirmedRequests()
   let hostLifetime = new AbortController()
   const probes = new Map<string, { key: string; consumerId: string; ownerId: string; sawRead: boolean; paused: boolean }>()
   let closed = false, storage: Awaited<ReturnType<typeof openExecutionStorage>> | null = null
@@ -520,8 +522,13 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
     const started=Date.now();let lastSaved=0,lastPhase=''
     // Speed diagnostics (numbers only): where the time of each request goes.
     const timing={dispatched:0,headers:0,firstByte:0,firstText:0}
+    // Stall data (10 Nov 2026): the longest silence between the provider's headers/bytes, so a stall limit can be set from
+    // real numbers without ever cutting Sol's long thinking (no limit is applied here).
+    let lastByteAt=0,maxGapMs=0
     let progress:ProviderProgress={phase:'connecting',bytes:0,events:0}
     const noteProgress=(value:ProviderProgress)=>{
+      const at=Date.now()
+      if(value.phase==='headers'||value.phase==='reading'||value.phase==='completed'){if(lastByteAt)maxGapMs=Math.max(maxGapMs,at-lastByteAt);lastByteAt=at}
       if(value.phase==='headers'&&!timing.headers)timing.headers=Date.now()
       if(value.phase==='reading'&&!timing.firstByte)timing.firstByte=Date.now()
       progress=value
@@ -530,11 +537,15 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         writePrivateAtomic(path.join(o.directory,`${record.runId}.request.json`),JSON.stringify({version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,...value})+'\n')
       }
     }
+    let raw: Buffer | null = null
     try {
       const chunks: Buffer[] = []; let size = 0
       for await (const data of req) { size += data.length; if (size > 16 * 1024 * 1024) return fail(); chunks.push(data) }
+      raw = Buffer.concat(chunks)
+      // A request whose earlier reply failed unconfirmed is never sent again (Claude Code repeating it): refused, run left open.
+      if (!match[2] && unconfirmed.any(record.runId) && unconfirmed.has(record.runId, requestDigest(raw))) return fail('provider-unconfirmed')
       // Speed: one prompt-cache key per conversation, and Sol's reasoning carried between the steps of a turn (as Codex does).
-      const input = JSON.parse(Buffer.concat(chunks).toString('utf8')), body = toResponses(input, { cacheKey: cacheKeyOf(record), carryReasoning: true })
+      const input = JSON.parse(raw.toString('utf8')), body = toResponses(input, { cacheKey: cacheKeyOf(record), carryReasoning: true })
       phase='authorization'
       if (!current(record.lease.request)) throw executionHttpError('execution-runtime-mismatch','runtime')
       if (match[2]) {
@@ -567,19 +578,21 @@ export function createBridgeRuntime(o: BridgeRuntimeOptions) {
         carried:Array.isArray(body.input)?body.input.filter(item=>(item as {type?:unknown})?.type==='reasoning').length:0,
         tools:reply.content.filter(block=>block.type==='tool_use').length,
         ms:{beforeProvider:timing.dispatched?timing.dispatched-started:null,headers:since(timing.headers),firstByte:since(timing.firstByte),
-          firstText:since(timing.firstText),total:done-started},usage:responseUsage(response)})
+          firstText:since(timing.firstText),total:done-started,maxGap:maxGapMs||null},usage:responseUsage(response)})
     } catch (error) {
       // A request Claude Code ended (Esc, a stopped background task) does not pause the chat, but only when that end is provably
       // what stopped it (request-failure.ts); every other failure pauses, as before.
       const ended = endedByClaudeCode({ outer: signal, phase, dispatched: providerDispatched, inner: providerSignal, cause: providerFailure, provider: providerRecord, error })
       // 10 Nov 2026: two causes no longer pause (request-failure.ts keepsRunOpen): an unanswered CRM login check before anything
       // was sent, and this controller stopping (hub restart, Update). Every other failure pauses, as before.
-      const open = ended ? null : keepsRunOpen({ phase, dispatched: providerDispatched, error, stopping: lifetime.signal.aborted || hostLifetime.signal.aborted })
+      const open = ended ? null : keepsRunOpen({ phase, dispatched: providerDispatched, error, stopping: lifetime.signal.aborted || hostLifetime.signal.aborted, failure: providerFailure })
+      // The run stays open after an unconfirmed reply only because this exact request is never sent again.
+      if (open === 'provider-unconfirmed' && raw) unconfirmed.add(record.runId, requestDigest(raw))
       const paused = !ended && !open
       if (paused) pause(record)
       const failure={...(providerFailure??requestFailureSummary(error,phase,signal)),providerDispatched}
       const diagnostic={version:1,at:new Date().toISOString(),runId:record.runId,elapsedMs:Date.now()-started,
-        phase,...(providerDispatched?{progress}:{}),...failure,paused,...(ended?{endedBy:'claude-code'}:{}),...(open?{open}:{}),
+        phase,...(providerDispatched?{progress,maxGapMs,silentMs:lastByteAt?Date.now()-lastByteAt:null}:{}),...failure,paused,...(ended?{endedBy:'claude-code'}:{}),...(open?{open,recovery:'new-message'}:{}),
         // What the adapter itself saw (e.g. the HTTP status) when that differs from the cancellation recorded above.
         ...(providerRecord&&providerRecord.stage!=='transport'?{provider:providerRecord}:{})}
       try {

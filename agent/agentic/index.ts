@@ -103,11 +103,12 @@ import { killTree } from '../proc-tree.ts'
 import { answerable, createApprovalLog, promptOf } from './approvals.ts'
 import type { Elevation } from './approval-recovery.ts'
 import { createAutoUpdate } from './auto-update.ts'
+import { withRun, type QuietView } from '../update/coordinator.ts'
 import type { WaTools } from '../whatsapp/index.ts'
 import { waTool } from '../whatsapp/tools.ts'
 import type { SignedKind } from '../../shared/approval-sign.ts'
 import { createHash } from 'node:crypto'
-import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
+import type { AnswerRequest, ApprovalItem, ApprovalsAnswer, AutoUpdateRun, AutoUpdateStatus, CancelRequest, PreparedCard, SendAsMeRequest } from '../../shared/approvals.ts'
 import { configuredModel, readFileRun } from './runinfo.ts'
 import { createFloorStore, assertCodexThreadAvailable, type FloorStore } from './floors.ts'
 import { createOfflineSettings, OFFLINE_AFTER_MS } from './offline.ts'
@@ -116,6 +117,8 @@ import type { CodexManager } from '../codex/index.ts'
 import { parseVersion } from '../codex/find.ts'
 import { dependencyReport } from './dependencies.ts'
 import type { DependenciesAnswer, DependencyPc, DependencyReport } from '../../shared/dependencies.ts'
+import { buildMcpInventory, findRunner, planInstall, registerCurated, removeCurated, type InventoryChat } from './mcp-inventory.ts'
+import { MCP_CURATED, readMcpInstallDone, readMcpInstallPlan, readMcpInventory, type McpInstallDone, type McpInstallPlan, type McpInventory, type McpInventoryAnswer, type McpInventoryPc } from '../../shared/mcp-inventory.ts'
 import { profileName, removeProfile, sweepProfiles, writeProfile, type McpServerToml } from '../codex/home.ts'
 import { CODEX_FORMAT, discoverThread, findRollout } from '../codex/rollout.ts'
 import { watchForThread } from '../codex/discovery.ts'
@@ -364,6 +367,10 @@ export interface AgenticOptions {
   speech?: (ws: WsSocket) => void
   /** F-078: the build running now (its version), for the morning summary. */
   currentBuild?: () => string | null
+  /** F-173a: what the app's automatic update is doing (main.ts reads it off the coordinator), added to GET /auto-update. */
+  updateRun?: () => AutoUpdateRun | null
+  /** F-173a: the switch was changed: the coordinator looks again at once. */
+  onAutoUpdateChanged?: () => void
   /** F-072: the Assistant's orders get their answers carried back to it by the app (orders.ts). On; SAD_ORDER_REPLIES=0, or an order-replies.off file in this folder, switches it off (the way it was). Tests set it. */
   orderReplies?: boolean
   /** Order-reply carrier (11 Nov), tests: shorter waits for claude's report of a typed reply and before a reply that was not taken is typed again. */
@@ -443,6 +450,13 @@ export interface Agentic {
   resumeChat(sessionId: string, text?: string): Promise<boolean>
   /** F-075: chats in the middle of something (running or asking) on this PC. */
   busyChats(): number
+  /**
+   * F-173a: what the automatic update looks at, read-only (nothing here starts, stops or types anything). Each one may throw:
+   * the coordinator treats that as unknown and not quiet.
+   */
+  quiet: QuietView
+  /** F-173a: the automatic-update switch as it is now (read afresh). */
+  autoUpdateStatus(): AutoUpdateStatus
   /** F-075: the chat host changes with an update: the open chats are written down (so the new agent resumes them), then ended in the host. */
   retireChatHost(): Promise<void>
   /**
@@ -558,6 +572,25 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const fwd = (p: string) => p.replace(/\\/g, '/')
   const hookScript = fileURLToPath(new URL('./memory-hook.ts', import.meta.url))
   writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}"`, timeout: 10 }] }] } })}\n`)
+  // 12 Nov (Agent 12, Lead's yes): while the memory layer is off, every NEW Claude chat still gets the PROMPT REPORT: the same script with
+  // --report-only, which only tells the agent which prompt claude took (the send confirmation, o655f, and the order-reply carrier), prints
+  // nothing, gives up after 2 s and always exits 0. The memory layer's own switch is not touched. Off for new chats: SAD_PROMPT_HOOK=0 or the
+  // file <state>/agent/prompt-hook.off, looked at at each chat start; a running chat keeps the flags it started with.
+  // Claude's own limit stays the memory hook's 10 s: it counts from the moment claude starts the hook, and Windows sometimes takes ~3 s just
+  // to start it (real rig, 12 Nov: with a 3 s limit claude printed "hook ... timed out" under the prompt). The script's own 2 s cap is the wait.
+  const promptHookFile = path.join(o.dir, 'prompt-hook.json')
+  writeAtomic(promptHookFile, `${json({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}" --report-only`, timeout: 10 }] }] } })}\n`)
+  const promptHookOff = () => process.env.SAD_PROMPT_HOOK === '0' || existsSync(path.join(o.dir, '..', 'prompt-hook.off'))
+  // One answer per chat start: the pool reads `settings` twice in one statement (chats.ts), and both reads must agree even if the file
+  // appears in between; the next start (a later tick) looks again.
+  let promptHookPick: string | undefined | null = null
+  const promptHookSettings = () => {
+    if (promptHookPick === null) {
+      promptHookPick = promptHookOff() ? undefined : promptHookFile
+      queueMicrotask(() => { promptHookPick = null })
+    }
+    return promptHookPick
+  }
 
   /** 'alone': no hub (as before F-021); 'hub': it keeps the floors; 'member': it shows its hub's. */
   const mode = (): 'alone' | 'hub' | 'member' => (!team ? 'alone' : team.role() === 'hub' ? 'hub' : team.hub() ? 'member' : 'alone')
@@ -1193,8 +1226,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     codexSend: o.codexSend,
     token: o.token,
     credential: o.credential,
-    // F-051: recall in every prompt, once the memory layer is on (main.ts).
-    settings: o.memory?.start ? hooksFile : undefined,
+    // F-051: recall in every prompt, once the memory layer is on (main.ts). Else the prompt report (12 Nov), unless it is switched off:
+    // a getter, so the switch is looked at each time a chat starts.
+    get settings() { return o.memory?.start ? hooksFile : promptHookSettings() },
     onChange: () => {
       noteOpen()
       // A chat that ended lets its session go (after its last write is sent on).
@@ -1230,7 +1264,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const nativeChats = combinePools(createChatPool(poolOptions), openCode.pool)
   if (o.codex && o.chatHost?.inspect && o.chatHost.current && !o.spawn) {
     executionService = createExecutionService({ directory: path.join(o.dir, 'codex-claude'), manager: o.codex, host: o.chatHost, self,
-      pool: () => nativeChats, memorySettings: poolOptions.settings,
+      pool: () => nativeChats, memorySettings: o.memory?.start ? hooksFile : undefined,
       current: request => {
         try {
           const at = bySession(request.binding.sessionId!)
@@ -2249,6 +2283,58 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
     })) }
   }
+
+  // ---- F-168 part 2: every MCP server on each PC, and a register-only Install from a short curated list (admin only, this PC's list file only).
+  const mcpDeps = () => ({ pc: { id: self().id, name: self().name }, registryFile: mcpRegistryFile, runner: (n: 'uvx' | 'npx') => findRunner(n) })
+  function localMcpInventory(): McpInventory {
+    const chatList: InventoryChat[] = []
+    let chatsWithoutHome = 0
+    for (const floor of allFloors()) for (const a of floor.agents) {
+      if (!a.homePc) { if (mode() !== 'member') chatsWithoutHome++; continue }
+      if (a.homePc !== self().id) continue
+      chatList.push({ floor: floor.name, agent: a.name, cwd: floor.codeDir || defaultCodeDir, mcpServers: a.mcpServers, running: !!(a.sessionId && nativeChats.info(a.sessionId)) })
+    }
+    return buildMcpInventory({ ...mcpDeps(), claudeJson, appServerNames: Object.keys(appMcpServers), chats: chatList, chatsWithoutHome })
+  }
+  async function mcpInventoryAnswer(): Promise<McpInventoryAnswer> {
+    return { version: 1, pcs: await Promise.all(pcs().map(async (pc): Promise<McpInventoryPc> => {
+      if (pc.here) return { ...pc, inventory: localMcpInventory(), error: null }
+      try {
+        const inventory = readMcpInventory(await request<unknown>(peerOf(pc.id), 'mcp-inventory', {}, 20_000))
+        return inventory ? { ...pc, inventory, error: null } : { ...pc, inventory: null, error: "It answered something this page can't read: update that PC." }
+      } catch (e) {
+        return { ...pc, inventory: null, error: /doesn't do mcp-inventory/.test(message(e)) ? 'That PC runs an older build: update it to see its MCP servers.' : `Can't reach it right now (${message(e)}).` }
+      }
+    })) }
+  }
+  /** Which PC an MCP action is for: this one, or (from the Server only) a linked one. Never a PC this one cannot speak for. */
+  function mcpTarget(body: unknown): { pc: string; id: string; here: boolean } {
+    if (!isObject(body) || typeof body.pc !== 'string' || typeof body.id !== 'string' || !MCP_CURATED.some(c => c.id === body.id)) throw apiError(400, 'Expected {pc, id} with an id from the list')
+    const here = body.pc === self().id
+    if (!here && mode() !== 'hub') throw apiError(409, "Another PC's MCP list is changed from the Server's page, not from here.")
+    if (!here && !pcs().some(p => p.id === body.pc)) throw apiError(404, 'No such PC')
+    return { pc: body.pc, id: body.id, here }
+  }
+  async function mcpPlanAnswer(body: unknown): Promise<McpInstallPlan> {
+    const t = mcpTarget(body)
+    if (t.here) return planInstall(mcpDeps(), t.id)
+    const plan = readMcpInstallPlan(await request<unknown>(peerOf(t.pc), 'mcp-plan', { id: t.id }, 20_000).catch(e => { throw apiError(/doesn't do mcp-plan/.test(message(e)) ? 409 : 503, /doesn't do mcp-plan/.test(message(e)) ? 'That PC runs an older build: update it to install here.' : `Can't reach that PC right now (${message(e)}).`) }))
+    if (!plan || plan.pc.id !== t.pc || plan.id !== t.id) throw apiError(502, "That PC answered something this page can't read: update it.")
+    return plan
+  }
+  async function mcpApply(action: 'register' | 'remove', body: unknown): Promise<McpInstallDone> {
+    const t = mcpTarget(body)
+    const fingerprint = isObject(body) ? body.fingerprint : undefined
+    if (t.here) return action === 'register' ? registerCurated(mcpDeps(), t.id, fingerprint) : removeCurated(mcpDeps(), t.id)
+    const op = action === 'register' ? 'mcp-register' : 'mcp-remove'
+    const done = readMcpInstallDone(await request<unknown>(peerOf(t.pc), op, { id: t.id, fingerprint }, 20_000).catch(e => {
+      if (isObject(e) && typeof e.status === 'number' && e.status >= 400 && e.status < 500) throw e
+      throw apiError(/doesn't do mcp-/.test(message(e)) ? 409 : 503, /doesn't do mcp-/.test(message(e)) ? 'That PC runs an older build: update it to change its MCP list.' : `Can't reach that PC right now (${message(e)}).`)
+    }))
+    if (!done || done.pc.id !== t.pc || done.id !== t.id) throw apiError(502, "That PC answered something this page can't read. Check its MCP list before trying again.")
+    return done
+  }
+  const mcpIdOf = (raw: unknown) => { if (!isObject(raw) || typeof raw.id !== 'string' || !MCP_CURATED.some(c => c.id === raw.id)) throw apiError(400, 'Expected {id} from the list'); return raw.id }
 
   function retireCodexSettings(r: MountRequest) {
     const c = callerOf(r)
@@ -4371,10 +4457,13 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   function setAutoUpdate(raw: unknown, by: string, r?: ProofRequest) {
     if (!isObject(raw) || typeof raw.on !== 'boolean') throw apiError(400, 'Expected {on}')
-    const who = humanProof('autoupdate', [raw.on], undefined, r)
-    const st = autoUpdate.set(raw.on, `${who} via ${by}`)
+    // F-173a: the choice is recorded with WHO made it (an administrator's current CRM session, never a chat or a machine) and when.
+    const caller = requireCrmHuman(o.auth, r, true)
+    const who = describeHuman(caller)
+    const st = autoUpdate.set(raw.on, `${who} via ${by}`, caller.person?.id ?? null)
     deviceLog(`Automatic updates when quiet switched ${raw.on ? 'ON' : 'off'}`, `${who} via ${by}`)
-    return st
+    o.onAutoUpdateChanged?.()
+    return withRun(st, o.updateRun?.() ?? null)
   }
   const deviceLog = (detail: string, by: string) => approvalLog.add({ kind: 'device', floor: '', agent: '', pc: self().name, sessionId: '', detail, by })
   function retiredApprovalDevices(): never { throw Object.assign(apiError(410, 'Approval-device enrollment was removed. Sign in through CRM; no device registration is used.'), { code: 'approval-devices-retired' }) }
@@ -4938,6 +5027,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
     // F-165: what Codex in Claude Code needs on this PC and on each PC within reach, read-only.
     ['GET', /^\/dependencies$/, () => dependenciesAnswer(), 'local'],
+    // F-168 part 2: every MCP server on each PC within reach, and the register-only install. A signed-in app administrator only (the CRM cookie).
+    ['GET', /^\/mcp-inventory$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpInventoryAnswer()), 'local'],
+    ['POST', /^\/mcp-install\/plan$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpPlanAnswer(r.body)), 'local'],
+    ['POST', /^\/mcp-install$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('register', r.body)), 'local'],
+    ['POST', /^\/mcp-remove$/, (_, r) => (requireCrmHuman(o.auth, r, true), mcpApply('remove', r.body)), 'local'],
     ['POST', /^\/codex\/refresh$/, async () => {
         await o.codex?.check()
         return codexAnswer()
@@ -5006,7 +5100,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r)), 'local'],
-    ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), autoUpdate.read())],
+    ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), withRun(autoUpdate.read(), o.updateRun?.() ?? null))],
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r), r))],
     ['GET', /^\/approvals\/devices$/, () => retiredApprovalDevices()],
     ['POST', /^\/approvals\/devices\/code$/, () => retiredApprovalDevices()],
@@ -5623,6 +5717,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-165: a member's Dependencies page asks for the hub's checks.
         case 'dependencies':
           return answer(() => localDependencies())
+        // F-168 part 2: a member's MCP page asks for the hub's own servers (reading only; changes to the hub's list are made on the hub).
+        case 'mcp-inventory':
+          return answer(() => localMcpInventory())
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         case 'delivery-authorize':
@@ -5742,6 +5839,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         // F-165: the hub's Dependencies page asks for this PC's checks.
         case 'dependencies':
           return answer(() => localDependencies())
+        // F-168 part 2: the Server's MCP page asks this PC for its servers, and (an administrator's click on the Server, confirmed on its page) to
+        // look at, add or remove ONE curated entry in this PC's own list. Only the Server's link reaches this switch.
+        case 'mcp-inventory':
+          return answer(() => localMcpInventory())
+        case 'mcp-plan':
+          return answer(raw => planInstall(mcpDeps(), mcpIdOf(raw)))
+        case 'mcp-register':
+          return answer(raw => registerCurated(mcpDeps(), mcpIdOf(raw), isObject(raw) ? raw.fingerprint : undefined))
+        case 'mcp-remove':
+          return answer(raw => removeCurated(mcpDeps(), mcpIdOf(raw)))
         case 'delivery-capabilities':
           return answer(() => ({ version: 1, idempotent: true, receipts: true, humanInputAuthorization: 1 }))
         case 'delivery-status':
@@ -6212,6 +6319,22 @@ export function createAgentic(o: AgenticOptions): Agentic {
     restartCodexChats,
     resumeChat,
     busyChats: () => Object.values(chats.states()).filter(st => st === 'running' || st === 'question').length,
+    quiet: {
+      // The host has taken its chats over and recovery has reopened its list: before that "no chat" means "not known yet".
+      ready: () => hostAdopted && recoveryDone,
+      // Every chat running on a PC this hub sees (its own and each member's), with its state: a chat on another PC is cut from the hub too.
+      chats: () => Object.fromEntries(Object.entries(whereAll()).map(([sid, w]) => [sid, { state: w.state, name: floors.bySession(sid)?.agent.name }])),
+      drafts: () => chats.live().filter(c => chats.drafting(c.sessionId)).length,
+      orders: () => orders.list().length,
+      // pendingCount() is null when a store is unavailable or closed: whether something is pending is then unknown, and the signal throws (= "not quiet", fail closed).
+      deliveries: () => {
+        const sends = messageReceipts.pendingCount(), native = nativeReceipts.pendingCount()
+        if (sends === null || native === null) throw new Error('delivery receipts are unavailable')
+        return sends + native
+      },
+      bridge: () => chats.live().filter(c => c.bridgeRunId !== undefined).map(c => floors.bySession(c.sessionId)?.agent.name ?? c.sessionId.slice(0, 8)),
+    },
+    autoUpdateStatus: () => autoUpdate.read(),
     async retireChatHost() {
       // Written down first: ending them would otherwise empty the list.
       recovery?.freeze()

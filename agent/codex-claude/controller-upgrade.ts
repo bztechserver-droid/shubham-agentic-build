@@ -29,10 +29,10 @@ export const RETIRED_CONTROLLERS = Object.freeze([PREVIOUS_CONTROLLER_SHA256,
   // The tool-result image fix (child 63fe0f33…, adopted 1210's children).
   'ee5eb0e41c8ecda0011be7ca867b8c1e2cd0695d10ac44495ffad8aa9496b86f'])
 /** The controllers whose running children the next build adopts: only builds whose children run exactly UNCHANGED_CHILD_FILES.
- * Empty now: child.ts changed (a lost controller no longer pauses the gateway for good; the cut request alone stays refused),
- * so no earlier child is identical, and those chats are stopped and reopened once at that Update. The build after it lists
- * this build's controller. */
-export const PREVIOUS_CONTROLLERS: readonly string[] = Object.freeze([])
+ * The pause-fix build (gateway cut self-recovers, child 40342aa5…): the unconfirmed-reply fix changes only the controller,
+ * so its running bridge chats are carried on at the next Update instead of being stopped. */
+export const PREVIOUS_CONTROLLERS: readonly string[] = Object.freeze([
+  'c4cf384d9802ed654e8425e7c1f8e9c3ecfdbffb26a981fc3538d753311106e3'])
 /** The exact child sources the adopted children run (checked against these files on disk at every start). */
 export const UNCHANGED_CHILD_FILES = Object.freeze({
   'child.ts':'40342aa55e547065cf92e1e4c1acab060549d8388eab77c4aa9e7565152ec50e',

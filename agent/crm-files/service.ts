@@ -12,6 +12,7 @@ import {
   type CrmReveal,
   type CrmNode,
   type CrmRights,
+  type CrmSearch,
   type CrmSpoolEntry,
   type CrmVersion,
 } from '../../shared/crm-files.ts'
@@ -90,7 +91,58 @@ export interface CrmFilesOptions {
   log?: { info(m: string): void; warn(m: string): void }
   /** oa2f8: the most one file may be now (the uploads' settings: the CRM's own limit, or the person's number). Left out: CRM_FILES_MAX_UPLOAD. The one-request upload and the drive's saves follow it. */
   maxUpload?: () => number
+  /**
+   * o813f: how the bytes of a file are read. 'drive' (left out = this): a file over 100 MB (DRIVE_API_OVER) that the CRM keeps in Google Drive is read through Google's Drive API
+   * (files.get alt=media with the CRM's own Drive token, in ranges), not through the public download link, which answers Google's virus-scan notice instead of such a file; every
+   * other file through the CRM's own download, as before. 'crm': every file through the CRM's own download (GET /org/files/:id/raw), the way before o813f, kept as a setting
+   * (index.ts: `downloadViaFile`, the file DOWNLOAD_VIA_CRM_FILE in the agent's state folder).
+   */
+  downloadVia?: () => 'drive' | 'crm'
 }
+
+/** o813f: this file in the agent's state folder sends every download through the CRM's own (the way before o813f; a file over 100 MB fails there). */
+export const DOWNLOAD_VIA_CRM_FILE = 'crm-download-via-crm.on'
+
+/**
+ * o813f (Lead, 12 Nov 2026): ONLY a record over this size (its fileSize in the CRM) is read through Google's Drive API; every other file goes through the CRM's own download, as before.
+ * 100 MB in Google's own counting (100 × 1000 × 1000), so Google's virus-scan cut-off is covered.
+ */
+export const DRIVE_API_OVER = 100 * 1000 * 1000
+
+/** o813f: the CRM's Drive token goes only to Google's API, over https (the pretend Google of the tests listens on 127.0.0.1). */
+export function tokenMayGoTo(url: string): boolean {
+  return /^https:\/\/www\.googleapis\.com\//.test(url) || /^http:\/\/127\.0\.0\.1:\d{1,5}\//.test(url)
+}
+
+/** o813f: the download setting as the agent reads it: 'crm' while DOWNLOAD_VIA_CRM_FILE is in `dir`, else 'drive' (looked at on every read, so it takes effect at once). */
+export function downloadViaFile(dir: string): () => 'drive' | 'crm' {
+  const file = path.join(dir, DOWNLOAD_VIA_CRM_FILE)
+  return () => (existsSync(file) ? 'crm' : 'drive')
+}
+
+/**
+ * o813f: the Google Drive id in a link the CRM keeps for a file, read the way the CRM's own download reads it (sam-crm-be fileController driveDirectUrl: drive.google.com/file/d/<id>,
+ * drive.google.com/open|uc|thumbnail?id=<id>, lh<n>.googleusercontent.com/d/<id>; an id of 20 characters at least). Null for anything else, which is read through the CRM as before.
+ */
+export function driveIdOf(url: string): string | null {
+  const m =
+    /^https?:\/\/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]{20,})/i.exec(url) ??
+    /^https?:\/\/drive\.google\.com\/(?:open|uc|thumbnail)\?(?:[^#]*&)?id=([A-Za-z0-9_-]{20,})/i.exec(url) ??
+    /^https?:\/\/lh\d\.googleusercontent\.com\/d\/([A-Za-z0-9_-]{20,})/i.exec(url)
+  return m ? m[1] : null
+}
+
+/** o813f: what a download says when Google keeps a file back, or sends its notice instead of it, or stops. */
+export const DOWNLOAD_WORDS = {
+  harmful: 'Google Drive has marked this file as harmful (malware or spam), so it is not downloaded. That is Google’s decision; only the file’s owner can look at it, in Google Drive itself.',
+  scanPage:
+    'Google Drive sent its virus-scan notice instead of this file: a file over 100 MB does not come through the CRM’s own download, and the direct Google Drive way was not open for it here (for example, this account has no upload permission in the CRM).',
+  broke: 'Google Drive stopped sending this file and did not go on from where it stopped. Try again.',
+  notShown: 'The CRM does not show this file to this account (it may have been removed), so it is not read.',
+} as const
+
+/** o813f: Google's "can't scan this file for viruses" page, as the public link sends it in place of a file over 100 MB. */
+const SCAN_NOTICE = /<title>[^<]*virus scan warning[^<]*<\/title>|can(?:'|&#39;|’)t scan this file for viruses/i
 
 /**
  * od0b1: what the uploads in parts (uploads.ts) need of the CRM and of Google Drive: the same checks, the same key and folders, and the same record the one-request upload makes.
@@ -154,11 +206,19 @@ export interface CrmFilesService {
   status(): Promise<CrmFilesStatus>
   children(id: string): Promise<CrmChildren>
   node(id: string): Promise<CrmNode>
-  /** The bytes of a file, streamed from the CRM (its /org/files/:id/raw); the caller pipes `stream` and must destroy it if the reader goes away. */
+  /**
+   * The bytes of a file, streamed; the caller pipes `stream` and must destroy it if the reader goes away. o813f: a file over 100 MB in Google Drive comes through Google's Drive API once
+   * the CRM has said yes for it (a break in the line goes on from where it stopped); anything else, or what the API does not give, through the CRM's own download (/org/files/:id/raw).
+   */
   file(id: string): Promise<{ stream: Readable; size: number | null; type: string; name: string }>
-  /** S9a: bytes [start, start + length) of a file by a ranged request to the CRM (fewer only at the end of the file); a CRM that ignores the range is read and cut. For the in-app WinFsp drive. */
+  /**
+   * S9a: bytes [start, start + length) of a file by ONE ranged request (fewer only at the end of the file, none past it). For the in-app WinFsp drive. o813f: a file over 100 MB in Google
+   * Drive is asked of Google's Drive API once the CRM has said yes for it; anything else of the CRM (a CRM that ignores the range is read and cut).
+   */
   fileBytes(id: string, start: number, length: number): Promise<Buffer>
   versions(id: string): Promise<CrmVersion[]>
+  /** P1: files and projects whose name holds `q` (2 characters at least), at most `limit` (200). */
+  search(q: string, limit: number): Promise<CrmSearch>
   /**
    * S5: a save made through a drive: the bytes are kept on this PC (the spool) and this returns at once; they go up in the background. It checks the rights first (a save the CRM would refuse is
    * refused now, not accepted and then parked). `target` = a CRM file to save over as a NEW VERSION; without it, a new file in the folder `parent`. Null when this agent keeps no spool.
@@ -754,6 +814,233 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     }
   }
 
+  // ---- o813f: the bytes of a file over 100 MB, through Google's Drive API (Shubham, relayed 12 Nov; Lead's conditions) -------------------------------------------
+  // The public download link (what the CRM's own download, /org/files/:id/raw, fetches) answers Google's "can't scan this file for viruses" page in place of a file over 100 MB. For such
+  // a file ONLY (the record's fileSize over DRIVE_API_OVER), Google's Drive API is used, Google's own way for a program to download: files.get alt=media with the CRM's own Drive token,
+  // by Range requests; download only. Nothing is clicked through: what Google refuses there (a file it marked as harmful: 403 cannotDownloadAbusiveFile) stays refused, acknowledgeAbuse
+  // is never sent, and the CRM's download is not tried instead. The CRM still decides what may be read: the file must be in the CRM's own list for this account (findFile, which also
+  // hides projects it may not open), the Drive id is the one in the link the CRM keeps for THAT record (driveIdOf), and the CRM must say yes for that very file just before (crmLetsOpen).
+  // The token: from the CRM (org/upload/gdrive-token), in this process's memory only, sent only to Google's API over https (tokenMayGoTo); never logged, stored, answered or shown.
+
+  /** The Drive id to read this record by, through the API: only a record over DRIVE_API_OVER whose link is Drive's own, and only while the setting says so. Null = the CRM's own download. */
+  const apiDriveId = (f: RawFile): string | null => ((o.downloadVia?.() ?? 'drive') === 'drive' && f.fileSize !== null && f.fileSize > DRIVE_API_OVER ? driveIdOf(f.fileUrl) : null)
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+  /**
+   * Before the bytes of a file are read from Drive, the CRM is asked about THAT file (Lead, 12 Nov): GET org/files/:id/versions must answer 200 (the CRM has no GET org/files/:id; its
+   * own download and versions check a file the same way). Anything else stops the read, nothing is read from Drive, and the page gets the CRM's plain reason: 404 (the CRM does not
+   * show it to this account), 403 (with the CRM's own words), signed out, or the CRM not answering. A yes is kept a minute per file (the in-app drive reads 4 MiB blocks).
+   */
+  const crmSaidYes = new Map<string, number>()
+  async function crmLetsOpen(f: RawFile): Promise<void> {
+    const at = crmSaidYes.get(f.id)
+    if (at !== undefined && now() - at < 60_000) return
+    let r: Response
+    try {
+      r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/versions`)
+    } catch (e) {
+      if ((e as Error)?.name === 'CrmNotSignedIn') throw new CrmFilesError(409, 'crm-signin', CRM_FILES_REASONS.signedOut)
+      throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
+    }
+    if (r.status === 404) {
+      await r.body?.cancel().catch(() => undefined)
+      throw new CrmFilesError(404, 'notfound', DOWNLOAD_WORDS.notShown)
+    }
+    if (!r.ok) throw await refusal(r, 'opening this file')
+    await r.body?.cancel().catch(() => undefined)
+    crmSaidYes.set(f.id, now())
+  }
+  const typeOf = (f: RawFile, r: Response) => (f.fileType && f.fileType !== 'application/octet-stream' ? f.fileType : (r.headers.get('content-type') ?? 'application/octet-stream'))
+
+  /** The first byte of a 206 answer (Content-Range: bytes a-b/size), or null. */
+  const rangeStart = (r: Response): number | null => {
+    const m = /^bytes (\d+)-\d+\/(?:\d+|\*)$/.exec(r.headers.get('content-range') ?? '')
+    return m ? Number(m[1]) : null
+  }
+
+  /** The chunks of an answer's body, as Buffers; reading stops (the body is cancelled) when the reader stops. */
+  async function* chunksOf(body: ReadableStream<Uint8Array>): AsyncGenerator<Buffer> {
+    const reader = body.getReader()
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return
+        yield Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined)
+    }
+  }
+
+  /**
+   * The chunks of an answer of the CRM's own download. Google's virus-scan notice (an HTML page of a few KB that the public link sends in place of a file over 100 MB, and that the CRM's
+   * download hands on as if it were the file) is refused in words, never passed on as the file. Only an answer that starts like an HTML page, for a file that is not one, is looked at.
+   */
+  async function* crmChunks(body: ReadableStream<Uint8Array>, f: RawFile): AsyncGenerator<Buffer> {
+    const chunks = chunksOf(body)
+    const head: Buffer[] = []
+    let headLen = 0
+    let ended = false
+    const more = async (upTo: number) => {
+      while (!ended && headLen < upTo) {
+        const n = await chunks.next()
+        if (n.done) ended = true
+        else {
+          head.push(Buffer.from(n.value))
+          headLen += n.value.length
+        }
+      }
+    }
+    try {
+      await more(2048)
+      if (!/html/i.test(f.fileType ?? '') && /^\s*(?:<!doctype html|<html)/i.test(Buffer.concat(head).subarray(0, 512).toString('latin1'))) {
+        await more(256 * 1024)
+        if (SCAN_NOTICE.test(Buffer.concat(head).toString('utf8'))) throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.scanPage)
+      }
+      if (headLen) yield Buffer.concat(head)
+      if (!ended) yield* chunks
+    } finally {
+      await chunks.return(undefined)
+    }
+  }
+
+  /** Bytes [start, start + length) of a whole-file answer: what is before `start` is read and dropped, and reading stops once `length` bytes are kept. */
+  async function sliceOf(chunks: AsyncGenerator<Buffer>, start: number, length: number): Promise<Buffer> {
+    const out: Buffer[] = []
+    let seen = 0
+    let kept = 0
+    for await (const chunk of chunks) {
+      const from = Math.max(0, start - seen)
+      seen += chunk.length
+      if (from < chunk.length) {
+        const part = chunk.subarray(from, from + (length - kept))
+        out.push(part)
+        kept += part.length
+      }
+      if (kept >= length) break
+    }
+    return Buffer.concat(out)
+  }
+
+  /**
+   * One request to Google's Drive API for the bytes of `driveId`: `range` from..to (inclusive), from.. to the end, or null for the whole file. 'crm' = read it through the CRM's download
+   * instead: this account has no Drive token (no upload permission: the CRM refuses it), the token does not see the file (404), a Google Docs file has no bytes (403 fileNotDownloadable),
+   * or Google still fails after the tries. A token that ended early (401) is fetched again once; a busy Google (5xx, 429, a rate limit) or a broken line is asked again.
+   */
+  async function driveMedia(driveId: string, range: { from: number; to?: number } | null, signal?: AbortSignal): Promise<Response | 'crm'> {
+    // The token goes nowhere but Google's API, over https.
+    if (!tokenMayGoTo(`${driveApi}/`)) return 'crm'
+    let renewed = false
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // The CRM refused this account a Drive token a moment ago: not asked again for a minute (mayUpload keeps the same answer).
+      if (upload.ok === false && now() - upload.at < 60_000) return 'crm'
+      let t: DriveToken
+      try {
+        t = await driveToken()
+      } catch (e) {
+        if (e instanceof CrmFilesError && e.code === 'crm-signin') throw e
+        if (e instanceof CrmFilesError && e.code === 'forbidden') upload = { ok: false, at: now() }
+        return 'crm'
+      }
+      let res: Response
+      try {
+        res = await gfetch(`${driveApi}/files/${encodeURIComponent(driveId)}?alt=media&supportsAllDrives=true`, {
+          // Accept-Encoding identity: the ranges and the length are those of the file itself, never of a compressed form of it (fetch adds it to a Range request by itself).
+          headers: { authorization: `Bearer ${t.accessToken}`, ...(range ? { range: `bytes=${range.from}-${range.to ?? ''}` } : { 'accept-encoding': 'identity' }) },
+          signal,
+        })
+      } catch (e) {
+        if (signal?.aborted) throw e
+        await pause(300 * (attempt + 1))
+        continue
+      }
+      if (res.ok || res.status === 416) return res
+      const reason = await googleReason(res)
+      if (res.status === 403 && reason === 'cannotDownloadAbusiveFile') throw new CrmFilesError(403, 'forbidden', DOWNLOAD_WORDS.harmful, { status: 403, reason })
+      if (res.status === 401 && !renewed) {
+        renewed = true
+        token = null
+        continue
+      }
+      if (res.status >= 500 || res.status === 429 || (res.status === 403 && /rate|limit/i.test(reason ?? ''))) {
+        await pause(300 * (attempt + 1))
+        continue
+      }
+      return 'crm'
+    }
+    return 'crm'
+  }
+
+  /** The whole file through the API, by Range requests: bytes=0- and, when the line breaks, bytes=N- from where it stopped (3 tries in a row at most). Null = read it through the CRM. */
+  async function driveWhole(driveId: string, f: RawFile): Promise<{ stream: Readable; size: number | null; type: string; name: string } | null> {
+    const ctl = new AbortController()
+    const first = await driveMedia(driveId, { from: 0 }, ctl.signal)
+    if (first === 'crm') return null
+    if (!first.body || !(first.status === 206 ? rangeStart(first) === 0 : first.status === 200)) {
+      await first.body?.cancel().catch(() => undefined)
+      return null
+    }
+    const len = Number(first.headers.get('content-length'))
+    const total = first.headers.has('content-length') && Number.isSafeInteger(len) && len >= 0 ? len : null
+    const firstBody = first.body
+    async function* bytes(): AsyncGenerator<Buffer> {
+      let body = firstBody
+      let got = 0
+      let fails = 0
+      for (;;) {
+        try {
+          for await (const chunk of chunksOf(body)) {
+            got += chunk.length
+            fails = 0
+            yield chunk
+          }
+          if (total === null || got >= total) return
+          throw new Error('the answer ended early')
+        } catch (e) {
+          if (ctl.signal.aborted) return
+          if (e instanceof CrmFilesError) throw e
+          if (++fails > 3) throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.broke)
+        }
+        // Go on from byte `got`.
+        const next = await driveMedia(driveId, { from: got }, ctl.signal)
+        if (next === 'crm' || !next.body || !(next.status === 206 ? rangeStart(next) === got : next.status === 200 && got === 0)) {
+          if (next !== 'crm') await next.body?.cancel().catch(() => undefined)
+          throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.broke)
+        }
+        body = next.body
+      }
+    }
+    const stream = Readable.from(bytes(), { objectMode: false })
+    stream.once('close', () => ctl.abort())
+    return { stream, size: total ?? f.fileSize, type: typeOf(f, first), name: f.fileName }
+  }
+
+  /** Bytes [start, start + length) by one ranged request to the API (a second try if the line breaks); fewer only at the end of the file, none past it. Null = read them through the CRM. */
+  async function drivePart(driveId: string, start: number, length: number): Promise<Buffer | null> {
+    for (let attempt = 0; ; attempt++) {
+      const res = await driveMedia(driveId, { from: start, to: start + length - 1 })
+      if (res === 'crm') return null
+      try {
+        if (res.status === 416 || !res.body) {
+          await res.body?.cancel().catch(() => undefined)
+          return Buffer.alloc(0)
+        }
+        if (res.status === 206) {
+          if (rangeStart(res) !== start) {
+            await res.body.cancel().catch(() => undefined)
+            throw new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.broke)
+          }
+          const b = Buffer.from(await res.arrayBuffer())
+          return b.length > length ? b.subarray(0, length) : b
+        }
+        // 200: the whole file came (the range was not taken): only the slice is kept.
+        return await sliceOf(chunksOf(res.body), start, length)
+      } catch (e) {
+        if (attempt >= 1) throw e instanceof CrmFilesError ? e : new CrmFilesError(502, 'failed', DOWNLOAD_WORDS.broke)
+      }
+    }
+  }
+
   /** Sends `stream` (exactly `size` bytes) to Drive in ONE request; returns the key and the link the CRM record will keep. (The first way, kept: the page's single-request upload and the drive's saves.) */
   async function pushToDrive(name: string, type: string, stream: Readable, size: number): Promise<{ key: string; url: string }> {
     let opened: { key: string; mime: string; session: string }
@@ -1032,7 +1319,15 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     async file(id) {
       const g = id.startsWith('gone:readme:') || id.startsWith('kept:') ? goneFile(id) : null
       if (g) return { stream: g.path ? createReadStream(g.path) : Readable.from([g.bytes ?? Buffer.alloc(0)]), size: g.node.size ?? 0, type: g.node.type ?? 'application/octet-stream', name: g.node.name }
+      // The CRM's own list for this account says which file this is (findFile); o813f: one over 100 MB that it keeps in Google Drive comes through Google's Drive API, once the CRM
+      // has said yes for this very file.
       const { f } = await findFile(id)
+      const driveId = apiDriveId(f)
+      if (driveId) {
+        await crmLetsOpen(f)
+        const viaApi = await driveWhole(driveId, f)
+        if (viaApi) return viaApi
+      }
       let r: Response
       try {
         r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/raw`)
@@ -1042,10 +1337,19 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       }
       if (!r.ok || !r.body) throw await refusal(r, 'this file')
       const len = Number(r.headers.get('content-length'))
+      // o813f: looked at BEFORE anything is answered, so Google's virus-scan notice in place of the file is an error, never a download.
+      const chunks = crmChunks(r.body, f)
+      const head = await chunks.next()
       return {
-        stream: Readable.fromWeb(r.body as never),
+        stream: Readable.from(
+          (async function* () {
+            if (!head.done) yield head.value
+            yield* chunks
+          })(),
+          { objectMode: false },
+        ),
         size: Number.isFinite(len) && len >= 0 && r.headers.has('content-length') ? len : f.fileSize,
-        type: f.fileType && f.fileType !== 'application/octet-stream' ? f.fileType : (r.headers.get('content-type') ?? 'application/octet-stream'),
+        type: typeOf(f, r),
         name: f.fileName,
       }
     },
@@ -1064,6 +1368,13 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         }
       }
       const { f } = await findFile(id)
+      // o813f: a file over 100 MB that the CRM keeps in Google Drive: one ranged request to Google's Drive API, once the CRM has said yes for this very file.
+      const driveId = length > 0 ? apiDriveId(f) : null
+      if (driveId) {
+        await crmLetsOpen(f)
+        const viaApi = await drivePart(driveId, start, length)
+        if (viaApi) return viaApi
+      }
       let r: Response
       try {
         r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/raw`, { headers: { range: `bytes=${start}-${start + length - 1}` } })
@@ -1076,26 +1387,42 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         return b.length > length ? b.subarray(0, length) : b
       }
       if (!r.ok || !r.body) throw await refusal(r, 'this file')
-      // The CRM answered the whole file (it ignored the range): read and drop what is before `start`, keep `length`, and stop reading.
-      const reader = r.body.getReader()
-      const out: Buffer[] = []
-      let seen = 0
-      let kept = 0
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const chunk = Buffer.from(value)
-        const from = Math.max(0, start - seen)
-        seen += chunk.length
-        if (from < chunk.length) {
-          const part = chunk.subarray(from, from + (length - kept))
-          out.push(part)
-          kept += part.length
+      // The CRM answered the whole file (it ignored the range): read and drop what is before `start`, keep `length`, and stop reading. o813f: Google's virus-scan notice is refused.
+      return await sliceOf(crmChunks(r.body, f), start, length)
+    },
+
+    async search(q, limit) {
+      const needle = q.trim().toLowerCase()
+      if (needle.length < 2) return { results: [], more: false }
+      const cap = Math.max(1, Math.min(Math.floor(limit) || 50, 200))
+      const s = await load()
+      const mayUp = [...s.projects.values()].some(p => p.writable) ? await mayUpload() : false
+      const has = (name: string) => name.toLowerCase().includes(needle)
+      const results: { node: CrmNode; path: string }[] = []
+      for (const p of s.projects.values()) if (has(p.name)) results.push({ node: projectNode(p, 0, false), path: 'projects' })
+      const groupsSeen = new Map<string, RawGroup[]>()
+      for (const f of s.files) {
+        if (results.length > cap * 2) break
+        if (!has(f.fileName)) continue
+        const pid = pidOf(f)
+        if (f.folder !== 'projects' || !pid) {
+          results.push({ node: fileNode(f, f.folder === 'projects' ? UNCATEGORISED : catId(f.folder), false, false), path: f.folder === 'projects' ? 'projects / Uncategorised' : f.folder })
+          continue
         }
-        if (kept >= length) break
+        const p = s.projects.get(pid)
+        if (!p) continue
+        let groups = groupsSeen.get(pid)
+        if (!groups) {
+          groups = await groupsOf(pid).catch(() => [])
+          groupsSeen.set(pid, groups)
+        }
+        const place = placeOf(f, new Map([[pid, groups]]))
+        const chain: string[] = []
+        for (let g = place.parent.startsWith('grp:') ? groups.find(x => x.id === place.parent.split(':')[2]) : undefined; g; g = g.parentId ? groups.find(x => x.id === g!.parentId) : undefined) chain.unshift(g.name)
+        results.push({ node: fileNode(f, place.parent, p.writable, mayUp), path: ['projects', p.name, ...chain].join(' / ') })
       }
-      await reader.cancel().catch(() => undefined)
-      return Buffer.concat(out)
+      results.sort((a, b) => a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base', numeric: true }) || a.node.id.localeCompare(b.node.id))
+      return { results: results.slice(0, cap), more: results.length > cap }
     },
 
     async versions(id) {

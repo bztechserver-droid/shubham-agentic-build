@@ -339,6 +339,8 @@ export interface ChatPoolOptions {
   draftRecheckMs?: number
   /** o4743, tests: how long one paste waits for its line to read clear before the next one goes in (default 4000 ms). */
   pasteSettleMs?: number
+  /** Lost-Enter watch, tests: how long a paste may go without any terminal output before it is logged (default 1000 ms). */
+  echoWaitMs?: number
   /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
   settings?: string
   /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
@@ -425,6 +427,10 @@ interface Chat {
   /** o655f (Stage 1): the session id claude says it is on NOW when it is not the chat's own (after /clear or /resume claude starts a new session and a new file). */
   claudeSid?: string
   typedAt?: number
+  /** Lost-Enter watch (see watchEcho): the timer, when the last silence was logged, and when the paste was whose echo did not come. */
+  echoWatch?: ReturnType<typeof setTimeout>
+  lastEchoLogAt?: number
+  silentSince?: number
   /** o4743: the last input that reached the terminal: when, what kind (never the words) and from where; for the log only. */
   lastInput?: { at: number; kind: string; via: 'page' | 'app' }
 }
@@ -742,10 +748,32 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     if (c.exited) return false
     try {
       c.pty.write(data)
+      if (data.endsWith(PASTE_END)) watchEcho(c, data.length)
       return true
     } catch {
       return false
     }
+  }
+
+  /**
+   * o4743 / lost Enter (11 Nov 2026): a Claude chat that is reading its input echoes a paste in its box within about 100 ms. On 11 Nov two order replies
+   * pasted at 20:03:35 sat unsent for seven minutes in an IDLE Claude chat and were then taken together (the transcript), which fits a terminal UI that
+   * was not reading its keyboard. This only WATCHES: when no terminal output comes within 1 s after a paste it logs one line (counts and ages, never any
+   * words; at most one per 30 s per chat) and one more when output comes again. It types nothing and changes nothing.
+   */
+  const ECHO_WAIT_MS = o.echoWaitMs ?? 1000
+  function watchEcho(c: Chat, chars: number) {
+    if (c.echoWatch) return
+    const armedAt = Date.now(), lastBefore = c.lastOutputAt
+    c.echoWatch = setTimeout(() => {
+      c.echoWatch = undefined
+      if (c.exited || c.lastOutputAt > armedAt) return
+      if (Date.now() - (c.lastEchoLogAt ?? 0) < 30_000) return
+      c.lastEchoLogAt = Date.now()
+      c.silentSince = armedAt
+      log?.info(`chat ${c.info.sessionId.slice(0, 8)}: no terminal output within ${ECHO_WAIT_MS} ms after a paste (${chars} characters in the last write; the last output was ${Math.max(0, Math.round((armedAt - lastBefore) / 1000))} s before it; ${c.viewers.size} viewers; state ${c.state}): the chat may not be reading its input`)
+    }, ECHO_WAIT_MS)
+    c.echoWatch.unref?.()
   }
 
   const treeKill = o.treeKill ?? stopTree
@@ -763,6 +791,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   function finish(c: Chat, code: number | null) {
     if (c.exited) return
     c.exited = true
+    if (c.echoWatch) clearTimeout(c.echoWatch)
     c.mirror?.dispose()
     keys.delete(c.key)
     if (chats.get(c.info.sessionId) === c) chats.delete(c.info.sessionId)
@@ -792,6 +821,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     chats.set(c.info.sessionId, c)
     keys.set(c.key, c)
     pty.onData(data => {
+      if (c.silentSince !== undefined) {
+        log?.info(`chat ${c.info.sessionId.slice(0, 8)}: terminal output again ${Math.round((Date.now() - c.silentSince) / 1000)} s after a paste that got no echo (it had not been reading its input)`)
+        c.silentSince = undefined
+      }
       c.buffer.push(data)
       c.sizes.push({ cols: c.size.cols, rows: c.size.rows })
       c.bytes += data.length

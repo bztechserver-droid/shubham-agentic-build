@@ -5,7 +5,7 @@ import type { ApiMount } from '../api.ts'
 import type { CrmProxy } from '../agentic/crmproxy.ts'
 import { createWinMount } from './mount-win.ts'
 import { crmFilesMount } from './routes.ts'
-import { createCrmFiles, type CrmFilesService, type MountDriver } from './service.ts'
+import { createCrmFiles, downloadViaFile, type CrmFilesService, type MountDriver } from './service.ts'
 import { CRM_FILES_MAX_UPLOAD } from '../../shared/crm-files.ts'
 import { UPLOAD_SETTINGS_FILE } from './upload-settings.ts'
 import { createCrmUploads, type CrmUploads } from './uploads.ts'
@@ -90,7 +90,8 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
   const driver = o.mountDriver ?? win ?? undefined
   // oa2f8: the size limit is the uploads' setting (the CRM's own where it said it); the one-request upload and the drive's saves follow it too.
   let uploadsRef: CrmUploads | null = null
-  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD })
+  // o813f: a file in Google Drive is downloaded through Google's Drive API; the file crm-download-via-crm.on in this folder sends every download through the CRM's own (the old way).
+  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD, downloadVia: downloadViaFile(o.dir) })
   serviceRef = service
   // oa2f8: the waiting folder is a setting (crm-uploads.json beside the default one); it may not be inside the app's own folder (an update replaces it).
   const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), settingsFile: path.join(o.dir, UPLOAD_SETTINGS_FILE), notInside: [o.root], backend: service.uploadBackend, log: o.log })

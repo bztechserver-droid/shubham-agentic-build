@@ -248,6 +248,11 @@ export function createCodex(o: CodexOptions): CodexManager {
       !!login && login.sha256 === receipt.contentHash && !!side && side.sha256 === receipt.contentHash && side.userId === receipt.ownerId &&
       side.subscriptionId === receipt.subscriptionId && side.baseRevision === receipt.revision
   }
+  /** Before anything is sent: `expected` is not current only because its receipt aged (60 s) with the CRM check unanswered:
+   * same credential and files, and no definite answer (revocation, change, expiry) since the last good check. */
+  function agedBridge(expected: ManagerBridgeContext): boolean {
+    return !bridgeValidated && bridgeFailure === 'bridge-validation-stale' && lastCheck !== 'definitive' && heldBridge(expected)
+  }
   function validationBinding(): string {
     const login = readLogin(paths), side = readSidecar(paths)
     return JSON.stringify([sessionEpoch(o.session()), login?.sha256 ?? null, side?.userId ?? null, side?.subscriptionId ?? null,
@@ -343,6 +348,7 @@ export function createCodex(o: CodexOptions): CodexManager {
     },
     current: (id, expected) => bridgeConsumers.has(id) ? currentBridge(expected) : null,
     held: (id, expected) => bridgeConsumers.has(id) && heldBridge(expected),
+    aged: (id, expected) => bridgeConsumers.has(id) && agedBridge(expected),
     async use(id, expected, send, signal) {
       const controller = new AbortController(), combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
       let invoked = false
@@ -350,7 +356,8 @@ export function createCodex(o: CodexOptions): CodexManager {
         const envelope = await serial(async () => {
           if (combined.aborted) throw bridgeCredentialError('bridge-cancelled')
           const context = bridgeConsumers.has(id) ? currentBridge(expected) : null
-          if (!context) throw bridgeCredentialError('bridge-context-changed')
+          // Aged out on the way here with the CRM unanswered (nothing sent): its own reason, so the run stays open.
+          if (!context) throw bridgeCredentialError(bridgeConsumers.has(id) && agedBridge(expected) ? 'bridge-validation-stale' : 'bridge-context-changed')
           const login = readLogin(paths), auth = login ? authorization(login.text, context.revision) : null
           if (!auth || login!.sha256 !== context.contentHash || !currentBridge(context)) throw bridgeCredentialError('bridge-context-changed')
           const flights = bridgeFlights.get(id) ?? new Set<AbortController>(); flights.add(controller); bridgeFlights.set(id, flights)

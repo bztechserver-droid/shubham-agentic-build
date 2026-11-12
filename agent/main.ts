@@ -11,6 +11,9 @@ import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
 import { createBuild, findDevDir, type Build, type ChatHostGate } from './build.ts'
+import { authError, mayPublish } from './auth/types.ts'
+import { createCoordinator, type Coordinator } from './update/coordinator.ts'
+import { createUpdateState } from './update/state.ts'
 import { createBridge } from './claude/bridge.ts'
 import { createAuth } from './auth/index.ts'
 import { CRM_URL, CrmError, trimUrl } from './claude/crm.ts'
@@ -107,6 +110,9 @@ export interface AgentExtras {
   currentBuild?: () => string | null
   /** F-075: set here once the chats run in the chat host, for the update to ask about it (build.ts). */
   chatHostGate?: { current: ChatHostGate | null }
+  /** F-173a: the build the automatic update applies (the hub's), and where its coordinator is kept (created here, on the hub only). */
+  updateBuild?: Build
+  updateCoordinator?: { current: Coordinator | null }
   /** F-080: Whisper on this PC, for the phone app's /voice/speech too (Chris: one utterance, up to 60 s). */
   speech?: SpeechEngine | null
 }
@@ -298,6 +304,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     chatHost,
     newerBuild: () => extras.newerBuild?.() ?? null,
     currentBuild: () => extras.currentBuild?.() ?? null,
+    updateRun: () => extras.updateCoordinator?.current?.status() ?? null,
+    onAutoUpdateChanged: () => extras.updateCoordinator?.current?.nudge(),
     // F-080: Chris's speech-to-text (Overlay's /voice/speech, device key) is the hub's Whisper stream.
     speech: extras.speech ? speechStream(extras.speech, log.child('speech'), { maxMs: 60_000 }) : undefined,
     // F-058: under the guard, the chats that were open when the app last stopped come back.
@@ -332,6 +340,22 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   crmFilesService = agentic?.crmFiles.service ?? null
   if (agentic && chatHost && extras.chatHostGate) {
     extras.chatHostGate.current = { protocol: chatHost.info.protocol, version: chatHost.info.version, busy: () => agentic.busyChats(), retire: () => agentic.retireChatHost() }
+  }
+  // F-173a: the automatic update, on the hub only. No route and no tool starts it; it follows the admin's switch (Settings > Updates, default off).
+  if (role === 'hub' && agentic && extras.updateBuild && extras.updateCoordinator) {
+    const updateBuild = extras.updateBuild
+    const co = createCoordinator({
+      setting: () => agentic.autoUpdateStatus(),
+      build: () => updateBuild,
+      ...agentic.quiet,
+      // Fix other PCS's recovery watcher (its status.json): configured, never a built-in path.
+      receiptFile: process.env.SAD_RECOVERY_STATUS || null,
+      state: createUpdateState(path.join(paths.agent, 'agentic', 'auto-update-state.json')),
+      log: log.child('auto-update'),
+      changed: () => changed(),
+    })
+    extras.updateCoordinator.current = co
+    co.start()
   }
   // F-079: on the hub only, and only with the Agents section. It runs only while it is used (agent/whatsapp/).
   if (role === 'hub' && agentic) whatsapp = createWhatsApp({ dir: path.join(paths.root, 'whatsapp'), log: log.child('whatsapp'), human: (kind, fields, sig, r) => agentic.humanProof(kind, fields, sig, r) })
@@ -960,6 +984,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   async function stopAll() {
     for (const t of timers) clearInterval(t)
+    extras.updateCoordinator?.current?.close()
     // F-079: WhatsApp closes its Chrome properly alongside the rest (if the agent ends first, the worker still does).
     const waClosed = whatsapp?.close()
     // Claude subscription failover first: nothing may start restarting a chat while they are being closed.
@@ -1065,6 +1090,7 @@ if (import.meta.main) {
     const root = path.resolve(import.meta.dirname, '..')
     const devDir = findDevDir(root)
     const hostGate: { current: ChatHostGate | null } = { current: null }
+    const updateCoordinator: { current: Coordinator | null } = { current: null }
     build = createBuild({
       chatHostGate: hostGate,
       root,
@@ -1073,12 +1099,17 @@ if (import.meta.main) {
       log: log.child('build'),
       restart: code => void shutdown('updating to the newer build', code),
       supervised: process.env.SAD_SUPERVISED === '1',
+      // F-173a: the rule of Publish (F-119): from a page, only a signed-in administrator; a program on this PC with the machine token and no page headers is as before.
+      authorizeUpdate: r => {
+        if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only an administrator, signed in, presses Update from a page.', 'admin-only')
+      },
+      onUpdateCancel: () => updateCoordinator.current?.cancel(),
     })
     // F-020: the build runs the floors and their chats; Dev, only with --agents (its own, apart).
     const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
     speech = createEngine({ log: log.child('speech') })
-    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
+    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, updateBuild: build, updateCoordinator, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

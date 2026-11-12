@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Role } from '../shared/agent-api.ts'
@@ -92,6 +92,38 @@ export interface BuildOptions {
   /** Tests: how long an update waits for idle chats before it asks (10 min), and how often it looks (5 s). */
   hostWaitMs?: number
   hostPollMs?: number
+  /**
+   * F-173a: who may press Update (POST /update) and cancel it (POST /update-cancel) from a route. main.ts passes the same rule as
+   * Publish (F-119, auth/types.ts mayPublish): a PAGE (a browser, remote or local) needs a signed-in administrator; a program on the
+   * Server with the local machine token and no page headers is as before (Lead presses Update that way on the person's typed words).
+   * Required and without a default, so a build made without it does not compile. The AUTOMATIC update never goes through this route:
+   * it spends a permit (commitUpdate) that only the coordinator in this process can make.
+   */
+  authorizeUpdate: (r: MountRequest) => void
+  /** F-173a: the automatic update hears the Cancel button, and holds the build it was about to apply. */
+  onUpdateCancel?: () => void
+}
+
+/** F-173a: the right to start ONE update. Made by `issuePermit`, spent by `commitUpdate`; it names the build it is for and lasts 15 s. */
+export interface UpdatePermit {
+  readonly id: string
+  /** The build version it was issued for ('' when none is known: only an administrator's press may be for that). */
+  readonly to: string
+  readonly via: 'admin' | 'auto'
+}
+
+/**
+ * F-173a: how an AUTOMATIC update stays honest between the last look and the restart. `quiet()` is read synchronously and returns why the
+ * app is not quiet any more (null = still quiet): a send that is pending, a chat that became busy, a draft, an open order. The restart
+ * waits for it to clear for at most `waitMs` instead of cutting; if it does not, nothing is restarted and `onAbort` hears why.
+ */
+export interface UpdateHold {
+  quiet(): string | null
+  onAbort(reason: string): void
+  /** Default 15 s. */
+  waitMs?: number
+  /** Default 250 ms. */
+  pollMs?: number
 }
 
 export interface Build {
@@ -102,7 +134,17 @@ export interface Build {
   /** F154: typed target-local update; no force/body accepted. */
   requestUpdate(): BuildInfo & { restarting: boolean }
   busy(): number
+  /** F-173a: a permit to start one update (for the build that is available now when `to` is given). */
+  issuePermit(via: UpdatePermit['via'], to: string): UpdatePermit
+  /**
+   * F-173a: starts the update a permit stands for, once. An automatic one never forces: it is refused (409) while any chat of this
+   * PC is busy; with a `hold` it looks once more right before it cuts anything and waits (bounded) for the app to be quiet instead of
+   * cutting, and when the chat host has to be retired it only restarts if that worked.
+   */
+  commitUpdate(permit: UpdatePermit, hold?: UpdateHold): BuildInfo & { restarting: boolean }
 }
+
+const PERMIT_MS = 15_000
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -316,28 +358,67 @@ export function createBuild(o: BuildOptions): Build {
     return !next || next.protocol !== g.protocol || next.version !== g.version
   }
 
-  function go(retire: ChatHostGate | null) {
+  /** F-173a: waits (bounded) until the app is quiet again; null as soon as `hold.quiet()` says so, else why it never was. Nothing is cut meanwhile. */
+  async function holdUntilQuiet(hold: UpdateHold): Promise<string | null> {
+    const until = Date.now() + (hold.waitMs ?? 15_000)
+    for (;;) {
+      let why: string | null
+      try {
+        why = hold.quiet()
+      } catch (e) {
+        why = `the last look failed: ${e instanceof Error ? e.message : String(e)}`
+      }
+      if (why === null) return null
+      if (Date.now() >= until) return why
+      await new Promise<void>(resolve => setTimeout(resolve, hold.pollMs ?? 250).unref())
+    }
+  }
+
+  function go(retire: ChatHostGate | null, strict = false, hold?: UpdateHold) {
     if (hostTimer) clearInterval(hostTimer)
     hostTimer = null
     hostWait = null
     // Answer first; then go, and Start.cmd (or the guard) takes it from here.
     void (async () => {
+      if (hold) {
+        // The coordinator's last look was a moment ago; a send, a draft or a busy chat since then makes the restart wait, never cut.
+        const why = await holdUntilQuiet(hold)
+        if (why !== null) {
+          log?.warn(`updating: the automatic update stops here, the app was not quiet: ${why}`)
+          return hold.onAbort(why)
+        }
+      }
       if (retire) {
         try {
           log?.info('updating: the chat host changes with this build; its chats are saved and ended, and come back resumed')
           await retire.retire()
         } catch (e) {
           log?.warn(`updating: could not retire the chat host: ${e instanceof Error ? e.message : String(e)}`)
+          // F-173a: an automatic update does not restart over a host it could not retire; the person's own press always did.
+          if (strict) {
+            log?.warn('updating: the automatic update stops here; nothing was restarted')
+            return hold?.onAbort('the chat host could not be retired')
+          }
         }
       }
+      // An automatic update has no answer to send first: it restarts at once, so the window after the last look stays as short as it can.
+      if (hold) return o.restart(UPDATE_EXIT_CODE)
       setTimeout(() => o.restart(UPDATE_EXIT_CODE), 300).unref()
     })()
   }
 
-  function startUpdate(body?: unknown) {
+  function startUpdate(body?: unknown, via: UpdatePermit['via'] = 'admin', hold?: UpdateHold) {
     if (!update.can) throw apiError(409, update.cannot ?? "This PC can't update itself")
     const g = o.chatHostGate?.current ?? null
-    const force = isObject(body) && body.force === true
+    const force = via === 'admin' && isObject(body) && body.force === true
+    if (via === 'auto') {
+      // Never a wait, never a force: the coordinator checked every chat a moment ago; a busy one now means "not now".
+      if (!g) throw apiError(409, 'The chat host is not reporting, so whether chats are busy is unknown.')
+      if (g.busy() > 0) throw apiError(409, `${g.busy()} chat(s) are busy; the automatic update does not wait for them.`)
+      if (hostWait) throw apiError(409, 'An update is already waiting for the chats.')
+      go(hostChanges(g) ? g : null, true, hold)
+      return { ...info(), restarting: true }
+    }
     if (g && hostChanges(g)) {
       if (!force && g.busy() > 0) {
         // F-075: not while a chat is mid-answer: wait for them to be idle, then ask.
@@ -369,7 +450,26 @@ export function createBuild(o: BuildOptions): Build {
     if (hostTimer) clearInterval(hostTimer)
     hostTimer = null
     hostWait = null
+    o.onUpdateCancel?.()
     return info()
+  }
+
+  // F-173a: one permit, one update. A permit for build X is refused once X is no longer the one available (a newer one was published
+  // since), after 15 s, and the second time.
+  const permits = new Map<string, { to: string; via: UpdatePermit['via']; at: number }>()
+  function issuePermit(via: UpdatePermit['via'], to: string): UpdatePermit {
+    const now = Date.now()
+    for (const [id, p] of permits) if (now - p.at > PERMIT_MS) permits.delete(id)
+    const id = randomBytes(12).toString('hex')
+    permits.set(id, { to, via, at: now })
+    return Object.freeze({ id, to, via })
+  }
+  function commitUpdate(permit: UpdatePermit, hold?: UpdateHold) {
+    const held = permits.get(permit.id)
+    permits.delete(permit.id)
+    if (!held || held.via !== permit.via || held.to !== permit.to || Date.now() - held.at > PERMIT_MS) throw apiError(409, 'That update permit is not valid (used, expired or not issued here).')
+    if (held.via === 'auto' && (held.to === '' || update.available?.version !== held.to)) throw apiError(409, 'The build this update was for is no longer the newest one.')
+    return startUpdate(undefined, held.via, held.via === 'auto' ? hold : undefined)
   }
 
   const first = setTimeout(() => void check(), FIRST_CHECK_MS)
@@ -385,8 +485,16 @@ export function createBuild(o: BuildOptions): Build {
     // F-119: whether this browser may press Publish rides with the info, for the page that shows the button.
     'GET /info': r => ({ ...info(), mayPublish: mayPublish(r.headers, r.caller) }),
     'POST /check': () => check(),
-    'POST /update': r => startUpdate(r.body),
-    'POST /update-cancel': () => cancelUpdate(),
+    // F-173a: from a page, only a signed-in administrator presses Update or cancels it (as Publish); a program on this PC with the machine token and no page headers is as before.
+    'POST /update': r => {
+      o.authorizeUpdate(r)
+      // The person's own press: its body (force, after the wait) is theirs, as it always was.
+      return startUpdate(r.body, 'admin')
+    },
+    'POST /update-cancel': r => {
+      o.authorizeUpdate(r)
+      return cancelUpdate()
+    },
     'POST /publish': r => {
       // F-119: from a page, only a browser signed in as sbskrrt; a local tool with the machine token and no page headers is as before.
       if (!mayPublish(r.headers, r.caller)) throw authError(403, 'Only sbskrrt, signed in, publishes from a page.', 'admin-only')
@@ -396,6 +504,8 @@ export function createBuild(o: BuildOptions): Build {
 
   return {
     requestUpdate: () => startUpdate(),
+    issuePermit,
+    commitUpdate,
     busy: () => o.chatHostGate?.current?.busy() ?? 0,
     mount: {
       prefix: '/build',

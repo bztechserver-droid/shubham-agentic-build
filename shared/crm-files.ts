@@ -11,6 +11,8 @@
 // Routes (all JSON unless said; prefix /agent-api/agentic/crm-files; for the owner like the other PC pages):
 //   GET  /status                       -> CrmFilesStatus
 //   GET  /children?id=<nodeId|root>    -> CrmChildren          (children of a folder node; the tree is cached ~5 s like the old drive)
+//   GET  /children?id=<nodeId|root>&limit=<n>   -> CrmChildren with `total`   (P1: only the first n children of a big folder; no limit = all of them, as before)
+//   GET  /search?q=<text>&limit=<n>     -> CrmSearch   (P1: files and projects whose NAME holds the text, at least 2 characters; at most 200)
 //   GET  /node?id=<nodeId>             -> CrmNode
 //   GET  /file?id=<fileNodeId>         -> the bytes (Content-Type = the stored type, Content-Disposition: attachment; filename*, Content-Length)
 //   GET  /versions?id=<fileNodeId>     -> { versions: CrmVersion[] }
@@ -106,6 +108,20 @@ export interface CrmChildren {
   children: CrmNode[]
   /** The breadcrumb from the root to this node. */
   path: { id: string; name: string }[]
+  /** P1: only with `limit` on the request: how many children the folder has in all (`children` holds the first `limit` of them). */
+  total?: number
+}
+
+/** P1: one file or project that a name search found, with where it is ("projects / Website redesign / Designs"). */
+export interface CrmSearchHit {
+  node: CrmNode
+  path: string
+}
+
+export interface CrmSearch {
+  results: CrmSearchHit[]
+  /** There are more than were returned (the search is cut at `limit`). */
+  more: boolean
 }
 
 export interface CrmVersion {

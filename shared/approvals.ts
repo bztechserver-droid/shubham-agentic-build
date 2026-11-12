@@ -79,13 +79,46 @@ export interface SendAsMeRequest {
 
 /** F-081: "Apply new builds automatically when quiet" (auto-update.json on the hub; the guard applies, this agent keeps the switch). */
 export interface AutoUpdateStatus {
+  /** F-173a: on only with a recorded consent (`consent`); a legacy `true` without one reads as off. */
   on: boolean
   changedAt: string | null
   changedBy: string
-  /** The guard's last automatic update. */
+  /** F-173a: who switched it on or off, and when: a signed-in administrator's own choice. `revision` grows with every change. */
+  consent?: { by: string; personId: string | null; at: string; revision: number } | null
+  /** The last automatic update (F-173a: the app's own, with its result). */
   lastApplied: { at: string; from: string; to: string; note: string } | null
-  /** The guard's last look that found it not quiet (or otherwise held off), and why. */
+  /** The last look that found it not quiet (or otherwise held off), and why. */
   lastSkipped: { at: string; why: string } | null
+  /** F-173a: what the automatic update is doing now. Only the agent adds it (GET /auto-update). */
+  run?: AutoUpdateRun | null
+}
+
+export interface AutoUpdateBlocker {
+  /** A fixed word, for logs and tests ("chat-busy", "order-open"). */
+  code: string
+  /** In plain words, for the page ("Memory is working"). Never a command line, a message or a path. */
+  label: string
+  count?: number
+}
+
+export type AutoUpdateRunState = 'off' | 'idle' | 'waiting' | 'countdown' | 'deferred' | 'committing' | 'restarting'
+export type AutoUpdateResult = 'took' | 'did-not-take' | 'unknown' | 'not-started'
+
+export interface AutoUpdateRun {
+  state: AutoUpdateRunState
+  /** When this state began. */
+  since: string
+  /** The build it would apply. */
+  to: string | null
+  /** When it began waiting for a quiet moment, while it does. */
+  waitingSince: string | null
+  /** The cancelable countdown's end. */
+  countdownEndsAt: string | null
+  blockers: AutoUpdateBlocker[]
+  /** What this check cannot see, said plainly. */
+  cannotSee: string[]
+  /** The last operation this app made and how it ended (known after the restart, by the new agent). */
+  last: { id: string; from: string; to: string; committedAt: string; resolvedAt: string | null; result: AutoUpdateResult | null; actual: string | null; note: string } | null
 }
 
 export interface ApprovalLogEntry {

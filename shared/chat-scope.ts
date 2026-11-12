@@ -1,5 +1,5 @@
 import type { AuthPerson, ChatAccess, ChatCan, ChatOwner } from './auth.ts'
-import { OLD_ROUTE } from './old-route.ts'
+import { LIVE_CLASSIC_ROUTE, OLD_LEGACY_ROUTE, OLD_ROUTE } from './old-route.ts'
 
 // F-118: the three tabs of the chat lists (My chats, Shared chats, All chats) and the filter by owner. The agent already sends each connection only the chats it
 // may see (shared/auth.ts scopeFloors); this narrows THAT to the tab the person picked, so it never widens anything. Pure, tested.
@@ -98,7 +98,7 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
  * answers everyone else 403 {code:'admin-only'} on every route they use. Everyone else keeps Home, Features, Themes, Agents, Chats and Settings.
  */
 // Order o5007: the old-app reader (OLD_ROUTE) is the owner's too: its socket and its setting answer everyone else 403.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', OLD_ROUTE]
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

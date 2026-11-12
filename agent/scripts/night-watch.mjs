@@ -10,9 +10,8 @@
 //      the guard says the running agent is not its own ("adopted"), this writes that list from the app's own
 //      answer every 5 s, in the format the app reads at its start (agent/agentic/recover.ts). Once the agent is the
 //      guard's, the agent keeps the list itself and this stops.
-//   3. APPLY (F-081), only with --apply, and only when <state>/agent/agentic/auto-update.json says so: presses what the
-//      Build page's Update now presses, when no chat is mid-answer and no publish is running, once an hour at most.
-//      Without --apply it never does it.
+//   3. APPLY (F-081): NO LONGER DONE HERE (F-173a). The app applies a newer build itself when it is quiet and the administrator's
+//      switch is on (agent/update/). `--apply` is accepted and does nothing; this watcher never calls Update.
 // Plain node, no packages: it runs from <state>/nightwatch/, a copy that no update of the app touches.
 // One at a time: it holds a loopback port; a second one exits at once.
 
@@ -124,7 +123,6 @@ async function main() {
   const logsDir = path.join(state, 'agent', 'logs')
   const nightLog = path.join(agentic, 'night-log.jsonl')
   const listFile = path.join(agentic, 'open-chats.json')
-  const autoFile = path.join(agentic, 'auto-update.json')
   const apiPort = Number(process.env.SAD_API_PORT) || 21221
   const uiPort = Number(process.env.SAD_UI_PORT) || 5173
   const guardPort = Number(process.env.SAD_GUARD_PORT) || 21228
@@ -273,34 +271,17 @@ async function main() {
     if (api?.status !== 200) note({ kind: 'event', source: 'watch', cause: 'app-down', text: 'the app\'s API did not answer' })
   }
 
-  // ---- F-081: apply a newer build when quiet (only with --apply)
-  let lastApplied = readJson(autoFile, {})?.lastApplied?.at ? Date.parse(readJson(autoFile, {}).lastApplied.at) : 0
+  // ---- F-081 / F-173a: this watcher no longer applies anything. The app applies a newer build itself (agent/update/coordinator.ts,
+  // the switch in Settings > Updates), and /build/update takes only a signed-in administrator, never this machine token.
+  // `--apply` is still accepted so an old scheduled task keeps starting; it says so once and stays a log-only watcher.
+  let saidInert = false
   async function maybeApply() {
-    if (!apply) return
-    const file = readJson(autoFile, null)
-    const info = (await get(apiPort, '/agent-api/build/info', 4000, true))?.body
-    const floors = (await get(apiPort, '/agent-api/agentic/floors', 4000, true))?.body
-    const healthy = (await get(apiPort, '/agent-api/health'))?.status === 200
-    const d = applyDecision({ file, update: info?.update, publishState: info?.publish?.state, states: Object.values(floors?.live ?? {}), lastAppliedAt: lastApplied, now: Date.now(), healthy })
-    if (d.skip !== undefined && d.skip !== null) {
-      const f = readJson(autoFile, {})
-      if (f.lastSkipped?.why !== d.skip) {
-        atomicWrite(autoFile, JSON.stringify({ ...f, lastSkipped: { at: iso(), why: d.skip } }, null, 2))
-        note({ kind: 'apply-skipped', why: d.skip })
-      }
-      return
-    }
-    if (!d.apply) return
-    const again = readJson(autoFile, null)
-    if (again?.autoApplyWhenQuiet !== true) return
-    const res = await fetch(`http://127.0.0.1:${apiPort}/agent-api/build/update`, { method: 'POST', headers: { 'x-sad-token': token(), 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(8000) }).catch(() => null)
-    const f = readJson(autoFile, {})
-    lastApplied = Date.now()
-    atomicWrite(autoFile, JSON.stringify({ ...f, lastApplied: { at: iso(), from: info?.current?.version ?? null, to: info?.update?.available?.version ?? null, note: res?.ok ? '' : `the app answered ${res?.status ?? 'nothing'}` } }, null, 2))
-    note({ kind: 'applied', from: info?.current?.version, to: info?.update?.available?.version, ok: !!res?.ok })
+    if (!apply || saidInert) return
+    saidInert = true
+    note({ kind: 'apply-inert', why: 'the app applies new builds itself now (F-173a); this watcher only logs' })
   }
 
-  note({ kind: 'watch-start', pid: process.pid, mode: apply ? 'apply allowed (if the switch is on)' : 'log only', state })
+  note({ kind: 'watch-start', pid: process.pid, mode: apply ? 'log only (--apply is inert: the app applies builds itself)' : 'log only', state })
   tailEvents() // sets the offsets
   let nextSample = 0
   for (;;) {

@@ -59,6 +59,10 @@ export interface ManagerBridgeSource {
   /** For an operation already sent: the same credential is still held and nothing revoked or changed it. A receipt that only
    * grew older than its 60 s (a slow or unanswered CRM check) still holds; it fences new requests, not completed ones. */
   held?(consumerId: string, expected: ManagerBridgeContext): boolean
+  /** Before anything is sent: `expected` is not current ONLY because its receipt grew older than 60 s while the CRM check
+   * went unanswered (same credential, nothing revoked or changed). Such a request is refused as 'bridge-validation-stale',
+   * which leaves the run open, never as a credential change (which pauses it). */
+  aged?(consumerId: string, expected: ManagerBridgeContext): boolean
   /** Capture/validate + invoke send synchronously under the queue; await its result OUTSIDE the global queue. */
   use<T>(consumerId: string, expected: ManagerBridgeContext, send: (authorization: BridgeRequestAuthorization, signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>
   /** The ownership guard runs inside the manager queue immediately before deleting the hold. */
@@ -132,6 +136,9 @@ export function createCodexBridgeCredentialBroker(o: BridgeCredentialBrokerOptio
     if (e.closed || e.blocked || !e.context) throw bridgeCredentialError('bridge-lease-invalid')
     binding(e.lease.request)
     const fresh = o.source.current(e.consumerId, e.context)
+    // 10 Nov 2026 (Memory, 18:03): the receipt aged out between this request's check and its send while the CRM did not
+    // answer. Nothing is sent either way; it keeps its own reason, so the run is left open instead of paused.
+    if (!fresh && o.source.aged?.(e.consumerId, e.context)) throw bridgeCredentialError('bridge-validation-stale')
     if (!fresh || !sameBridgeCredential(e.context, fresh)) throw bridgeCredentialError('bridge-context-changed')
     requireBridgeContext(fresh, e.lease.request.ownerId, now(), margin)
     e.context = Object.freeze({ ...fresh })

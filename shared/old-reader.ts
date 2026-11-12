@@ -8,7 +8,7 @@ import { FAST_MODELS, type FastModel, type FastServerFrame, type FastState } fro
 // and the hub share: the names, the settings, the cited paths shown as chips, the questions kept in this browser and what the page shows.
 
 // The page's address, its name, its socket and its shortcut live in old-route.ts (no imports there, so anything may read them).
-export { OLD_KEY, OLD_LABEL, OLD_ROUTE, OLD_SOCKET } from './old-route.ts'
+export { OLD_BLURB, OLD_KEY, OLD_LABEL, OLD_LEGACY_ROUTE, OLD_ROUTE, OLD_SOCKET } from './old-route.ts'
 /** Questions (and their answers) kept in this browser, newest first. */
 export const OLD_HISTORY_MAX = 20
 export const OLD_HISTORY_KEY = 'sad-old-reader-history'

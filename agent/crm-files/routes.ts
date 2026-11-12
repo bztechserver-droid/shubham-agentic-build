@@ -68,6 +68,7 @@ function sizeOf(req: IncomingMessage): number {
 const METHODS: Record<string, string[]> = {
   status: ['GET'],
   children: ['GET'],
+  search: ['GET'],
   node: ['GET'],
   file: ['GET'],
   versions: ['GET'],
@@ -172,8 +173,17 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
           switch (name) {
             case 'status':
               return send(res, 200, await svc.status())
-            case 'children':
-              return send(res, 200, await svc.children(url.searchParams.get('id') || 'root'))
+            case 'children': {
+              const r = await svc.children(url.searchParams.get('id') || 'root')
+              // P1: a big folder is read in parts: the first `limit` children and how many there are in all (no limit: everything, as before).
+              const limit = Number(url.searchParams.get('limit'))
+              if (Number.isInteger(limit) && limit > 0) return send(res, 200, { ...r, children: [...r.children.filter(c => c.isFolder), ...r.children.filter(c => !c.isFolder)].slice(0, limit), total: r.children.length })
+              return send(res, 200, r)
+            }
+            case 'search': {
+              const limit = Number(url.searchParams.get('limit') ?? 50)
+              return send(res, 200, await svc.search(url.searchParams.get('q') ?? '', Number.isFinite(limit) ? limit : 50))
+            }
             case 'node':
               return send(res, 200, await svc.node(q(url, 'id')))
             case 'versions':

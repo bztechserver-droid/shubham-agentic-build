@@ -10,7 +10,9 @@ const PING_MS = 15_000
 /** A failure that leaves the run open: what happened, and that the next message goes through. Nothing was retried. */
 export const openMessage = (open: OpenReason) => open === 'validation-unanswered'
   ? 'Codex in Claude Code: the ChatGPT login could not be confirmed with the CRM in time (this PC is very busy), so nothing was sent. Send your message again in a moment; nothing was retried.'
-  : 'Codex in Claude Code: the app restarted while this reply was being written. That request is not sent again (its result is unknown). Send a new message to continue; nothing was retried.'
+  : open === 'provider-unconfirmed'
+    ? 'Codex in Claude Code: the previous reply failed and was not retried (ChatGPT\'s stream stopped before the reply was complete). Send a new message to continue.'
+    : 'Codex in Claude Code: the app restarted while this reply was being written. That request is not sent again (its result is unknown). Send a new message to continue; nothing was retried.'
 const errorMessage = (summary?: RequestFailureSummary) => {
   const reason = summary?.stage === 'authorization' ? 'Authorization for this execution is no longer current.'
     : summary?.stage === 'runtime' ? 'This execution no longer has current runtime proof.'

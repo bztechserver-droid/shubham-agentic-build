@@ -71,6 +71,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/codex\/refresh$/, OWNER],
   // F-165: what Codex in Claude Code needs on each PC (versions, sign-in, setup state): the owner of the app only.
   ['GET', /^\/dependencies$/, OWNER],
+  // F-168 part 2: every MCP server on each PC and the register-only install: the owner of the app, and the route itself also needs a signed-in CRM administrator.
+  ['GET', /^\/mcp-inventory$/, OWNER],
+  ['POST', /^\/mcp-install\/plan$/, OWNER],
+  ['POST', /^\/mcp-install$/, OWNER],
+  ['POST', /^\/mcp-remove$/, OWNER],
   ['GET', /^\/codex\/settings$/, SIGNED],
   ['PUT', /^\/codex\/settings$/, OWNER],
   ['PUT', /^\/offline-chats$/, OWNER],
