@@ -133,16 +133,18 @@ export function createAccountsImport(o: AccountsImportOptions) {
           sql = await open(cfg)
           const existing = await sql.begin(async tx => {
             await tx`select set_config('app.person_id', ${args.person}, true)`
-            const found: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source from sad.account_email where source = 'crm'`
+            const found: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source, app_touched_at is not null as touched from sad.account_email where source = 'crm'`
             return found
           })
-          const have = new Map(existing.map(e => [String(e.source_id), { hash: String(e.source_hash ?? ''), gone: e.gone_from_source === true }]))
+          const have = new Map(existing.map(e => [String(e.source_id), { hash: String(e.source_hash ?? ''), gone: e.gone_from_source === true, touched: e.touched === true }]))
           const seen = new Set(items.map(i => i.r.sourceId))
           const toInsert = items.filter(i => !have.has(i.r.sourceId))
-          const toUpdate = items.filter(i => have.has(i.r.sourceId) && have.get(i.r.sourceId)!.hash !== i.hash)
-          const same = items.filter(i => have.has(i.r.sourceId) && have.get(i.r.sourceId)!.hash === i.hash)
-          const missing = [...have.entries()].filter(([id, h]) => !seen.has(id) && !h.gone).map(([id]) => id)
-          report.plan = { insert: toInsert.length, update: toUpdate.length, unchanged: same.length, goneFromCrm: missing.length }
+          const toUpdate = items.filter(i => have.has(i.r.sourceId) && !have.get(i.r.sourceId)!.touched && have.get(i.r.sourceId)!.hash !== i.hash)
+          const same = items.filter(i => have.has(i.r.sourceId) && !have.get(i.r.sourceId)!.touched && have.get(i.r.sourceId)!.hash === i.hash)
+          // Rows the app has edited or disabled are never written over by the copy (Shubham, o7b71).
+          const keptByApp = items.filter(i => have.get(i.r.sourceId)?.touched === true)
+          const missing = [...have.entries()].filter(([id, h]) => !seen.has(id) && !h.gone && !h.touched).map(([id]) => id)
+          report.plan = { insert: toInsert.length, update: toUpdate.length, unchanged: same.length, keptByApp: keptByApp.length, goneFromCrm: missing.length }
           if (!args.apply) return report
 
           const done = { inserted: 0, updated: 0, unchanged: 0, flaggedGone: 0, batches: 0 }
@@ -168,13 +170,13 @@ export function createAccountsImport(o: AccountsImportOptions) {
             for (let i = 0; i < same.length; i += BATCH) {
               await sql.begin(async tx => {
                 await tx`select set_config('app.person_id', ${args.person}, true)`
-                for (const it of same.slice(i, i + BATCH)) await tx`update sad.account_email set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.r.sourceId}`
+                for (const it of same.slice(i, i + BATCH)) await tx`update sad.account_email set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.r.sourceId} and app_touched_at is null`
               })
             }
             for (let i = 0; i < missing.length; i += BATCH) {
               await sql.begin(async tx => {
                 await tx`select set_config('app.person_id', ${args.person}, true)`
-                for (const id of missing.slice(i, i + BATCH)) await tx`update sad.account_email set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id}`
+                for (const id of missing.slice(i, i + BATCH)) await tx`update sad.account_email set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id} and app_touched_at is null`
               })
             }
             done.flaggedGone = missing.length
@@ -209,22 +211,27 @@ export function createAccountsImport(o: AccountsImportOptions) {
 
 async function writeOne(tx: Tx, person: string, key: Buffer, r: CrmEmail, mac: string | null, hash: string): Promise<void> {
   const enc = r.password === null ? null : encryptPassword(key, r.password)
-  // UPDATE first, then INSERT when there was nothing to update. (Not "insert ... on conflict do update set x = excluded.x": reading excluded.password_enc needs the right to SELECT that column, which the
-  // app's login deliberately does not have: the database refuses it. An update with the new values as parameters needs only the right to update.)
+  // UPDATE first (never a row the app has edited or disabled: app_touched_at), then, when nothing was updated, look: a row that is there is KEPT BY THE APP and is skipped
+  // whole (its link rows too); a row that is not there is inserted. (Not "insert ... on conflict do update": reading excluded.password_enc needs the right to SELECT that column,
+  // which the app's login deliberately does not have.)
   const changed: Row[] = await tx`
     update sad.account_email set source_hash = ${hash}, address = ${r.address}, recovery_email = ${r.recoveryEmail}, phone = ${r.phone}, description = ${r.description}, has_password = ${r.password !== null},
       password_enc = ${enc}, password_mac = ${mac}, is_disabled = ${r.isDisabled}, created_by_name = ${r.createdByName}, source_created_at = ${r.sourceCreatedAt}, source_updated_at = ${r.sourceUpdatedAt},
       last_seen_at = now(), gone_from_source = false, gone_at = null, updated_at = now()
-    where owner_id = ${person} and source = 'crm' and source_id = ${r.sourceId}
+    where owner_id = ${person} and source = 'crm' and source_id = ${r.sourceId} and app_touched_at is null
     returning id::text as id`
-  const saved: Row[] =
-    changed.length > 0
-      ? changed
-      : await tx`
+  let emailId: string
+  if (changed.length > 0) {
+    emailId = String(changed[0].id)
+  } else {
+    const there: Row[] = await tx`select id::text as id from sad.account_email where owner_id = ${person} and source = 'crm' and source_id = ${r.sourceId}`
+    if (there.length > 0) return
+    const made: Row[] = await tx`
     insert into sad.account_email (owner_id, source, source_id, source_hash, address, recovery_email, phone, description, has_password, password_enc, password_mac, is_disabled, created_by_name, source_created_at, source_updated_at, last_seen_at, gone_from_source, gone_at)
     values (${person}, 'crm', ${r.sourceId}, ${hash}, ${r.address}, ${r.recoveryEmail}, ${r.phone}, ${r.description}, ${r.password !== null}, ${enc}, ${mac}, ${r.isDisabled}, ${r.createdByName}, ${r.sourceCreatedAt}, ${r.sourceUpdatedAt}, now(), false, null)
     returning id::text as id`
-  const emailId = String(saved[0]?.id)
+    emailId = String(made[0]?.id)
+  }
   const present = await tx`select source_id::text as source_id from sad.account_email_use where email_id = ${emailId} and gone_from_source = false and source_id is not null`
   for (const u of r.uses) {
     await tx`

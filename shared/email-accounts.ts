@@ -133,7 +133,7 @@ export interface ImportReport {
   /** What the CRM has, from one read of its list. */
   crm: { total: number; active: number; disabled: number; withPassword: number; uses: number; bytes: number }
   /** What copying would do (or did), against what the new database already holds. Null when the new database or the key is not set up yet: then only the CRM's counts are known. */
-  plan: { insert: number; update: number; unchanged: number; goneFromCrm: number } | null
+  plan: { insert: number; update: number; unchanged: number; keptByApp?: number; goneFromCrm: number } | null
   /** Why there is no plan, in plain words. */
   planNote: string | null
   /** Only for a copy that ran. */

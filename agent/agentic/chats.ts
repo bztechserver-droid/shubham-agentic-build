@@ -1376,7 +1376,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           await new Promise<void>(resolve => setTimeout(resolve, 100))
         }
         if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
+        // 12 Nov (o1bfb): the wait for a readable box has its own budget. When it ran out, nothing was typed and the box was never readable:
+        // that is "composer-unavailable", not a preflight failure (the send itself used to start with no budget left and say so).
+        if (opt?.waitUntilReady && !blocked(c) && boxComposer(c.screen.lines(), c.screen.typedLines()) === null) {
+          opt.onBlocked?.('composer-unavailable'); reportBefore(opt, began, 'screen-unreadable'); return 'blocked'
+        }
         const sendStart = Date.now()
+        // The send after a ready box gets at least half its budget, so a long wait can never leave it with none.
+        const sendBudget = Math.max(deadline - Date.now(), (o.codexSend?.timeoutMs ?? 96_000) / 2)
         // o655f (Stage 1): claude's own word that it took exactly this text (its UserPromptSubmit hook, noted by promptSeen) since this send began.
         const tookIt = () => promptTook(c.seen, pasted, began)
         const result = await sendToCodex({
@@ -1405,7 +1412,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
           beforeInput: opt?.authorize,
           onBlocked: opt?.onBlocked,
           report: r => offsetReport(opt, r, sendStart - began),
-        }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: Math.max(0, deadline - Date.now()), preTyped })
+        }, text, { settleMs: 300, checkMs: 150, ...o.codexSend, timeoutMs: sendBudget, preTyped })
         // An unconfirmed end may only be a hook still on its way (it lands within about 110 ms of the Enter): a short grace before giving up.
         // (Only for a chat whose hook has already spoken once: for one that never reports, waiting would only slow the old answer down.)
         if (result !== 'unconfirmed' || !c.seen) return result

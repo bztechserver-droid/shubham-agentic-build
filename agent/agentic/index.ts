@@ -157,6 +157,7 @@ import { createCrmReads } from './crm-reads.ts'
 import { createCrmWrite } from './crm-write.ts'
 import { createCrmProxy } from './crmproxy.ts'
 import { createAccountsEmail } from './accounts-email.ts'
+import { createAccountsEmailWrite } from './accounts-email-write.ts'
 import { createAccountsImport } from './accounts-import.ts'
 import { createAccountsCodebases } from './accounts-codebases.ts'
 import { createCodebaseTabs } from './codebase-tabs.ts'
@@ -755,6 +756,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // order o57e2, o4d14: the Accounts page's Email tab, read from the NEW Supabase project (schema sad; db/accounts/README.md) through the login sad_app named in two files in this state folder. Nothing connects
   // until Shubham has made those files himself; the answer says so in plain words.
   const accountsEmail = createAccountsEmail({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
+  // Order ofd53 (slice 1 of o45c0): the email edit modal's writes (soft delete; the owner's rows only).
+  const accountsEmailWrite = createAccountsEmailWrite({ dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // order o5c4d: the one-way copy of the CRM's email accounts into that database (reads the CRM with the PC's CRM sign-in, writes only to the new database, deletes nothing).
   const accountsImport = createAccountsImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // orders o0e2a, oc2db: the Accounts page's Codebases tab: its list (the codebases with their detail rows and platform accounts) and the one-way copy from the CRM (no secret is copied: flags and counts only).
@@ -5332,6 +5335,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/crm\/session$/, (): CrmSessionInfo => crmProxy.session(), 'local'],
     // order o57e2, o4d14: the email accounts for the Accounts page's Email tab, from the new Supabase project: address, note, switched off, where used. Never a password. The owner's (POLICY).
     ['GET', /^\/accounts\/email$/, (_, r) => accountsEmail.list(access.ownerOf(callerOf(r)).id), 'local'],
+    // Order ofd53: the email edit modal. The owner's only (POLICY); the database's rules check the owner again (accounts-email-write.ts).
+    ['POST', /^\/accounts\/email$/, (_, r) => accountsEmailWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
+    ['PUT', /^\/accounts\/email\/([^/]+)$/, ([id], r) => accountsEmailWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
+    ['DELETE', /^\/accounts\/email\/([^/]+)$/, ([id], r) => accountsEmailWrite.remove(access.ownerOf(callerOf(r)).id, id), 'local'],
+    // Order o8ebe: the password reveal (owner only; logged by the agent, never the password).
+    ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, ([id], r) => accountsEmailWrite.reveal(access.ownerOf(callerOf(r)).id, id), 'local'],
     // order o5c4d: "apply" false (the default) only counts and compares; true copies. Counts only come back, never a row. The owner's (POLICY).
     ['POST', /^\/accounts\/email\/import$/, (_, r) => accountsImport.run({ person: access.ownerOf(callerOf(r)).id, apply: isObject(r.body) && r.body.apply === true }), 'local'],
     // orders o0e2a, oc2db: the codebases for the Accounts page's Codebases tab (with their detail rows and platform accounts; no .env, no password). The owner's (POLICY).

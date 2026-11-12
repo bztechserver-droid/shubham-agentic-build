@@ -32,7 +32,7 @@ export function createAccountsEmail(o: AccountsEmailOptions) {
         sql = await open(read)
         const { mails, uses } = await sql.begin(async tx => {
           await tx`select set_config('app.person_id', ${person}, true)`
-          const mails: Row[] = await tx`select id, address, recovery_email, phone, description, has_password, is_disabled, source_updated_at from sad.account_email order by is_disabled, address limit 501`
+          const mails: Row[] = await tx`select id, address, recovery_email, phone, description, has_password, is_disabled, source_updated_at from sad.account_email where deleted_at is null order by is_disabled, address limit 501`
           const uses: Row[] = await tx`select email_id, used_for from sad.account_email_use where gone_from_source = false order by email_id, sort_order limit 6000`
           return { mails, uses }
         })
