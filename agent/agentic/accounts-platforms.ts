@@ -34,6 +34,7 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
             select p.id, p.platform, p.account_type, p.account_type_disabled, p.name, p.sign_in_email, p.email_source_id, p.phone, p.contact_name, p.contact_linked, p.contact_disabled, p.has_password,
               p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled
             from sad.account_platform p left join sad.account_email e on e.source_id = p.email_source_id
+            where p.deleted_at is null
             order by p.is_disabled, lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
           const links: Row[] = await tx`
             select pc.platform_id, pc.parts, c.id as codebase_id, c.name as codebase_name

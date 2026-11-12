@@ -14,7 +14,7 @@ import { openAccountsDb, readAccountsDb, readAccountsKey, reasonOf, WORDS, type 
 export interface CodebaseTabsOptions {
   dir: string
   open?: typeof openAccountsDb
-  log?: { warn(message: string): void }
+  log?: { warn(message: string): void; info?(message: string): void }
 }
 
 const PERSON = /^[A-Za-z0-9._:@-]{1,80}$/
@@ -264,7 +264,7 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
       const id = uuid(varId)
       if (!id) throw apiError(400, 'That variable id is not valid.')
       const key = keyOrRefuse()
-      return run(person, async tx => {
+      const out = await run(person, async tx => {
         const rows: Row[] = await tx`select value_sealed from sad.account_env_var where id = ${id} and deleted_at is null`
         if (rows.length === 0) throw apiError(404, NO_ROW)
         try {
@@ -273,6 +273,9 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
           throw apiError(500, 'That value could not be opened with the key on this PC.')
         }
       })
+      // The reveal is logged: who, which row, when. Never the value.
+      o.log?.info?.(`environment variable revealed: row ${id} by ${person} at ${new Date().toISOString()}`)
+      return out
     },
   }
 }

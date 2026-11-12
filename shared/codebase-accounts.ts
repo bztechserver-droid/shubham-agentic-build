@@ -277,6 +277,8 @@ export interface CopyPlan {
   insert: number
   update: number
   unchanged: number
+  /** Order o7b71 (accounts edit): rows the app has edited or disabled, kept as the app left them (not written, not flagged). */
+  keptByApp?: number
   goneFromCrm: number
 }
 export interface CopyDone {

@@ -53,6 +53,11 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/pc-control\/pcs\/([^/]+)\/slots\/([^/]+)\/engine$/, SIGNED],
   ['GET', /^\/watchdog$/, OWNER],
   ['GET', /^\/accounts\/email$/, OWNER],
+  // Codebase details slice: the codebase's details (the owner's only).
+  ['PUT', /^\/accounts\/codebases\/([^/]+)$/, OWNER],
+  // Accounts edit slice: the platform accounts edit and soft delete (the owner's only).
+  ['PUT', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
+  ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
   // Order o8ebe: the password reveal (the owner's only).
   ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, OWNER],
   // Order ofd53: the email edit modal (the owner's only).

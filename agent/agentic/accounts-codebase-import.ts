@@ -204,13 +204,14 @@ export function platformFingerprint(p: CopyPlatform): string {
 }
 
 
-function plan<T extends { id: string; hash: string }>(items: T[], have: Map<string, { hash: string; gone: boolean }>) {
+function plan<T extends { id: string; hash: string }>(items: T[], have: Map<string, { hash: string; gone: boolean; touched?: boolean }>) {
   const seen = new Set(items.map(i => i.id))
   const toInsert = items.filter(i => !have.has(i.id))
-  const toUpdate = items.filter(i => have.has(i.id) && have.get(i.id)!.hash !== i.hash)
-  const same = items.filter(i => have.has(i.id) && have.get(i.id)!.hash === i.hash)
-  const missing = [...have.entries()].filter(([id, h]) => !seen.has(id) && !h.gone).map(([id]) => id)
-  const p: CopyPlan = { insert: toInsert.length, update: toUpdate.length, unchanged: same.length, goneFromCrm: missing.length }
+  const kept = items.filter(i => have.get(i.id)?.touched === true)
+  const toUpdate = items.filter(i => have.has(i.id) && !have.get(i.id)!.touched && have.get(i.id)!.hash !== i.hash)
+  const same = items.filter(i => have.has(i.id) && !have.get(i.id)!.touched && have.get(i.id)!.hash === i.hash)
+  const missing = [...have.entries()].filter(([id, h]) => !seen.has(id) && !h.gone && !h.touched).map(([id]) => id)
+  const p: CopyPlan = { insert: toInsert.length, update: toUpdate.length, unchanged: same.length, ...(kept.length > 0 ? { keptByApp: kept.length } : {}), goneFromCrm: missing.length }
   return { p, toInsert, toUpdate, same, missing }
 }
 
@@ -266,11 +267,11 @@ export function createCodebaseImport(o: CodebaseImportOptions) {
           sql = await open(cfg)
           const existing = await sql.begin(async tx => {
             await tx`select set_config('app.person_id', ${args.person}, true)`
-            const a: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source from sad.account_codebase where source = 'crm'`
-            const b: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source from sad.account_platform where source = 'crm'`
+            const a: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source, app_touched_at is not null as touched from sad.account_codebase where source = 'crm'`
+            const b: Row[] = await tx`select source_id::text as source_id, source_hash, gone_from_source, app_touched_at is not null as touched from sad.account_platform where source = 'crm'`
             return { a, b }
           })
-          const haveOf = (rows: Row[]) => new Map(rows.map(e => [String(e.source_id), { hash: String(e.source_hash ?? ''), gone: e.gone_from_source === true }]))
+          const haveOf = (rows: Row[]) => new Map(rows.map(e => [String(e.source_id), { hash: String(e.source_hash ?? ''), gone: e.gone_from_source === true, touched: e.touched === true }]))
           const cPlan = plan(cItems, haveOf(existing.a))
           const pPlan = plan(pItems, haveOf(existing.b))
           report.plan = { codebases: cPlan.p, platforms: pPlan.p }
@@ -305,10 +306,10 @@ export function createCodebaseImport(o: CodebaseImportOptions) {
             // Rows that are the same are only "seen again" (and un-flagged if they were flagged); rows gone from the CRM are only flagged.
             await sql.begin(async tx => {
               await tx`select set_config('app.person_id', ${args.person}, true)`
-              for (const it of cPlan.same) await tx`update sad.account_codebase set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.id}`
-              for (const it of pPlan.same) await tx`update sad.account_platform set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.id}`
-              for (const id of cPlan.missing) await tx`update sad.account_codebase set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id}`
-              for (const id of pPlan.missing) await tx`update sad.account_platform set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id}`
+              for (const it of cPlan.same) await tx`update sad.account_codebase set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.id} and app_touched_at is null`
+              for (const it of pPlan.same) await tx`update sad.account_platform set last_seen_at = now(), gone_from_source = false, gone_at = null where source = 'crm' and source_id = ${it.id} and app_touched_at is null`
+              for (const id of cPlan.missing) await tx`update sad.account_codebase set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id} and app_touched_at is null`
+              for (const id of pPlan.missing) await tx`update sad.account_platform set gone_from_source = true, gone_at = now() where source = 'crm' and source_id = ${id} and app_touched_at is null`
             })
             report.done = done
             await finishRun(sql, args.person, runId, 'done', { ...done, crm: report.crm })
@@ -343,8 +344,13 @@ async function writeCodebase(tx: Tx, person: string, c: CopyCodebase, hash: stri
     update sad.account_codebase set source_hash = ${hash}, name = ${c.name}, repo_url = ${c.repoUrl}, repo_url_hidden = ${c.repoUrlHidden}, local_path = ${c.localPath}, description = ${c.description},
       description_hidden = ${c.descriptionHidden}, stack = ${c.stack}, owner_name = ${c.ownerName}, service_names = string_to_array(${c.serviceNames.join(SEP)}, chr(31)), has_env = ${c.hasEnv}, env_var_count = ${c.envVarCount},
       is_disabled = ${c.isDisabled}, source_created_at = ${c.sourceCreatedAt}, source_updated_at = ${c.sourceUpdatedAt}, last_seen_at = now(), gone_from_source = false, gone_at = null, updated_at = now()
-    where owner_id = ${person} and source = 'crm' and source_id = ${c.sourceId}
+    where owner_id = ${person} and source = 'crm' and source_id = ${c.sourceId} and app_touched_at is null
     returning id::text as id`
+  if (changed.length === 0) {
+    // Nothing updated: a codebase that is already there is kept by the app (edited there): skipped whole, its detail rows too.
+    const there: Row[] = await tx`select id::text as id from sad.account_codebase where owner_id = ${person} and source = 'crm' and source_id = ${c.sourceId}`
+    if (there.length > 0) return
+  }
   const saved: Row[] =
     changed.length > 0
       ? changed
@@ -377,8 +383,13 @@ async function writePlatform(tx: Tx, person: string, p: CopyPlatform, hash: stri
     update sad.account_platform set source_hash = ${hash}, platform = ${p.platform}, account_type = ${p.accountType}, name = ${p.name}, sign_in_email = ${p.signInEmail}, email_source_id = ${p.emailSourceId},
       phone = ${p.phone}, contact_name = ${p.contactName}, account_type_disabled = ${p.accountTypeDisabled}, contact_linked = ${p.contactLinked}, contact_disabled = ${p.contactDisabled}, has_password = ${p.hasPassword}, is_disabled = ${p.isDisabled}, source_created_at = ${p.sourceCreatedAt}, source_updated_at = ${p.sourceUpdatedAt},
       last_seen_at = now(), gone_from_source = false, gone_at = null, updated_at = now()
-    where owner_id = ${person} and source = 'crm' and source_id = ${p.sourceId}
+    where owner_id = ${person} and source = 'crm' and source_id = ${p.sourceId} and app_touched_at is null
     returning id::text as id`
+  if (changed.length === 0) {
+    // Nothing updated: a row that is already there is kept by the app (edited or disabled there): skipped whole, its links too.
+    const there: Row[] = await tx`select id::text as id from sad.account_platform where owner_id = ${person} and source = 'crm' and source_id = ${p.sourceId}`
+    if (there.length > 0) return
+  }
   const saved: Row[] =
     changed.length > 0
       ? changed
