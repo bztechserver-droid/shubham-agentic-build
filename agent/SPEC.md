@@ -1562,6 +1562,41 @@ as any non-local route.
   `/memory/search?q=&kinds=&limit=`, `/memory/wiki`, `/memory/page?path=`, `/memory/read?ref=`,
   `/memory/brief`, `POST /memory/compile {mode}`, `PATCH /memory/settings`.
 
+## Stage 1 of the simple chat-terminal layer (agentic/turns.ts; order o400b, 12 Nov 2026)
+
+What a Claude chat is doing, and an order's answer, come from **Claude's own transcript**: no screen
+reading decides them and no new hooks are added (Sync Research's plan, rules 1-4: hooks print red
+errors in every terminal while the agent restarts). Rows of Claude Code 2.1.322:
+- **Busy** from the row of a prompt it took (a `user` row with `promptSource`: typed, queued,
+  suggestion_accepted, system for task notifications, scheduled tasks and inbox messages); while it
+  is busy a message is an `enqueue` row, then `dequeue` (it runs next) or `remove` + a
+  `queued_command` attachment (taken in mid-turn). It stays busy after a turn's end while a queued
+  message waits or was dequeued (at most 10 s if none starts).
+- **Asking** from an assistant `tool_use` of AskUserQuestion or ExitPlanMode until its `tool_result`.
+- **Idle** at `system` `turn_duration` (normal end or API error: `stopped` finished / failed) or the
+  "[Request interrupted by user…" row (Esc: interrupted; a second end of the same turn changes nothing).
+- Compaction rows, local and `!` commands, sub-agent rows and rows the app's engine conversion wrote
+  (no promptId, no promptSource) never change the state.
+
+`createTurnReader` follows every native Claude chat running here (not Codex, OpenCode or Codex in
+Claude Code), and its successor file after /clear or /resume. Only rows stamped since the chat's
+process started count: a resumed conversation's history (it may have stopped mid-turn) never
+decides. A chat found running (an Update, the switch turned back on) is read back from its file's end
+to its last turn end or its start. It looks at the files every 150 ms (only what grew is read) and
+lists the chats once a second.
+It gives the pool `chatSignals` { asking, transcriptTook (Agent 4's simple send), state }: in the
+simple layer the pool's states, info, activity, `asking()` and the reaper use `state`, so the `live`
+states, Approvals, orders, the heartbeat and the watchdog all get Claude's word. The chat view sends
+the page `{t: 'claude', claude: {state: busy | asking | idle, since, stopped?, lastAnswer?}}` (not in
+`ChatFeedMessage`, so an older page passes it by). **Orders** to a Claude chat (`createOrderWatch`,
+orders.ts `turnOf`): answered by the last assistant text before the first turn end after the order
+entered the conversation (its own row, or a `queued_command`); an `enqueue` row is taken, not
+answered; nothing is decided by the state reading idle. The order-reply carrier counts the
+Assistant's own row that took a reply as its confirmation too, and holds a reply only while that chat
+asks (not on a draft read off its screen). **"Old way"** (`SAD_SYNC=old` or
+`<state>/agent/sync-old.on`; `GET`/`POST /sync-mode {mode: 'simple' | 'old'}`, the POST for the
+owner only): everything above off, the screen's state and the old order rule exactly as before.
+
 ## F-050: the chat view (agentic/chatview.ts, screen.ts)
 
 The Chats page (DESIGN.md › Chats) reads a chat's conversation and what is on its screen, and types

@@ -103,6 +103,9 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/codex\/settings$/, SIGNED],
   ['PUT', /^\/codex\/settings$/, OWNER],
   ['PUT', /^\/offline-chats$/, OWNER],
+  // Stage 1 (o400b): the "Old way" switch of this PC's chat-terminal layer: every page reads it (it shows chats by it), only the owner changes it.
+  ['GET', /^\/sync-mode$/, SIGNED],
+  ['POST', /^\/sync-mode$/, OWNER],
   ['GET', /^\/sessions$/, OWNER],
   ['GET', /^\/sessions\/copy-all$/, OWNER],
   ['POST', /^\/sessions\/copy-all$/, OWNER],

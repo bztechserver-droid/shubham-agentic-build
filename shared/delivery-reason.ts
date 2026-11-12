@@ -6,6 +6,7 @@ export const DELIVERY_BLOCK_REASONS = [
   'peer-unreachable', 'peer-delivery-unsupported', 'peer-authorization-unsupported', 'peer-blocked',
   'menu', 'draft', 'unresolved-send', 'composer-unavailable', 'screen-unavailable',
   'input-changed', 'empty-message', 'preflight-failed',
+  'asking', // 12 Nov (Stage 1): the transcript says Claude has a question open: nothing typed, answer it and send again
 ] as const
 export type DeliveryBlockReason = typeof DELIVERY_BLOCK_REASONS[number]
 export function isDeliveryBlockReason(value: unknown): value is DeliveryBlockReason {
@@ -31,6 +32,8 @@ export const DELIVERY_CAUSES = [
   'write-refused',
   'agent-closing',              // the agent/hub was closing while it was pending
   'agent-restarted',            // found pending when the agent started again
+  'no-report',                  // 12 Nov (Stage 1): no transcript row and no prompt report came for the text within 5 s (not sent again)
+  'slash-command',              // 12 Nov (Stage 1): a slash command was typed and shown as sent; Claude writes no prompt report for it (not a confirmation)
   'exception',
 ] as const
 export type DeliveryCause = typeof DELIVERY_CAUSES[number]
@@ -80,5 +83,6 @@ export function deliveryBlockWords(reason: DeliveryBlockReason, targetPcName?: s
     case 'empty-message': return 'There was no message text to submit. Nothing was typed.'
     case 'peer-blocked': return 'The destination PC refused this send without reporting a specific reason. Update that PC or inspect its terminal. Nothing was submitted.'
     case 'preflight-failed': return 'The delivery preflight failed before typing. Refresh the destination and review your kept draft.'
+    case 'asking': return 'Claude is asking a question in the terminal. Answer it there, then send again. Nothing was typed.'
   }
 }

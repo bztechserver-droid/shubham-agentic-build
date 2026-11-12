@@ -80,6 +80,7 @@ import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
 import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
 import { createOrders, FAST_FROM, phoneUser, scanMessages, type HandoffApi, type Order, type OrderProgress } from './orders.ts'
+import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
 import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
 import { createWatchdog, readFreeCommitMB } from './watchdog.ts'
@@ -327,6 +328,8 @@ export interface AgenticOptions {
    *  sender for those too (default: SAD_CHECK_AGENT_MESSAGES=1 or <state>/agent/check-agent-messages.on; off, the old way). Codex, OpenCode and
    *  Codex-in-Claude-Code chats always use the checked sender. */
   checkAgentMessages?: boolean
+  /** 12 Nov (Stage 1, fixtures): the "Old way" rule; absent, the rule is SAD_SYNC=old or sync-old.on beside the agent folder. */
+  oldWay?: () => boolean
   /** F-087: the fast Assistant's warm process (fast-host.ts): on or off (default: SAD_FAST_ASSISTANT=1 or <state>/agent/fast-assistant.on; off, nothing exists). */
   fastAssistant?: boolean
   /** F-087: tests: the pieces of the fast host that would start a real claude, replaced. */
@@ -561,6 +564,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     formatOf: sid => (isCodexSession(sid) ? CODEX_FORMAT : CLAUDE_FORMAT),
     // o655f (Stage 1): after /clear or /resume claude goes on in a NEW session and a new file, in the same terminal: the chat view follows it.
     successor: sid => chats.claudeSession?.(sid) ?? null,
+    // Stage 1 (o400b): what the chat is doing as Claude's own transcript says, for the page's `claude` message (the simple layer only).
+    claude: sid => (syncOld() ? null : turns?.turn(sid) ?? null),
   })
   // F-062: the effort each chat running here was started with, and when (what its chip says until a /effort changes it).
   const launched = new Map<string, { effort: string; at: string; ultracode: boolean }>()
@@ -1213,6 +1218,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     return mirrorOffNow
   }
+  let syncOldAt = 0
+  let syncOldNow = false
+  /**
+   * 12 Nov (oad50 / o400b, Stage 1): the "Old way" switch, one per PC: SAD_SYNC=old, or the file <state>/agent/sync-old.on (beside input-mirror.off;
+   * Settings › Chats writes it, POST /sync-mode). On: today's checked send, the screen's state and the old order rule. Off (the default): the simple
+   * layer. Looked at once a second at most (it is asked at every terminal write); the route that changes it looks again at once.
+   */
+  function syncOld(): boolean {
+    if (o.oldWay) return o.oldWay()
+    if (Date.now() - syncOldAt > 1000) {
+      syncOldAt = Date.now()
+      syncOldNow = process.env.SAD_SYNC === 'old' || existsSync(path.join(o.dir, '..', 'sync-old.on'))
+    }
+    return syncOldNow
+  }
+  /** Stage 1 (o400b): Claude's own transcript, read for every Claude chat running here (turns.ts); made right after the pool. */
+  let turns: TurnReader | null = null
   const poolOptions: ChatPoolOptions = {
     addDirs: [uploads.dir],
     // F-083: a chat with an open order or unfinished work is never ended for being idle.
@@ -1243,6 +1265,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     codexBin: () => o.codex?.bin() ?? null,
     codexCredential: () => o.codex?.credentialEnv() ?? null,
     codexSend: o.codexSend,
+    // 12 Nov (oad50, Stage 1): "Old way" is off by default. On: SAD_SYNC=old, or the file sync-old.on beside the agent folder (one switch per PC);
+    // o.oldWay in tests. One function for the sender and the transcript reader (syncOld, above: the same rule, looked at once a second).
+    oldWay: syncOld,
+    // Stage 1 (o400b, Agent 12): what Claude's own transcript says (turns.ts), for Agent 4's simple send (asking, transcriptTook) and the pool's state.
+    chatSignals: {
+      asking: sid => turns?.asking(sid) ?? false,
+      transcriptTook: (sid, text, since) => turns?.took(sid, text, since) === true,
+      state: sid => turns?.state(sid) ?? null,
+    },
     token: o.token,
     credential: o.credential,
     // F-051: recall in every prompt, once the memory layer is on (main.ts). Else the prompt report (12 Nov), unless it is switched off:
@@ -1445,6 +1476,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       return result
     },
   }
+  // Stage 1 (o400b): every native Claude chat running here (not Codex, not OpenCode, not Codex in Claude Code) is followed in its own transcript while
+  // the simple layer is on; a change of what it is doing is told like any other (the `live` states, debounced).
+  turns = createTurnReader({
+    sessions: () => (syncOld() ? [] : nativeChats.live().filter(c => c.engine === 'claude' && !c.execution).map(c => ({ sessionId: c.sessionId, startedAt: c.startedAt }))),
+    target: sid => nativeChats.claudeSession?.(sid) ?? sid,
+    find: sid => findClaudeTranscript(sid, projectsDir),
+    log,
+    onChange: () => poolOptions.onChange?.(),
+  })
 
   // F-075: the chats the agent before this one left running in the chat host are taken over at once.
   let hostAdopted = !o.chatHost
@@ -2379,6 +2419,29 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return offlineAnswer()
   }
 
+  /** Stage 1 (o400b): GET /agentic/sync-mode, what Web's Settings › Chats › "Old way" reads: 'simple' (the default) or 'old'; `forced`: SAD_SYNC=old. */
+  function syncModeAnswer() {
+    syncOldAt = 0
+    return { mode: syncOld() ? 'old' : 'simple', forced: process.env.SAD_SYNC === 'old' }
+  }
+  /** POST /agentic/sync-mode {mode}: this PC's switch (the file sync-old.on beside the agent folder), for the owner only. */
+  function setSyncMode(raw: unknown, r: MountRequest) {
+    if (!isObject(raw) || (raw.mode !== 'simple' && raw.mode !== 'old')) throw apiError(400, "Expected {mode: 'simple' | 'old'}")
+    const c = callerOf(r)
+    if (o.auth && c.person?.canSeeAll !== true) {
+      o.auth.deny(c, c.person ? 403 : 401, c.person ? 'admin-only' : 'sign-in', 'POST /agent-api/agentic/sync-mode')
+      throw c.person ? authError(403, 'Only the owner of this app changes this.', 'admin-only') : authError(401, 'Sign in first.', 'sign-in')
+    }
+    const file = path.join(o.dir, '..', 'sync-old.on')
+    if (raw.mode === 'old') writeAtomic(file, `Old way: on since ${new Date().toISOString()} (Settings › Chats)\n`)
+    else rmSync(file, { force: true })
+    log?.warn(`${c.person?.username ?? 'someone'} set the chat-terminal layer to ${raw.mode === 'old' ? 'the Old way' : 'Simple'}${process.env.SAD_SYNC === 'old' ? ' (SAD_SYNC=old still forces the Old way)' : ''}`)
+    const answer = syncModeAnswer()
+    // The states now come from the other source: told to every page.
+    poolOptions.onChange?.()
+    return answer
+  }
+
   const memberTimer = team ? setInterval(memberTick, 1000) : null
   memberTimer?.unref()
   const stateTimer = team
@@ -2981,6 +3044,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // Only the hub keeps them: a member's tool calls are run by the hub (callTool).
   // F-087: where a hand-off's answer and progress go (the fast Assistant's session registers them: handoff.listen below).
   const fastLinks: { onReturn?: (order: Order, text: string) => Promise<boolean>; onProgress?: (p: OrderProgress) => void } = {}
+  // Stage 1 (o400b, rule 4): each open order is followed in its target's own Claude transcript, wherever this PC has it (a member's copy on the hub too).
+  const orderTurns = createOrderWatch({ find: sid => findClaudeTranscript(sid, projectsDir), target: sid => chats.claudeSession?.(sid) ?? sid })
   const orders = createOrders({
     now: Date.now,
     file: path.join(o.dir, 'orders.json'),
@@ -2997,16 +3062,27 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const file = findTranscript(sid, projectsDir)
       return file ? scanMessages(readTranscriptFile(file), id) : { started: false, answer: '' }
     },
+    // Stage 1 (o400b, rule 4): a Claude chat's order is answered from its transcript (the last words before the first turn end after the order
+    // entered); Codex, OpenCode and "Old way" keep the rule above.
+    turnOf: (sid, id, since) => (syncOld() || isCodexSession(sid) || isOpenCode(sid) ? null : orderTurns.turnOf(sid, id, since)),
+    forget: id => orderTurns.forget(id),
     deliver: async (assistantSid, body, order) => {
       // F-087: the fast Assistant is a process, not a chat: its answer goes to the session (nothing is typed anywhere).
       if (order.from === FAST_FROM) return fastLinks.onReturn ? fastLinks.onReturn(order, body).catch(() => false) : false
       const w = whereAll()[assistantSid]
       // M1: typing ends with Enter, which would pick the highlighted option of a prompt nobody answered: kept, and tried again later.
-      if (w && (atPrompt(assistantSid) || hasDraft(assistantSid))) return false
+      // Stage 1 (o400b): in the simple layer only Claude's own open question holds it (its transcript), never a draft read off the screen.
+      if (w && (atPrompt(assistantSid) || (syncOld() && hasDraft(assistantSid)))) return false
       return w ? typeInto({ sessionId: assistantSid, id: w.id }, body).catch(() => false) : false
     },
     // Order-reply carrier (11 Nov): a typed reply is in only when the Assistant's claude reports it took exactly that text (its UserPromptSubmit hook).
-    taken: (assistantSid, body, since) => chats.promptTaken?.(assistantSid, body, since) ?? null,
+    // Stage 1 (o400b): or its transcript has the row that took it (a user or enqueue row, or a queued_command): either one is enough.
+    taken: (assistantSid, body, since) => {
+      const hook = chats.promptTaken?.(assistantSid, body, since) ?? null
+      if (hook === true || syncOld()) return hook
+      const row = turns?.took(assistantSid, body, since) ?? null
+      return row === true ? true : hook === false || row === false ? false : null
+    },
     ...(o.orderReplyWaits ? { waits: o.orderReplyWaits } : {}),
   })
   function orderReplies(): boolean {
@@ -5081,6 +5157,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/codex\/settings$/, () => ({ enabled: true }), 'local'],
     ['PUT', /^\/codex\/settings$/, (_, r) => retireCodexSettings(r), 'local'],
     ['PUT', /^\/offline-chats$/, (_, r) => setOfflineChats(r.body, r), 'local'],
+    // Stage 1 (o400b): the "Old way" switch of this PC's chat-terminal layer (Web's Settings › Chats).
+    ['GET', /^\/sync-mode$/, () => syncModeAnswer(), 'local'],
+    ['POST', /^\/sync-mode$/, (_, r) => setSyncMode(r.body, r), 'local'],
     ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
     [
@@ -6138,9 +6217,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** F-050: the chat view's feed for one session (chatview.ts): the end of its conversation, then what it grows by. */
   function chatSocket(query: URLSearchParams) {
     const sid = query.get('session') ?? ''
+    // Stage 1 (o400b): a page that knows the `claude` message asks for it (&claude=1); every other page gets the feed exactly as before.
+    const claude = query.get('claude') === '1'
     return (ws: WsSocket) => {
       if (!UUID_RE.test(sid)) return ws.close(1008, 'Expected ?session=<the chat id>')
-      const detach = chatFeeds.attach(sid, m => ws.sendText(JSON.stringify(m)))
+      const detach = chatFeeds.attach(sid, m => ws.sendText(JSON.stringify(m)), { claude })
       ws.onText(() => {})
       ws.onClose(detach)
     }
@@ -6446,6 +6527,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (stateTimer) clearInterval(stateTimer)
       tail.close()
       chatFeeds.close()
+      turns?.close()
       clearInterval(memberBriefTimer)
       layer.close()
       chats.closeAll()

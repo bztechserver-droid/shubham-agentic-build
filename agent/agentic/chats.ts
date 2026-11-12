@@ -133,6 +133,14 @@ export function squashPrompt(text: string, cut = false): string {
 }
 
 /** Did claude take exactly `sent` (paste markers off) as a prompt since `since`, by its hook's reports? One rule for a send's confirmation and an order's reply. */
+/**
+ * 12 Nov (Stage 1): the simple send is used only for a native Claude chat that is not Codex-in-Claude (info.execution), and only while Old way is off.
+ * Everything else keeps the checked path. Exported so the routing is tested without starting a bridge chat.
+ */
+export function simpleLayerFor(info: { engine: string; execution?: unknown }, oldWay: boolean): boolean {
+  return info.engine === 'claude' && !info.execution && !oldWay
+}
+
 export function promptTook(seen: readonly { norm: string; cut: boolean; at: number }[] | undefined, sent: string, since: number): boolean {
   if (!seen?.length) return false
   const want = squashPrompt(sent.split(PASTE_END).join(''))
@@ -320,6 +328,26 @@ export interface ChatPoolOptions {
   codexCredential?: () => { name: string; value: string } | null
   /** F-134, tests: shorter waits for a Codex chat's sender. */
   codexSend?: SendOptions
+  /**
+   * 12 Nov (oad50, Sync Stage 1): the "Old way" switch. Off (the default), a Claude chat's send is the simple layer: one paste, one Enter, never refused
+   * for what the screen shows (draft, menu, unresolved, mirror) and confirmed by claude's own prompt report. On, the checked path as it was.
+   */
+  oldWay?: () => boolean
+  /**
+   * 12 Nov (sync design change, plan rules 2-3): the chat's state from Claude's TRANSCRIPT (Agent 12's reader; no new hooks). `asking(sessionId)`: a question
+   * is open, so a send is REFUSED as "asking" (nothing typed, never shown as sent) and must be sent again after the answer. `transcriptTook(sessionId,
+   * text, since)`: a user or enqueue row carrying the text since `since`. Absent: the send is confirmed by Claude's prompt report alone.
+   */
+  chatSignals?: {
+    asking?: (sessionId: string) => boolean
+    transcriptTook?: (sessionId: string, text: string, since: number) => boolean
+    /**
+     * Stage 1 (o400b, Agent 12's reader, turns.ts): what the chat is doing as Claude's own transcript says (running / question / idle); null when its
+     * transcript is not read here. Unless "Old way" is on, the pool shows and decides by it (states, info, activity, asking, the reaper); the screen's
+     * reading stays for Old way, Codex and Codex in Claude Code.
+     */
+    state?: (sessionId: string) => ChatState | null
+  }
   /** CLAUDE_CODE_OAUTH_TOKEN as this Windows account has it now (F-007 keeps it there); null: leave the inherited one. */
   token?: () => string | null
   /**
@@ -414,6 +442,8 @@ interface Chat {
   /** Keep pastes and their delayed Enters from separate messages together. */
   codexSending?: Promise<SendResult>
   delivering?: Promise<SendResult>
+  /** 12 Nov (Stage 1): the simple sends of this chat, one after another, so two pastes never interleave. */
+  simpleTail?: Promise<unknown>
   generation?: string
   inputEpoch?: number
   /** F-193: the live mirror of its input line (made when a chat box first asks), until when the old direct paste is in flight, and when a person last typed in it. */
@@ -436,6 +466,7 @@ interface Chat {
 }
 
 export function createChatPool(o: ChatPoolOptions): ChatPool {
+  const oldWay = o.oldWay ?? (() => process.env.SAD_SYNC === 'old')
   const chats = new Map<string, Chat>()
   const actualExits = new Map<string, Promise<void>>()
   const keys = new Map<string, Chat>()
@@ -443,9 +474,26 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   let spawnPty = o.spawn ?? null
   const changed = () => o.onChange?.()
 
-  const infoOf = (c: Chat): ChatInfo => {
+  const infoOf = (c: Chat): ChatInfo => ({ ...c.info, state: stateNow(c), viewers: c.viewers.size })
+
+  /**
+   * Stage 1 (o400b, Sync Research plan rule 3): a Claude chat's state as its own transcript says (chatSignals.state), in the simple layer; null: the
+   * screen's reading as before (Old way, a Codex chat, Codex in Claude Code, a chat whose transcript is not read here yet).
+   */
+  function claudeState(c: Chat): ChatState | null {
+    if (c.engine !== 'claude' || c.info.execution || oldWay()) return null
+    try {
+      return o.chatSignals?.state?.(c.info.sessionId) ?? null
+    } catch {
+      return null
+    }
+  }
+  /** What the chat is doing: Claude's own word when it has one, else the screen's reading put right (settle). */
+  function stateNow(c: Chat): ChatState {
+    const s = claudeState(c)
+    if (s) return s
     settle(c)
-    return { ...c.info, state: c.state, viewers: c.viewers.size }
+    return c.state
   }
 
   // M1: is a question menu up? Read off the screen as it is drawn now, not off the state, which is guessed from words
@@ -744,6 +792,58 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     }
   }
 
+  /**
+   * 12 Nov (oad50, Sync Stage 1, Special's part): the simple send for a Claude chat, the default. One paste, one Enter, in order behind any earlier
+   * simple send of this chat. Nothing is refused for what the screen shows (draft, menu, unresolved, mirror): his words go in. Claude's own prompt
+   * report is the only confirmation; if it does not come within 5 s the send is "unconfirmed" (grey, quiet) and is NEVER sent again.
+   */
+  function simpleSend(c: Chat, text: string, opt?: DeliveryOptions): Promise<SendResult> {
+    const run = (c.simpleTail ?? Promise.resolve()).then(() => simpleOne(c, text, opt), () => simpleOne(c, text, opt))
+    c.simpleTail = run.catch(() => undefined)
+    return run
+  }
+  async function simpleOne(c: Chat, text: string, opt?: DeliveryOptions): Promise<SendResult> {
+    if (c.exited) return 'gone'
+    if (opt?.guard?.() === false) { opt.onBlocked?.('input-changed'); return 'blocked' }
+    if (opt?.authorize && !(await opt.authorize('paste').catch(() => false))) { opt.onBlocked?.('authorization-revoked'); return 'blocked' }
+    const pasted = text.split(PASTE_END).join('')
+    if (!pasted.trim()) { opt?.onBlocked?.('empty-message'); return 'blocked' }
+    const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+    const sid = c.info.sessionId, signals = o.chatSignals
+    const began = Date.now(), marks: [DeliveryMark, number][] = []
+    const mark = (name: DeliveryMark) => { if (marks.length < 16) marks.push([name, Date.now() - began]) }
+    // Every end is reported (counts-only delivery log): which branch ended the send, and when.
+    const done = (result: SendResult, cause: DeliveryCause): SendResult => { mark('end'); try { opt?.onReport?.({ result, cause, marks }) } catch { /* diagnostics never change a send */ } return result }
+    // Claude has a question open (the transcript says so, exact): nothing is typed; the send is refused as "asking", never shown as sent.
+    if (signals?.asking?.(sid)) { opt?.onBlocked?.('asking'); return done('blocked', 'menu-appeared') }
+    if (!write(c, PASTE_START)) return done('gone', 'write-refused')
+    mark('paste')
+    for (let offset = 0; offset < pasted.length;) {
+      let end = Math.min(offset + 1024, pasted.length)
+      if (end < pasted.length && /[\uD800-\uDBFF]/.test(pasted[end - 1])) end--
+      if (!write(c, pasted.slice(offset, end))) return done('gone', 'write-refused')
+      offset = end
+      if (offset < pasted.length) await sleep(10)
+    }
+    if (!write(c, PASTE_END)) return done('gone', 'write-refused')
+    mark('pasted')
+    await sleep(300)
+    if (c.exited) return done('gone', 'terminal-gone')
+    if (opt?.authorize && !(await opt.authorize('submit').catch(() => false))) { opt.onBlocked?.('authorization-revoked'); return done('blocked', 'authorization-denied') }
+    if (!write(c, '\r')) return done('gone', 'write-refused')
+    mark('enter-1')
+    // Slash commands get no prompt report and usually no user row: they show as sent when typed; their effect shows by itself (/clear).
+    if (/^\s*\//.test(pasted)) return done('sent', 'slash-command')
+    const took = () => promptTook(c.seen, pasted, began) || signals?.transcriptTook?.(sid, pasted, began) === true
+    for (let waited = 0; waited < 5000; waited += 100) {
+      if (took()) return done('sent', 'confirmed')
+      if (c.exited) return done('gone', 'terminal-gone')
+      await sleep(100)
+    }
+    // Claude's own word did not come in 5 s: a quiet, grey "not confirmed"; the message is never pasted or pressed again.
+    return done(took() ? 'sent' : 'unconfirmed', took() ? 'confirmed' : 'no-report')
+  }
+
   function write(c: Chat, data: string) {
     if (c.exited) return false
     try {
@@ -835,7 +935,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       c.screen.write(data)
       noteState(c, data)
       c.lastOutputAt = Date.now()
-      if (c.state === 'running') c.lastActive = c.lastOutputAt
+      if ((claudeState(c) ?? c.state) === 'running') c.lastActive = c.lastOutputAt
       answerGates(c, data)
       c.mirror?.poke()
       for (const v of c.viewers) {
@@ -1040,7 +1140,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
   const idleMs = o.idleReapMs ?? IDLE_REAP_MS
   function reapOnce(t = Date.now()) {
     for (const c of [...chats.values()]) {
-      if (c.exited || c.viewers.size || c.state === 'running' || c.state === 'question') continue
+      if (c.exited || c.viewers.size) continue
+      const st = stateNow(c)
+      if (st === 'running' || st === 'question') continue
       if (backgroundOf(c)) {
         c.lastActive = t
         continue
@@ -1176,8 +1278,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       const out: Record<string, ChatState> = {}
       for (const c of chats.values()) {
         if (c.exited) continue
-        settle(c)
-        out[c.info.sessionId] = c.state
+        out[c.info.sessionId] = stateNow(c)
       }
       return out
     },
@@ -1310,7 +1411,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
 
     asking(id) {
       const c = chats.get(id)
-      return !!c && !c.exited && blocked(c)
+      if (!c || c.exited) return false
+      // Stage 1 (o400b): in the simple layer a Claude chat is asking when its transcript has a question open, never by its screen.
+      const s = claudeState(c)
+      return s ? s === 'question' : blocked(c)
     },
 
     type(id, text, opt) {
@@ -1323,6 +1427,9 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     async deliver(id, text, opt) {
       const c = chats.get(id)
       if (!c || c.exited) return 'gone'
+      // Stage 1 (oad50): the simple send for a Claude chat, unless "Old way" is on. Nothing before it refuses on what the screen shows.
+      // Only where Agent 12's transcript reader runs: a Claude chat that is not Codex-in-Claude (c.info.execution). Everything else keeps the checked path.
+      if (simpleLayerFor(c.info, oldWay())) return simpleSend(c, text, opt)
       const refuse = (reason: DeliveryBlockReason): SendResult => { opt?.onBlocked?.(reason); return 'blocked' }
       if (blocked(c)) return refuse('menu')
       if (c.engine === 'codex') {
@@ -1503,8 +1610,7 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     activity(id) {
       const c = chats.get(id)
       if (!c || c.exited) return null
-      settle(c)
-      return { state: c.state, startedAt: c.info.startedAt, lastOutputAt: c.lastOutputAt, lastActiveAt: Math.max(c.lastActive, c.lastSeen), background: backgroundOf(c) }
+      return { state: stateNow(c), startedAt: c.info.startedAt, lastOutputAt: c.lastOutputAt, lastActiveAt: Math.max(c.lastActive, c.lastSeen), background: backgroundOf(c) }
     },
 
     press(id, data) {

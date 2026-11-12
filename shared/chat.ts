@@ -122,6 +122,28 @@ export type ChatFeedMessage =
   /** What claude is doing now, from its spinner line (null: nothing to say). */
   | { t: 'status'; status: ChatStatus | null }
 
+/**
+ * Stage 1 of the simple chat-terminal layer (order o400b, 12 Nov 2026): what a Claude chat is doing as Claude's OWN TRANSCRIPT says (agent/agentic/
+ * turns.ts), never its screen. Web's names: busy (a prompt taken, until its turn ends), asking (an AskUserQuestion or ExitPlanMode question open),
+ * idle (the turn ended: `stopped` says how, `lastAnswer` holds its last words, cut at 4,000 characters). `since`: when it became so (ISO).
+ */
+export interface ClaudeTurn {
+  state: 'busy' | 'asking' | 'idle'
+  since: string
+  stopped?: 'finished' | 'interrupted' | 'failed'
+  lastAnswer?: string
+}
+
+/**
+ * The chat WebSocket's extra message for it, for a page that asks (`/chat?session=<id>&claude=1`): on connect and at every change, only for a Claude
+ * chat read on the PC that serves the socket in the simple layer (null: no longer read). Not part of ChatFeedMessage: a page that does not ask never
+ * gets it, so its feed is exactly as before.
+ */
+export interface ChatFeedClaude {
+  t: 'claude'
+  claude: ClaudeTurn | null
+}
+
 /** GET /floors/:f/agents/:a/chat?before=<offset>&limit=<n>: an older page. */
 export interface ChatHistory {
   items: ChatItem[]

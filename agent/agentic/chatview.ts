@@ -2,6 +2,7 @@ import { closeSync, fstatSync, openSync, readSync, statSync, type Stats } from '
 import {
   CHAT_WINDOW_MESSAGES,
   type ChatAsk,
+  type ChatFeedClaude,
   type ChatFeedMessage,
   type ChatHistory,
   type ChatItem,
@@ -10,6 +11,7 @@ import {
   type ChatPreview,
   type ChatSender,
   type ChatToolItem,
+  type ClaudeTurn,
 } from '../../shared/chat.ts'
 import { splitAttachments } from '../../shared/attachments.ts'
 import type { Logger } from '../log.ts'
@@ -481,12 +483,16 @@ interface Follow {
   /** F-134: the format of its file. */
   format: RowFormat
   subs: Set<(m: ChatFeedMessage) => void>
+  /** Stage 1 (o400b): the subscribers that asked for the `claude` message (a page that knows it: ?claude=1). */
+  claudeSubs: Set<(m: ChatFeedMessage) => void>
   timer: ReturnType<typeof setInterval> | null
   /** o655f: the session claude was on when this was last looked at, when it is not the chat's own (see ChatFeedsOptions.successor). */
   successor: string | null
   /** What was last said of the screen (JSON), so a change is said once. */
   menu: string
   status: string
+  /** Stage 1 (o400b): what was last said of Claude's own state (JSON), likewise. */
+  claude: string
 }
 
 export interface ChatFeedsOptions {
@@ -509,11 +515,19 @@ export interface ChatFeedsOptions {
    * session id and a new file. The chat view follows it (a fresh `hello` on the new file); null: the chat's own file, as before.
    */
   successor?: (sessionId: string) => string | null
+  /**
+   * Stage 1 (o400b): what a Claude chat running here is doing as its own transcript says (turns.ts), for the page's `claude` message; null: nothing
+   * to say (not read here, the Old way, another engine). Sent on connect and when it changes, as `menu` and `status` are.
+   */
+  claude?: (sessionId: string) => ClaudeTurn | null
 }
 
 export interface ChatFeeds {
-  /** A page's socket for one session: `hello` now, then `add` and `patch` as the file grows. Returns detach. */
-  attach(sessionId: string, send: (m: ChatFeedMessage) => void): () => void
+  /**
+   * A page's socket for one session: `hello` now, then `add` and `patch` as the file grows. Returns detach. `claude`: this subscriber also gets the
+   * Stage 1 `claude` message (shared/chat.ts ChatFeedClaude); only a page that knows it asks, so nothing changes for any other.
+   */
+  attach(sessionId: string, send: (m: ChatFeedMessage) => void, opts?: { claude?: boolean }): () => void
   /** An older page: the `limit` messages before byte offset `before`. */
   history(sessionId: string, before: number, limit?: number): ChatHistory
   /** The last thing said in a conversation, for the list. */
@@ -522,6 +536,12 @@ export interface ChatFeeds {
 }
 
 const identOf = (st: { ino: number | bigint; birthtimeMs: number }) => `${st.ino}:${Math.round(st.birthtimeMs)}`
+
+/**
+ * Stage 1 (o400b): the `claude` message (shared/chat.ts ChatFeedClaude) goes down the same socket as the feed's own messages. It is kept out of the
+ * ChatFeedMessage union on purpose, so a page built before it type-checks and runs unchanged (its reducer passes an unknown message by); hence the cast.
+ */
+const claudeMessage = (claude: ClaudeTurn | null): ChatFeedMessage => ({ t: 'claude', claude } satisfies ChatFeedClaude) as unknown as ChatFeedMessage
 
 export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   const projectsDir = o.projectsDir ?? claudeProjectsDir()
@@ -605,9 +625,31 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
     }
   }
 
+  /** Stage 1 (o400b): Claude's own state looked at; a change is sent once (null too, once it was something), to the subscribers that asked. */
+  function pollClaude(f: Follow) {
+    if (!o.claude || !f.claudeSubs.size) return
+    try {
+      const claude = o.claude(f.sessionId)
+      const c = JSON.stringify(claude)
+      if (c === f.claude) return
+      f.claude = c
+      const m = claudeMessage(claude)
+      for (const s of f.claudeSubs) {
+        try {
+          s(m)
+        } catch {
+          // That page is gone; its detach follows.
+        }
+      }
+    } catch (e) {
+      o.log?.warn(`chat feed ${f.sessionId.slice(0, 8)}: claude state: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   function tick(f: Follow) {
     follow(f)
     pollScreen(f)
+    pollClaude(f)
   }
 
   /** One look at the file: what it grew by, as items, or a new hello when it is not the file it was. */
@@ -667,7 +709,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
   }
 
   return {
-    attach(sessionId, sendTo) {
+    attach(sessionId, sendTo, opts) {
       let f = follows.get(sessionId)
       if (f) {
         // Join up with the others exactly: catch the follow up first, then read the end up to where it is.
@@ -676,7 +718,7 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
         sendTo({ t: 'hello', sessionId, items: t?.items ?? [], before: t?.before ?? null, size: f.pos })
       } else {
         const format = formatOf(sessionId)
-        f = { sessionId, file: null, ident: '', pos: 0, conv: format.make(), format, subs: new Set(), timer: null, successor: o.successor?.(sessionId) ?? null, menu: 'null', status: 'null' }
+        f = { sessionId, file: null, ident: '', pos: 0, conv: format.make(), format, subs: new Set(), claudeSubs: new Set(), timer: null, successor: o.successor?.(sessionId) ?? null, menu: 'null', status: 'null', claude: 'null' }
         locate(f)
         try {
           sendTo(hello(f))
@@ -694,12 +736,24 @@ export function createChatFeeds(o: ChatFeedsOptions = {}): ChatFeeds {
         if (menu) sendTo({ t: 'menu', menu })
         if (status) sendTo({ t: 'status', status })
       }
+      // Stage 1 (o400b): Claude's own state, for a page that asked for it and has just joined.
+      if (o.claude && opts?.claude) {
+        try {
+          const claude = o.claude(sessionId)
+          f.claude = JSON.stringify(claude)
+          if (claude) sendTo(claudeMessage(claude))
+        } catch {
+          // Said on the next tick, if at all.
+        }
+      }
       const watch = f
       watch.subs.add(sendTo)
+      if (opts?.claude) watch.claudeSubs.add(sendTo)
       watch.timer ??= setInterval(() => tick(watch), pollMs)
       watch.timer.unref()
       return () => {
         watch.subs.delete(sendTo)
+        watch.claudeSubs.delete(sendTo)
         if (watch.subs.size) return
         if (watch.timer) clearInterval(watch.timer)
         watch.timer = null

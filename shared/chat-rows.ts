@@ -126,8 +126,12 @@ export function inTimeOrder(items: ChatItem[]): ChatItem[] {
 /** Whether two instants are on the same calendar day, here. */
 const sameDay = (a: string, b: string) => new Date(a).toDateString() === new Date(b).toDateString()
 
-export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = []): ChatRow[] {
-  const items = inTimeOrder(feedItems)
+/**
+ * ocbbf (Stage 1, the simple layer): `keepFeedOrder` shows the feed in Claude's own order (its file order) and never moves a message by its typed time:
+ * Claude's own report says when a message was taken, and that is the place it has in the conversation.
+ */
+export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = [], opts: { keepFeedOrder?: boolean } = {}): ChatRow[] {
+  const items = opts.keepFeedOrder ? feedItems : inTimeOrder(feedItems)
   const { matched } = reconcile(items, pending)
   // A message sent from here and not echoed yet waits where it was sent: right after the last item the page had when it was sent, so
   // what arrives afterwards lands BELOW it, and its echo (stamped with the same moment) takes that very place. When the page cannot tell

@@ -167,12 +167,32 @@ export function scanMessages(msgs: { role: string; text: string }[], id: string,
 
 export type ChatNow = 'running' | 'question' | 'idle' | undefined
 
+/**
+ * Stage 1 (order o400b, Sync Research plan rule 4): an order's turn as its target's own transcript tells it (turns.ts createOrderWatch). `entered`: its
+ * message is in the conversation (its user row, or a queued_command when Claude took it in mid-turn); `queued`: it waits in Claude's queue; `ended`:
+ * the first turn end after it entered is written (turn_duration, or the interrupt row after Esc), and `answer` is the last assistant text before it.
+ */
+export interface OrderTurn {
+  entered: boolean
+  queued: boolean
+  ended: boolean
+  answer: string
+  how?: 'finished' | 'interrupted' | 'failed'
+}
+
 export interface OrderDeps {
   now(): number
   /** What a chat is doing now: undefined when it isn't running anywhere. */
   stateOf(sessionId: string): ChatNow
   /** The target's transcript, for this order. */
   scan(sessionId: string, orderId: string): Scan
+  /**
+   * Stage 1 (o400b): the order's turn in its target's Claude transcript (rule 4), or null when there is none here or "Old way" is on: then the old
+   * rule (the state reads idle twice, the order's own user row, the text after it). `since`: when the order was opened (ms).
+   */
+  turnOf?(sessionId: string, orderId: string, since: number): OrderTurn | null
+  /** Stage 1: an order is closed; whatever was kept to follow it goes. */
+  forget?(orderId: string): void
   /**
    * Types `text` into the Assistant's chat; false when nothing was typed (that chat isn't running, or a question or unsent text in its box).
    * True only says it was typed: whether it was TAKEN is `taken` (below). For a hand-off (`from` is FAST_FROM) it is the fast Assistant's
@@ -262,6 +282,7 @@ export function createOrders(deps: OrderDeps): Orders {
     orders = orders.filter(x => x.id !== o.id)
     idle.delete(o.id)
     lastScan.delete(o.id)
+    deps.forget?.(o.id)
     if (warn) deps.log?.warn(line)
     else deps.log?.info(line)
     save()
@@ -320,21 +341,22 @@ export function createOrders(deps: OrderDeps): Orders {
     if (o.tries === 1) deps.log?.info(`order ${o.id}: its reply waits: the Assistant's chat cannot be typed into now (not running, a question, or text in its box)`)
     if (deps.now() - o.at > GIVE_UP_MS + KEEP_REPLY_MS) {
       orders = orders.filter(x => x.id !== o.id)
+      deps.forget?.(o.id)
       save()
     }
   }
 
   /** F-087: the progress line a hand-off is due (10 s, 60 s, then every 5 minutes), once. */
-  function progressDue(o: Order, st: ChatNow, age: number) {
+  function progressDue(o: Order, st: ChatNow, age: number, turn: OrderTurn | null = null) {
     if (o.kind !== 'handoff' || !deps.progress) return
     const n = o.progressSent ?? 0
     const due = n === 0 ? 10_000 : n === 1 ? 60_000 : 60_000 + (n - 1) * 5 * 60_000
     if (age < due) return
     o.progressSent = n + 1
-    // Has the chat taken the message up? Looked at only when a line is due.
+    // Has the chat taken the message up? Looked at only when a line is due (Stage 1: its transcript has it, in the conversation or in Claude's queue).
     let started = false
     try {
-      started = deps.scan(o.to.sessionId, o.id).started
+      started = turn ? turn.entered || turn.queued : deps.scan(o.to.sessionId, o.id).started
     } catch {
       started = false
     }
@@ -344,12 +366,54 @@ export function createOrders(deps: OrderDeps): Orders {
     save()
   }
 
+  /** Stage 1: the reply's words from the order's turn: its last words, and how it stopped when that was not a plain end. */
+  const turnAnswer = (t: OrderTurn) =>
+    t.how === 'interrupted'
+      ? t.answer ? `${t.answer}\n\n(Its turn was stopped with Esc here.)` : '(Its turn was stopped with Esc before it wrote an answer; see its conversation.)'
+      : t.how === 'failed' ? `(Its turn ended with an error.) ${t.answer}`.trim() : t.answer
+
+  /**
+   * Stage 1 (o400b, rule 4): the order is answered by Claude's own transcript: the last assistant text before the first turn end after the order
+   * entered the conversation (its own row, or taken in mid-turn). Nothing is decided by the state reading idle: a turn that goes on for an hour is
+   * waited for, and a reply is never "(no written answer)" while the agent is still working.
+   */
+  function stepByTurn(o: Order, t: OrderTurn, st: ChatNow, age: number) {
+    if (t.ended) {
+      o.queued = false
+      return finish(o, turnAnswer(t))
+    }
+    if (t.entered || t.queued) {
+      // Taken (or waiting in Claude's own queue, which starts it next): answered when its turn ends.
+      o.queued = false
+      idle.set(o.id, 0)
+      if (age > GIVE_UP_MS) return finish(o, `Still working on this after ${Math.round(age / 3_600_000)} h; no answer yet.`)
+      return
+    }
+    // Not in its transcript at all yet (a paste is written there within about 0.3 s).
+    if (st === undefined) return finish(o, `${o.to.agent}'s chat stopped before it took this order.`)
+    if (st === 'running' || st === 'question') {
+      idle.set(o.id, 0)
+      return
+    }
+    if (age > NOT_TAKEN_MS) {
+      if (o.kind === 'handoff') deps.progress?.({ orderId: o.id, phase: 'not-taken', sec: Math.round(age / 1000), ...(o.origin ? { origin: o.origin } : {}) })
+      return finish(o, `${o.to.agent}'s chat did not take this order (it is waiting and has not started on it). It may need a nudge.`)
+    }
+  }
+
   async function step(o: Order) {
     // A reply that is made and waiting for the Assistant's chat.
     if (o.pending) return finish(o, '')
     const st = deps.stateOf(o.to.sessionId)
     const age = deps.now() - o.at
-    progressDue(o, st, age)
+    let turn: OrderTurn | null = null
+    try {
+      turn = deps.turnOf?.(o.to.sessionId, o.id, o.at) ?? null
+    } catch {
+      turn = null
+    }
+    progressDue(o, st, age, turn)
+    if (turn) return stepByTurn(o, turn, st, age)
     if (st === 'running' || st === 'question') {
       idle.set(o.id, 0)
       if (age > GIVE_UP_MS) return finish(o, `Still working on this after ${Math.round(age / 3_600_000)} h; no answer yet.`)
