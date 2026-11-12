@@ -2202,6 +2202,25 @@ Tests: `whatsapp/engine.test.ts` (24: the mapping, linking with and without `rea
   pushes the event, answers what it did (version, size, phones asked) or why nothing was offered. The hub does not know which version a phone runs,
   so it does not compare; the phone acts only when its setting is on, the build is newer than its own, and it is unlocked.
 
+## F-206 (order o5dc6): the Phone app page's downloads
+
+Files: `agent/agentic/phone-apps.ts` (+ test), `shared/phone-apps.ts` (+ test), the mount in `agent/main.ts` (every PC); the page
+`src/pages/PhoneApp.tsx` at `/phone-app`, the last entry of `src/app/nav.ts`, the owner's in `shared/chat-scope.ts`.
+
+- **Who.** Every route wants a page signed in as the owner through CRM (`requireCrmHuman(auth, …, true)`), on top of the API's own gate
+  (token, Origin, a mount for the owner). Nobody signed in, a program on the PC or an ended session → 401 `sign-in`; someone else → 403
+  `admin-only`; a chat's tool key → 403 `not-yours`.
+- **Shubham Agentic.** `C:\sac\out\agentic` (`SAD_AGENTIC_APK_DIR` overrides). `mobile/scripts/agentic.mjs build` copies an APK there and
+  writes its record `agentic-<versionName>-debug.build-info.json` (`app`, `versionName`, `code`, `type`, `apkSha256`, `bytes`, `apk`,
+  `builtAt`) only after verify passed. The newest record, by the build number in its name, is the build offered. When that record is not
+  usable, or its file is missing, not its size or not its sha256, nothing is offered (the page says why) and nothing older is offered instead.
+- **Hey Chris.** The build `C:\sac\out\offer.json` offers to Chris's Update button (F-085's rule; `SAD_APP_OFFER` overrides).
+- **Routes.** `GET /agent-api/phone-apps/` → `{apps:[{id:'agentic'|'chris', name, build:{versionName, versionCode, bytes, sha256, at, file}|null,
+  why, download}]}`. `GET|HEAD /agent-api/phone-apps/<id>/<versionCode>.apk` → the file (`application/vnd.android.package-archive`,
+  `Content-Disposition: attachment` with its file name, `Cache-Control: no-store`, one `Range`). A number that is not the build offered now
+  → 409 (the page shows a build, and the file is that build). Shubham Agentic's file is read whole, its sha256 checked against the record,
+  and exactly those bytes are sent (a mismatch → 409, nothing sent). The log has the version and the bytes only.
+
 ## Firewall script (scripts/firewall-hub.ps1)
 
 - Admin required: it checks and says so if it is not elevated.

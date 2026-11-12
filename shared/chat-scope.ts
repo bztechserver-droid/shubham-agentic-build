@@ -98,7 +98,8 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
  * answers everyone else 403 {code:'admin-only'} on every route they use. Everyone else keeps Home, Features, Themes, Agents, Chats and Settings.
  */
 // Order o5007: the old-app reader (OLD_ROUTE) is the owner's too: its socket and its setting answer everyone else 403.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+// Order o5dc6: the Phone app page (the APKs to download) is the owner's: its routes want the owner signed in.
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

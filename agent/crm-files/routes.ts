@@ -90,6 +90,12 @@ const METHODS: Record<string, string[]> = {
   'removed/dismiss': ['POST'],
   ignore: ['GET', 'POST'],
   'spool/retry': ['POST'],
+  // ocbbf: Keep on this PC (pins-host.ts): the view, a pin, an unpin, the limit, and the copies kept for a removed project dropped.
+  pins: ['GET'],
+  'pins/pin': ['POST'],
+  'pins/unpin': ['POST'],
+  'pins/settings': ['POST'],
+  'pins/drop-kept': ['POST'],
 }
 
 /** od0b1: the uploads in parts (there only when the agent holds them: uploads.ts). */
@@ -140,6 +146,12 @@ async function uploadRoute(up: CrmUploads, name: string, req: IncomingMessage, r
       await up.clear(str((await readJson(req)).id, 'id'))
       return send(res, 200, { ok: true })
   }
+}
+
+/** ocbbf: Keep on this PC; a refusal (not set up here) says so in plain words. */
+function keepOf(svc: CrmFilesService) {
+  if (!svc.keep) throw new CrmFilesError(400, 'unsupported', CRM_FILES_REASONS.unsupported)
+  return svc.keep
 }
 
 /** S6: the projects whose access was removed, with how many saves are still kept for each. */
@@ -267,6 +279,33 @@ export function crmFilesMount(svc: CrmFilesService, uploads?: CrmUploads): ApiMo
                 svc.ignore.setDefaults(b.defaults)
               }
               return send(res, 200, { defaults: svc.ignore.defaults(), keptHere: svc.spool?.keptHere() ?? 0 })
+            }
+            case 'pins':
+              return send(res, 200, keepOf(svc).view())
+            case 'pins/pin': {
+              const b = await readJson(req)
+              const id = str(b.id, 'id')
+              const kind = b.kind === 'folder' ? 'folder' : b.kind === 'file' ? 'file' : null
+              if (!kind || !/^(file|proj|grp):/.test(id)) throw new CrmFilesError(400, 'failed', 'Only a file, a folder or a project can be kept on this PC.')
+              return send(res, 200, await keepOf(svc).pin(id, kind))
+            }
+            case 'pins/unpin': {
+              const b = await readJson(req)
+              return send(res, 200, await keepOf(svc).unpin(str(b.id, 'id')))
+            }
+            case 'pins/settings': {
+              const b = await readJson(req)
+              if (typeof b.quotaMb !== 'number') throw new CrmFilesError(400, 'failed', 'quotaMb is needed (a whole number of MB).')
+              try {
+                return send(res, 200, await keepOf(svc).setQuota(b.quotaMb))
+              } catch (e) {
+                throw new CrmFilesError(400, 'failed', e instanceof Error ? e.message : String(e))
+              }
+            }
+            case 'pins/drop-kept': {
+              const b = await readJson(req)
+              const dropped = await keepOf(svc).dropKept(str(b.projectId, 'projectId'))
+              return send(res, 200, { ...keepOf(svc).view(), dropped })
             }
             case 'spool':
               return send(res, 200, spoolOf(svc))

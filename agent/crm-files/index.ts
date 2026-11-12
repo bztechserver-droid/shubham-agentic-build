@@ -9,6 +9,7 @@ import { createCrmFiles, downloadViaFile, type CrmFilesService, type MountDriver
 import { CRM_FILES_MAX_UPLOAD } from '../../shared/crm-files.ts'
 import { UPLOAD_SETTINGS_FILE } from './upload-settings.ts'
 import { createCrmUploads, type CrmUploads } from './uploads.ts'
+import { createPinsHost, type PinsHost } from './pins-host.ts'
 
 // F-126: the CRM files module of the agent: the tree and its changes (service.ts), the page's routes (routes.ts), and the mount of this PC. On Windows the mount is crm-fs.exe through
 // WinFsp (mount-win.ts); on Linux the Linux agent brings its own driver (a loopback WebDAV that GNOME's gvfs mounts) and passes it in as `mountDriver`; anywhere else it says it is not
@@ -91,8 +92,12 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
   // oa2f8: the size limit is the uploads' setting (the CRM's own where it said it); the one-request upload and the drive's saves follow it too.
   let uploadsRef: CrmUploads | null = null
   // o813f: a file in Google Drive is downloaded through Google's Drive API; the file crm-download-via-crm.on in this folder sends every download through the CRM's own (the old way).
-  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD, downloadVia: downloadViaFile(o.dir) })
+  // ocbbf: "Keep on this PC" (pins-host.ts): its copies live in <state>/crm-pins; it is made after the service, which reaches it through this getter.
+  let pinsRef: PinsHost | null = null
+  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD, downloadVia: downloadViaFile(o.dir), pins: () => pinsRef })
   serviceRef = service
+  const pins = createPinsHost({ dir: path.join(o.dir, 'crm-pins'), tree: () => service.pinTree(), fetchBytes: (id, start, length) => service.fileBytes(id, start, length), log: o.log })
+  pinsRef = pins
   // oa2f8: the waiting folder is a setting (crm-uploads.json beside the default one); it may not be inside the app's own folder (an update replaces it).
   const uploads = createCrmUploads({ dir: path.join(o.dir, 'crm-uploads'), settingsFile: path.join(o.dir, UPLOAD_SETTINGS_FILE), notInside: [o.root], backend: service.uploadBackend, log: o.log })
   uploadsRef = uploads
@@ -104,6 +109,8 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
       // The uploads that were going on when the agent stopped carry on, side by side with the drive coming back (neither waits for, or stops, the other).
       // They start in a test run too (their folder is the test's own); only the drive keeps S9a's rule of never mounting by itself there.
       const going = uploads.start().catch(e => o.log?.warn(`uploads: the pending folder could not be read (${e instanceof Error ? e.message : String(e)})`))
+      // ocbbf: the copies kept on this PC carry on (their store is read; the downloads go on by themselves).
+      void pins.start().catch(e => o.log?.warn(`pins: the copies kept on this PC could not be read (${e instanceof Error ? e.message : String(e)})`))
       try {
         if (o.autoStart === false || (o.autoStart === undefined && process.env.NODE_TEST_CONTEXT)) return
         await (win ?? o.mountDriver)?.resume?.()
@@ -117,6 +124,7 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
       const driveClosing = (async () => (win ?? o.mountDriver)?.close?.())()
       driveClosing.catch(() => undefined)
       await uploads.close().catch(() => undefined)
+      await pins.close().catch(() => undefined)
       await service.spool?.close().catch(() => undefined)
       await driveClosing
     },

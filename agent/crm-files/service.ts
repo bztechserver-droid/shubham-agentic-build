@@ -23,6 +23,9 @@ import { open as openFile } from 'node:fs/promises'
 import { createIgnoreRules, type IgnoreRules } from './ignore-rules.ts'
 import { createRemovedIndex, type RemovedProject } from './removed.ts'
 import { createSpool, type Spool } from './spool.ts'
+import { versionToken, type PinItem } from './offline-pins.ts'
+import type { PinsHost } from './pins-host.ts'
+import type { CrmPinMark } from '../../shared/crm-files.ts'
 
 // F-126: the CRM's files as a tree, for the page, for the Linux mount (in process) and for the Windows host's bridge. The CRM's own RECORDS decide what is a file and where it is
 // (files, file_groups, file_versions), not the Google Drive folders. The tree is the one the old agentic-claude-manager drive built:
@@ -98,6 +101,8 @@ export interface CrmFilesOptions {
    * (index.ts: `downloadViaFile`, the file DOWNLOAD_VIA_CRM_FILE in the agent's state folder).
    */
   downloadVia?: () => 'drive' | 'crm'
+  /** ocbbf: "Keep on this PC" (pins-host.ts). A getter: the host is made after the service. Left out: nothing is kept, and no node has a mark. */
+  pins?: () => PinsHost | null
 }
 
 /** o813f: this file in the agent's state folder sends every download through the CRM's own (the way before o813f; a file over 100 MB fails there). */
@@ -228,6 +233,10 @@ export interface CrmFilesService {
   spool: Spool | null
   /** S6: the projects whose access was removed (null when there is no spool). */
   lostAccess: { list(): RemovedProject[]; dismiss(id: string): boolean } | null
+  /** ocbbf: "Keep on this PC" (null when this agent keeps none). */
+  readonly keep: PinsHost | null
+  /** ocbbf: the whole accessible tree for the copies: every folder (projects, groups, Uncategorised) and every file, with its version and size. */
+  pinTree(): Promise<PinItem[]>
   /** S7: the .driveignore rules (null when there is no spool). `defaults`: the built-in list of editor and system files (~$*, *.tmp, Thumbs.db, desktop.ini, .DS_Store, node_modules, *.crdownload) is on (the default). */
   ignore: { defaults(): boolean; setDefaults(on: boolean): void; rules: IgnoreRules } | null
   upload(parent: string, name: string, type: string, stream: Readable, size: number): Promise<CrmNode>
@@ -474,14 +483,78 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
 
   const ROOT: CrmNode = { id: 'root', kind: 'root', name: 'CRM files', parentId: null, isFolder: true, rights: NO }
 
+  // ocbbf (Web, 12 Nov, v2): about half the CRM's files have no size on record (an old bulk import: fileSize null). Their size is read as Google Drive's METADATA
+  // (files.get fields=size, with the CRM's own Drive token, as the >100 MB download already does), never as bytes: the CRM's /raw ignores a Range and fetches the
+  // whole file first (sam-crm-be fileController serveFileRaw). Lazy: only for the folder being listed, at most 3 asks at once, cached per file id and fileKey,
+  // a failed ask is not repeated for 10 minutes. No Drive link, no token, or no answer: the size stays unknown (no size is shown, never 0 bytes from us).
+  const driveSizes = new Map<string, { key: string; size: number }>()
+  const driveSizeMiss = new Map<string, { key: string; at: number }>()
+  const SIZE_AT_ONCE = 3
+  const SIZE_MISS_MS = 10 * 60 * 1000
+  let sizeSlots = 0
+  const sizeWaiting: (() => void)[] = []
+  const sizing = new Map<string, Promise<void>>()
+  const sizeOf = (f: RawFile): number | null => {
+    if (f.fileSize !== null) return f.fileSize
+    const hit = driveSizes.get(f.id)
+    return hit && hit.key === f.fileKey ? hit.size : null
+  }
+  /** Google's metadata for one Drive file: its size, or null. Only fields=size is asked (never alt=media: no bytes are read). */
+  async function driveSizeOf(driveId: string): Promise<number | null> {
+    if (!tokenMayGoTo(`${driveApi}/`)) return null
+    const t = await driveToken()
+    const res = await gfetch(`${driveApi}/files/${encodeURIComponent(driveId)}?fields=size&supportsAllDrives=true`, { headers: { authorization: `Bearer ${t.accessToken}` } })
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined)
+      return null
+    }
+    const j = (await res.json().catch(() => null)) as { size?: unknown } | null
+    const size = Number(j?.size)
+    return j !== null && j.size !== undefined && Number.isSafeInteger(size) && size >= 0 ? size : null
+  }
+  function sizeAsk(f: RawFile): Promise<void> {
+    const running = sizing.get(f.id)
+    if (running) return running
+    const miss = driveSizeMiss.get(f.id)
+    if (miss && miss.key === f.fileKey && now() - miss.at < SIZE_MISS_MS) return Promise.resolve()
+    const driveId = driveIdOf(f.fileUrl)
+    if (!driveId) return Promise.resolve()
+    const run = (async () => {
+      while (sizeSlots >= SIZE_AT_ONCE) await new Promise<void>(r => sizeWaiting.push(r))
+      sizeSlots++
+      try {
+        const size = await driveSizeOf(driveId)
+        if (size === null) driveSizeMiss.set(f.id, { key: f.fileKey, at: now() })
+        else driveSizes.set(f.id, { key: f.fileKey, size })
+      } catch {
+        driveSizeMiss.set(f.id, { key: f.fileKey, at: now() })
+      } finally {
+        sizeSlots--
+        sizeWaiting.shift()?.()
+      }
+    })().finally(() => sizing.delete(f.id))
+    sizing.set(f.id, run)
+    return run
+  }
+  /** Asks for the sizes of the files of one folder that have none on record: waits for them at most `budgetMs`; the rest go on in the background (the next listing has them). */
+  async function learnSizes(files: RawFile[], budgetMs = 1500): Promise<void> {
+    const todo = files.filter(f => sizeOf(f) === null)
+    if (todo.length === 0) return
+    const all = Promise.all(todo.map(f => sizeAsk(f)))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([all, new Promise<void>(r => { timer = setTimeout(r, budgetMs) })])
+    clearTimeout(timer)
+  }
+
   function fileNode(f: RawFile, parentId: string, writable: boolean, mayUp: boolean): CrmNode {
+    const size = sizeOf(f)
     return {
       id: fileId(f.id),
       kind: 'file',
       name: f.fileName,
       parentId,
       isFolder: false,
-      ...(f.fileSize !== null ? { size: f.fileSize } : {}),
+      ...(size !== null ? { size } : {}),
       ...(f.fileType ? { type: f.fileType } : {}),
       ...(f.createdAt ? { createdAt: f.createdAt } : {}),
       ...((f.updatedAt ?? f.createdAt) ? { modifiedAt: (f.updatedAt ?? f.createdAt) as string } : {}),
@@ -540,19 +613,23 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   const readmeNode = (p: RemovedProject): CrmNode => ({ id: `gone:readme:${p.id}`, kind: 'file', name: 'README.txt', parentId: `gone:${p.id}`, isFolder: false, size: Buffer.byteLength(readmeText(p.name)), type: 'text/plain', createdAt: goneIso(p.since), modifiedAt: goneIso(p.since), versions: 1, rights: NO })
   const keptNode = (e: CrmSpoolEntry, pid: string): CrmNode => ({ id: `kept:${e.id}`, kind: 'file', name: e.name, parentId: `gone:${pid}`, isFolder: false, size: e.size, type: 'application/octet-stream', createdAt: e.since, modifiedAt: e.since, versions: 1, rights: NO })
 
+  // ocbbf: the copies kept on this PC for a project whose access was removed (pins-host.ts), listed beside its saves; read in place from the copy.
+  const keptPinsFor = (pid: string): { id: string; name: string; cachePath: string; size: number }[] => o.pins?.()?.keptFor(pid) ?? []
+  const keptPinNode = (k: { id: string; name: string; size: number }, pid: string, since: number): CrmNode => ({ id: `kept:pin:${k.id}`, kind: 'file', name: k.name, parentId: `gone:${pid}`, isFolder: false, size: k.size, type: 'application/octet-stream', createdAt: goneIso(since), modifiedAt: goneIso(since), versions: 1, rights: NO })
+
   async function goneChildren(id: string): Promise<{ node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }> {
     const gone = removedIndex?.list() ?? []
     const crumbs = [{ id: 'root', name: ROOT.name }, { id: GONE_ROOT, name: GONE_NAME }]
     if (id === GONE_ROOT) {
       if (gone.length === 0) throw new CrmFilesError(404, 'notfound', 'There is no such folder.')
-      const kids = gone.map((p): CrmNode => ({ id: `gone:${p.id}`, kind: 'project', name: p.name, parentId: GONE_ROOT, isFolder: true, childCount: 1 + keptFor(p.id).length, createdAt: goneIso(p.since), rights: NO }))
+      const kids = gone.map((p): CrmNode => ({ id: `gone:${p.id}`, kind: 'project', name: p.name, parentId: GONE_ROOT, isFolder: true, childCount: 1 + keptFor(p.id).length + keptPinsFor(p.id).length, createdAt: goneIso(p.since), rights: NO }))
       return { node: goneRootNode(kids.length), children: kids.sort(byName), path: crumbs.slice(0, 2) }
     }
     if (id.startsWith('gone:readme:') || id.startsWith('kept:')) throw new CrmFilesError(400, 'failed', 'That is a file, not a folder.')
     const pid = id.slice('gone:'.length)
     const p = gone.find(x => x.id === pid)
     if (!p) throw new CrmFilesError(404, 'notfound', 'That project is not in the Access removed folder.')
-    const kids = [readmeNode(p), ...keptFor(pid).map(e => keptNode(e, pid))]
+    const kids = [readmeNode(p), ...keptFor(pid).map(e => keptNode(e, pid)), ...keptPinsFor(pid).map(k => keptPinNode(k, pid, p.since))]
     const node: CrmNode = { id, kind: 'project', name: p.name, parentId: GONE_ROOT, isFolder: true, childCount: kids.length, createdAt: goneIso(p.since), rights: NO }
     return { node, children: kids.sort(byName), path: [...crumbs, { id, name: p.name }] }
   }
@@ -563,6 +640,13 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       const p = (removedIndex?.list() ?? []).find(x => x.id === id.slice('gone:readme:'.length))
       return p ? { node: readmeNode(p), bytes: Buffer.from(readmeText(p.name), 'utf8') } : null
     }
+    if (id.startsWith('kept:pin:')) {
+      for (const p of removedIndex?.list() ?? []) {
+        const k = keptPinsFor(p.id).find(x => `kept:pin:${x.id}` === id)
+        if (k) return { node: keptPinNode(k, p.id, p.since), path: k.cachePath }
+      }
+      return null
+    }
     if (id.startsWith('kept:')) {
       for (const p of removedIndex?.list() ?? []) {
         const e = keptFor(p.id).find(x => `kept:${x.id}` === id)
@@ -571,6 +655,53 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       }
     }
     return null
+  }
+
+  // ocbbf: the folders a node sits in, from its parent up (a group, then its groups, then the project); what "Keep on this PC" inherits from.
+  async function chainOf(parentId: string | null): Promise<string[]> {
+    const out: string[] = []
+    let cur: string | null = parentId
+    while (cur && cur.startsWith('grp:')) {
+      const [, pid, gid] = cur.split(':')
+      out.push(cur)
+      const g = (await groupsOf(pid)).find(x => x.id === gid)
+      cur = g ? (g.parentId ? grpId(pid, g.parentId) : projId(pid)) : null
+    }
+    if (cur && cur.startsWith('proj:')) out.push(cur)
+    return out
+  }
+
+  /** ocbbf: the "Keep on this PC" mark of each project, group and file in a listing (none for categories, the Access removed folder and the drive's own rows). */
+  async function withPins(r: { node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }) {
+    const keep = o.pins?.() ?? null
+    if (!keep) return r
+    const chains = new Map<string, string[]>()
+    for (const n of [r.node, ...r.children]) {
+      if (!n.parentId || !/^(file|proj|grp):/.test(n.id)) continue
+      if (!chains.has(n.parentId)) chains.set(n.parentId, await chainOf(n.parentId))
+      const mark: CrmPinMark | null = keep.markOf(n.id, chains.get(n.parentId)!)
+      if (mark) n.pin = mark
+    }
+    return r
+  }
+
+  /** ocbbf: the whole accessible tree for the copies (every project, group and Uncategorised as a folder; every file with its version and size). */
+  async function pinTree(): Promise<PinItem[]> {
+    const s = await load()
+    const items: PinItem[] = [{ id: UNCATEGORISED, kind: 'folder', parentId: null, name: 'Uncategorised' }]
+    const gmap = new Map<string, RawGroup[]>()
+    for (const p of s.projects.values()) {
+      items.push({ id: projId(p.id), kind: 'folder', parentId: null, name: p.name })
+      const groups = await groupsOf(p.id)
+      gmap.set(p.id, groups)
+      for (const g of groups) items.push({ id: grpId(p.id, g.id), kind: 'folder', parentId: g.parentId ? grpId(p.id, g.parentId) : projId(p.id), name: g.name })
+    }
+    for (const f of s.files) {
+      const size = sizeOf(f)
+      const modifiedAt = f.updatedAt ?? f.createdAt
+      items.push({ id: fileId(f.id), kind: 'file', parentId: placeOf(f, gmap).parent, name: f.fileName, size, version: versionToken({ fileKey: f.fileKey, modifiedAt, size, versions: f.versions }) })
+    }
+    return items
   }
 
   async function childrenOf(id: string): Promise<{ node: CrmNode; children: CrmNode[]; path: { id: string; name: string }[] }> {
@@ -616,12 +747,14 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       const mine = s.files.filter(f => f.folder === tag)
       if (mine.length === 0 && !s.files.some(f => f.folder === tag)) throw new CrmFilesError(404, 'notfound', 'There is no such folder.')
       const node: CrmNode = { id, kind: 'category', name: tag, parentId: 'root', isFolder: true, childCount: mine.length, rights: NO }
+      await learnSizes(mine)
       return { node, children: mine.map(f => fileNode(f, id, false, false)).sort(byName), path: [...crumbs, { id, name: tag }] }
     }
 
     if (kind === 'proj' && rest.join(':') === 'none') {
       const mine = s.files.filter(f => f.folder === 'projects' && !pidOf(f))
       const node: CrmNode = { id: UNCATEGORISED, kind: 'project', name: 'Uncategorised', parentId: catId('projects'), isFolder: true, childCount: mine.length, rights: NO }
+      await learnSizes(mine)
       return { node, children: mine.map(f => fileNode(f, UNCATEGORISED, false, false)).sort(byName), path: [...crumbs, { id: catId('projects'), name: 'projects' }, { id, name: 'Uncategorised' }] }
     }
 
@@ -637,6 +770,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       const kidsGroups = groups.filter(g => (gid ? g.parentId === gid : !g.parentId || !groups.some(x => x.id === g.parentId)))
       const filesHere = s.files.filter(f => f.folder === 'projects' && pidOf(f) === pid && placeOf(f, gmap).parent === id)
       const countIn = (g: RawGroup) => s.files.filter(f => pidOf(f) === pid && f.groupId === g.id).length + groups.filter(x => x.parentId === g.id).length
+      await learnSizes(filesHere)
       const kids = [
         ...kidsGroups.map(g => groupNode(p, g, id, countIn(g), mayUp)),
         ...filesHere.map(f => fileNode(f, id, p.writable, mayUp)),
@@ -1261,6 +1395,10 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     mount,
     spool,
     lostAccess: removedIndex ? { list: () => removedIndex.list(), dismiss: id => removedIndex.dismiss(id) } : null,
+    get keep() {
+      return o.pins?.() ?? null
+    },
+    pinTree,
     ignore: spool
       ? {
           rules,
@@ -1311,7 +1449,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     },
 
     async children(id) {
-      return childrenOf(id)
+      return withPins(await childrenOf(id))
     },
 
     node: nodeOf,
@@ -1367,7 +1505,16 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
           await fh.close()
         }
       }
-      const { f } = await findFile(id)
+      // ocbbf: when the CRM cannot be asked, a copy kept on this PC (finished, whatever its version) is read instead; a refusal of the CRM is still a refusal.
+      const fromKeptCopy = async (): Promise<Buffer | null> => (await o.pins?.()?.readOffline(id, start, length)) ?? null
+      let f: RawFile
+      try {
+        ;({ f } = await findFile(id))
+      } catch (e) {
+        const kept = await fromKeptCopy()
+        if (kept) return kept
+        throw e
+      }
       // o813f: a file over 100 MB that the CRM keeps in Google Drive: one ranged request to Google's Drive API, once the CRM has said yes for this very file.
       const driveId = length > 0 ? apiDriveId(f) : null
       if (driveId) {
@@ -1379,6 +1526,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       try {
         r = await client.request('GET', `org/files/${encodeURIComponent(f.id)}/raw`, { headers: { range: `bytes=${start}-${start + length - 1}` } })
       } catch (e) {
+        const kept = await fromKeptCopy()
+        if (kept) return kept
         if ((e as Error)?.name === 'CrmNotSignedIn') throw new CrmFilesError(409, 'crm-signin', CRM_FILES_REASONS.signedOut)
         throw new CrmFilesError(502, 'crm-down', CRM_FILES_REASONS.crmDown)
       }

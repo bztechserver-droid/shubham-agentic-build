@@ -7,6 +7,7 @@ import { duplexPair, type Duplex } from 'node:stream'
 import { AGENT_API_PREFIX, type AgentSettings, type AgentState, type DeviceInfo, type HostOs, type JoinState, type ScreenVia } from '../shared/agent-api.ts'
 import { agenticOff, createAgentic } from './agentic/index.ts'
 import { createMcpCatalogMount } from './agentic/mcp-catalog.ts'
+import { createPhoneAppsMount } from './agentic/phone-apps.ts'
 import type { LinkPeer } from './agentic/roam.ts'
 import { findTranscript } from './agentic/transcripts.ts'
 import { apiError, startApi, type Api, type ApiActions, type ApiMount } from './api.ts'
@@ -965,7 +966,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
   }
 
   try {
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
+    // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()

@@ -101,6 +101,35 @@ export interface CrmNode {
   /** Folders: how many children (files and folders). */
   childCount?: number
   rights: CrmRights
+  /** ocbbf: kept on this PC. `via` is 'self' (pinned here) or 'folder' (its folder or project is pinned); `ready` is whether a finished copy is on this PC now (files). Left out: not kept. */
+  pin?: CrmPinMark
+}
+
+/** ocbbf: "Keep on this PC" on one node (see CrmNode.pin). */
+export interface CrmPinMark {
+  via: 'self' | 'folder'
+  ready: boolean
+}
+
+/** ocbbf: what the page shows about what is kept on this PC: the usage, the limit, what waits, and what was kept after an access was removed. */
+export interface CrmPinStatus {
+  pinnedFiles: number
+  pinnedBytes: number
+  cacheBytes: number
+  quotaBytes: number
+  pinnedOverQuota: boolean
+  queued: number
+  waitingRetry: boolean
+  waitingForSpace: number
+  sizeUnknown: number
+  heldAfterRemoval: number
+}
+
+/** ocbbf: the pins view: the status, the limit in MB, the explicit pins (with names), and whether the cache folder is the default one. */
+export interface CrmPins {
+  status: CrmPinStatus
+  quotaMb: number
+  pins: { id: string; kind: 'file' | 'folder'; name: string; since: number }[]
 }
 
 export interface CrmChildren {
