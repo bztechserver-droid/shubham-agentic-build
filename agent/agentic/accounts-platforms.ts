@@ -38,7 +38,7 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
             order by p.is_disabled, lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
           const links: Row[] = await tx`
             select pc.platform_id, pc.parts, c.id as codebase_id, c.name as codebase_name
-            from sad.account_platform_codebase pc left join sad.account_codebase c on c.source_id = pc.codebase_source_id
+            from sad.account_platform_codebase pc left join sad.account_codebase c on coalesce(c.source_id, c.id) = pc.codebase_source_id
             where pc.gone_from_source = false order by pc.platform_id, lower(coalesce(c.name, '')) limit 8000`
           return { accounts, links }
         })

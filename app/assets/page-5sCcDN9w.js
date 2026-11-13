@@ -1,1 +1,0 @@
-import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./jsx-runtime-DePvh3-m.js";import{o as n}from"./navigation-CO53nhQX.js";import{t as r}from"./source-of-truth-key-BH0IhxIa.js";import{t as i}from"./source-of-truth-D_7lMMxI.js";var a=e(t());function o(){let e=n(),{companyId:t,source:o}=r(e?.key??``);return(0,a.jsx)(i,{companyId:t,source:o})}export{o as default};

@@ -61,6 +61,7 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   // Codebase details slice: the codebase's details (the owner's only).
   ['PUT', /^\/accounts\/codebases\/([^/]+)$/, OWNER],
   // Accounts edit slice: the platform accounts edit and soft delete (the owner's only).
+  ['POST', /^\/accounts\/platforms$/, OWNER],
   ['PUT', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
   ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, OWNER],
   // Order o8ebe: the password reveal (the owner's only).

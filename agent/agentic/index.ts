@@ -5543,6 +5543,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Order o8ebe: the password reveal (owner only; logged by the agent, never the password).
     ['POST', /^\/accounts\/email\/([^/]+)\/reveal$/, ([id], r) => accountsEmailWrite.reveal(access.ownerOf(callerOf(r)).id, id), 'local'],
     // Accounts edit slice: the platform accounts (owner only; soft delete).
+    // Add account (order oc35dc): a platform account made in the app, with its codebases (the owner's only; nothing is written to the CRM).
+    ['POST', /^\/accounts\/platforms$/, (_, r) => accountsPlatformWrite.create(access.ownerOf(callerOf(r)).id, r.body), 'local'],
     ['PUT', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.update(access.ownerOf(callerOf(r)).id, id, r.body), 'local'],
     ['DELETE', /^\/accounts\/platforms\/([^/]+)$/, ([id], r) => accountsPlatformWrite.remove(access.ownerOf(callerOf(r)).id, id), 'local'],
     // Codebase details slice: the codebase's details (owner only).
