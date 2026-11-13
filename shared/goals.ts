@@ -27,6 +27,10 @@ export interface Goal {
   /** When the goal was created (an ISO time; the CRM's goals table has created_at and its list sends every column). Absent: the sort "Date added" puts the goal last. */
   createdAt?: string
   updatedAt?: string
+  /** o410f: who gave the goal out (the CRM's goals.assigned_by): the creator when it was made with an assignee, then whoever re-assigned it. Absent on an older backend. */
+  assignedBy?: string | null
+  /** o410f: who made the goal (the CRM's goals.created_by). Absent on an older backend. */
+  createdBy?: string | null
 }
 
 /** A task in the CRM's Today bucket (the bucket holds goal ids; its answer keeps the old "task" keys). */
@@ -72,6 +76,49 @@ export const assigneesOf = (g: Pick<Goal, 'ownerId' | 'assigneeIds'>): string[] 
 /** "Mine" is the CRM's own test (its All my goals list): I am among the assignees. `myId` comes from GET /v1/auth/me. */
 export const isMine = (g: Pick<Goal, 'ownerId' | 'assigneeIds'>, myId: string | null) => myId !== null && assigneesOf(g).includes(myId)
 export const isOpen = (g: Pick<Goal, 'status'>) => normaliseStatus(g.status) === 'todo'
+
+// o410f / o04eb (13 Nov 2026), his words: "in mine there should be three selecrlts all only mine and assigned to other". Mine has three choices:
+//   all     everything that is his: the goals assigned to him, and the goals he gave to other people
+//   mine    "Only mine": the goals assigned to him (the CRM's All my goals; the default, unchanged: his own order, its sorts and its dragging)
+//   given   "Assigned to others": the goals he gave to other people, with their names on each one
+// "Gave" is the CRM's own record (read only): he is the goal's assigned_by (who named the assignee: the creator at first, then whoever re-assigned it) or its
+// created_by, and someone other than him is among its assignees. A goal he made for himself alone, or one nobody is assigned to, was given to no one.
+
+export type MineScope = 'all' | 'mine' | 'given'
+export const MINE_SCOPES: readonly MineScope[] = ['all', 'mine', 'given']
+export const MINE_SCOPE_WORDS: Record<MineScope, string> = { all: 'All', mine: 'Only mine', given: 'Assigned to others' }
+export const DEFAULT_MINE_SCOPE: MineScope = 'mine'
+/** The last choice, kept in this browser: the Goals page and the overlay's Goals tab share it. */
+export const MINE_SCOPE_KEY = 'sad-goals-mine-scope'
+
+/** The saved choice; nothing, a stray value or no storage is Only mine. */
+export function readMineScope(read: (key: string) => string | null): MineScope {
+  try {
+    const v = read(MINE_SCOPE_KEY)
+    return MINE_SCOPES.includes(v as MineScope) ? (v as MineScope) : DEFAULT_MINE_SCOPE
+  } catch {
+    return DEFAULT_MINE_SCOPE
+  }
+}
+
+/** He gave this goal to someone else: he assigned it or created it, and someone other than him is among its assignees. */
+export function isGivenBy(g: Pick<Goal, 'ownerId' | 'assigneeIds' | 'assignedBy' | 'createdBy'>, myId: string | null): boolean {
+  if (myId === null || (g.assignedBy !== myId && g.createdBy !== myId)) return false
+  return assigneesOf(g).some(id => id !== myId)
+}
+
+/** Is the goal in this choice of Mine? */
+export function inMineScope(g: Pick<Goal, 'ownerId' | 'assigneeIds' | 'assignedBy' | 'createdBy'>, scope: MineScope, myId: string | null): boolean {
+  if (scope === 'mine') return isMine(g, myId)
+  if (scope === 'given') return isGivenBy(g, myId)
+  return isMine(g, myId) || isGivenBy(g, myId)
+}
+
+/** The goals still to do in each choice of Mine (the numbers on the choices); disabled goals are not counted. */
+export function mineScopeCounts(goals: readonly Goal[], myId: string | null): Record<MineScope, number> {
+  const open = goals.filter(g => !g.isDisabled && isOpen(g))
+  return { all: open.filter(g => inMineScope(g, 'all', myId)).length, mine: open.filter(g => isMine(g, myId)).length, given: open.filter(g => isGivenBy(g, myId)).length }
+}
 
 /** The names a goal is assigned to ("Shubham Bhole, Asha"): a person the members list doesn't have is "Someone". */
 export function namesOf(g: Pick<Goal, 'ownerId' | 'assigneeIds'>, members: readonly Member[], myId: string | null): string[] {
