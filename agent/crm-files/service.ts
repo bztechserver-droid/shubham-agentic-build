@@ -162,8 +162,9 @@ export interface CrmUploadBackend {
    * All the bytes are in Google Drive (`driveId`, `url`): the CRM's sharing policy, then the CRM record (a new file into `target`, or a new version of the file `target`).
    * `lookFirst`: an earlier try may have landed without its answer reaching us, so the CRM is read first and a record with this key is taken as done (never a second one).
    * A new file whose name was taken meanwhile is recorded as "name (2).ext" and `savedAs` says so.
+   * `share: false` (F-211's conversation copies): the CRM's "anyone with the link" policy is not applied to this file; left out, it is, as before.
    */
-  finish(p: { kind: CrmUploadKind; target: string; name: string; type: string; size: number; key: string; driveId: string; url: string; lookFirst: boolean }): Promise<{ node: CrmNode; savedAs?: string }>
+  finish(p: { kind: CrmUploadKind; target: string; name: string; type: string; size: number; key: string; driveId: string; url: string; lookFirst: boolean; share?: boolean }): Promise<{ node: CrmNode; savedAs?: string }>
   /** The fetch used for Google (the session's parts and questions go through it). */
   fetch: typeof fetch
   /**
@@ -1302,7 +1303,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     open: (name, type, size) => openDriveSession(name, type, size),
 
     async finish(p) {
-      await sharePolicy(p.driveId)
+      if (p.share !== false) await sharePolicy(p.driveId)
       const sent = { key: p.key, url: p.url }
       if (p.kind === 'version') {
         if (p.lookFirst) {

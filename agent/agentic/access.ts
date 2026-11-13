@@ -94,6 +94,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/heartbeat\/beat$/, OWNER],
   ['GET', /^\/floors$/, SIGNED],
   ['GET', /^\/offline-chats$/, SIGNED],
+  // F-211: the conversations' copy in the CRM drive, chat by chat (the owner of the app only).
+  ['GET', /^\/conversations-drive$/, OWNER],
   // F-134: Codex on this PC: its status (names only), asking the CRM now, and the setting.
   ['GET', /^\/codex\/status$/, SIGNED],
   ['GET', /^\/opencode\/status$/, SIGNED],

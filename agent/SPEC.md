@@ -1453,6 +1453,37 @@ would fork it, so one PC runs it at a time, and every PC keeps a copy.
   conversation into the member's own folder) and e2e step 11 (two real agents on a real link, a
   pretend claude: followed, taken over, the JSONL both ways, where it ran last).
 
+## F-211: every chat's conversation copied into the CRM drive (agentic/conversations.ts; stage 1, 13 Nov 2026)
+
+Shubham's choices (orders obd04, o63c5, o7472): plain JSONL with readable names (no encryption), all
+floors, one way only (the drive is a copy: nothing is read back, nothing on the PC changes), no
+automatic carry-on on the Server and no hand-back.
+- **Who sends.** The hub, or a PC on its own: it holds every PC's copy of every session (F-021). A
+  member sends nothing. Every floor's Claude chats count (also Codex in Claude Code; not PC Control's,
+  native Codex or OpenCode), and a running chat's successor session after /clear or /resume.
+- **Where.** The CRM project `Conversations` (made once if missing, looked for by name first), folders
+  `<owner username> / <PC> / <floor> / <agent> / <sessionId>` (names made legal, at most 100
+  characters; a CRM that refuses that depth gets one folder of all those names under the project),
+  files `part-0001.jsonl`, `part-0002.jsonl`, … and `manifest.json`.
+- **When.** Every 5 s each session's file is looked at; what it grew by goes up as a part when
+  8 MiB waits (a backlog in parts of up to 64 MiB), after 10 quiet minutes, at the latest an hour
+  after its first waiting byte, or 30 s after the chat stopped. A part ends at the end of a row (a
+  half-written row waits); one part per session on its way, four in all. The manifest (one file;
+  later ones are new versions of it) lists the parts the CRM has, in order, with byte ranges and
+  sha256, once everything that waited is up and every 5 minutes during a long backlog. A copy that is
+  shorter, or differs before the bytes sent (F-021 replaced a diverged copy), starts again from byte
+  0 as a new epoch (part numbers go on; the manifest lists only the last epoch).
+- **How.** The drive's resumable uploads (od0b1) in an engine of their own (`<state>/agent/agentic/
+  conversations/pending`, so the page's uploads list never shows them), with `finish({share: false})`:
+  never "anyone with the link" (the CRM itself shows every file to its organisation). What was sent is
+  kept in `conversations/conversations.json`; an upload the engine forgot after a restart counts only
+  when its folder has a file of its name and size, else the same bytes go again.
+- **Off:** `SAD_CONV_DRIVE=0` or `<state>/agent/conversations-drive.off`; never by itself inside a
+  test run. Status for the owner: `GET /agentic/conversations-drive`.
+- **Tests:** `conversations.test.ts` (the real drive service and uploads against the pretend CRM and
+  Google Drive, real Claude rows), `conversations-wiring.test.ts` (the agent: which chats, the switch,
+  the route).
+
 ## F-022: another PC's Claude conversations (agentic/index.ts, transcripts.ts)
 
 - `GET /agentic/sessions?pc=&q=&limit=&offset=` → {sessions, total, pcs}: this PC's (or, with

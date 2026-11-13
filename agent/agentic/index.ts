@@ -171,6 +171,8 @@ import { createAccountsPlatforms } from './accounts-platforms.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
+import { createCrmUploads } from '../crm-files/uploads.ts'
+import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
 import { createMemoryLayer, type MemoryLayer } from './memory-layer.ts'
 import { appendAt, createTail, markOf, NO_FILE, sameMark, settled, type FileMark } from './mirror.ts'
@@ -395,6 +397,10 @@ export interface AgenticOptions {
   orderReplies?: boolean
   /** Order-reply carrier (11 Nov), tests: shorter waits for claude's report of a typed reply and before a reply that was not taken is typed again. */
   orderReplyWaits?: { confirmMs: number; retypeAfterMs: number[] }
+  /** F-211, tests: the conversations' copy in the CRM drive on (true) or off (false); left out: on, except inside a test run (and never on a member, nor when switched off). */
+  conversationsDrive?: boolean
+  /** F-211, tests: how often the conversations are looked at (ms); 0: only when a test asks (agentic.conversations.tick). */
+  conversationsTickMs?: number
   /**
    * The Assistant's chat is restarted (its conversation resumes) when the tool list its MCP process was given is not the one now, so a new tool reaches a chat that
    * was running at an Update. On; SAD_ASSISTANT_TOOLS_REFRESH=0, or an assistant-tools-refresh.off file in this folder, switches it off. Tests set it.
@@ -433,6 +439,8 @@ export interface AgenticOptions {
 export interface Agentic {
   /** F-126: the CRM files (agent/crm-files/): the tree and its changes, the page's routes, this PC's mount. */
   crmFiles: CrmFilesModule
+  /** F-211: every chat's conversation copied into the CRM drive (conversations.ts); tests look now with tick(). */
+  conversations: Pick<Conversations, 'tick' | 'status'>
   mount: ApiMount
   /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
   voiceMount: ApiMount
@@ -794,6 +802,35 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
   void crmFiles.resume().catch(() => undefined)
+  // F-211 stage 1 (orders obd04, o7472): every floor chat's conversation goes, one way, into the CRM drive's project "Conversations" as plain JSONL parts and a manifest
+  // (conversations.ts). Only the hub (or a PC on its own) sends: it holds every PC's copy (F-021). Its own uploads engine (its own waiting folder: the page's uploads list never
+  // shows these), and these files are never shared by link. Off: SAD_CONV_DRIVE=0, or <state>/agent/conversations-drive.off; never by itself inside a test run.
+  const convUploads = createCrmUploads({
+    dir: path.join(o.dir, 'conversations', 'pending'),
+    backend: { ...crmFiles.service.uploadBackend, finish: p => crmFiles.service.uploadBackend.finish({ ...p, share: false }) },
+    parallel: 2,
+    log: o.log,
+  })
+  void convUploads.start().catch(e => o.log?.warn(`conversations: the waiting folder could not be read (${e instanceof Error ? e.message : String(e)})`))
+  const conversations = createConversations({
+    dir: path.join(o.dir, 'conversations'),
+    sessions: () => conversationSessions(),
+    fileOf: sid => findClaudeTranscript(sid, projectsDir),
+    drive: {
+      children: id => crmFiles.service.children(id),
+      folder: (parent, name) => crmFiles.service.folder(parent, name),
+      async createProject(name) {
+        const r = await crmProxy.request('POST', 'org/projects', { json: { name, description: "Every chat's conversation (its JSONL), copied by the Agentic app (F-211)." } })
+        await r.body?.cancel().catch(() => undefined)
+        if (!r.ok) throw new Error(`the CRM did not make the project "${name}" (${r.status})`)
+      },
+    },
+    uploads: convUploads,
+    on: () => (o.conversationsDrive ?? !process.env.NODE_TEST_CONTEXT) && mode() !== 'member' && process.env.SAD_CONV_DRIVE !== '0' && !existsSync(path.join(o.dir, '..', 'conversations-drive.off')),
+    signedIn: () => crmProxy.session().signedIn,
+    ...(o.conversationsTickMs !== undefined ? { tickMs: o.conversationsTickMs } : {}),
+    log: o.log,
+  })
 
   // F-051: the memory layer, kept on the hub (or a PC on its own); a member's chats reach it
   // through the hub, as their tool calls do. Started with the agent when main.ts says so, else
@@ -1822,6 +1859,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
     const running = whereAll()
     if (mode() === 'member') return Object.fromEntries(Object.entries(replica.last).filter(([sid]) => !running[sid]))
     return Object.fromEntries([...held].filter(([sid, h]) => h.last && !running[sid]).map(([sid, h]) => [sid, h.last!]))
+  }
+
+  /**
+   * F-211: every floor chat's Claude conversation (all floors; not PC Control's, and not native Codex or OpenCode, whose conversations are not Claude's JSONL), with the names its
+   * folder in the CRM drive is made of: its owner's username, the PC it runs or ran on, its floor and agent. A running chat that /clear or /resume moved to another session counts
+   * that session too.
+   */
+  function conversationSessions(): ConvSession[] {
+    const where = whereAll(), last = lastAll(), me = self()
+    const out: ConvSession[] = []
+    for (const f of floors.list()) {
+      if (isPcControl(f)) continue
+      for (const a of f.agents) {
+        const sid = a.sessionId
+        if (!sid || engineFor(a) !== 'claude') continue
+        const base = { owner: a.owner?.username || SBSKRRT_OWNER.username, pc: where[sid]?.name ?? last[sid]?.pc ?? me.name, floor: f.name, agent: a.name, running: !!where[sid] }
+        out.push({ sessionId: sid, ...base })
+        const next = chats.claudeSession?.(sid)
+        if (next && next !== sid) out.push({ sessionId: next, ...base })
+      }
+    }
+    return out
   }
 
   function teamInfo(): AgenticTeam | null {
@@ -5175,6 +5234,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['GET', /^\/floors$/, (_, r) => answerFloors(callerOf(r), r.query.get('scope')), 'local'],
     // F-127: this PC's setting for new chats while the Server is down, and how the floors made then are joining the Server's list.
     ['GET', /^\/offline-chats$/, () => offlineAnswer(), 'local'],
+    // F-211: how far each chat's conversation is in the CRM drive's "Conversations" (the owner's: it names every chat and folder).
+    ['GET', /^\/conversations-drive$/, () => conversations.status(), 'local'],
     // F-134: Codex on this PC.
     ['GET', /^\/opencode\/status$/, () => openCode.status(), 'local'],
     ['GET', /^\/codex\/status$/, () => codexAnswer(), 'local'],
@@ -6519,6 +6580,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
 
   return {
     crmFiles,
+    conversations,
     mount,
     voiceMount: voice.mount,
     fastHost,
@@ -6568,6 +6630,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       threadWatchers.clear()
       // o13d4: started here as before, and kept: the returned promise waits for it (its pins engine saves into <state>/crm-pins last).
       const crmClosed = crmFiles.close()
+      // F-211: what was sent is saved; the parts on their way stay in their waiting folder and go on at the next start.
+      conversations.close()
+      const convClosed = convUploads.close().catch(() => undefined)
       recovery?.freeze()
       if (resumeTimer) clearTimeout(resumeTimer)
       if (liveTimer) clearTimeout(liveTimer)
@@ -6600,7 +6665,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       clearInterval(voiceTimer)
       events.clear()
       // o13d4: settles once the last writes into the state folder are done; never rejects (a failed close was never thrown before either).
-      return Promise.allSettled([crmClosed, fastStopped]).then(() => undefined)
+      return Promise.allSettled([crmClosed, fastStopped, convClosed]).then(() => undefined)
     },
   }
 }
