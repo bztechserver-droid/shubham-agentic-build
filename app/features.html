@@ -3293,6 +3293,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-217",
+    "title": "The codebase links can name the account they belong to (which GitHub, Vercel or Supabase account): its name and sign-in email shown on the link, read from Accounts, with \"Add account…\" in the pick",
+    "said": "In the links can we also add ability to add accounts, so we know which GitHub account it belongs to, because if we add GitHub account then email is automatically known.",
+    "added": "2026-11-13",
+    "notes": [
+      "13 Nov 2026 (order o26c8, relayed by the Assistant; his words are the ones above). Built: each link in a codebase's Frontend, Backend and DB tabs has an optional \"Account\" pick from Accounts › Accounts, with the accounts of the platform the address points at (github.com, vercel.app, supabase.co) listed first, but any can be chosen. The link shows the account's name, its platform and its sign-in email, read from the account (never typed twice); tapping it opens that account on the Accounts tab. \"Add account…\" in the pick opens the Add account form and comes back with the new account chosen. The free-text note is kept. The migration is db/accounts/0013_link_account.sql: review only, not run; until it is run the links work as before and only the account field is missing (no error on the page). Worktree wt/link-account through the merge queue; not published."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

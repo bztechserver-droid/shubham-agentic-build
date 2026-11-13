@@ -81,6 +81,21 @@ export interface TabsLink {
   label: string
   url: string
   description: string
+  /** Order o26c8: the platform account this link belongs to (null: none), and its name, platform and sign-in email read from that account (never typed twice). */
+  platformId: string | null
+  accountName: string | null
+  accountPlatform: string | null
+  accountEmail: string | null
+}
+
+/** Order o26c8: the platform a link's address points at, to put its accounts first in the pick (github.com, vercel.app, supabase.co). Null: no suggestion. */
+export function platformHintFor(url: string): string | null {
+  const m = /^https?:\/\/([^/?#]+)/i.exec(url.trim())
+  const host = (m?.[1] ?? '').toLowerCase()
+  if (host === 'github.com' || host.endsWith('.github.com')) return 'GitHub'
+  if (host === 'vercel.app' || host.endsWith('.vercel.app') || host === 'vercel.com') return 'Vercel'
+  if (host === 'supabase.co' || host.endsWith('.supabase.co') || host === 'supabase.com') return 'Supabase'
+  return null
 }
 export interface TabsVar {
   id: string

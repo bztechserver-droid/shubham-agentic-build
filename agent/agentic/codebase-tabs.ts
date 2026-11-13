@@ -63,7 +63,22 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
     return c.value
   }
 
-  async function codebaseOr404(tx: Tx, cb: string) {
+  /** Order o26c8: a link's account, from the request: `id` (a platform account's id, or null to clear it) and `sent` (whether the form sent the field at all). */
+function accountChoice(r: Record<string, unknown>): { id: string | null; sent: boolean } {
+  if (!('accountId' in r)) return { id: null, sent: false }
+  if (r.accountId === null || r.accountId === '' || r.accountId === undefined) return { id: null, sent: true }
+  const id = uuid(r.accountId)
+  if (!id) throw apiError(400, 'That account id is not valid.')
+  return { id, sent: true }
+}
+
+/** The account must be the owner's own, live platform account (the row-level rule of 0004 limits what can be seen). */
+async function ownedLiveAccount(tx: Tx, id: string): Promise<void> {
+  const rows: Row[] = await tx`select id from sad.account_platform where id = ${id} and deleted_at is null`
+  if (rows.length === 0) throw apiError(400, 'That account is not there any more. Choose it again.')
+}
+
+async function codebaseOr404(tx: Tx, cb: string) {
     const rows: Row[] = await tx`select id from sad.account_codebase where id = ${cb}`
     if (rows.length === 0) throw apiError(404, NO_CODEBASE)
   }
@@ -78,6 +93,13 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
         await codebaseOr404(tx, cb)
         const secs: Row[] = await tx`select section, description from sad.account_codebase_section where codebase_id = ${cb} and deleted_at is null`
         const links: Row[] = await tx`select id, section, label, url, description from sad.account_codebase_link where codebase_id = ${cb} and deleted_at is null order by sort_order, created_at`
+        // Order o26c8: a link's account (platform_id, from migration 0013). Read only when that column is there: until 0013 is run the links show without accounts (no error).
+        const hasAccount: Row[] = await tx`select column_name from information_schema.columns where table_schema = 'sad' and table_name = 'account_codebase_link' and column_name = 'platform_id'`
+        const accountOf = new Map<string, { pid: string; platform: string; name: string | null; email: string | null }>()
+        if (hasAccount.length > 0) {
+          const acc: Row[] = await tx`select l.id, l.platform_id, p.platform, p.name, p.sign_in_email from sad.account_codebase_link l join sad.account_platform p on p.id = l.platform_id where l.codebase_id = ${cb} and l.deleted_at is null and p.deleted_at is null`
+          for (const a of acc) accountOf.set(str(a.id), { pid: str(a.platform_id), platform: str(a.platform), name: a.name == null ? null : str(a.name), email: a.sign_in_email == null ? null : str(a.sign_in_email) })
+        }
         const subs: Row[] = await tx`select id, name from sad.account_env_subset where codebase_id = ${cb} and deleted_at is null order by sort_order, created_at`
         const vars: Row[] = await tx`select v.id, v.subset_id, v.name, v.value_sealed from sad.account_env_var v join sad.account_env_subset s on s.id = v.subset_id where s.codebase_id = ${cb} and s.deleted_at is null and v.deleted_at is null order by v.name`
         const sections = { be: '', fe: '', deployment: '', database: '' } as Record<TabSection, string>
@@ -100,7 +122,13 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
         return {
           codebaseId: cb,
           sections,
-          links: links.filter(l => isSection(l.section)).map(l => ({ id: str(l.id), section: l.section as TabSection, label: str(l.label), url: str(l.url), description: str(l.description) })),
+          links: links.filter(l => isSection(l.section)).map(l => {
+            const a = accountOf.get(str(l.id))
+            return {
+              id: str(l.id), section: l.section as TabSection, label: str(l.label), url: str(l.url), description: str(l.description),
+              platformId: a?.pid ?? null, accountName: a?.name ?? null, accountPlatform: a?.platform ?? null, accountEmail: a?.email ?? null,
+            }
+          }),
           subsets: subs.map(s => ({ id: str(s.id), name: str(s.name), vars: varsBy.get(str(s.id)) ?? [] })),
           keyOk: key.ok,
         }
@@ -128,10 +156,15 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
       if (!isSection(r?.section)) throw apiError(400, 'The section is BE, FE, Deployment or Database.')
       const link = need(checkLink(input))
       const section = r.section
+      const account = accountChoice(r)
       return run(person, async tx => {
         await codebaseOr404(tx, cb)
+        if (account.id !== null) await ownedLiveAccount(tx, account.id)
         const next: Row[] = await tx`select coalesce(max(sort_order), 0) + 1 as n from sad.account_codebase_link where codebase_id = ${cb} and section = ${section}`
-        const made: Row[] = await tx`insert into sad.account_codebase_link (owner_id, codebase_id, section, label, url, description, sort_order) values (${person}, ${cb}, ${section}, ${link.label}, ${link.url}, ${link.description}, ${Number(next[0]?.n ?? 1)}) returning id`
+        // Without an account the statement is the one that has always run (it works before migration 0013); with one, the platform_id column is written.
+        const made: Row[] = account.id === null
+          ? await tx`insert into sad.account_codebase_link (owner_id, codebase_id, section, label, url, description, sort_order) values (${person}, ${cb}, ${section}, ${link.label}, ${link.url}, ${link.description}, ${Number(next[0]?.n ?? 1)}) returning id`
+          : await tx`insert into sad.account_codebase_link (owner_id, codebase_id, section, label, url, description, sort_order, platform_id) values (${person}, ${cb}, ${section}, ${link.label}, ${link.url}, ${link.description}, ${Number(next[0]?.n ?? 1)}, ${account.id}) returning id`
         return { id: str(made[0]?.id) }
       })
     },
@@ -140,8 +173,13 @@ export function createCodebaseTabs(o: CodebaseTabsOptions) {
       const id = uuid(linkId)
       if (!id) throw apiError(400, 'That link id is not valid.')
       const link = need(checkLink(input))
+      const account = accountChoice(input as Record<string, unknown>)
       return run(person, async tx => {
-        const rows: Row[] = await tx`update sad.account_codebase_link set label = ${link.label}, url = ${link.url}, description = ${link.description}, updated_at = now() where id = ${id} and deleted_at is null returning id`
+        if (account.id !== null) await ownedLiveAccount(tx, account.id)
+        // The account is written only when the form sends one (picked or cleared): an edit without it never touches the column (so it works before 0013).
+        const rows: Row[] = account.sent
+          ? await tx`update sad.account_codebase_link set label = ${link.label}, url = ${link.url}, description = ${link.description}, platform_id = ${account.id}, updated_at = now() where id = ${id} and deleted_at is null returning id`
+          : await tx`update sad.account_codebase_link set label = ${link.label}, url = ${link.url}, description = ${link.description}, updated_at = now() where id = ${id} and deleted_at is null returning id`
         if (rows.length === 0) throw apiError(404, NO_ROW)
         return { ok: true as const }
       })

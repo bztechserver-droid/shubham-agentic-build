@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-C_K64VkF.js";function t(){e(`/wpages`)}export{t as default};
