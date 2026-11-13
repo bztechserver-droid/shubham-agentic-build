@@ -2591,6 +2591,31 @@ workspace. Opening one opens the app's own page straight at that tab; nothing el
 - Tests: `shared/stable-ports.test.ts`, `ports/stable.test.ts` (the table, restart, a new PC, a removed one, the clash check, Change, a member, a lost
   Server file), `ports/stable-proxy.test.ts` (real sockets), `ports/index.test.ts` 15, `config.test.ts`, `api.test.ts`.
 
+## PC control's Ports tab (order oc0ae, 13 Nov 2026; pc-ports.ts, shared/pc-ports.ts, src/pc-control/PcPortsPanel.tsx)
+
+Shubham: "Can you make a ports button in the pc control next to updates please so i can see all ports also it should show the full tailscale url". READ
+ONLY: nothing here opens, closes, shares or changes a port (that stays on Settings › Ports).
+
+- **The report** (`PcPortsReport`): one PC's own view of its ports, from its Ports state: its tailnet name and IP, when it last looked, and rows (`PcPortRow`:
+  port, group, what, program, listening true/false/null, sharedBy ports|gate|other|null, address, url, serverUrl, note). Groups, in the page's order: the app's
+  own ports by name (`knownAppPorts`: the page, Dev 5174, the API, the chat host and RustDesk direct always; the links, discovery, the Ports gate, hbbs, hbbr and the
+  guard when they listen or are shared), its four stable ports with their state, the other Tailscale entries (443 = the main page), then every other program.
+  `address` = `https://<tailnet name>:<port>` for every port (null while the name is unknown); `url` = the link that opens it now, only from its own Tailscale
+  share (by name, else by IP); a PC that cannot see its ports (Tailscale down, test mode) says `listening: null`, never false.
+- **Route** `GET /agent-api/pc-ports/pcs/<id>`: not a scoped mount, so the owner only (403 admin-only for anyone else, like every route that talks to the PC);
+  only GET, nothing after the ID (400); an ID that is not a PC 404. The PC's own ID: its report. The Server, another ID: it asks that member over their link on
+  a `pc-ports-v1` stream (one request line `{protocol:1, targetId}`, one answer line `{ok:true, value}` or `{ok:false}`; 10 s, 256 KiB) and adds its own links
+  to that PC's stable ports (`serverUrl`: the Server answers every PC's when they are on). A member asked about another PC: 409 (use the Server's page).
+- **A member** serves the stream to its pinned Server only (the link stamps `from`), only about itself, and only once per stream.
+- **Unknown, said so**: no link to the PC (`offline`), a build without the stream (`unsupported`: update it from its Updates tab), a wrong, late or garbled
+  answer (`offline`). Then the rows are that PC's stable ports from the Server's table with the Server's state and links, `listening: null`, and the last
+  tailnet name it said.
+- **Checked twice** (`cleanReport`, by the Server and again by the page): the right PC, known words, bounded sizes, at most 400 rows; a bad row is left out;
+  a link is kept only when it is http(s) to a `*.ts.net` name, a Tailscale IPv4 (100.64.0.0/10) or IPv6 (fd7a:115c:a1e0::/48), with no user, path, query or fragment.
+- Tests: `shared/pc-ports.test.ts`, `pc-ports.test.ts` (self, member over a real stream pair, off, older build, liar, silent, garbage, IDs, the member's
+  refusals, the route), `pc-ports-api.test.ts` (owner 200, anyone else 403), the page's `src/pc-control/ports-report.test.mjs` and `workspace-tabs.test.mjs`
+  (Ports after Updates, the owner's only), and `src/pages/phone-width.test.mjs` (360 px, PC control's own scroll box included).
+
 ## F-118: who is using the app (auth/, agentic/access.ts, shared/auth.ts)
 
 Each person signs in IN THE PAGE (per browser) with their own CRM account; every chat belongs to one person; the owner can

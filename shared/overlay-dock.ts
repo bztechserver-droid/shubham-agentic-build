@@ -44,7 +44,14 @@ export function dockMax(viewport: number): number | null {
 export const canDock = (viewport: number): boolean => dockMax(viewport) !== null
 
 /** The width before he has dragged it: 40% of the window, between DOCK_MIN and DOCK_DEFAULT (an unfolded Fold gets about 300, a computer 420). */
-export const defaultDockWidth = (viewport: number): number => Math.round(Math.min(DOCK_DEFAULT, Math.max(DOCK_MIN, viewport * 0.4)))
+/** order o0205b: the compact bar's four tabs are 44 px touch targets, and with every control in the bar they need this much. The width before he drags opens at least this wide where the window has the room for it. */
+export const BAR_TAP_MIN = 362
+
+export const defaultDockWidth = (viewport: number): number => {
+  const share = Math.round(Math.min(DOCK_DEFAULT, Math.max(DOCK_MIN, viewport * 0.4)))
+  const room = dockMax(viewport)
+  return share < BAR_TAP_MIN && room !== null && room >= BAR_TAP_MIN ? BAR_TAP_MIN : share
+}
 
 /** A width kept in this browser: a whole number of px, or null (never dragged, or junk). The limits are applied when it is used, because the window can change. */
 export function parseDockWidth(raw: unknown): number | null {

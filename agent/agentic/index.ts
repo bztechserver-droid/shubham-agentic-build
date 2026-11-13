@@ -479,7 +479,12 @@ export interface Agentic {
    * Legacy fields/signature arguments are ignored, never a second authorization path.
    */
   humanProof(kind: SignedKind, fields: (string | number | boolean)[], signed: unknown, r?: ProofRequest): string
-  close(): void
+  /**
+   * Stops everything at once, as always. o13d4: the promise settles when the last writes into the state folder are done (the CRM files
+   * module's close, whose "Keep on this PC" engine saves its store last, and the fast host's stop). Nothing has to wait for it; whatever
+   * removes the state folder afterwards (a test's temp folder) must, or a late save lands mid-removal (ENOTEMPTY). It never rejects.
+   */
+  close(): Promise<void>
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -6524,7 +6529,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       humanInputGrants.close()
       for (const cancel of threadWatchers.values()) cancel()
       threadWatchers.clear()
-      void crmFiles.close()
+      // o13d4: started here as before, and kept: the returned promise waits for it (its pins engine saves into <state>/crm-pins last).
+      const crmClosed = crmFiles.close()
       recovery?.freeze()
       if (resumeTimer) clearTimeout(resumeTimer)
       if (liveTimer) clearTimeout(liveTimer)
@@ -6549,13 +6555,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       ui.close()
       voice.close()
       fastSession?.close()
-      void fastHost?.stop('the app is stopping')
+      const fastStopped = fastHost?.stop('the app is stopping')
       stopOldReader('the app is stopping')
       clearInterval(ordersTimer)
       clearInterval(heartbeatTimer)
       clearInterval(toolsRefreshTimer)
       clearInterval(voiceTimer)
       events.clear()
+      // o13d4: settles once the last writes into the state folder are done; never rejects (a failed close was never thrown before either).
+      return Promise.allSettled([crmClosed, fastStopped]).then(() => undefined)
     },
   }
 }

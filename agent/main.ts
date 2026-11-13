@@ -1,4 +1,6 @@
 import { createPcBuild, safeHubOrigin, PC_BUILD_STREAM, type BuildControl } from './pc-build.ts'
+import { createPcPorts, PC_PORTS_STREAM } from './pc-ports.ts'
+import { buildPortRows, cleanTailnetIp, cleanTailnetName, knownAppPorts, safeLink, stableFallbackRows, type PcPortRow, type PcPortsReport } from '../shared/pc-ports.ts'
 import { FREE_CREDENTIAL, openCodeCredential } from './opencode/crm.ts'
 import type net from 'node:net'
 import { copyFileSync, existsSync } from 'node:fs'
@@ -51,7 +53,7 @@ import { speechMount, stream as speechStream } from './speech/routes.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
-import { createPorts } from './ports/index.ts'
+import { createPorts, DEFAULT_GATE_PORT } from './ports/index.ts'
 import { scannersFor } from './ports/scan.ts'
 import { createStable } from './ports/stable.ts'
 import { createLinuxMount } from './crm-files/mount-linux.ts'
@@ -229,10 +231,16 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     },
   })
   let pcBuild: ReturnType<typeof createPcBuild> | null = null
+  let pcPorts: ReturnType<typeof createPcPorts> | null = null
   const onOpen = {
     [PC_BUILD_STREAM]: (meta: OpenMeta) => {
       if (!pcBuild) throw new Error('PC build controls unavailable')
       return pcBuild.serve(meta)
+    },
+    // Order oc0ae: the Server asks this PC for its ports report (PC control's Ports tab). Read only.
+    [PC_PORTS_STREAM]: (meta: OpenMeta) => {
+      if (!pcPorts) throw new Error('the ports report is unavailable')
+      return pcPorts.serve(meta)
     },
     // F-116: dialled at an address RustDesk's IP whitelist lets in (read from its own settings at each stream; never changed).
     rustdesk: rustdeskHandler({ port: config.rustdeskDirectPort, lan: lanAddress, tailnet, whitelist: () => readRustdeskWhitelist(), log: log.child('rustdesk') }),
@@ -391,6 +399,66 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     generation: () => member?.links.mux() ?? null,
     peer: id => { const mux = hub?.links.mux(id); return mux ? { generation: mux, open: () => mux.open(PC_BUILD_STREAM, {}) } : null },
     build: extras.buildControl ?? null,
+  })
+
+  // Order oc0ae: PC control's Ports tab. Each PC reports its own ports (read only); the Server asks a member over their link. A link that opens a port
+  // is only ever one of the PC's own Tailscale shares (shared/pc-ports.ts checks every link again).
+  const serverLink = (port: number): string | null => {
+    const s = portsMod.state().shares.find(x => x.port === port)
+    return s ? (safeLink(s.httpsUrl) ?? safeLink(s.ipUrl)) : null
+  }
+  const pcPortsReport = (): PcPortsReport => {
+    const p = portsState()
+    const mine = p.stable?.pcs.find(x => x.self) ?? null
+    const name = cleanTailnetName(p.self.name) ?? cleanTailnetName(tailnetName.get())
+    return {
+      protocol: 1,
+      pcId: identity.id,
+      connection: 'online',
+      reason: p.available ? null : (p.unavailable ?? 'This PC cannot see its ports right now, so whether they listen is unknown.'),
+      tailnetName: name,
+      tailnetAddress: cleanTailnetIp(p.self.address) ?? cleanTailnetIp(tailnet()),
+      scannedAt: p.scannedAt,
+      rows: buildPortRows({
+        tailnetName: name,
+        listening: p.available ? p.ports : null,
+        shares: p.shares,
+        main: portsMod.hello()?.main ?? null,
+        known: knownAppPorts({
+          page: Number(process.env.SAD_UI_PORT) || 5173,
+          dev: 5174,
+          api: ports.api,
+          peer: ports.peer,
+          discovery: ports.discovery,
+          gate: p.gate.port ?? DEFAULT_GATE_PORT,
+          hbbs: ports.hbbs,
+          hbbr: ports.hbbr,
+          rustdeskDirect: config.rustdeskDirectPort,
+          guard: Number(process.env.SAD_GUARD_PORT) || 21228,
+          chatHost: Number(process.env.SAD_CHAT_HOST_PORT) || 21229,
+        }),
+        stable: mine ? { ports: mine.ports, status: mine.status } : null,
+      }),
+    }
+  }
+  pcPorts = createPcPorts({
+    selfId: identity.id,
+    role: () => role,
+    hubId: () => devices.hub()?.id ?? null,
+    report: pcPortsReport,
+    peer: id => {
+      const mux = hub?.links.mux(id)
+      return mux ? { open: () => mux.open(PC_PORTS_STREAM, {}) } : null
+    },
+    member: id => {
+      const m = devices.member(id)
+      return m ? { name: m.name } : null
+    },
+    fallback: (id, name) => {
+      const pc = stable.state().pcs.find(x => x.id === id)
+      return pc ? stableFallbackRows(pc.ports, pc.status, serverLink, name) : []
+    },
+    serverLinks: (rows: PcPortRow[]) => rows.map(r => (r.group === 'stable' ? { ...r, serverUrl: serverLink(r.port) } : r)),
   })
 
   if (role === 'hub') hub = await startHub()
@@ -967,7 +1035,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
