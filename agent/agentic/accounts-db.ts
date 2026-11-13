@@ -112,7 +112,10 @@ export function reasonOf(e: unknown): { reason: NotConnected; code: string } {
   if (e instanceof AccountsDbError) return { reason: e.reason, code: e.code ?? e.reason }
   const code = isObject(e) && typeof e.code === 'string' ? e.code.slice(0, 20) : 'error'
   if (code === '28P01' || code === '28000') return { reason: 'login', code }
-  if (code === '42P01' || code === '3F000' || code === '42501') return { reason: 'no-tables', code }
+  // order oc924: a SCHEMA error (SQLSTATE class 42: an undefined column, table or function; 3F000: no schema) means a migration has not been run, not that the database cannot
+  // be reached. 42501 (no right to a table) keeps its own words.
+  if (code === '42501') return { reason: 'no-tables', code }
+  if (code.startsWith('42') || code === '3F000') return { reason: 'needs-update', code }
   return { reason: 'unreachable', code }
 }
 
@@ -122,6 +125,7 @@ export const WORDS: Record<NotConnected, string> = {
   login: 'The new database refused the login. Check the password file (accounts-db.pass) and the login named in accounts-db.json.',
   unreachable: "The new database can't be reached right now. The host or port in accounts-db.json may be wrong, the project may be paused, or the network is down.",
   'no-tables': 'The tables are not there yet (or the login has no right to them): run db/accounts/0001 and 0002 in the new project\'s SQL editor.',
+  'needs-update': 'The database needs an update: a migration has not been run yet (the agent log shows the error code). db/accounts/README.md lists the files in order; each one is run once in the new project\'s SQL editor.',
 }
 
 export const BAD_WORDS: Record<BadField, string> = {

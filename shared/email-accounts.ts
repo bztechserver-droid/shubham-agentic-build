@@ -25,7 +25,7 @@ export interface EmailAccountRow {
 }
 
 /** Why the list is not there yet. Each has plain words and a next step (agent/agentic/accounts-email.ts). */
-export type NotConnected = 'not-set-up' | 'package-missing' | 'login' | 'unreachable' | 'no-tables'
+export type NotConnected = 'not-set-up' | 'package-missing' | 'login' | 'unreachable' | 'no-tables' | 'needs-update'
 
 /** What the agent answers: the list, or a plain reason there is none yet (not an error: the page explains what comes next). */
 export type EmailAccountsAnswer = { connected: true; accounts: EmailAccountRow[] } | { connected: false; reason: NotConnected; message: string }

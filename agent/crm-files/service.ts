@@ -24,6 +24,7 @@ import { createIgnoreRules, type IgnoreRules } from './ignore-rules.ts'
 import { createRemovedIndex, type RemovedProject } from './removed.ts'
 import { createSpool, type Spool } from './spool.ts'
 import { versionToken, type PinItem } from './offline-pins.ts'
+import { findFiles, type FindAsk, type FindResult } from './find.ts'
 import type { PinsHost } from './pins-host.ts'
 import type { CrmPinMark } from '../../shared/crm-files.ts'
 
@@ -225,6 +226,8 @@ export interface CrmFilesService {
   versions(id: string): Promise<CrmVersion[]>
   /** P1: files and projects whose name holds `q` (2 characters at least), at most `limit` (200). */
   search(q: string, limit: number): Promise<CrmSearch>
+  /** o528e: the chat's crm_files tool (find.ts): files by the words of their name, project and folder, and by their kind. Read only. */
+  find(ask: FindAsk): Promise<FindResult>
   /**
    * S5: a save made through a drive: the bytes are kept on this PC (the spool) and this returns at once; they go up in the background. It checks the rights first (a save the CRM would refuse is
    * refused now, not accepted and then parked). `target` = a CRM file to save over as a NEW VERSION; without it, a new file in the folder `parent`. Null when this agent keeps no spool.
@@ -1573,6 +1576,26 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       }
       results.sort((a, b) => a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base', numeric: true }) || a.node.id.localeCompare(b.node.id))
       return { results: results.slice(0, cap), more: results.length > cap }
+    },
+
+    async find(ask) {
+      const s = await load()
+      const raw = new Map(s.files.map(f => [fileId(f.id), f]))
+      const r = await findFiles(
+        {
+          files: s.files.map(f => ({ id: fileId(f.id), name: f.fileName, type: f.fileType, size: sizeOf(f), modifiedAt: f.updatedAt ?? f.createdAt, category: f.folder, projectId: f.folder === 'projects' ? pidOf(f) || null : null, groupId: f.groupId })),
+          projects: s.projects,
+          groupsOf,
+        },
+        ask,
+      )
+      // The sizes the CRM has no record of, for the files answered: Google's metadata (never their bytes), as a folder listing does.
+      const unsized = r.files.filter(x => x.size === null).map(x => raw.get(x.id)).filter((f): f is RawFile => !!f)
+      if (unsized.length > 0) {
+        await learnSizes(unsized)
+        for (const x of r.files) if (x.size === null) x.size = sizeOf(raw.get(x.id)!)
+      }
+      return r
     },
 
     async versions(id) {

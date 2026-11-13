@@ -260,6 +260,9 @@ const NEEDS_SERVER = new Set([
   'crm_catalog',
   'crm_query',
   'crm_write',
+  // Order o528e: the CRM files, through the Server's own CRM sign-in, shown by the Server.
+  'crm_files',
+  'show_crm_file',
 ])
 
 /** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory, his CRM sign-in): the owner of the app's chats only. */
@@ -295,6 +298,9 @@ const ADMIN_TOOLS = new Set([
   'show_media',
   // Order o3963: a PC's screen is the owner's.
   'show_screen',
+  // Order o528e: his CRM sign-in's files, read only, served to the owner only.
+  'crm_files',
+  'show_crm_file',
 ])
 
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
@@ -1255,7 +1261,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const uploads = createUploadStore(path.join(o.dir, 'uploads'))
   uploads.prune()
   // Order o16d2: the pictures and videos the agents show in their chats (show_media), served by unguessable id to the owner only.
-  const mediaShelf = createMediaShelf({ file: path.join(o.dir, 'media.json') })
+  // Order o528e: and the CRM files they give (show_crm_file), read through this PC's own CRM files service.
+  const mediaShelf = createMediaShelf({ file: path.join(o.dir, 'media.json'), crm: crmFiles.service })
   // F-078: every chat that stops or starts, and why (chat-log.ts): the pattern Shubham is told in the morning.
   const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
   /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
@@ -3905,6 +3912,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const caption = typeof args.caption === 'string' && args.caption.trim() ? args.caption.trim().slice(0, 300) : null
         return json({ screen: { pc: pc.id, name: pc.name, caption, online: pc.online }, shown: `A button for ${pc.name}'s screen is in the chat now${pc.online ? '' : ` (${pc.name} is offline right now)`}. Nothing connects until he taps it.` })
       }
+      // Order o528e: the CRM's files (agent/crm-files/find.ts), as the CRM signed in on this PC lists them. Read only.
+      case 'crm_files': {
+        const words = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 200) : undefined)
+        const ask = { query: words(args.query), project: words(args.project), folder: words(args.folder), type: words(args.type), limit: typeof args.limit === 'number' ? args.limit : undefined }
+        if (!ask.query && !ask.project && !ask.folder && !ask.type) throw apiError(400, 'Say what to look for: query (words of the name), project, folder or type.')
+        return json(await crmFiles.service.find(ask))
+      }
+      // Order o528e: one CRM file in the chat (media.ts): a picture, a video, a PDF (its pages drawn here) or a file to download. Read only.
+      case 'show_crm_file': {
+        const media = await mediaShelf.shareCrm(args, { sessionId: sid, agent: agent.name })
+        const words = media.kind === 'pdf' ? 'a PDF he can open page by page (pinch to zoom) and download' : media.kind === 'file' ? 'a file he can download' : media.kind === 'video' ? 'a video he can play and save' : 'a picture he can open and save'
+        return json({ media, shown: `${media.name} is in the chat now, as ${words}.` })
+      }
       // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
       case 'phone_update': {
         if (!phoneUser(floor.name, agent)) {
@@ -6515,6 +6535,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
             throw authError(403, 'The pictures and videos the agents show are for the owner of this app.', 'admin-only')
           }
           return mediaShelf.serve(shown[1], req, res, url.searchParams.get('download') === '1')
+        }
+      // Order o528e: a PDF from the CRM: how many pages, and one page drawn as a picture (?w= its width). The same id, the same owner check.
+      const pages = /^\/media\/([A-Za-z0-9_-]{24})\/pdf(?:\/(\d{1,5}))?$/.exec(rest)
+      if (pages)
+        return (req, res, caller) => {
+          if (!access.isAdmin(caller ?? OPEN)) {
+            o.auth?.deny(caller ?? OPEN, 403, 'admin-only', `GET ${AGENT_API_PREFIX}${AGENTIC_PREFIX}/media/pdf`)
+            throw authError(403, 'The files the agents give are for the owner of this app.', 'admin-only')
+          }
+          return mediaShelf.pdf(pages[1], pages[2] ? Number(pages[2]) : null, Number(url.searchParams.get('w') ?? 1080), req, res)
         }
       return null
     },

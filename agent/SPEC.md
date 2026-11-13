@@ -1721,6 +1721,41 @@ JSON line (`{"screen":{pc,name,caption,online},...}`), and an unknown PC is refu
 - **Tests:** `shared/screen-bubble.test.ts` (the answer, the states, the row, Back with both layers), `agentic/index.test.ts` (the tool
   through the MCP shim), `src/chat/screen-wiring.test.mjs`.
 
+### Order o528e: any CRM file in the chat (agent/crm-files/find.ts, agent/agentic/media.ts, agent/agentic/pdf-pages.ts)
+
+His words: "if I ask you for any drive in the CRM, you should be able to give it to me here in the overlay chat ... a DP from development plan of
+a project". Two MCP tools (`tools.ts`), both owner-only (`ADMIN_TOOLS`) and the Server's (`NEEDS_SERVER`), both READ ONLY: nothing in the CRM is
+written, moved or deleted, and no second CRM client: the agent's own CRM files service (F-126) does the reading, as the CRM files page and the drive.
+
+- **`crm_files`** {query, project, folder, type, limit}: `service.find` hands the CRM's own listing (the files the signed-in person may see; a
+  project they may not open is never there) to `find.ts`. A query word is looked for in the file's name (weighs most), its folder (the project's
+  file groups, nested; or the Files page's category) and its project: a whole word, the start of a word, inside a word of 4 letters or more, or
+  the first letters of words in a row ("DP" finds Development Plan); a plural also without its s. `project` picks projects by their words or id
+  (several are named back); `folder` filters by the folder's words; `type` is a kind (pdf, image, video, drawing, sheet, document, slides,
+  archive, audio) or an ending. Best first, then the newest. A project's folders are asked of the CRM only when words need them or for where
+  an answered file is, four at a time, at most 8 s (the answer says when not all were looked through). Each file: id, name, project, folder,
+  where (projects / <project> / <folders>), type, ending, size (Google's metadata for one the CRM has none for, never its bytes), modifiedAt.
+  An unknown project is answered with names near it (a word of 3 letters or more as a word or its start).
+- **`show_crm_file`** {id, caption}: a row of the media shelf (o16d2's list, `media.json`) with the CRM file's id instead of a path, and where it
+  is. Its kind is decided by its ending AND its first bytes (one ranged read of 1 KB): a picture or a video (the MEDIA_TYPES), a PDF
+  (`%PDF-`), anything else a file to download (a name that lies is a file too). The answer is the same JSON line as show_media's, with
+  kinds `pdf` and `file` and `where` (`shared/media.ts`); the page draws a card for each.
+- **Serving** (`/agentic/media/<id>`, the same owner check): the bytes come from the CRM through the Server, never by the CRM's own link. A
+  picture, a video or a PDF is copied to `<agentic>/media-cache` (a day, 2 GB in all, 500 MB each; the oldest go first; only files of its own
+  are ever removed) and served AS IT ARRIVES, with Range (a video plays and seeks within what has come; a range far past it, like a video's
+  index at its end, is one ranged read of the CRM, at most 8 MB); a size the CRM does not say is answered once it has all come; one too large
+  to keep is read from the CRM range by range. A PDF and any other file are only ever downloads (attachment), another file as
+  application/octet-stream with no range; pictures and videos inline; all with nosniff and a sandbox CSP.
+- **PDF pages** (`/agentic/media/<id>/pdf` -> {pages}, `/pdf/<n>?w=` -> that page as a JPEG): drawn on the Server by Windows' own PDF reader
+  (Windows.Data.Pdf from Windows PowerShell, `pdf-pages.ts`; no new package: pdf.js is Shubham's call, Lead 13 Nov), one PowerShell at a time
+  for the whole app, the page asked for and the next two in one run, at one of PDF_WIDTHS (480 ... 4320; the screen's width in device pixels,
+  2.5x of it when zoomed in), the longer side at most 8192, JPEG (a fifth of a PNG's bytes on a real scanned page, as readable). Windows draws at
+  the screen's scale (150% on the Server): measured per run by a 100-pixel probe and asked for that much less. Not on Windows: 501, and the
+  card offers the download only. A PDF Windows cannot read: 422 in words.
+- **Tests:** `crm-files/find.test.ts` (matching, the fake CRM), `agentic/media-crm.test.ts` (kinds, refusals, serving as it arrives, Range,
+  the copy, the PDF routes), `agentic/pdf-pages.test.ts` (the queue; on Windows the real reader on a PDF made in the test), `shared/media.test.ts`,
+  `agentic/index.test.ts` (the tools through the MCP shim), `src/chat/media-wiring.test.mjs`.
+
 ## F-056: the task list (agentic/tasks.ts)
 
 The Tasks page (DESIGN.md › Tasks) and every chat share one list of tasks, kept by the hub. Types:

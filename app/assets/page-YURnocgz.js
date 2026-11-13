@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-8ROQsDDo.js";function t(){e(`/wpages`)}export{t as default};
