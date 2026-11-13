@@ -171,6 +171,9 @@ import { createAccountsPlatforms } from './accounts-platforms.ts'
 import { savedViewsRequest } from './views.ts'
 import { createMemoryStore, type MemoryStore } from './memory.ts'
 import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions } from '../crm-files/index.ts'
+import { createBrowserHost } from '../browser/host.ts'
+import { browserMount } from '../browser/mount.ts'
+import { BROWSER_PRIVATE_NOTE } from '../../shared/browser.ts'
 import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
@@ -263,6 +266,9 @@ const NEEDS_SERVER = new Set([
   // Order o528e: the CRM files, through the Server's own CRM sign-in, shown by the Server.
   'crm_files',
   'show_crm_file',
+  // Order o5dc4: the Browser runs on the Server.
+  'browser_open',
+  'browser_read',
 ])
 
 /** F-118: tools that reach Shubham's own things (his task list, his phone, his WhatsApp, his screen, the app's memory, his CRM sign-in): the owner of the app's chats only. */
@@ -301,6 +307,9 @@ const ADMIN_TOOLS = new Set([
   // Order o528e: his CRM sign-in's files, read only, served to the owner only.
   'crm_files',
   'show_crm_file',
+  // Order o5dc4: the Browser is his, like the PC's screen.
+  'browser_open',
+  'browser_read',
 ])
 
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
@@ -448,6 +457,8 @@ export interface Agentic {
   /** F-211: every chat's conversation copied into the CRM drive (conversations.ts); tests look now with tick(). */
   conversations: Pick<Conversations, 'tick' | 'status'>
   mount: ApiMount
+  /** Order o5dc4: the Browser's routes and live view, under /browser (agent/browser/mount.ts; the owner's only). */
+  browserMount: ApiMount
   /** F-074: the phone app's side: pairing and its device key's routes, under /voice (voice.ts). */
   voiceMount: ApiMount
   /** F-087: the fast Assistant's warm process; undefined while the feature is off (the default). */
@@ -807,6 +818,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const codebaseImport = createCodebaseImport({ proxy: crmProxy, dir: path.join(o.dir, '..'), log: o.log, open: o.accountsDbOpen })
   // F-126: the CRM's files in this app, and this PC's mount of them (the drive comes back by itself if it was on).
   const crmFiles = createCrmFilesModule({ dir: o.dir, proxy: crmProxy, root: path.resolve(import.meta.dirname, '..', '..'), mountDriver: o.crmFilesMountDriver, log: o.log })
+  // Order o5dc4: the Browser: one headless Chrome/Edge on this PC, started only when asked (agent/browser/host.ts), its own profile under <agentic>/browser.
+  const browser = createBrowserHost({ dir: path.join(o.dir, 'browser'), log: line => o.log?.info(line) })
   void crmFiles.resume().catch(() => undefined)
   // F-211 stage 1 (orders obd04, o7472): every floor chat's conversation goes, one way, into the CRM drive's project "Conversations" as plain JSONL parts and a manifest
   // (conversations.ts). Only the hub (or a PC on its own) sends: it holds every PC's copy (F-021). Its own uploads engine (its own waiting folder: the page's uploads list never
@@ -3919,6 +3932,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!ask.query && !ask.project && !ask.folder && !ask.type) throw apiError(400, 'Say what to look for: query (words of the name), project, folder or type.')
         return json(await crmFiles.service.find(ask))
       }
+      // Order o5dc4: the Browser (agent/browser/host.ts): open an address and read it, or read what is open. Nothing is clicked or typed by an agent.
+      case 'browser_open': {
+        const url = typeof args.url === 'string' ? args.url.trim() : ''
+        if (!url) throw apiError(400, 'Say which address: url is an http(s) address, a name like example.com, or words to search for.')
+        const r = await browser.open(url, { max: typeof args.max === 'number' ? args.max : undefined })
+        // Order o7e1e: the answer carries the private mark (its transcript rows are blanked in the CRM drive's copy, conversations.ts).
+        return json({ ...r, shown: 'It is open in the Browser page (Shubham sees it live there).', privacy: BROWSER_PRIVATE_NOTE })
+      }
+      case 'browser_read': {
+        const r = await browser.read(typeof args.max === 'number' ? args.max : undefined)
+        if (!r) throw apiError(409, 'No browser is open now. browser_open starts one with an address.')
+        return json({ ...r, privacy: BROWSER_PRIVATE_NOTE })
+      }
       // Order o528e: one CRM file in the chat (media.ts): a picture, a video, a PDF (its pages drawn here) or a file to download. Read only.
       case 'show_crm_file': {
         const media = await mediaShelf.shareCrm(args, { sessionId: sid, agent: agent.name })
@@ -6614,6 +6640,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     crmFiles,
     conversations,
     mount,
+    browserMount: browserMount(browser),
     voiceMount: voice.mount,
     fastHost,
     oldReaderHost: () => oldHost,
@@ -6662,6 +6689,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
       threadWatchers.clear()
       // o13d4: started here as before, and kept: the returned promise waits for it (its pins engine saves into <state>/crm-pins last).
       const crmClosed = crmFiles.close()
+      // Order o5dc4: the Server's browser stops with the app.
+      const browserClosed = browser.close().catch(() => undefined)
       // F-211: what was sent is saved; the parts on their way stay in their waiting folder and go on at the next start.
       conversations.close()
       const convClosed = convUploads.close().catch(() => undefined)
@@ -6697,7 +6726,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       clearInterval(voiceTimer)
       events.clear()
       // o13d4: settles once the last writes into the state folder are done; never rejects (a failed close was never thrown before either).
-      return Promise.allSettled([crmClosed, fastStopped, convClosed]).then(() => undefined)
+      return Promise.allSettled([crmClosed, fastStopped, convClosed, browserClosed]).then(() => undefined)
     },
   }
 }

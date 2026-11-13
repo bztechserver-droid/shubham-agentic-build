@@ -100,7 +100,7 @@ export const isOwnerOf = (a: { can?: ChatCan }) => a.can === undefined || a.can 
 // Order o5007: the old-app reader (OLD_ROUTE) is the owner's too: its socket and its setting answer everyone else 403.
 // Order o5dc6: the Phone app page (the APKs to download) is the owner's: its routes want the owner signed in.
 // Orders o2aac / o6056: Paperclip and Schedules are the owner's too ("like the other pages"); empty for now, what they grow into works on this PC.
-const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
+const ADMIN_PATHS = ['/devices', '/ports', '/build', '/setup', '/tasks', '/drive', '/chris', '/goals', '/whatsapp', '/crm', '/accounts', '/dependencies', '/mcps', '/paperclip', '/schedules', '/browser', '/phone-app', OLD_ROUTE, OLD_LEGACY_ROUTE, LIVE_CLASSIC_ROUTE]
 export function adminOnlyPath(pathname: string): boolean {
   return ADMIN_PATHS.some(p => pathname === p || pathname.startsWith(p + '/'))
 }

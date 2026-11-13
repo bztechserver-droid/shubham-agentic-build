@@ -1035,7 +1035,7 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount,
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
       createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()

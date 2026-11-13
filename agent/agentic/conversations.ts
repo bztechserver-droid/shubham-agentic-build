@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { CrmNode, CrmUpload, CrmUploadStart } from '../../shared/crm-files.ts'
+import { BROWSER_PRIVATE_MARK } from '../../shared/browser.ts'
 import { writeAtomic } from '../config.ts'
 
 // F-211, stage 1 (orders obd04, o63c5 and o7472; Shubham's own answers, 13 Nov 2026): every floor chat's conversation (its Claude Code JSONL) is kept in two places, on the PC
@@ -214,20 +215,62 @@ export function partEnd(file: string, from: number, limit: number, size: number)
   return from
 }
 
-/** Copies bytes [from, to) of `file` into `out`, and gives their sha256. */
-function copyRange(file: string, from: number, to: number, out: string): string {
+/**
+ * Order o7e1e (Shubham, on the Browser, F-220: "Includes ensure data privacy."): a row that holds a page's address or text never goes to the CRM.
+ * Those are the browser tools' calls (their address) and their answers (marked BROWSER_PRIVATE_MARK, in the user row and its api-request-blob
+ * row alike). The row's own bytes are replaced by as many bytes of a stand-in (a small JSON object, then spaces, the line's end kept), so a part
+ * is still bytes [from, to) of the file in length: the manifest's ranges and the size check of a part already in the drive still hold.
+ */
+const BROWSER_CALL = /"name"\s*:\s*"mcp__[^"]{1,100}__browser_(?:open|read)"/
+const STAND_IN = Buffer.from('{"type":"private","note":"A row of the Browser (a page\'s address or text): kept on the PC only."}')
+export const privateRow = (row: Buffer): boolean => {
+  const s = row.toString('latin1')
+  return s.includes(BROWSER_PRIVATE_MARK) || BROWSER_CALL.test(s)
+}
+export function blankRow(row: Buffer): Buffer {
+  let end = row.length
+  if (end && row[end - 1] === 0x0a) end--
+  if (end && row[end - 1] === 0x0d) end--
+  const out = Buffer.alloc(row.length, 0x20)
+  const stand = STAND_IN.length <= end ? STAND_IN : Buffer.from('{}')
+  if (stand.length <= end) stand.copy(out, 0)
+  row.copy(out, end, end)
+  return out
+}
+
+/** Copies bytes [from, to) of `file` into `out` (the Browser's rows blanked, the same length), and gives the sha256 of what it wrote. */
+export function copyRange(file: string, from: number, to: number, out: string): string {
   const hash = createHash('sha256')
   mkdirSync(path.dirname(out), { recursive: true })
   writeFileSync(out, '')
   const fdOut = openSync(out, 'a')
+  // The row begun at the end of the last chunk read (a part holds whole rows; a row may cross chunks).
+  let carry: Buffer[] = []
+  const put = (b: Buffer) => {
+    hash.update(b)
+    writeFileSync(fdOut, b)
+  }
+  const row = (pieces: Buffer[]) => {
+    const r = pieces.length === 1 ? pieces[0] : Buffer.concat(pieces)
+    return privateRow(r) ? blankRow(r) : r
+  }
   try {
     for (let at = from; at < to;) {
       const chunk = readAt(file, at, Math.min(1024 * 1024, to - at))
       if (!chunk.length) throw new Error('the conversation file is shorter than it was a moment ago')
-      hash.update(chunk)
-      writeFileSync(fdOut, chunk)
       at += chunk.length
+      const outs: Buffer[] = []
+      let start = 0
+      for (let nl = chunk.indexOf(0x0a); nl !== -1; nl = chunk.indexOf(0x0a, start)) {
+        outs.push(row([...carry, chunk.subarray(start, nl + 1)]))
+        carry = []
+        start = nl + 1
+      }
+      if (start < chunk.length) carry.push(chunk.subarray(start))
+      if (outs.length) put(outs.length === 1 ? outs[0] : Buffer.concat(outs))
     }
+    // A last row with no line end (a part always ends with one; never trusted blindly).
+    if (carry.length) put(row(carry))
   } finally {
     closeSync(fdOut)
   }
@@ -382,7 +425,7 @@ export function createConversations(o: ConversationsOptions): Conversations {
     return `${JSON.stringify(
       {
         v: 1,
-        what: 'A Claude Code conversation (its JSONL). The parts of the last epoch, joined in this order, are the whole file; a new epoch started again from its first byte.',
+        what: 'A Claude Code conversation (its JSONL). The parts of the last epoch, joined in this order, are the whole file; a new epoch started again from its first byte. Rows of the Browser (the address or text of a page) are blanked: the same number of bytes, a small {"type":"private"} object then spaces; they stay on the PC only.',
         sessionId: sid,
         owner: st.owner,
         pc: st.pc,
