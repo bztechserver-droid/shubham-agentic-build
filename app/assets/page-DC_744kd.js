@@ -1,1 +1,0 @@
-import{i as e}from"./navigation-DJWp_UI1.js";function t(){e(`/wpages`)}export{t as default};
