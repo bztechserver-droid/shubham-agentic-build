@@ -32,7 +32,7 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
           await tx`select set_config('app.person_id', ${person}, true)`
           const accounts: Row[] = await tx`
             select p.id, p.platform, p.account_type, p.account_type_disabled, p.name, p.sign_in_email, p.email_source_id, p.phone, p.contact_name, p.contact_linked, p.contact_disabled, p.has_password,
-              p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled
+              p.is_disabled, p.source_updated_at, e.id as email_id, e.is_disabled as email_disabled, p.authenticator_email, p.authenticator_app, p.authenticator_note
             from sad.account_platform p left join sad.account_email e on e.source_id = p.email_source_id
             where p.deleted_at is null
             order by p.is_disabled, lower(p.platform), lower(coalesce(p.name, p.sign_in_email, '')) limit 2001`
@@ -66,6 +66,9 @@ export function createAccountsPlatforms(o: AccountsPlatformsOptions) {
             disabled: a.is_disabled === true,
             updatedAt: a.source_updated_at,
             codebases: linksBy.get(String(a.id)) ?? [],
+            authenticatorEmail: a.authenticator_email,
+            authenticatorApp: a.authenticator_app,
+            authenticatorNote: a.authenticator_note,
           })),
         )
         return { connected: true, accounts: accounts ?? [] }

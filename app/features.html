@@ -3282,6 +3282,17 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-216",
+    "title": "Authenticator: which email account's authenticator app holds each account's 2FA codes, shown on each row, with a \"No authenticator\" filter",
+    "said": "Now I want you to add authenticator email option where we will add which email account has the email account.",
+    "added": "2026-11-13",
+    "notes": [
+      "13 Nov 2026 (order o2881, relayed by the Assistant; his words: \"Now I want you to add authenticator email option where we will add which email account has the email account.\" and the example: Vercel for techserverbz asks for a 6-digit authenticator code, and he wants to see which Google account's Authenticator app has that code). Built: three optional fields on an email account and on a platform account: \"Authenticator on\" (a pick from the Email tab's list), the app (Google Authenticator, Microsoft Authenticator, Authy or Other), and a short device note. Shown on each row, and a \"No authenticator\" quick filter on the Email and Accounts tabs. Never the 2FA secret or a code: the server refuses a note that looks like one. The migration is db/accounts/0012_authenticator.sql: review only, not run; run it after 0011. Worktree wt/authenticator through the merge queue; not published."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>

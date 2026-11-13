@@ -1,4 +1,5 @@
 import { apiError } from '../api.ts'
+import { checkAuthenticator, type AuthenticatorInput } from '../../shared/authenticator.ts'
 import { checkEmailEdit, type Checked, type EmailEditInput } from '../../shared/email-edit.ts'
 import { decryptPassword, encryptPassword, passwordMac } from './accounts-crypto.ts'
 import { openAccountsDb, readAccountsDb, readAccountsKey, reasonOf, WORDS, type AccountsSql, type Row, type Tx } from './accounts-db.ts'
@@ -65,10 +66,11 @@ export function createAccountsEmailWrite(o: AccountsEmailWriteOptions) {
     /** A new email account, made in the app (source 'app'). */
     async create(person: string, raw: unknown): Promise<{ id: string }> {
       const v: EmailEditInput = need(checkEmailEdit(raw))
+      const a: AuthenticatorInput = need(checkAuthenticator(raw))
       const s = sealed(v.password)
       return run(person, async tx => {
-        const made: Row[] = await tx`insert into sad.account_email (owner_id, source, address, recovery_email, phone, description, has_password, password_enc, password_mac, is_disabled)
-          values (${person}, 'app', ${v.address}, ${v.recoveryEmail}, ${v.phone}, ${v.note}, ${s !== null}, ${s?.enc ?? null}, ${s?.mac ?? null}, ${v.disabled}) returning id`
+        const made: Row[] = await tx`insert into sad.account_email (owner_id, source, address, recovery_email, phone, description, has_password, password_enc, password_mac, is_disabled, authenticator_email, authenticator_app, authenticator_note)
+          values (${person}, 'app', ${v.address}, ${v.recoveryEmail}, ${v.phone}, ${v.note}, ${s !== null}, ${s?.enc ?? null}, ${s?.mac ?? null}, ${v.disabled}, ${a.authenticatorEmail}, ${a.authenticatorApp}, ${a.authenticatorNote}) returning id`
         return { id: String(made[0]?.id) }
       })
     },
@@ -77,6 +79,7 @@ export function createAccountsEmailWrite(o: AccountsEmailWriteOptions) {
     async update(person: string, id: string, raw: unknown): Promise<{ ok: true }> {
       if (!UUID.test(id)) throw apiError(400, 'That email account id is not valid.')
       const v = need(checkEmailEdit(raw))
+      const a: AuthenticatorInput = need(checkAuthenticator(raw))
       const s = sealed(v.password)
       return run(person, async tx => {
         await ownedLive(tx, id)
@@ -92,6 +95,9 @@ export function createAccountsEmailWrite(o: AccountsEmailWriteOptions) {
           await tx`update sad.account_email set address = ${v.address}, recovery_email = ${v.recoveryEmail}, phone = ${v.phone}, description = ${v.note}, is_disabled = ${v.disabled}, app_touched_at = now(), updated_at = now()
             where id = ${id} and deleted_at is null`
         }
+        // order o2881: the authenticator (which email account holds its 2FA codes, the app, the device note). Never a secret or a code: none is accepted here.
+        await tx`update sad.account_email set authenticator_email = ${a.authenticatorEmail}, authenticator_app = ${a.authenticatorApp}, authenticator_note = ${a.authenticatorNote}
+          where id = ${id} and deleted_at is null`
         return { ok: true as const }
       })
     },

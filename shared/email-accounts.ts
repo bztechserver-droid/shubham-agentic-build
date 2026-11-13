@@ -22,6 +22,10 @@ export interface EmailAccountRow {
   hasPassword: boolean
   /** The CRM's own "last changed" for this account (an ISO time), for the table's date column; null when unknown. */
   updatedAt: string | null
+  /** Order o2881: the email account whose authenticator app holds this account's 2FA codes (its address), the app's name, and the device note. Never a code or a secret. */
+  authenticatorEmail: string | null
+  authenticatorApp: string | null
+  authenticatorNote: string | null
 }
 
 /** Why the list is not there yet. Each has plain words and a next step (agent/agentic/accounts-email.ts). */
@@ -96,7 +100,7 @@ export function safeEmailRows(raw: unknown): EmailAccountRow[] | null {
       .filter(Boolean)
       .slice(0, MAX_USES)
     const contact = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, MAX_CONTACT) : null)
-    rows.push({ id, address, provider: providerOf(address), note, noteHidden: hidden, disabled: r.isDisabled === true, usedFor, recoveryEmail: contact(r.recoveryEmail), phone: contact(r.phone), hasPassword: r.hasPassword === true, updatedAt: isoOrNull(r.updatedAt) })
+    rows.push({ id, address, provider: providerOf(address), note, noteHidden: hidden, disabled: r.isDisabled === true, usedFor, recoveryEmail: contact(r.recoveryEmail), phone: contact(r.phone), hasPassword: r.hasPassword === true, updatedAt: isoOrNull(r.updatedAt), authenticatorEmail: contact(r.authenticatorEmail), authenticatorApp: contact(r.authenticatorApp), authenticatorNote: contact(r.authenticatorNote) })
   }
   // Switched on first, then by address (the query sorts them so; kept here so the page never depends on it).
   return rows.sort((a, b) => Number(a.disabled) - Number(b.disabled) || a.address.localeCompare(b.address))

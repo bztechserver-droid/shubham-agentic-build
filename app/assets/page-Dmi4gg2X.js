@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-C_K64VkF.js";function t(){e(`/goals`)}export{t as default};

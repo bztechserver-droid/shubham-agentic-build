@@ -47,6 +47,10 @@ export interface PlatformAccountRow {
   disabled: boolean
   updatedAt: string | null
   codebases: PlatformCodebaseLink[]
+  /** Order o2881: the email account whose authenticator app holds this account's 2FA codes (its address), the app's name, and the device note. Never a code or a secret. */
+  authenticatorEmail: string | null
+  authenticatorApp: string | null
+  authenticatorNote: string | null
 }
 
 import type { NotConnected } from './email-accounts.ts'
@@ -101,6 +105,9 @@ export function safePlatformRows(raw: unknown): PlatformAccountRow[] | null {
       disabled: r.disabled === true,
       updatedAt: isoOf(r.updatedAt),
       codebases,
+      authenticatorEmail: clean(r.authenticatorEmail, 200),
+      authenticatorApp: clean(r.authenticatorApp, 40),
+      authenticatorNote: clean(r.authenticatorNote, 200),
     })
   }
   return rows.sort((a, b) => Number(a.disabled) - Number(b.disabled) || a.platformName.localeCompare(b.platformName) || (a.name ?? a.signInEmail ?? '').localeCompare(b.name ?? b.signInEmail ?? ''))
@@ -132,16 +139,19 @@ export interface PlatformFilters {
   codebase: string
   tab: AccountsStateTab
   gap: QuickGap
+  /** Order o2881: "No authenticator" keeps only the accounts with no authenticator recorded. */
+  noAuthenticator: boolean
 }
 /** The CRM page opens on its Active tab with nothing else set. */
-export const NO_PLATFORM_FILTERS: PlatformFilters = { search: '', type: 'all', platform: 'all', codebase: 'all', tab: 'active', gap: '' }
+export const NO_PLATFORM_FILTERS: PlatformFilters = { search: '', type: 'all', platform: 'all', codebase: 'all', tab: 'active', gap: '', noAuthenticator: false }
 /** "Any filter is on" as the CRM page counts it: the search, type, platform, codebase and the quick filter (the Active / Disabled tab is not one). */
-export const platformFiltersOn = (f: PlatformFilters): boolean => f.search !== '' || f.type !== 'all' || f.platform !== 'all' || f.codebase !== 'all' || f.gap !== ''
+export const platformFiltersOn = (f: PlatformFilters): boolean => f.search !== '' || f.type !== 'all' || f.platform !== 'all' || f.codebase !== 'all' || f.gap !== '' || f.noAuthenticator
 
 /** The rows the CRM page's filters keep, in its own order of tests. */
 export function filterPlatformRows(rows: readonly PlatformAccountRow[], f: PlatformFilters): PlatformAccountRow[] {
   const q = f.search.trim().toLowerCase()
   return rows.filter(r => {
+    if (f.noAuthenticator && (r.authenticatorEmail || r.authenticatorApp || r.authenticatorNote)) return false
     if (f.tab === 'active' && r.disabled) return false
     if (f.tab === 'disabled' && !r.disabled) return false
     if (f.gap === 'no-codebase' && r.codebases.length > 0) return false
