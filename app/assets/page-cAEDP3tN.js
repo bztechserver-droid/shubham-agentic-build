@@ -1,0 +1,1 @@
+import{i as e}from"./navigation-DJWp_UI1.js";function t(){e(`/goals`)}export{t as default};

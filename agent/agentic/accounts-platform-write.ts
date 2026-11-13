@@ -58,9 +58,10 @@ export function createAccountsPlatformWrite(o: AccountsPlatformWriteOptions) {
       const v: PlatformAddInput = need(checkPlatformAdd(raw))
       const a: AuthenticatorInput = need(checkAuthenticator(raw))
       return run(person, async tx => {
-        // Each codebase must be the owner's own, live codebase (the read rule of 0004 limits the rows; a missing one is refused, not skipped).
+        // Each codebase must be the owner's own codebase (the read rule of 0004 limits the rows; a missing one is refused, not skipped). The codebase table has no
+        // deleted_at column in any migration, so this check does not name one (naming it made the database answer 42703).
         const found: Row[] = v.codebases.length
-          ? await tx`select id::text as id, source_id::text as source_id from sad.account_codebase where id = any(${v.codebases}::uuid[]) and deleted_at is null`
+          ? await tx`select id::text as id, source_id::text as source_id from sad.account_codebase where id = any(${v.codebases}::uuid[])`
           : []
         if (found.length !== v.codebases.length) throw apiError(400, 'One of the codebases is not there any more. Choose the codebases again.')
         const made: Row[] = await tx`insert into sad.account_platform (owner_id, source, platform, account_type, name, sign_in_email, phone, contact_name, has_password, is_disabled, note, app_touched_at, authenticator_email, authenticator_app, authenticator_note)
