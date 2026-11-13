@@ -291,6 +291,8 @@ const ADMIN_TOOLS = new Set([
   'prepare_send',
   // Order o16d2: what it shows is served to the owner only.
   'show_media',
+  // Order o3963: a PC's screen is the owner's.
+  'show_screen',
 ])
 
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
@@ -3833,6 +3835,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
           throw apiError(409, `A file can be shown from chats running on the main PC (the Server) for now; this chat runs on ${w?.name ?? self().name}. Copy the file to the Server, or give an https:// address.`)
         }
         return json({ media: await mediaShelf.share(args, { sessionId: sid, agent: agent.name }), shown: 'It is in the chat now, as a picture or a video he can open, play and save.' })
+      }
+      // Order o3963: a button for a PC's Control screen (shared/screen-bubble.ts). Only names the PC: nothing connects until his tap opens the screen.
+      case 'show_screen': {
+        const want = typeof args.pc === 'string' ? args.pc.trim() : ''
+        if (!want) throw apiError(400, 'Say which PC: pc is its name (like Server) or its id.')
+        const pcs = controlDeviceCatalogue()
+        const pc = pcs.find(p => p.id === want) ?? pcs.find(p => p.name.toLowerCase() === want.toLowerCase())
+        if (!pc) throw apiError(404, `There is no PC called "${want}". The PCs are: ${pcs.map(p => p.name).join(', ') || 'none'}.`)
+        const caption = typeof args.caption === 'string' && args.caption.trim() ? args.caption.trim().slice(0, 300) : null
+        return json({ screen: { pc: pc.id, name: pc.name, caption, online: pc.online }, shown: `A button for ${pc.name}'s screen is in the chat now${pc.online ? '' : ` (${pc.name} is offline right now)`}. Nothing connects until he taps it.` })
       }
       // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
       case 'phone_update': {

@@ -1669,6 +1669,27 @@ same way when `src` is an https address or the app's own media link; anything el
 - **Tests:** `agentic/media.test.ts` (sharing, refusals, the route with real files and a real server: types, Range, 404/410, the wiring
   of the owner check), `shared/media.test.ts` (the answer, what may be drawn, markdown pictures, the row), `src/chat/media-wiring.test.mjs`.
 
+### Order o3963 (F-214): a PC's Control screen from a button in the chat (shared/screen-bubble.ts)
+
+His words: "Now on more thing if we can have the control screen of any pc also here then i click then overlay comes obve this overlay chat
+when i clik on area button given by you". The app's MCP tool **`show_screen`** (`tools.ts`, owner-only: `ADMIN_TOOLS`): `pc` (a PC's
+name, any case, or its device id, from `controlDeviceCatalogue()`: this PC and its members), `caption`. It connects nothing; it answers a
+JSON line (`{"screen":{pc,name,caption,online},...}`), and an unknown PC is refused with the PCs' names. As for show_media, the page
+(`shared/chat-rows.ts`) turns an answered call into a row of its own (`k: 'screen'`): a card with "Open <name>'s screen".
+
+- **What the card says** (`screenStateOf`): from the device agent's own state, the list the Control screen itself reads (this PC, or a
+  paired PC): ready (the app's own screen or RustDesk can be reached), off or unreachable, checking, not ready (neither way: an older
+  build or no screen set up), not a PC any more, the device agent down. Only a ready PC's button can be tapped, and only by the owner.
+- **The layer** (`src/overlay/ScreenLayer.tsx`, mounted once in `OverlayLayout` for the owner, inside the router): a dialog above the
+  overlay chat (the chat's panel is z 45, dialogs 50) holding PC control's own viewer, `<Remote deviceId onClose>`: the same password
+  the PC remembers, permissions and privacy switch; it connects as it mounts (the tap) and lets go as it unmounts. Full screen on a
+  phone, 94% of the window on a computer. `Remote`'s ways out (its toolbar's arrow, Cancel, Back to PC control) become buttons that close
+  the layer when `onClose` is given; elsewhere they are the links they were. Escape closes it unless the screen has the keyboard (then
+  it is the other PC's: hold it to give the keyboard back); Back closes it by its own history entry (`back-close.ts`'s `mark`
+  `__sadScreen`, above the overlay chat's `__sadOverlay`); a click beside it does nothing. The chat underneath keeps its scroll.
+- **Tests:** `shared/screen-bubble.test.ts` (the answer, the states, the row, Back with both layers), `agentic/index.test.ts` (the tool
+  through the MCP shim), `src/chat/screen-wiring.test.mjs`.
+
 ## F-056: the task list (agentic/tasks.ts)
 
 The Tasks page (DESIGN.md › Tasks) and every chat share one list of tasks, kept by the hub. Types:

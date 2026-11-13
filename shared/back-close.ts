@@ -18,6 +18,8 @@ export interface BackCloseDeps {
   isOpen: () => boolean
   close: () => void
   now?: () => number
+  /** Order o3963: the name of the history entry's mark: a second layer (the Control screen over the chat) keeps its own, so Back closes the top one first. */
+  mark?: string
 }
 
 export interface BackClose {
@@ -27,12 +29,13 @@ export interface BackClose {
   onPop(): void
 }
 
-const MARK = '__sadOverlay'
+const OVERLAY_MARK = '__sadOverlay'
 /** A history.back() we made whose popstate has not come: ignored for at most this long, so one that never comes cannot jam it. */
 const PENDING_MS = 1500
 
 export function createBackClose(deps: BackCloseDeps): BackClose {
   const h = deps.history
+  const MARK = deps.mark ?? OVERLAY_MARK
   const now = deps.now ?? Date.now
   let was = false
   let enabled = false

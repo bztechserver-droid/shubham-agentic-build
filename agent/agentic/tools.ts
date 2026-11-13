@@ -523,6 +523,21 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // Order o3963: a button for a PC's Control screen in the chat (shared/screen-bubble.ts); his tap opens it above the overlay chat.
+  {
+    name: 'show_screen',
+    description:
+      "Put a button into this chat that opens a PC's CONTROL SCREEN for Shubham: when HE taps it, that PC's live screen opens above the chat (the same viewer as PC control › Screen, with the same remembered password, permissions and privacy rules); closing it brings him back to the chat. Nothing connects until he taps. `pc` is the PC's name (like Server) or its id, as PC control lists them; `caption` is an optional line under the button. If the PC is off or on an older build the button says so. Use it when he asks to see or control a PC's screen.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pc: { type: 'string', description: "The PC: its name (like Server) or its device id." },
+        caption: { type: 'string', description: 'A line under the button (optional).' },
+      },
+      required: ['pc'],
+      additionalProperties: false,
+    },
+  },
   // F-079: Shubham's WhatsApp, for the overlay Assistant only: it reads when asked and drafts; only his tap sends.
   ...WA_TOOLS,
 ]

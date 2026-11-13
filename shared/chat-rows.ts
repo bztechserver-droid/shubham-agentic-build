@@ -1,6 +1,7 @@
 import type { ChatAttachment } from './attachments.ts'
 import type { ChatAssistantItem, ChatItem, ChatNoticeItem, ChatToolItem, ChatUserItem } from './chat.ts'
 import { isMediaToolName, parseMediaResult, type MediaShown } from './media.ts'
+import { isScreenToolName, parseScreenResult, type ScreenShown } from './screen-bubble.ts'
 
 // F-050: what the conversation list draws: chat items turned into rows. Consecutive tool calls
 // are one row (a single line that opens), bubbles from one side close together are a cluster
@@ -53,6 +54,8 @@ export type ChatRow =
   | { k: 'ask'; id: string; tool: ChatToolItem }
   /** Order o16d2: a picture or a video the agent showed (its show_media tool, answered): a bubble on the agent's side, not a tool line. */
   | { k: 'media'; id: string; tool: ChatToolItem; media: MediaShown }
+  /** Order o3963: a button for a PC's Control screen an agent offered (its show_screen tool, answered): a bubble on the agent's side; nothing connects before a tap. */
+  | { k: 'screen'; id: string; tool: ChatToolItem; screen: ScreenShown }
   | { k: 'notice'; id: string; item: ChatNoticeItem }
 
 /** Two bubbles from the same side this close are one cluster. */
@@ -198,6 +201,12 @@ export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = [], op
       const media = it.status === 'done' && isMediaToolName(it.name) ? parseMediaResult(it.output) : null
       if (media) {
         rows.push({ k: 'media', id: it.id, tool: it, media })
+        return
+      }
+      // Order o3963: once show_screen has answered, its button is a bubble of its own.
+      const screen = it.status === 'done' && isScreenToolName(it.name) ? parseScreenResult(it.output) : null
+      if (screen) {
+        rows.push({ k: 'screen', id: it.id, tool: it, screen })
         return
       }
       const prev = rows.at(-1)
