@@ -2612,6 +2612,10 @@ ONLY: nothing here opens, closes, shares or changes a port (that stays on Settin
   tailnet name it said.
 - **Checked twice** (`cleanReport`, by the Server and again by the page): the right PC, known words, bounded sizes, at most 400 rows; a bad row is left out;
   a link is kept only when it is http(s) to a `*.ts.net` name, a Tailscale IPv4 (100.64.0.0/10) or IPv6 (fd7a:115c:a1e0::/48), with no user, path, query or fragment.
+- **The page** (order obb9e, 13 Nov: "add the tab instead of keeping ports one below other"): below the PC's Tailscale name and IP and Refresh, the groups
+  are sub-tabs with their counts (This app, Stable ports, Shared, Other programs; only the groups that PC has), one shown at a time; two by two on a phone,
+  one row from 640 px. The last one chosen is kept in this browser (`sad-pc-ports-group`; a PC without it shows its first). The old stacked list stays as
+  the "One long list" switch in the tab, off by default (`sad-pc-ports-stacked` = "1"), with "Other programs" folded as before.
 - Tests: `shared/pc-ports.test.ts`, `pc-ports.test.ts` (self, member over a real stream pair, off, older build, liar, silent, garbage, IDs, the member's
   refusals, the route), `pc-ports-api.test.ts` (owner 200, anyone else 403), the page's `src/pc-control/ports-report.test.mjs` and `workspace-tabs.test.mjs`
   (Ports after Updates, the owner's only), and `src/pages/phone-width.test.mjs` (360 px, PC control's own scroll box included).
