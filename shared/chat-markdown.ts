@@ -4,6 +4,8 @@
 // and in a line code, **bold**, *italic*, ~~strike~~, links and bare urls. A message still being
 // written parses too: an unclosed fence is code to the end, an unclosed `*` is a star.
 
+import { safeMediaSrc } from './media.ts'
+
 export type Inline =
   | { t: 'text'; s: string }
   | { t: 'code'; s: string }
@@ -12,6 +14,8 @@ export type Inline =
   | { t: 'del'; c: Inline[] }
   | { t: 'link'; href: string; c: Inline[] }
   | { t: 'br' }
+  /** Order o16d2: ![words](src): drawn as a picture (or a video, by its ending) when src is an https address or the app's own media link. */
+  | { t: 'img'; src: string; alt: string }
 
 export type MdBlock =
   | { t: 'p'; c: Inline[] }
@@ -90,6 +94,19 @@ export function parseInline(s: string): Inline[] {
       buf += run
       i = k
       continue
+    }
+    if (c === '!' && s[i + 1] === '[') {
+      // Order o16d2: a picture. Only an https address or the app's own media link is drawn; anything else (a file path, http, data:) keeps its words.
+      const m = /^!\[((?:[^\]\\]|\\.)*)\]\(\s*((?:[^\s()]|\([^\s()]*\))+)(?:\s+"[^"]*")?\s*\)/.exec(s.slice(i))
+      if (m) {
+        const src = safeMediaSrc(m[2])
+        const alt = m[1].replace(/\\(.)/g, '$1').trim()
+        flush()
+        if (src) out.push({ t: 'img', src, alt })
+        else if (alt) out.push({ t: 'text', s: alt })
+        i += m[0].length
+        continue
+      }
     }
     if (c === '[') {
       // The address may hold one level of parentheses (Wikipedia's do).

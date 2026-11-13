@@ -143,6 +143,7 @@ import { createAssistantSettings, goalsPageCall } from './assistant-settings.ts'
 import { createToolsSeen, needsRefresh, toolsVersion } from './tools-seen.ts'
 import { TOOLS } from './tools.ts'
 import { contentTypeOf, createUploadStore, PIECE_BYTES } from './uploads.ts'
+import { createMediaShelf } from './media.ts'
 import { ATTACH_MAX_BYTES, isStoredName, safeName, storedName } from '../../shared/attachments.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { CONTINUE_TEXT, createRecovery, type Recovery, type Remembered } from './recover.ts'
@@ -288,6 +289,8 @@ const ADMIN_TOOLS = new Set([
   'watchdog_status',
   'memory_read',
   'prepare_send',
+  // Order o16d2: what it shows is served to the owner only.
+  'show_media',
 ])
 
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
@@ -1212,6 +1215,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // F-069: the files sent to the chats that run on this PC (the page's photos, pictures and files).
   const uploads = createUploadStore(path.join(o.dir, 'uploads'))
   uploads.prune()
+  // Order o16d2: the pictures and videos the agents show in their chats (show_media), served by unguessable id to the owner only.
+  const mediaShelf = createMediaShelf({ file: path.join(o.dir, 'media.json') })
   // F-078: every chat that stops or starts, and why (chat-log.ts): the pattern Shubham is told in the morning.
   const chatLog = createChatLog(path.join(o.dir, 'chat-events.jsonl'))
   /** Why the next start of a chat is happening, when it is not the usual (the heartbeat starting it again). */
@@ -3819,6 +3824,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return json(rosterOf({ ...floor, agents: floor.agents.filter(a => a.id === agent.id || access.rights(me, a) !== null) }, agent))
       case 'watchdog_status':
         return json(watchdogView())
+      // Order o16d2: a picture or a video shown in this chat (media.ts). The answer is the JSON line the page draws it from (shared/media.ts).
+      // A file has to be on the PC that serves the page: a chat running on another PC has its files there, so only an https address works from it.
+      case 'show_media': {
+        const w = whereAll()[sid]
+        const fromFile = typeof args.path === 'string' && args.path.trim() !== ''
+        if (fromFile && (mode() === 'member' || (w && w.id !== self().id))) {
+          throw apiError(409, `A file can be shown from chats running on the main PC (the Server) for now; this chat runs on ${w?.name ?? self().name}. Copy the file to the Server, or give an https:// address.`)
+        }
+        return json({ media: await mediaShelf.share(args, { sessionId: sid, agent: agent.name }), shown: 'It is in the chat now, as a picture or a video he can open, play and save.' })
+      }
       // F-085: the Update button's push, from the PC. The overlay assistant and the Mobile chat (floor Final), as for the phone's hands.
       case 'phone_update': {
         if (!phoneUser(floor.name, agent)) {
@@ -6417,6 +6432,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return (req, res, caller) => {
           access.needChat(caller ?? OPEN, agentOf(floorOf(decodeURIComponent(down[1])), decodeURIComponent(down[2])), 'view', 'GET attachment')
           return attachDownload(req, res, decodeURIComponent(down[1]), decodeURIComponent(down[2]), decodeURIComponent(down[3]))
+        }
+      // Order o16d2: a picture or video an agent showed in its chat: by its unguessable id only (never a path), the owner's only, read only, with Range.
+      const shown = /^\/media\/([A-Za-z0-9_-]{24})$/.exec(rest)
+      if (shown)
+        return (req, res, caller) => {
+          if (!access.isAdmin(caller ?? OPEN)) {
+            o.auth?.deny(caller ?? OPEN, 403, 'admin-only', `GET ${AGENT_API_PREFIX}${AGENTIC_PREFIX}/media`)
+            throw authError(403, 'The pictures and videos the agents show are for the owner of this app.', 'admin-only')
+          }
+          return mediaShelf.serve(shown[1], req, res, url.searchParams.get('download') === '1')
         }
       return null
     },

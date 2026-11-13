@@ -1,1 +1,0 @@
-import{i as e}from"./rolldown-runtime-COiEfhsA.js";import{t}from"./jsx-runtime-DePvh3-m.js";import{r as n}from"./legacy-views-DYMFLU7k.js";var r=e(t());function i(){return(0,r.jsx)(n,{})}export{i as default};

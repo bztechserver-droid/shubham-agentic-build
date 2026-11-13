@@ -1,5 +1,6 @@
 import type { ChatAttachment } from './attachments.ts'
 import type { ChatAssistantItem, ChatItem, ChatNoticeItem, ChatToolItem, ChatUserItem } from './chat.ts'
+import { isMediaToolName, parseMediaResult, type MediaShown } from './media.ts'
 
 // F-050: what the conversation list draws: chat items turned into rows. Consecutive tool calls
 // are one row (a single line that opens), bubbles from one side close together are a cluster
@@ -50,6 +51,8 @@ export type ChatRow =
   | { k: 'tools'; id: string; tools: ChatToolItem[]; running: boolean }
   /** The agent's question (AskUserQuestion), a card of its own with its options as buttons. */
   | { k: 'ask'; id: string; tool: ChatToolItem }
+  /** Order o16d2: a picture or a video the agent showed (its show_media tool, answered): a bubble on the agent's side, not a tool line. */
+  | { k: 'media'; id: string; tool: ChatToolItem; media: MediaShown }
   | { k: 'notice'; id: string; item: ChatNoticeItem }
 
 /** Two bubbles from the same side this close are one cluster. */
@@ -189,6 +192,12 @@ export function toRows(feedItems: ChatItem[], pending: PendingMessage[] = [], op
       day(it.at)
       if (it.ask) {
         rows.push({ k: 'ask', id: it.id, tool: it })
+        return
+      }
+      // Order o16d2: once show_media has answered, the picture or video is its own bubble. Still running, or refused: a tool line, as any other.
+      const media = it.status === 'done' && isMediaToolName(it.name) ? parseMediaResult(it.output) : null
+      if (media) {
+        rows.push({ k: 'media', id: it.id, tool: it, media })
         return
       }
       const prev = rows.at(-1)

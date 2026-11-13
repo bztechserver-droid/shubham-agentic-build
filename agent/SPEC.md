@@ -1641,6 +1641,34 @@ MB (`GET .../messages` was bounded to its last 8 MB for the same reason).
   (the socket, history, previews, say, the menu over the socket), `screen.test.ts` (the model, and the
   recorded menu and spinner), and in `shared/`: `chat-markdown.test.ts`, `chat-rows.test.ts`.
 
+### Order o16d2 (F-213): pictures and videos in the chat (agentic/media.ts, shared/media.ts)
+
+His words: "Now one big feature to add is you should be able to show me images and videos here itself in the chat like whatsapp does
+ok". An agent shows one with the app's MCP tool **`show_media`** (`tools.ts`): `path` (the full path of a file on this PC) or `url` (an
+https address), `caption`, `kind` (for an address with no file ending). Nothing new travels: the tool's answer is a JSON line
+(`{"media":{kind,src,name,size,caption},...}`), the transcript carries it as the tool call's `output` (it fits the 1500 characters), and
+the page (`shared/chat-rows.ts`) turns an answered `show_media` call into a row of its own (`k: 'media'`), a bubble on the agent's side;
+running or refused, it stays a tool line. `![words](src)` in an agent's message (`shared/chat-markdown.ts`, inline `img`) is drawn the
+same way when `src` is an https address or the app's own media link; anything else (a file path, http, data:) keeps only its words.
+
+- **Serving** (`GET|HEAD /agentic/media/<id>`, the page's `/agent-api/agentic/media/<id>`): `<id>` is 18 random bytes (24 url-safe
+  characters) and the only thing taken from the address; it picks a row of `media.json` (in the agentic folder, the newest 5000 shares).
+  The owner of the app only (`access.isAdmin`, else 403 `admin-only`); the tool is in `ADMIN_TOOLS` too. Pictures (.png .jpg .gif .webp
+  .avif .bmp) and videos (.mp4 .m4v .mov .webm .ogv; .mov is served as video/mp4); no SVG. The name's ending AND the file's first bytes
+  must agree when it is shared and again each time it is served (a file swapped under the same name is 410), at most 200 MB (413), a file
+  gone is 410. One Range (206, 416 past the end) so a video seeks. `X-Content-Type-Options: nosniff`, a sandboxing
+  `Content-Security-Policy`, `Content-Disposition` inline (`?download=1`: attachment, with the real name in `filename*`).
+- **Where:** a file must be on the PC that serves the page. A chat running on another PC (a member, or a hub floor's chat running on a
+  member) is refused a `path` (409, said in words); an `url` works from any PC.
+- **The page** (`src/chat/Media.tsx`, `ImageViewer.tsx`): a picture is a thumbnail (at most 320 px high) that opens full screen: two
+  fingers zoom (to 6x), a double tap zooms on that spot or back, a drag pans when zoomed, a swipe down at normal size closes (the scrim
+  fades), the wheel zooms on a computer. A video plays in place (`playsInline`, its first frame as the poster by `#t=0.1`), with a sound
+  switch and its own full screen (the viewer, from where it was): the browser's full screen and download are hidden (`controlsList`)
+  because the phone app's WebView has no full screen. Each has a save button (`?download=1`; the phone app saves it with the WebView's
+  sign-in). An address of another site opens in a new tab instead.
+- **Tests:** `agentic/media.test.ts` (sharing, refusals, the route with real files and a real server: types, Range, 404/410, the wiring
+  of the owner check), `shared/media.test.ts` (the answer, what may be drawn, markdown pictures, the row), `src/chat/media-wiring.test.mjs`.
+
 ## F-056: the task list (agentic/tasks.ts)
 
 The Tasks page (DESIGN.md › Tasks) and every chat share one list of tasks, kept by the hub. Types:

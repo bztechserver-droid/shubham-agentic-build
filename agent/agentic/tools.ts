@@ -507,6 +507,22 @@ export const TOOLS: ToolDef[] = [
       additionalProperties: false,
     },
   },
+  // Order o16d2: a picture or a video in the chat itself, the way WhatsApp shows one (agent/agentic/media.ts, shared/media.ts).
+  {
+    name: 'show_media',
+    description:
+      "Show Shubham a PICTURE or a VIDEO right in this chat, the way WhatsApp does: it appears in the conversation as a picture he can open full screen (pinch to zoom) or a video that plays in place, each with a save button. Give either `path`, the FULL path of a file on this PC (a screenshot, a generated image, an .mp4), or `url`, an https:// address. Pictures: .png .jpg .jpeg .gif .webp .avif .bmp; videos: .mp4 .m4v .mov .webm .ogv; at most 200 MB. The file stays where it is (do not move or delete it while he may still look at it); only the owner of the app can open it, by a link nobody can guess. Works for chats running on the main PC (the Server). In a written answer, ![words](https://…) shows an https picture the same way; a file path in markdown is not shown, so use this tool for files.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'The full path of the picture or video on this PC, like C:\\Users\\you\\Pictures\\shot.png.' },
+        url: { type: 'string', description: 'Or an https:// address of a picture or video.' },
+        caption: { type: 'string', description: 'A line under it (optional).' },
+        kind: { type: 'string', enum: ['image', 'video'], description: 'Only for an address whose name does not end in a picture or video ending.' },
+      },
+      additionalProperties: false,
+    },
+  },
   // F-079: Shubham's WhatsApp, for the overlay Assistant only: it reads when asked and drafts; only his tap sends.
   ...WA_TOOLS,
 ]
