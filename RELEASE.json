@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.13-1402",
-  "commit": "14335a5",
+  "version": "2026.11.13-1413",
+  "commit": "772aada",
   "dirty": false,
-  "builtAt": "2026-11-13T08:32:39.838Z",
-  "devHash": "945ff4bbc7e647c38856",
+  "builtAt": "2026-11-13T08:43:37.028Z",
+  "devHash": "aea66282387837524ba0",
   "chatHost": {
     "protocol": 1,
     "version": 1

@@ -3232,6 +3232,21 @@
     ],
     "done": null,
     "doneNote": ""
+  },
+  {
+    "id": "F-212",
+    "title": "The compact Assistant bar: the tabs, the heartbeat, the terminal and the menu in one row at the top, and the chat's own header goes",
+    "said": "please merge the top Assistant bar and the chat Assistant bar; move the terminal and the horizontal (menu) bar together",
+    "added": "2026-11-13",
+    "notes": [
+      "13 Nov 2026 (order o1e3b, relayed by the Assistant): built and merged into shubham as 3acf62e through the queue. Settings > Chats > Assistant style has \"Compact Assistant bar\", on by default; the old two bars are kept as the other choice.",
+      "13 Nov 2026 (order oeffb): the tabs are equal cells at 44 px; the chat tools (terminal, menu) are a fixed right group; under 520 px the terminal and the pin fold into one \"Chat actions\" menu; the docked drawer opens at least 362 px where the window has the room. Merged as aa1a2e7.",
+      "13 Nov 2026 (orders o0205 and obca1): the heartbeat is a small status dot in the bar (green all well, amber something to tell, red cannot reach the agent); \"Remember the overlay's size\" is on by default, so the overlay reopens maximized, normal or collapsed as it was closed, also after a reload. Merged as aa1a2e7.",
+      "13 Nov 2026 (order o9b90, his words via the Assistant: \"The terminal icon is not showing when the screen is small.\"): CANCELLED by order o4f4b (\"Don't change that\"): the terminal stays in \"Chat actions\" under 520 px. Nothing merged for it.",
+      "13 Nov 2026 (orders o2c16 and o2290, his words: \"Now when the screen is big on the top bar we see assistant written on left of chat please remove that.\" and \"And the icon.\"): the word and the icon left of the Chat tab are removed at every width; the bar keeps its name for screen readers (role group, aria-label). Checked at 360, 768, 1280 and 1920 px. Worktree wt/bar-no-title through the merge queue; not published."
+    ],
+    "done": null,
+    "doneNote": ""
   }
 ]
 </script>
