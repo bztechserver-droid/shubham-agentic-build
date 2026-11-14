@@ -1,5 +1,8 @@
 import { createPcBuild, safeHubOrigin, PC_BUILD_STREAM, type BuildControl } from './pc-build.ts'
 import { createPcPorts, PC_PORTS_STREAM } from './pc-ports.ts'
+import { createSshTerm } from './pc-ssh-term.ts'
+import { loadNodePty } from './agentic/chats.ts'
+import os from 'node:os'
 import { buildPortRows, cleanTailnetIp, cleanTailnetName, knownAppPorts, safeLink, stableFallbackRows, type PcPortRow, type PcPortsReport } from '../shared/pc-ports.ts'
 import { FREE_CREDENTIAL, openCodeCredential } from './opencode/crm.ts'
 import type net from 'node:net'
@@ -50,8 +53,10 @@ import { createSavedPasswords } from './saved-passwords.ts'
 import { createAppScreen } from './screen/index.ts'
 import { createEngine, type Engine as SpeechEngine } from './speech/engine.ts'
 import { speechMount, stream as speechStream } from './speech/routes.ts'
+import { createTts, type Tts } from './speech/tts.ts'
 import { startUiServer, type UiServer } from './ui-server.ts'
 import { createWhatsApp, type WhatsApp } from './whatsapp/index.ts'
+import { createWhatsAppBackendProxy } from './whatsapp-backend/proxy.ts'
 import { defaultRunner as tailscaleRunner } from './drive/tailscale.ts'
 import { createPorts, DEFAULT_GATE_PORT } from './ports/index.ts'
 import { scannersFor } from './ports/scan.ts'
@@ -459,6 +464,37 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
       return pc ? stableFallbackRows(pc.ports, pc.status, serverLink, name) : []
     },
     serverLinks: (rows: PcPortRow[]) => rows.map(r => (r.group === 'stable' ? { ...r, serverUrl: serverLink(r.port) } : r)),
+  })
+
+  // Orders o1fa0 + o2915: PC control's SSH tab opens a live SSH session from THIS PC's own ssh client and key (pc-ssh-term.ts). Human only, the
+  // owner only (the signed-in CRM administrator, as the PC screen); only to tailnet addresses; the key and any password never reach the page.
+  const linkHost = (id: string): string | null => {
+    const address = hub?.links.devices().find(d => d.id === id)?.address ?? null
+    return address ? address.replace(/^\[?([^\]]+?)\]?:\d+$/, '$1') : null
+  }
+  const sshHome = os.homedir()
+  const sshKey = path.join(sshHome, '.ssh', 'id_ed25519')
+  const sshTerm = createSshTerm({
+    pc: id => {
+      if (id === identity.id) return { name: config.name, tailnetGuess: tailnet() }
+      if (role === 'hub') {
+        const m = devices.member(id)
+        return m ? { name: m.name, tailnetGuess: linkHost(id) } : null
+      }
+      const h = devices.hub()
+      return h && h.id === id ? { name: h.name, tailnetGuess: h.tailnet ? h.tailnet.replace(/:\d+$/, '') : null } : null
+    },
+    auth,
+    pty: loadNodePty,
+    ssh: {
+      exe: process.platform === 'win32' ? path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe') : 'ssh',
+      keyFile: existsSync(sshKey) ? sshKey : null,
+      knownHosts: path.join(sshHome, '.ssh', 'known_hosts'),
+      cwd: sshHome,
+      env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => typeof e[1] === 'string')),
+    },
+    dir: path.join(paths.agent, 'ssh'),
+    log: log.child('ssh'),
   })
 
   if (role === 'hub') hub = await startHub()
@@ -1035,8 +1071,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
 
   try {
     // Order o5dc6: the Phone app page's downloads (the owner, signed in), on every PC; a PC with no build says so.
-    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
-      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), ...(extras.mounts ?? [])] })
+    api = await startApi({ port: ports.api, token, actions, onClients, auth, log: log.child('api'), mounts: [pcBuild.mount, pcPorts.mount, sshTerm.mount, createPhoneAppsMount({ auth, log: log.child('phone-apps') }), agentic?.mount ?? agenticOff(),...(agentic ? [agentic.voiceMount, agentic.crmFiles.mount, agentic.browserMount,
+      createMcpCatalogMount({ registryFile: path.join(paths.agent, 'agentic', 'mcp-servers.json'), pc: () => ({ id: identity.id, name: config.name }), auth })] : []), ...(whatsapp ? [whatsapp.mount] : []), createWhatsAppBackendProxy({ dir: process.env.WA_BACKEND_DIR ?? path.join(paths.root, 'whatsapp-backend') }), ...(extras.mounts ?? [])] })
   } catch (e) {
     await stopAll()
     throw new Error(`cannot open the local API on 127.0.0.1:${ports.api}: ${message(e)} (is another agent running?)`, { cause: e })
@@ -1062,6 +1098,8 @@ export async function startAgent(config: Config, log: Logger = rootLog, extras: 
     rowWatch?.stop()
     claude.close()
     agentic?.close()
+    // Order o2915: every open SSH session ends with the agent (each ssh by its own handle).
+    sshTerm.closeAll()
     auth.close()
     void portsMod.close()
     void stable.close()
@@ -1096,6 +1134,8 @@ if (import.meta.main) {
   let build: Build | null = null
   // F-080: Whisper on this PC for the mic (loaded only while someone speaks; agent/speech).
   let speech: SpeechEngine | null = null
+  // F-221: the PC voice (Windows' own voices, for live talk); its helper starts with the first sentence, never here.
+  let pcVoice: Tts | null = null
   let ui: UiServer | null = null
   let uiTailnet: UiServer | null = null
   let logsDir: string | null = null
@@ -1123,6 +1163,7 @@ if (import.meta.main) {
     try {
       build?.close()
       await within('letting Whisper go', speech?.stop(), 3000)
+      await within('letting the PC voice go', pcVoice?.stop(), 3000)
       await within('closing the page', ui?.close(), 3000)
       await within('closing the tailnet page', uiTailnet?.close(), 3000)
       await within('stopping the agent', agent?.stop(), 10_000)
@@ -1179,7 +1220,8 @@ if (import.meta.main) {
     const agents = build.info().kind === 'build' || process.argv.includes('--agents') || process.env.SAD_AGENTS === '1'
     if (!agents) log.info('the Agents section is off: this is Dev, and the build runs the chats (--agents turns it on here)')
     speech = createEngine({ log: log.child('speech') })
-    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'))], devDir, agents, speech, chatHostGate: hostGate, updateBuild: build, updateCoordinator, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
+    pcVoice = createTts({ log: log.child('speech') })
+    agent = await startAgent(config, log, { buildControl: build, mounts: [build.mount, speechMount(speech, log.child('speech'), pcVoice)], devDir, agents, speech, chatHostGate: hostGate, updateBuild: build, updateCoordinator, newerBuild: () => build?.info().update.available?.version ?? null, currentBuild: () => build?.info().current?.version ?? null })
     log.info(`ready: the app talks to 127.0.0.1:${agent.apiPort}`)
     // F-020: a build serves its own page (--app <dir>), on 5173 as Vite does in Dev.
     const appIndex = process.argv.indexOf('--app')

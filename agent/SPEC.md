@@ -1513,6 +1513,46 @@ automatic carry-on on the Server and no hand-back.
   an `agentic` request `open` {floorId, agentId}, which runs the same there. `team.pcs` lists the PCs
   reachable now. Test: `team.test.ts` (from the Server to the Laptop and back).
 
+## F-235: Import agent from a conversation (agentic/index.ts, transcripts.ts; order o7c1c, 14 Nov 2026)
+
+Shubham: "Add a feature in the agent floor to add an agent from an existing one, by browsing into the
+existing PCs' Claude .jsonl. We should be able to point at it, and give the ability to import the jsonl".
+F-018's Bring in a Claude chat (and F-022's other PCs) became it; seating a conversation in an existing
+agent's chat stays, as before.
+- **Where.** A floor's ⋯ menu: Import agent from a conversation…, after Add agent; the Design tab:
+  Import agent, next to Add agent. Both, and the dialog, only for the owner of the app (`useIsOwner`);
+  `POST /floors/:id/import` is OWNER now (it was floor manage; `GET /sessions` already was).
+- **Browsing.** `GET /agentic/sessions` takes `dir` (one project folder's, a name, never a path) and
+  `folders=1` (the PC's project folders that hold conversations: `dir`, the folder they were held in
+  from the newest one's lines, how many, bytes, the newest's time; newest first). Each conversation adds
+  `dir`, `first` (the first typed prompt), `last` (the newest words the person typed or claude wrote:
+  never a tool's output or input, thinking, a slash command, a reminder or a cut-in notice; none when its
+  last 256 KB are all tools' output) and `startedAt` (its first line's time), read with its title from the
+  same 128 KB head and 256 KB tail. `q` keeps those with every word in the title, first or last message,
+  folder or id. Title, first and last are one line, what looks like a secret hidden (shared/secret-text.ts:
+  key and token shapes, the value after a secret's name, Bearer/Basic, an address's password, a private
+  key block, long random runs; never a UUID) on the PC that holds it, before they are cut or searched.
+  The hub's answer names its PCs that can't be reached now (`offline`, from their PC Control workspaces).
+  A member asks the hub (its own list too), so its page lists every PC the hub reaches; "copied here" is
+  then its own; without its hub, its own list as before. Another PC's list names whose chat each is too.
+- **Importing.** `POST /floors/:id/import {sessionId, pc?, runOn, name, role?}` (with `runOn`; without it,
+  as before): a new agent (not `agentId`: 400), its name checked before any copy (409), whose chat is a
+  copy of that conversation under a new id: the original is only ever read. `runOn` is the PC that holds
+  it (`pc`, else this one): that PC makes the copy beside the original (on another PC, the hub's request
+  `session-copy` {sessionId, newId, floorId}; an older PC without it: 409 "<PC> needs the update first"),
+  so it resumes in the folder it was held in (else under that PC's folder for the floor), and the hub
+  brings its own copy up at once (backfill). Another PC: the hub brings it over (F-022) and copies it, and
+  that PC gets the copy through F-021 when it opens it, in its folder for the floor. The agent's home is
+  `runOn` (F-064), so opening it from any page runs it there. A member passes the request to the hub (10
+  minutes allowed). If seating fails, the copy is taken back (`session-copy` {drop}: only a copy that PC
+  made for an import, and only while no floor has it). The answer adds `on` {id, name}.
+- **Opening at once.** A member asked to `open` a chat waits (5 s at most) for a floor and agent the hub
+  has just made to reach its floors (they are sent 150 ms after a change).
+- **Tests:** `transcripts.test.ts` (first and last messages, secrets, folders, one folder's, the search,
+  the owner rules), `shared/secret-text.test.ts`, `team.test.ts` (run on the laptop: copied there, the
+  original untouched, resumed in its own folder there; run on the Server: brought over; the laptop's page
+  through the hub; an older laptop), `src/agentic/import-agent-wiring.test.mjs`.
+
 ## F-026: Publish only when Dev has something new (build.ts, scripts/publish.ts)
 
 - `devFingerprint(dir)`: sha256 (20 hex) of `git rev-parse HEAD`, `git diff HEAD --binary` and every
@@ -1627,6 +1667,14 @@ Assistant's own row that took a reply as its confirmation too, and holds a reply
 asks (not on a draft read off its screen). **"Old way"** (`SAD_SYNC=old` or
 `<state>/agent/sync-old.on`; `GET`/`POST /sync-mode {mode: 'simple' | 'old'}`, the POST for the
 owner only): everything above off, the screen's state and the old order rule exactly as before.
+- **One Send, one message (o0122, 14 Nov 2026).** The simple send pastes whatever the line holds, so a
+  chat its PC sends the simple way is never live-typed into (F-193): its mirror is `unsupported`
+  (reason `simple-send`), so a chat box that joins is told so and keeps his words until Send. (A page
+  from a PC in the Old way still offers live sync; the chat may run on another PC: the Server's page
+  live-typed into the Assistant on the laptop and his words went in twice in one prompt, the page's
+  unmatched Sent bubble made three.) Before a simple send the mirror's own text left in the line (typed
+  while that PC was in the Old way) is taken out, after any edit of its own still on its way; text
+  that is not the mirror's stays. Tests: `input-mirror-messages.test.ts` (o0122).
 
 ## F-050: the chat view (agentic/chatview.ts, screen.ts)
 
@@ -2665,6 +2713,7 @@ Every PC's own agent can share some or all of the ports its programs listen on, 
   - **The CRM organisation in the file key (oa2f8 fix, 11 Nov 2026)**: the first REAL upload stopped before Google because the agent read the organisation from `GET v1/auth/me`, which the real CRM answers with `{ user }` only. `service.ts` `readOrgId` reads `GET org/me` (`organization.id`, where the CRM’s own pages read it) and still reads the older shape; the one-request upload, the uploads in parts and the drive program’s bridge (`bridge.ts` `/api/crm/session`) all use it. An answer the agent can not use (a 502 `failed` of its own) now shows its own words in the upload’s note, not “Google Drive did not take it”. The pretend CRM (`crm.fake.ts`) answers like the real one. Tests: `agent/crm-files/org-id.test.ts`.
   - **The uploads’ settings (oa2f8, 11 Nov 2026, Shubham: “keep it as a setting with the CRM’s real limit read from the CRM where possible”; “keep the folder location a setting and show free space and the waiting size, warn at low free space”)**: `agent/crm-files/upload-settings.ts`, kept in `<state>/crm-uploads.json`; routes `GET/POST /uploads/settings` (`CrmUploadSettingsView`, `CrmUploadSettingsChange`); the list carries `maxSizeFrom` and `space` (folder, free bytes, held, still coming, warning line, `low`, a plain `note`). SIZE LIMIT: `limitMb` null (default) follows the CRM: the CRM’s own limit once the CRM has said it, else 500 MB; a number is used as it is but never above what the CRM said. The CRM has no route that tells its limit, so it is taken where the CRM says it BY ITSELF: its refusal of a real record (“file_size must not exceed N bytes”, learned as `refused`, in force at once and kept; that upload stops `failed`/`toolarge`), and its upload token’s answer (`maxFileSize`), should the CRM ever add it there (noted when the token is fetched for the agent’s own work). The agent puts NO question of its own to the CRM (Lead, 11 Nov 2026: a request built to be refused is still a write request to the real CRM; such a question would be its own opt-in candidate, proven first, with his word). The one-request upload and the drive’s saves follow the same limit (`createCrmFiles({ maxUpload })`). WAITING FOLDER: `dir` null = `<state>/crm-uploads`; another must be a whole path on this PC’s own disks (no network folder, not inside the app’s own folder); it is checked by writing and removing a small file of the agent’s own; it changes ONLY while no upload waits (409 otherwise; nothing is ever moved between folders); each upload keeps the folder it began in. FREE SPACE: shown with what the uploads hold and what is still to come; `low` when free − coming < `lowFreeMb` (5 GB by default, a setting), said once in the log. The page: `src/crm-files/UploadSettings.tsx` (the card and the warning), `upload-space-words.ts`. Tests: `agent/crm-files/upload-settings.test.ts` (a pretend CRM with the real record check), `upload-client.test.ts`, `src/crm-files/upload-settings.test.mjs`.
   - **Downloads of files over 100 MB through Google's Drive API (o813f, 12 Nov 2026; Shubham's order relayed by the Assistant: he accepted the upload token's risk and asked for files over 100 MB without Google's virus-scan page; Lead's conditions)**: the CRM's own download (`GET /org/files/:id/raw`, sam-crm-be serveFileRaw) fetches the public link, which answers Google's "can't scan this file for viruses" page in place of a file over 100 MB, and buffers the whole file. ONLY a record over `DRIVE_API_OVER` (100,000,000 bytes, its CRM `fileSize`) that the CRM keeps in Google Drive is now read through Google's Drive API, by every way the app reads a CRM file (the page's download and preview `GET /file`, the in-app drive's ranged 4 MiB blocks `fileBytes`, the WebDAV drive, a `.driveignore` file): `files.get?alt=media` with the CRM's own Drive token (`org/upload/gdrive-token`), download only, Range requests (`bytes=0-` for a whole download, which goes on from the byte it had when the line breaks, `bytes=N-`, 3 tries in a row; one range per drive block), identity encoding. Every other file goes through the CRM's own download as before. The CRM still decides what may be read: the file must be in the CRM's own list for this account (`findFile`, which also hides projects it may not open), the Drive id is the one in the link the CRM keeps for THAT record, read as the CRM's own download reads it (`driveIdOf`: `/file/d/<id>`, `open|uc|thumbnail?id=<id>`, `lh<n>.googleusercontent.com/d/<id>`, an id of 20 characters at least), and the CRM must say yes for that very file right before the first Drive read (`GET org/files/:id/versions` answers 200; the CRM has no `GET org/files/:id`; kept 60 s per file): 404 (`DOWNLOAD_WORDS.notShown`), 403 (the CRM's own words), signed out or no answer stop the read, and nothing is read from Drive. The token stays in the agent's memory, goes only to `https://www.googleapis.com` in the Authorization header (`tokenMayGoTo`), and is never logged, written, answered or shown. Google keeps its virus decision: `acknowledgeAbuse` is never sent; a file Google marked as harmful (403 `cannotDownloadAbusiveFile`) is refused in plain words (`DOWNLOAD_WORDS.harmful`) and the CRM's download is NOT tried instead. Read through the CRM's download, as before: a link that is not Drive's, an account the CRM gives no Drive token (no upload permission; asked once a minute), a file the token does not see (404), a Google Docs file (403 `fileNotDownloadable`), Google still failing after the tries. There, Google's virus-scan notice in place of the file is refused in words (`DOWNLOAD_WORDS.scanPage`), never handed over as the file (an HTML file is still an HTML file). The old way is kept as a setting: the file `crm-download-via-crm.on` in the agent's state folder sends every download through the CRM's own (read on every download, no restart). Not changed: the Windows drive host `crm-fs.exe` (C#; used only when the in-app drive can not run) still reads Drive's public link with `confirm=t`, and the CRM's own website still uses its `/raw`. Tests: `agent/crm-files/download-api.test.ts` (a 120 MB file through the route, the in-app drive and WebDAV; a cut line; the threshold: 50 MB and exactly 100,000,000 bytes never touch Drive; the CRM's yes per file: 404, 403, no answer; harmful; no token; 404/Docs; 401/503; the token in no log, error or answer and sent nowhere else; the setting), `google.fake.ts` (alt=media, ranges, failures).
+  - **The Marketing Projects folder (oe692, 14 Nov 2026; Shubham, relayed by the Assistant: "one more folder in the mounted drive called Marketing Projects")**: the CRM marks a regular project as a marketing one with its own `project_type` (`general` | `marketing`; `GET org/projects` answers `projectType`; the CRM's Projects page labels it). The drive has a top folder `MARKETING_FOLDER` ("Marketing Projects", id `cat:Marketing Projects`) beside the categories and "projects", ALWAYS (empty when the CRM has no marketing project). It holds the projects whose type is `marketing`, which are then not under "projects" too (`homeOf`: the project node's parent, the breadcrumbs, search's and the chat's crm_files "where": `Marketing Projects / <project> / <folders>`). Inside, a marketing project is a regular CRM project: its folders are its file groups, a new folder is `POST org/file-groups`, a new file is a CRM record `folder: projects, source: project:<id>, group_id` (the CRM's Projects page shows them), rights as any project. The folder itself only reads the CRM: at its top nothing can be put, made, renamed or moved (rights all false; "New things go into a project or one of its folders."); new projects are made in the CRM. A CRM category (a file's `folder` tag) of the same name, in any case, is shown inside it, never as a second top folder. Every way the drive is shown has it (the /drive page, the in-app drive, WebDAV, `.driveignore` walks, Keep on this PC by node id). The old way is kept as a setting: the file `crm-marketing-folder.off` in the agent's state folder (`marketingFolderFile`; read on every listing, no restart) puts every project back under "projects" and removes the folder. Tests: `agent/crm-files/marketing-folder.test.ts` (always there; the marketing project with its folder and file; a new folder and file are that project's CRM records; reads only, nothing at its top; the setting; a same-named category; search and find; the in-app drive's paths); the top-level lists in `service.test.ts`, `routes.test.ts`, `winfsp-crm.test.ts`, `winfsp-live.test.ts`, `dav-crm.test.ts`.
 - Tests: `ports/parts.test.ts`, `gate.test.ts` (real sockets), `index.test.ts` (fake tailscale `fake-tailscale.ts`, throwaway certificate `test-cert.ts`), `links.test.ts`, `api.test.ts`.
 
 ## Stable ports per PC (order od91f, 11 Nov 2026; ports/stable.ts, ports/stable-proxy.ts, shared/stable-ports.ts)
@@ -2734,6 +2783,31 @@ ONLY: nothing here opens, closes, shares or changes a port (that stays on Settin
 - Tests: `shared/pc-ports.test.ts`, `pc-ports.test.ts` (self, member over a real stream pair, off, older build, liar, silent, garbage, IDs, the member's
   refusals, the route), `pc-ports-api.test.ts` (owner 200, anyone else 403), the page's `src/pc-control/ports-report.test.mjs` and `workspace-tabs.test.mjs`
   (Ports after Updates, the owner's only), and `src/pages/phone-width.test.mjs` (360 px, PC control's own scroll box included).
+
+## PC control's SSH tab: a live SSH terminal (orders o1fa0 + o2915, 14 Nov 2026; pc-ssh-term.ts, shared/pc-ssh-term.ts, src/pc-control/PcSshPanel.tsx)
+
+Shubham: "now add a tab ssh in the pc control please", then "no iw wnat to use it in the app it self". The SSH tab (after Ports, the owner's only) opens a
+live SSH session to that PC in the page. THIS PC's agent (normally the Server's) runs its own ssh client with its own key in a pseudo-terminal (node-pty,
+ConPTY on Windows) and streams it: the key and any password never reach the browser; the page is a screen and a keyboard.
+
+- **Human only** (the PC screen's and phone control's rule, `requireCrmHuman(auth, r, true)`): `POST /agent-api/pc-ssh/pcs/<id>/session {user, host, port}`
+  needs the signed-in CRM administrator's own session; a chat tool (`x-sad-chat-key`) is 403 `not-yours`, nobody or an ended session 401 `sign-in`,
+  anyone else 403 `admin-only`. It answers a one-use ticket (32 random bytes, 30 s) and the fingerprints this PC's known_hosts has for that host and
+  port and for the host on port 22 (plain, `[host]:port` and hashed lines). Not a scoped mount, so the API's owner gate applies too.
+- **The terminal**: WebSocket `/agent-api/pc-ssh/terminal?ticket=<t>`, admitted only for the same sign-in (session id and person) and only once. Text
+  frames: page → `{t:'in', d}` (≤ 64 KiB) and `{t:'size', cols 2-500, rows 1-300}`; agent → `{t:'out', d}` and once `{t:'exit', code, reason}`.
+  The ssh runs as `ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 -p <port> <user>@<host>` (the key
+  only when that file exists), argv only, never a shell; TERM=xterm-256color. Closing the socket (Close, another tab, leaving the page), the sign-in
+  ending (auth.track) or the agent stopping ends it: `kill()` on that pty's own handle, never by name or tree. At most 4 sessions at once (429).
+- **Only the tailnet**: the host is a Tailscale IPv4 (100.64.0.0/10) or a `*.ts.net` name; the user a plain login name that can never be read as an
+  ssh option (starts with a letter or digit; letters, digits, . _ -); the port 1-65535. 400 otherwise; 404 for a PC this agent does not have.
+- **The form**: `GET /agent-api/pc-ssh/pcs/<id>/target` fills it with the last target used for that PC (`<state>/agent/ssh/targets.json`, saved
+  when a session opens), else the PC's Tailscale address from its link (port 22, user empty). Host keys: OpenSSH takes a PC's key on another port
+  without asking when the same key is known for the bare host (port 22); it asks only for a new or different key, and that answer is Shubham's.
+- Nothing about SSH itself is changed here: no config, no key. The read-only SSH status list (installed, running, port, password and root login,
+  allowed users, key fingerprints, Tailscale SSH, a Test that reads the banner only) is the next slice.
+- Tests: `shared/pc-ssh-term.test.ts`, `pc-ssh-term.test.ts` (the human rule, the ticket, the session with a pretend pty, 4 at most, known_hosts,
+  the saved target), `src/pc-control/ssh-term.test.mjs`, `workspace-tabs.test.mjs` (SSH after Ports, the owner's only), `src/pages/phone-width.test.mjs`.
 
 ## F-118: who is using the app (auth/, agentic/access.ts, shared/auth.ts)
 

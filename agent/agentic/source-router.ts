@@ -84,6 +84,10 @@ export function createSourceRouter(d: RouterDeps): FastHost {
     keyOwns(key) {
       return d.claude.keyOwns(key)
     },
+    // F-221 (ob98a): either one still stopping a cut-off turn.
+    stopping() {
+      return d.claude.stopping() || d.api.stopping()
+    },
     async tick() {
       await d.claude.tick()
       await d.api.tick()

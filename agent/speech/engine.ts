@@ -84,6 +84,20 @@ export interface TranscribeOptions {
   partial?: boolean
   /** Use exactly this encoder window (frames) instead of fitting it to the audio (dictation: DICTATION_WINDOW). Audio too long for it gets the full window. */
   window?: number
+  /**
+   * F-221 (live talk): a guess, sent at his first short pause before the turn has surely ended: refused at once (409, `busy`) when Whisper has
+   * anything running or queued or is loading the model, and then nothing is queued, so a guess never waits behind anything or delays a real turn.
+   */
+  guess?: boolean
+}
+
+/** F-221: the request a job is for. */
+export interface TranscribeJob {
+  /**
+   * Aborted when the page went away (a fetch it aborted, a closed tab): a job that has not started (still queued, or waiting for the model to
+   * load) is dropped, and Whisper never runs it.
+   */
+  signal?: AbortSignal
 }
 
 export interface EngineDeps {
@@ -108,7 +122,7 @@ export interface EngineDeps {
 
 export interface Engine {
   status(): EngineStatus
-  transcribe(pcm: Buffer, o?: TranscribeOptions): Promise<Transcript | null>
+  transcribe(pcm: Buffer, o?: TranscribeOptions, job?: TranscribeJob): Promise<Transcript | null>
   /** Loads the model now (the mic was pressed), so the first sentence doesn't wait for it. */
   warm(): Promise<void>
   stop(): Promise<void>
@@ -118,6 +132,9 @@ export interface Engine {
 export function SpeechError(message: string, status: number): Error & { status: number } {
   return Object.assign(new Error(message), { status })
 }
+
+/** F-221: a guess while Whisper has work: refused, nothing queued (the route answers 409 {busy: true}). */
+export const busyError = () => Object.assign(SpeechError('Whisper is busy', 409), { busy: true as const })
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -346,15 +363,69 @@ export function createEngine(d: EngineDeps = {}): Engine {
     async warm() {
       await load()
     },
-    transcribe(pcm, o = {}) {
+    transcribe(pcm, o = {}, job = {}) {
       if (o.partial && pending > 0) return Promise.resolve(null)
-      if (pcm.length < 3200) return Promise.resolve({ text: '', raw: '', audioMs: pcmMs(pcm), ms: 0 }) // < 0.1 s
+      const audioMs = pcmMs(pcm)
+      // A model load counts as busy too: a guess queued behind it would only wait (the final at the end of his turn waits for it just as well).
+      if (o.guess && (pending > 0 || starting !== null)) {
+        log?.info(`speech: whisper guess refused (${pending > 0 ? 'busy' : 'loading'}) audio=${audioMs}ms`)
+        return Promise.reject(busyError())
+      }
+      if (pcm.length < 3200) return Promise.resolve({ text: '', raw: '', audioMs, ms: 0 }) // < 0.1 s
+      // F-221: one line per job, numbers only (never the words): how long it waited (the queue, and a load), how long Whisper ran, whether it
+      // was a guess, dropped before it started (its page went away), or written for a page that had gone by then.
+      const yn = (b: boolean | undefined) => (b ? 'yes' : 'no')
+      const note = (wait: number, run: number, f: { dropped?: boolean; closed?: boolean; failed?: boolean } = {}) =>
+        log?.info(`speech: whisper job audio=${audioMs}ms wait=${Math.max(0, wait)}ms run=${Math.max(0, run)}ms guess=${yn(o.guess)} dropped=${yn(f.dropped)} closed=${yn(f.closed)} failed=${yn(f.failed)}`)
+      const dropped = () => SpeechError('The page went away before Whisper started on it', 499)
+      const { signal } = job
+      const asked = now()
+      if (signal?.aborted) {
+        note(0, 0, { dropped: true })
+        return Promise.reject(dropped())
+      }
       pending++
-      const run = queue.then(() => infer(pcm, o))
-      queue = run.catch(() => {})
-      return run.finally(() => {
+      let counted = true
+      const release = () => {
+        if (!counted) return
+        counted = false
         pending--
+      }
+      let started = false
+      // Its page went away while it waited (in the queue, or for the model to load): it stops counting as Whisper's work at once, and it never runs.
+      const leave = () => {
+        if (!started) release()
+      }
+      signal?.addEventListener('abort', leave, { once: true })
+      const run = queue.then(async () => {
+        // The model first, while the job still has not started: a load takes 6.5-25 s on this PC (the first turn after Whisper idled out), and a
+        // page that goes away during it still drops the job (`leave` stops it counting as busy at once; Whisper never runs it once the model is
+        // up). A job whose page has already gone never starts a load.
+        try {
+          if (!signal?.aborted) await load()
+        } catch (e) {
+          note(now() - asked, 0, { closed: signal?.aborted, failed: true })
+          throw e
+        } finally {
+          signal?.removeEventListener('abort', leave)
+        }
+        if (signal?.aborted) {
+          note(now() - asked, 0, { dropped: true })
+          throw dropped()
+        }
+        started = true
+        const t = now()
+        try {
+          const r = await infer(pcm, o)
+          note(now() - asked - r.ms, r.ms, { closed: signal?.aborted })
+          return r
+        } catch (e) {
+          note(t - asked, now() - t, { closed: signal?.aborted, failed: true })
+          throw e
+        }
       })
+      queue = run.catch(() => {})
+      return run.finally(release)
     },
     async stop() {
       await unload('the agent is stopping')

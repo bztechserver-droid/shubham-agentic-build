@@ -13,10 +13,36 @@ export type AnswerSource = 'subscription' | 'api'
 /** An ask is at most this many characters; a frame at most MAX_FRAME_BYTES (4 bytes a character, plus the rest). */
 export const MAX_TEXT = 2000
 export const MAX_FRAME_BYTES = 12 * 1024
+/** F-221 (ob98a): what he heard of an answer he cut off, sent with his next ask: at most this many characters. */
+export const MAX_HEARD = 600
 /** Ids the client makes (an ask, a tab, a device): short and plain, so they can be logged and compared. */
 export const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 /** The id of a turn the HUB starts (the Assistant telling the answer to a hand-off): `o:` and the order's id. */
 export const orderTurn = (orderId: string) => `o:${orderId}`
+/** F-221 (ob98a): an `o:` turn id as a client may name it in a cancel (barge-in on the turn that tells a hand-off's answer). */
+const ORDER_TURN_RE = /^o:[A-Za-z0-9_.-]{1,62}$/
+
+/**
+ * F-221 (ob98a): a tap-to-send card. Spoken words never approve, pay, delete or publish: a hand-off made while the connection HOLDS (its `hold`
+ * latch), and a message the Orchestrator wants to send to another chat while a spoken order holds it, are not typed anywhere. They wait on his
+ * screen as a card with the exact words, and only his tap on Send (an HTTP route with his signed-in CRM session, never a socket frame) sends them.
+ * `to` is a display name: the big chat ("the Assistant") for a hand-off, "<agent> on <floor>" for a relay. `version` changes when the card does;
+ * Send names the version it showed. Times are ms since the epoch.
+ */
+export interface TalkCard {
+  id: string
+  version: number
+  kind: 'handoff' | 'relay'
+  to: string
+  text: string
+  via: 'voice' | 'typed'
+  createdAt: number
+  expiresAt: number
+}
+
+/** Why a card went: sent by his tap, dropped (his drop, a stop word, End, stop), expired (10 minutes, or the oldest of too many), its socket closed, another screen took the Assistant. */
+export type CardGoneReason = 'sent' | 'dropped' | 'expired' | 'closed' | 'taken-over'
+export const CARD_GONE_REASONS: readonly CardGoneReason[] = ['sent', 'dropped', 'expired', 'closed', 'taken-over']
 
 /**
  * What GET /voice/hello says about the fast Assistant, as the top-level field `fast`.
@@ -42,13 +68,23 @@ export const MAX_ASKS_PER_MIN = 30
 export type FastClientFrame =
   /** Claim the Assistant. One owner at a time: a second client taking it makes the first get state 'taken-over'. `resume` (a reconnect) does not take it from another. */
   | { t: 'start'; client: 'web' | 'phone'; id: string; model?: FastModel; resume?: boolean }
-  /** A question or an order. `via` says how it was given (voice answers are written for the ear). `thorough` asks for Sonnet for this turn. A new ask while one runs cuts the old one off (it ends with done {cancelled}). */
-  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean; source?: AnswerSource }
-  /** Barge-in: stop turn `id` now (what is already spoken stays said). */
+  /**
+   * A question or an order. `via` says how it was given (voice answers are written for the ear). `thorough` asks for Sonnet for this turn. A new ask while one runs cuts the old one off (it ends with done {cancelled}).
+   * F-221 (ob98a): `heard` = the part of the previous answer he actually heard before he cut in (at most MAX_HEARD characters): the Assistant goes on from there.
+   */
+  | { t: 'ask'; id: string; text: string; via: 'voice' | 'typed'; thorough?: boolean; source?: AnswerSource; heard?: string }
+  /** Barge-in: stop turn `id` now (what is already spoken stays said). F-221: also `o:<orderId>`, the hub's turn that tells a hand-off's answer, when it was told on this connection. */
   | { t: 'cancel'; id: string }
-  /** The client is done: the Assistant is released (the hub keeps the process warm for a while). */
+  /** The client is done: the Assistant is released (the hub keeps the process warm for a while). F-221: this connection's cards are dropped too. */
   | { t: 'stop' }
   | { t: 'ping' }
+  /**
+   * F-221 (ob98a): this connection's HOLD latch. While it is on and this connection owns the Assistant, EVERY hand-off made during its asks becomes a
+   * card he taps to send (never typed). Live talk sends `hold {on:true}` right after `start`; the Alt+K bar when its "tap to send" setting is on.
+   */
+  | { t: 'hold'; on: boolean }
+  /** F-221: drop one card of this connection (`card`: its id), or all of them (a stop word, a change of mind, End). */
+  | { t: 'drop'; card?: string }
 
 // --- hub -> client -------------------------------------------------------------------------------
 
@@ -58,16 +94,19 @@ export type FastState = 'off' | 'starting' | 'ready' | 'unavailable' | 'paused' 
 export type HandoffPhase = 'queued' | 'typed' | 'working' | 'waiting-you' | 'slow' | 'not-taken'
 
 export type FastServerFrame =
-  /** The Assistant itself: `reason` is one plain sentence for anything but 'ready' / 'starting'. `paused` = memory is low; asks go to the Orchestrator directly. */
-  | { t: 'state'; state: FastState; reason?: string; model?: FastModel }
+  /**
+   * The Assistant itself: `reason` is one plain sentence for anything but 'ready' / 'starting'. `paused` = memory is low; asks go to the Orchestrator directly.
+   * F-221 (ob98a): `holds: true` = this hub can hold hand-offs as cards (the `hold` latch, `card` frames); a page offers live talk only then.
+   */
+  | { t: 'state'; state: FastState; reason?: string; model?: FastModel; holds?: boolean }
   /** A piece of the answer text as it streams (speak it as it arrives). `id` is the ask's, or `o:<orderId>` for a turn the hub started. */
   | { t: 'delta'; id: string; text: string }
   /** A boundary where speech may start (the end of a text block): speak what is queued. */
   | { t: 'flush'; id: string }
   /** The Assistant is using a tool: a short label to show or say ("Opening that"). */
   | { t: 'tool'; id: string; name: string; label: string }
-  /** The turn is over. `text` is everything it said. `cancelled` when an ask or a cancel cut it off. */
-  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean; source?: AnswerSource }
+  /** The turn is over. `text` is everything it said. `cancelled` when an ask or a cancel cut it off. `ttftMs`: from the turn being written to its first word. */
+  | { t: 'done'; id: string; text: string; ms?: number; costUsd?: number; cancelled?: boolean; source?: AnswerSource; ttftMs?: number }
   // (costUsd: what the API charged for the answer; the Claude login's figure is not what Shubham pays, so the page shows it for the API only.)
   | { t: 'error'; id?: string; status: number; message: string }
   /** The Assistant handed the ask to the Orchestrator: `line` is a one-line description of the request for a card ("Asked the Orchestrator: publish the build"); what the Assistant SAYS about it arrives as ordinary delta frames. `orderId` tracks it (it is also an ask id for Chris: GET /voice/ask/<orderId>). */
@@ -75,6 +114,10 @@ export type FastServerFrame =
   | { t: 'handoff-progress'; orderId: string; phase: HandoffPhase; sec: number; words?: string }
   /** The Orchestrator's full reply (the screen shows it; the Assistant then says a short version in a turn `o:<orderId>`). `cancelled` when the order was stopped. */
   | { t: 'handoff-answer'; orderId: string; text: string; cancelled?: boolean }
+  /** F-221 (ob98a): a card to show (new, or changed: a higher `version`). Only his tap on Send sends it (an HTTP route, never a frame). */
+  | { t: 'card'; card: TalkCard }
+  /** F-221: a card went. `orderId` when his tap sent it as that order (its handoff, progress and answer follow as usual). */
+  | { t: 'card-gone'; id: string; reason: CardGoneReason; orderId?: string }
   | { t: 'pong' }
 
 // --- checking what a client sends ---------------------------------------------------------------
@@ -85,6 +128,12 @@ const bad = (message: string, status = 400): FastParse => ({ ok: false, status, 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 // A client's id never starts with 'o:': that prefix is the hub's own turns (orderTurn).
 const isId = (v: unknown): v is string => typeof v === 'string' && ID_RE.test(v) && !v.startsWith('o:')
+/** F-221: control characters become spaces, then the text is one tidy line (what he heard is quoted to the model, so it cannot start a line of its own). */
+const oneLine = (s: string) =>
+  Array.from(s, c => (c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 ? ' ' : c))
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim()
 
 /** One text message from a client, checked. Anything not known is refused (with a plain sentence), never guessed at. */
 export function parseClientFrame(raw: string): FastParse {
@@ -112,14 +161,27 @@ export function parseClientFrame(raw: string): FastParse {
       if (text.length > MAX_TEXT) return bad(`That is longer than ${MAX_TEXT} characters.`, 413)
       // Order o7f34: which answerer (the efficient route's compare button and its setting); left out, the server decides.
       if (v.source !== undefined && v.source !== 'subscription' && v.source !== 'api') return bad("source is 'subscription' or 'api'.")
-      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}), ...(v.source ? { source: v.source } : {}) } }
+      // F-221 (ob98a): what he heard of the answer he cut off. Empty is the same as left out.
+      let heard = ''
+      if (v.heard !== undefined) {
+        if (typeof v.heard !== 'string') return bad('heard is the part of the last answer he heard, as text.')
+        heard = oneLine(v.heard)
+        if (heard.length > MAX_HEARD) return bad(`heard is longer than ${MAX_HEARD} characters.`, 413)
+      }
+      return { ok: true, frame: { t: 'ask', id: v.id, text, via: v.via, ...(v.thorough === true ? { thorough: true } : {}), ...(v.source ? { source: v.source } : {}), ...(heard ? { heard } : {}) } }
     }
     case 'cancel':
-      return isId(v.id) ? { ok: true, frame: { t: 'cancel', id: v.id } } : bad('cancel needs the id of the ask.')
+      // F-221: an o: id is the hub's turn telling a hand-off's answer (the session lets a connection cancel only one told to it).
+      return isId(v.id) || (typeof v.id === 'string' && ORDER_TURN_RE.test(v.id)) ? { ok: true, frame: { t: 'cancel', id: v.id } } : bad('cancel needs the id of the ask.')
     case 'stop':
       return { ok: true, frame: { t: 'stop' } }
     case 'ping':
       return { ok: true, frame: { t: 'ping' } }
+    case 'hold':
+      return typeof v.on === 'boolean' ? { ok: true, frame: { t: 'hold', on: v.on } } : bad('hold needs on: true or false.')
+    case 'drop':
+      if (v.card === undefined) return { ok: true, frame: { t: 'drop' } }
+      return isId(v.card) ? { ok: true, frame: { t: 'drop', card: v.card } } : bad('drop takes the id of one card, or nothing for all of them.')
     default:
       return bad(`No such frame: ${v.t.slice(0, 20)}.`)
   }

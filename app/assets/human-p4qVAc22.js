@@ -1,0 +1,1 @@
+var e={"data-human-only":`true`},t=e=>(`nativeEvent`in e?e.nativeEvent.isTrusted:e.isTrusted)===!0;function n(e){return n=>{t(n)&&e(n)}}export{t as n,n as r,e as t};

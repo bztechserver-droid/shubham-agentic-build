@@ -252,6 +252,16 @@ export interface ChatPool {
   generation?(sessionId: string): string | null
   /** Types it once the TUI is up and past its start gates; for a chat that is still starting. */
   typeWhenReady(sessionId: string, text: string, opt?: { holdForDraft?: boolean }): void
+  /**
+   * F-221 (T4 review): how many of the app's own texts wait in typeWhenReady for this chat's prompt (a carry-on, a nudge, a hand-off's line): on their
+   * way, not typed yet. With `text`, only those that are exactly it. 0 when none (or it is not running here).
+   */
+  waiting?(sessionId: string, text?: string): number
+  /**
+   * F-221 (T4 review): what its SCREEN shows it doing now (the old way's reading), whatever its transcript says. A chat started again at once reads
+   * its record back, where the turn the stop cut off still runs; its screen shows only what this run draws. null when it isn't running here.
+   */
+  screenState?(sessionId: string): ChatState | null
   kill(sessionId: string, why?: string): boolean
   /** Native PTY exit acknowledgement, rather than removal of its in-memory chat entry. */
   waitStopped?(sessionId: string): Promise<void>
@@ -369,8 +379,12 @@ export interface ChatPoolOptions {
   pasteSettleMs?: number
   /** Lost-Enter watch, tests: how long a paste may go without any terminal output before it is logged (default 1000 ms). */
   echoWaitMs?: number
-  /** F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. */
-  settings?: string
+  /**
+   * F-051: a --settings file (the memory's UserPromptSubmit hook); claude adds it to the user's own settings. F-221 (ob98a, T4): or a function of the
+   * chat being started, asked ONCE per start of a Claude chat that takes settings (never a Codex chat, never Codex in Claude Code): index.ts gives
+   * the Orchestrator's chat its own file with the voice lock (latch-hook.ts) and every other chat what it had. Undefined: no --settings at all.
+   */
+  settings?: string | ((s: StartChat) => string | undefined)
   /** F-069: folders claude may read besides the chat's own (the uploads folder: --add-dir), so a file it is given a path to opens without a question. */
   addDirs?: string[]
   /**
@@ -661,7 +675,12 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         quietMs: () => Date.now() - Math.max(c.lastOutputAt, c.typedAt ?? 0),
         log: line => log?.info(`chat ${c.info.sessionId.slice(0, 8)}: ${line}`),
       },
-      { off: () => o.mirrorOff?.() === true, unsupported: () => (c.engine !== 'claude' ? c.engine : c.info.execution ? 'codex-in-claude' : null) },
+      // o0122 (14 Nov 2026, Shubham: "the live typing sending thrice"): a chat that sends the simple way (Stage 1, this PC's Old way off) is
+      // never live-typed into. The simple send pastes the message whatever the line holds, so text the mirror had typed went in with it: his
+      // words twice in one prompt (the page's own Sent bubble, unmatched, made three). It happened when the page's PC is in the Old way (its
+      // pages offer live sync) and the chat runs on a PC that is not (the Server's page, the Assistant on the laptop). The chat box is told
+      // "unsupported" when it joins, so it keeps his words until Send, as with live sync off.
+      { off: () => o.mirrorOff?.() === true, unsupported: () => (c.engine !== 'claude' ? c.engine : c.info.execution ? 'codex-in-claude' : simpleLayerFor(c.info, oldWay()) ? 'simple-send' : null) },
     )
     return c.mirror
   }
@@ -1088,14 +1107,36 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     return true
   }
 
+  /**
+   * F-221 (T4 review): the texts typeWhenReady holds for each chat, until each is pasted, handed on to another wait, or dropped. The hub reads them
+   * (waiting): a chat with a carry-on still to come is not at rest for a spoken line, and a carry-on not typed yet when the chat host link goes again
+   * is told again when it is reopened.
+   */
+  const waitingTexts = new Map<string, string[]>()
+  function waitFor(id: string, text: string): () => void {
+    waitingTexts.set(id, [...(waitingTexts.get(id) ?? []), text])
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      const list = waitingTexts.get(id) ?? []
+      const i = list.indexOf(text)
+      const rest = i < 0 ? list : [...list.slice(0, i), ...list.slice(i + 1)]
+      if (rest.length) waitingTexts.set(id, rest)
+      else waitingTexts.delete(id)
+    }
+  }
+
   /** Types `text` once the chat is at its prompt: waits past start-up questions and past any later question (never drops it for that). */
   function typeWhenReady(id: string, text: string, opt?: { holdForDraft?: boolean }) {
     const born = Date.now()
     let since = born
+    const over = waitFor(id, text)
     const poll = setInterval(() => {
       const c = chats.get(id)
       if (!c || c.exited || Date.now() - since > 90_000 || Date.now() - born > 6 * 3_600_000) {
         clearInterval(poll)
+        over()
         if (c && !c.exited) log?.warn(`chat ${id.slice(0, 8)}: never reached its prompt; a message for it was dropped`)
         return
       }
@@ -1117,9 +1158,14 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       } else if (TRUST_GATE_RE.test(tail) || !PROMPT_READY_RE.test(tail)) return
       clearInterval(poll)
       setTimeout(() => {
-        if (c.exited) return
-        if (opt?.holdForDraft && draftOnScreen(c)) return typeWhenReady(id, text, opt)
-        if (!paste(c, text) && menuOnScreen(c)) typeWhenReady(id, text, opt)
+        // Waited for again (a new wait counts it first), pasted (a paste on its way is the box's own busy), or dropped: it no longer waits here.
+        try {
+          if (c.exited) return
+          if (opt?.holdForDraft && draftOnScreen(c)) return typeWhenReady(id, text, opt)
+          if (!paste(c, text) && menuOnScreen(c)) typeWhenReady(id, text, opt)
+        } finally {
+          over()
+        }
       }, 800).unref()
     }, 400)
     poll.unref()
@@ -1233,7 +1279,10 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
         // Shubham chose bypass for all existing/new chats: resumes get the same launch default.
         // The native startup consent is recorded by prepareClaudeConfig, not answered with keys.
         args.push('--permission-mode', 'bypassPermissions')
-        if (o.settings && !s.bridge) args.push('--settings', o.settings)
+        // F-221 (ob98a, T4): read once per start (a function is asked for this chat only; Codex in Claude Code never gets settings).
+        const pick = s.bridge ? undefined : o.settings
+        const settings = typeof pick === 'function' ? pick(s) : pick
+        if (settings) args.push('--settings', settings)
       }
       const file = s.bridge ? process.execPath : /\.cmd$/i.test(claude) ? (env.ComSpec ?? 'cmd.exe') : claude
       const argv = s.bridge ? [s.bridge.wrapperPath, s.bridge.descriptorFile, ...args] : /\.cmd$/i.test(claude) ? ['/d', '/c', claude, ...args] : args
@@ -1429,7 +1478,20 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
       if (!c || c.exited) return 'gone'
       // Stage 1 (oad50): the simple send for a Claude chat, unless "Old way" is on. Nothing before it refuses on what the screen shows.
       // Only where Agent 12's transcript reader runs: a Claude chat that is not Codex-in-Claude (c.info.execution). Everything else keeps the checked path.
-      if (simpleLayerFor(c.info, oldWay())) return simpleSend(c, text, opt)
+      if (simpleLayerFor(c.info, oldWay())) {
+        // o0122: the live mirror types nothing into a chat that sends the simple way (mirrorOf), but text it typed before (this PC was in the
+        // Old way until a moment ago) is taken out first: one Enter must never send it with the message. Only the mirror's own text, as the
+        // Old way does, after any edit of its own still on its way (takeOut waits for it: a Send right after the last key found the mirror
+        // still reading its text back); text that is not the mirror's stays ('foreign'); nothing is typed back (the chat box still holds his
+        // words). Not taken out: refused, and nothing of the message is typed.
+        const m = c.mirror
+        if (m) {
+          const out = await m.takeOut(opt?.human === true)
+          if (out === 'typing' || out === 'failed') { opt?.onBlocked?.('draft'); return 'blocked' }
+          if (c.exited) return 'gone'
+        }
+        return simpleSend(c, text, opt)
+      }
       const refuse = (reason: DeliveryBlockReason): SendResult => { opt?.onBlocked?.(reason); return 'blocked' }
       if (blocked(c)) return refuse('menu')
       if (c.engine === 'codex') {
@@ -1553,6 +1615,18 @@ export function createChatPool(o: ChatPoolOptions): ChatPool {
     },
 
     typeWhenReady,
+
+    waiting(id, text) {
+      const list = waitingTexts.get(id) ?? []
+      return text === undefined ? list.length : list.filter(t => t === text).length
+    },
+
+    screenState(id) {
+      const c = chats.get(id)
+      if (!c || c.exited) return null
+      settle(c)
+      return c.state
+    },
 
     kill(id, why = 'stopped') {
       const c = chats.get(id)

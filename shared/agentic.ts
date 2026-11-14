@@ -346,15 +346,38 @@ export interface ClaudeSession {
   pc?: string
   /** F-022, listing another PC's: this PC has a copy of it already. */
   here?: boolean
+  /** F-235: the project folder it is in (~/.claude/projects/<dir>). An older PC leaves the F-235 fields out. */
+  dir?: string
+  /** F-235: the first thing typed in it, one line; what looks like a secret is hidden (shared/secret-text.ts). */
+  first?: string | null
+  /** F-235: its last message, the person's or Claude's own words (never a tool's output), one line, secrets hidden. */
+  last?: string | null
+  /** F-235: when it started (its first line's time), when its file says. */
+  startedAt?: string | null
 }
 
-/** F-022: GET /agentic/sessions?pc=&q=&limit=&offset= */
+/** F-235: a project folder of a PC's Claude history (~/.claude/projects/<dir>) that holds conversations. */
+export interface ClaudeProjectFolder {
+  dir: string
+  /** The folder its conversations were held in (its newest one's lines say); null when none says. */
+  cwd: string | null
+  sessions: number
+  bytes: number
+  /** Its newest conversation's last write. */
+  updatedAt: string
+}
+
+/** F-022: GET /agentic/sessions?pc=&q=&limit=&offset= (F-235: &dir=&folders=1) */
 export interface SessionsAnswer {
   sessions: ClaudeSession[]
   /** How many match, of which this is a page. */
   total: number
   /** The PCs whose conversations can be listed now: this one first. */
   pcs: { id: string; name: string; here: boolean }[]
+  /** F-235, asked with folders=1: that PC's project folders, the newest first (an older PC leaves it out). */
+  folders?: ClaudeProjectFolder[]
+  /** F-235: the hub's other PCs that can't be reached now (known by their PC Control workspace): named, not listed. */
+  offline?: { id: string; name: string }[]
 }
 
 /** F-022: copying every conversation of another PC here (GET/POST /agentic/sessions/copy-all). */
@@ -379,6 +402,12 @@ export interface ImportChat {
   /** A new agent's name and role. */
   name?: string
   role?: string
+  /**
+   * F-235, Import agent from a conversation (a new agent only): the PC its chat runs on, its home from then on. The PC that holds the
+   * conversation (`pc`, else this one): the copy is made there, beside the original, and resumes in its own folder. Another: the hub
+   * brings it over and copies it, and that PC gets the copy through the F-021 sync, in its folder for the floor. Left out: as before.
+   */
+  runOn?: string
 }
 
 export interface ChatImported {
@@ -386,8 +415,10 @@ export interface ChatImported {
   agent: FloorAgent
   /** The copy's id, the agent's chat now. The original is left as it was. */
   sessionId: string
-  /** Where the conversation was held: its chat opens there. */
+  /** Where the conversation was held: its chat opens there. F-235: '' when it opens in another PC's folder for the floor, not known here. */
   cwd: string
+  /** F-235: the PC its chat runs on (its home), when one was chosen. */
+  on?: { id: string; name: string }
 }
 
 /** One message of a chat's transcript (the Agents tab's reader). */

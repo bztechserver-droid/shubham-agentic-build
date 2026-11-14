@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { IncomingHttpHeaders } from 'node:http'
 import { apiError, type ApiMount, type MountRequest, type WsSocket } from '../api.ts'
+import { PHONE_SWITCH_HEADER } from '../../shared/phone-control.ts'
 import type { Caller } from '../auth/types.ts'
 import { writeAtomic } from '../config.ts'
 import { nameProblem } from '../../shared/file-names.ts'
@@ -87,6 +88,15 @@ export interface VoiceDeps {
    * device's signature (strict: no unsigned old way). Says who signed, for the log. Without it, no pair code is made.
    */
   proof?(body: unknown, r?: { caller?: Caller; headers: IncomingHttpHeaders }): string
+  /**
+   * Order oae15: switching phone control ON is his own: a signed-in CRM administrator's session (index.ts), never a chat, a phone or a page
+   * nobody signed in on. Throws otherwise; says who, for the log. Without it the switch cannot be turned on (off always can).
+   */
+  controlProof?(body: unknown, r?: { caller?: Caller; headers: IncomingHttpHeaders }): string
+  /** Order oae15: the switch changed (the approvals log says so). */
+  controlSwitched?(on: boolean, by: string): void
+  /** Order oae15: this PC's place in the team. The phone is reached through the hub, so a member PC neither switches nor stops it. */
+  mode?(): 'alone' | 'hub' | 'member'
   /** The Assistant's chat feed, as /agentic/chat sends it (hello, add, patch, menu, status); returns the way to stop. */
   feed?(send: (m: unknown) => void): () => void
   /** Older items of the Assistant's conversation. */
@@ -465,7 +475,8 @@ export function createVoice(deps: VoiceDeps): Voice {
   }
 
   // --- the mount -------------------------------------------------------------------------------
-  const pageRoute = (rest: string) => rest === '/pair-code' || rest === '/devices' || rest === '/devices/revoke' || rest === '/control-status' || rest === '/control-stop'
+  const pageRoute = (rest: string) =>
+    rest === '/pair-code' || rest === '/devices' || rest === '/devices/revoke' || rest === '/control-status' || rest === '/control-stop' || rest === '/control-switch'
   const mount: ApiMount = {
     prefix: '/voice',
     // Everything but the page's own routes carries the phone's key, never the app's token.
@@ -512,8 +523,28 @@ export function createVoice(deps: VoiceDeps): Voice {
         phone.forget(id)
         return { devices: voice.devices() }
       }
-      const control = phone.page(method, rest)
-      if (control !== undefined) return control
+      // Order oae15: the PC's own switch for phone control. On is his (controlProof, and only the card's own request, which says so in a
+      // header no other request of a page carries: a CRM handler that builds a path from an id cannot); off always works and stops the phone
+      // at once, and so does Stop now. The phone is reached through the hub: a member PC says where to go instead.
+      const member = deps.mode?.() === 'member'
+      if (member && method === 'POST' && (rest === '/control-switch' || rest === '/control-stop')) {
+        throw Object.assign(apiError(409, 'Phone control is on the Server: switch it, or stop the phone, in the app on the Server (Settings › Devices › Phone control).'), { code: 'hub-only' })
+      }
+      if (method === 'POST' && rest === '/control-switch') {
+        const on = (r.body as { on?: unknown } | null)?.on
+        if (typeof on !== 'boolean') throw apiError(400, 'Expected {on}')
+        let by = 'the app'
+        if (on) {
+          if (r.headers[PHONE_SWITCH_HEADER] !== '1') throw apiError(403, 'Phone control is switched on only from its card in Settings › Devices, with his own tap.')
+          if (!deps.controlProof) throw apiError(503, 'Switching phone control on needs the CRM administrator session; sign in on the app page.')
+          by = deps.controlProof(r.body, r)
+        }
+        phone.setSwitch(on, by, devices.map(x => x.id))
+        deps.controlSwitched?.(on, by)
+        return phone.status()
+      }
+      const control = phone.page(method, rest, devices.map(x => x.id))
+      if (control !== undefined) return member && rest === '/control-status' ? { ...(control as object), member: true } : control
       if (method === 'POST' && rest === '/pair') return pair(r.body)
       const d = auth(r)
       if (method === 'GET' && rest === '/hello') {

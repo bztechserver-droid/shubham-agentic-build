@@ -1,0 +1,1 @@
+var e=`/live`,t=`/old`,n=`Live talking`,r=`Ask the old app, answers in seconds`,i=`/live-classic`,a=`Live talking classic`,o=`The old app's voice talk, as it was`,s=`/old`,c={code:`KeyO`,label:`Alt+O`};export{c as a,e as c,r as i,s as l,a as n,n as o,i as r,t as s,o as t};

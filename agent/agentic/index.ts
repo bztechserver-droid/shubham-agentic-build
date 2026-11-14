@@ -47,6 +47,7 @@ import {
   type ChatOpened,
   type ChatRun,
   type ChatState,
+  type ClaudeProjectFolder,
   type ClaudeSession,
   type Floor,
   type FloorAgent,
@@ -56,13 +57,14 @@ import {
   type DefaultModel,
   type OpenChatRequest,
   type RunsAnswer,
+  type SessionsAnswer,
   type TerminalClientMessage,
   type TuneAnswer,
   type TuneRequest,
 } from '../../shared/agentic.ts'
 import type { PreviewsAnswer, SayAnswer, SayDirectAnswer, SayRequest, DeliveryReceipt } from '../../shared/chat.ts'
 import { deliveryBlockWords, diagnosticWords, isDeliveryBlockReason, type DeliveryBlockReason } from '../../shared/delivery-reason.ts'
-import { readDraftClear, readDraftView } from '../../shared/chat-draft.ts'
+import { readDraftClear, readDraftView, type DraftKind, type DraftView } from '../../shared/chat-draft.ts'
 import { createDeliveryReceipts } from './delivery-receipts.ts'
 import { createHumanInputGrants, type HumanInputPhase } from './human-delivery.ts'
 import type { TasksAnswer, TaskStatus } from '../../shared/tasks.ts'
@@ -73,13 +75,17 @@ import { writeAtomic } from '../config.ts'
 import type { Logger } from '../log.ts'
 import { composeAgentBrief, MCP_SERVER_NAME, writeBrief } from './briefs.ts'
 import { claudeJsonPath, prepareClaudeConfig } from './claude-config.ts'
-import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type PtySpawn } from './chats.ts'
+import { createChatPool, findClaude, type ChatPool, type ChatPoolOptions, type PtySpawn, type StartChat } from './chats.ts'
 import { ownBridgeChat } from './bridge-stop.ts'
 import type { ChatHostLink } from '../chathost/link.ts'
 import { createChatFeeds } from './chatview.ts'
 import { createUiBridge } from './ui-bridge.ts'
 import { chosen, mcpConfigFor, readRegistry, strictConfigFor } from './mcp-registry.ts'
-import { createOrders, FAST_FROM, phoneUser, scanMessages, type HandoffApi, type Order, type OrderProgress } from './orders.ts'
+import { createOrders, FAST_FROM, isAcknowledgement, isReply, phoneUser, scanMessages, type HandoffApi, type HandOffOptions, type HandOffResult, type Order, type OrderOrigin, type OrderProgress } from './orders.ts'
+import { CARD_TEXT_MAX, cleanCardText, createTalkCards, neutralizeMarks, type CardRecord } from './talk-cards.ts'
+import { BUSY_WORDS, createLatchFiles, createLineQueue, createLockRecord, createSpokenLatch, HELD_WORDS, holdsChat, LINE_POLL_MS, latchVerdict, lockHook, noLockWords, REFUSED_WORDS } from './talk-latch.ts'
+import { createResidualHolds, type Seen } from './talk-residual.ts'
+import { LATCH_NAME } from './latch-hook.ts'
 import { createOrderWatch, createTurnReader, type TurnReader } from './turns.ts'
 import { readStatus } from './screen.ts'
 import { createHeartbeat, unfinishedWork } from './heartbeat.ts'
@@ -89,9 +95,9 @@ import { createVoice, type AskView } from './voice.ts'
 import { spawn, spawnSync } from 'node:child_process'
 import { createFastHost, type FastHost, type FastDeps } from './fast-host.ts'
 import { namesChoice, namesFor, type NamesChoice } from '../../shared/fast-names.ts'
-import { fastHello } from '../../shared/fast.ts'
+import { fastHello, ID_RE, MAX_TEXT } from '../../shared/fast.ts'
 import { buildBrief, buildSnapshot, type SnapshotInput } from './fast-brief.ts'
-import { createFastSession, type FastSession } from './fast.ts'
+import { createFastSession, type FastSession, type Origin } from './fast.ts'
 import { fastDenied } from './fast-tools.ts'
 import { readMemory } from './fast-gate.ts'
 import { FAST_TOOLS } from './fast-tools-list.ts'
@@ -174,6 +180,7 @@ import { createCrmFilesModule, type CrmFilesModule, type CrmFilesModuleOptions }
 import { createBrowserHost } from '../browser/host.ts'
 import { browserMount } from '../browser/mount.ts'
 import { BROWSER_PRIVATE_NOTE } from '../../shared/browser.ts'
+import { phoneAnswer } from '../../shared/phone-private.ts'
 import { createCrmUploads } from '../crm-files/uploads.ts'
 import { createConversations, type Conversations, type ConvSession } from './conversations.ts'
 import { noMeaning, type Embedder } from './embedder.ts'
@@ -313,6 +320,43 @@ const ADMIN_TOOLS = new Set([
 ])
 
 /** F-124: what a proof needs of the request: who is asking and the browser's headers. */
+/**
+ * Order oae15 (review): the first string, at any depth, that would climb out of a URL path where page code puts it: a ".." segment between
+ * slashes or backslashes, also written with %2e (once or twice encoded). Plain words and ids ("Q3/Q4 plan", "Wait...") pass; null when none.
+ */
+export function pathClimb(v: unknown, depth = 0): string | null {
+  if (depth > 8) return null
+  if (typeof v === 'string') {
+    let s = v
+    for (let i = 0; i < 3; i++) {
+      if (/(^|[\\/])(\.|%2e){2}([\\/?#;]|$)/i.test(s)) return v
+      let next: string
+      try {
+        next = decodeURIComponent(s)
+      } catch {
+        return null
+      }
+      if (next === s) return null
+      s = next
+    }
+    return null
+  }
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const hit = pathClimb(x, depth + 1)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (v && typeof v === 'object') {
+    for (const [k, x] of Object.entries(v)) {
+      const hit = pathClimb(k, depth + 1) ?? pathClimb(x, depth + 1)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
 export interface ProofRequest {
   caller?: Caller
   headers: IncomingMessage['headers']
@@ -623,7 +667,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const hooksFile = path.join(o.dir, 'hooks.json')
   const fwd = (p: string) => p.replace(/\\/g, '/')
   const hookScript = fileURLToPath(new URL('./memory-hook.ts', import.meta.url))
-  writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}"`, timeout: 10 }] }] } })}\n`)
+  // F-221 (ob98a, T4): the two prompt hooks are named, so the Orchestrator's own settings file (below) carries exactly the same one.
+  const memoryPromptHook = [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}"`, timeout: 10 }] }]
+  writeAtomic(hooksFile, `${json({ hooks: { UserPromptSubmit: memoryPromptHook } })}\n`)
   // 12 Nov (Agent 12, Lead's yes): while the memory layer is off, every NEW Claude chat still gets the PROMPT REPORT: the same script with
   // --report-only, which only tells the agent which prompt claude took (the send confirmation, o655f, and the order-reply carrier), prints
   // nothing, gives up after 2 s and always exits 0. The memory layer's own switch is not touched. Off for new chats: SAD_PROMPT_HOOK=0 or the
@@ -631,10 +677,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // Claude's own limit stays the memory hook's 10 s: it counts from the moment claude starts the hook, and Windows sometimes takes ~3 s just
   // to start it (real rig, 12 Nov: with a 3 s limit claude printed "hook ... timed out" under the prompt). The script's own 2 s cap is the wait.
   const promptHookFile = path.join(o.dir, 'prompt-hook.json')
-  writeAtomic(promptHookFile, `${json({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}" --report-only`, timeout: 10 }] }] } })}\n`)
+  const reportPromptHook = [{ hooks: [{ type: 'command', command: `"${fwd(process.execPath)}" "${fwd(hookScript)}" --report-only`, timeout: 10 }] }]
+  writeAtomic(promptHookFile, `${json({ hooks: { UserPromptSubmit: reportPromptHook } })}\n`)
   const promptHookOff = () => process.env.SAD_PROMPT_HOOK === '0' || existsSync(path.join(o.dir, '..', 'prompt-hook.off'))
-  // One answer per chat start: the pool reads `settings` twice in one statement (chats.ts), and both reads must agree even if the file
-  // appears in between; the next start (a later tick) looks again.
+  // One answer per chat start: two reads in one start must agree even if the file appears in between (the pool read `settings` twice before
+  // F-221 T4 made it one call); the next start (a later tick) looks again.
   let promptHookPick: string | undefined | null = null
   const promptHookSettings = () => {
     if (promptHookPick === null) {
@@ -642,6 +689,33 @@ export function createAgentic(o: AgenticOptions): Agentic {
       queueMicrotask(() => { promptHookPick = null })
     }
     return promptHookPick
+  }
+  // F-221 (ob98a, T4): the voice lock below the model (latch-hook.ts). The Orchestrator's chat, and ONLY it (a hook process at every tool call of
+  // every chat would slow all agents), starts with its own settings file: the very prompt hook it gets by the rules above (the memory's, the prompt
+  // report, or none) plus a PreToolUse hook on every tool that refuses all but reads while a spoken line holds the chat (talk-latch.ts mirrors the
+  // latch into talk-latch/<session>). Written as that chat starts, naming it; the hub's own (a member keeps no orders, so nothing could hold there).
+  // Which chats were started with it is kept (voice-lock.json, by start time): GET /talk/caps says 'full' only for the Orchestrator running now.
+  const orchestratorHooksFile = path.join(o.dir, 'hooks-orchestrator.json')
+  const latchDir = path.join(o.dir, 'talk-latch')
+  const latchHookScript = fileURLToPath(new URL('./latch-hook.ts', import.meta.url))
+  const voiceLocks = createLockRecord(path.join(o.dir, 'voice-lock.json'), log)
+  /** The chat whose start the settings below just gave the voice lock (startHere notes it once the start went through). */
+  let voiceLockGiven: string | null = null
+  /** What a Claude chat starts with (chats.ts asks once per start, never for Codex or Codex in Claude Code). */
+  function chatSettings(s: StartChat): string | undefined {
+    const base = o.memory?.start ? hooksFile : promptHookSettings()
+    const at = mode() === 'member' ? undefined : allFloors().flatMap(f => (f.id === s.floorId ? f.agents.filter(a => a.id === s.agentId).map(a => ({ f, a })) : []))[0]
+    if (!at || !isOrchestratorAgent(at.f.name, at.a) || !LATCH_NAME.test(s.sessionId)) return base
+    const prompt = base === hooksFile ? memoryPromptHook : base === promptHookFile ? reportPromptHook : null
+    try {
+      writeAtomic(orchestratorHooksFile, `${json({ hooks: { ...(prompt ? { UserPromptSubmit: prompt } : {}), PreToolUse: [lockHook(process.execPath, latchHookScript, latchDir, s.sessionId)] } })}\n`)
+    } catch (e) {
+      // Started the old way: its app tools are still held by the hub, and the page does not offer the direct line (caps say 'app-tools').
+      log?.warn(`voice lock: could not write ${orchestratorHooksFile}; the Orchestrator starts without it: ${message(e)}`)
+      return base
+    }
+    voiceLockGiven = s.sessionId
+    return orchestratorHooksFile
   }
 
   /** 'alone': no hub (as before F-021); 'hub': it keeps the floors; 'member': it shows its hub's. */
@@ -1307,6 +1381,23 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
   /** Stage 1 (o400b): Claude's own transcript, read for every Claude chat running here (turns.ts); made right after the pool. */
   let turns: TurnReader | null = null
+  /**
+   * F-221 (ob98a, fix round 3): true from the moment the link to the chat host is lost until it is back AND onBack's reopen loop is over (onLost,
+   * onBack below). The pool's chats ended then because the link went, not the chats: the host may still run them (link.ts takes the same processes
+   * over when the link is back) or they are reopened and told to carry on. Meanwhile a chat not seen is not known to have stopped (chatsKnown: a
+   * spoken order holds), and the chats that left with the link (leftWithHost) let no lease go and are reported as `reconnecting` (liveReport: a
+   * member PC's, so the hub keeps holding them).
+   */
+  let hostSettling = false
+  const leftWithHost = new Set<string>()
+  /** Each loss counts: a chat whose reopen a newer loss overtook is reopened again by the next loop (reopenLost). */
+  let hostLosses = 0
+  /**
+   * F-221 (T4 phase 2): what the chats are seen doing, told to the residual holds as it changes (a chat here, a member PC's report), so a short turn
+   * is seen working too, not only at the orders tick. Only chats in the report count (one not in it is another PC's, or gone: the tick decides).
+   * Set once the residual holds exist (below the orders).
+   */
+  let sawChats: (states: Readonly<Record<string, ChatState>>) => void = () => {}
   const poolOptions: ChatPoolOptions = {
     addDirs: [uploads.dir],
     // F-083: a chat with an open order or unfinished work is never ended for being idle.
@@ -1325,6 +1416,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
       }
       const at = bySession(e.sessionId)
       chatLog.append({ event: 'stop', sessionId: e.sessionId, agent: at?.agent.name ?? '?', floor: at?.floor.name ?? '?', cause: e.cause, code: e.code, ranMin: Math.max(0, Math.round((Date.now() - Date.parse(e.startedAt)) / 60_000)) })
+      // F-221 (ob98a, fix round 2): a chat that ended (stopped, or restarted) cannot run a spoken line it had: that order is closed at the next tick
+      // and lets go. (When the agent itself stops, the chat host keeps its chats going and nothing ends here.) Fix round 3: not while this agent
+      // holds no link to the chat host (before its first take-over, or from a lost link until it is back): the pool's chats end then (-1) because
+      // the LINK went, and the host may still run them (link.ts takes the same processes over) or they are reopened and told to carry on.
+      if (!(o.chatHost && !hostAdopted)) spokenChatEnded(e.sessionId)
     },
     toolsUrl: () => `${o.apiUrl()}${AGENTIC_PREFIX}/mcp`,
     mcpConfig,
@@ -1349,13 +1445,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
     token: o.token,
     credential: o.credential,
     // F-051: recall in every prompt, once the memory layer is on (main.ts). Else the prompt report (12 Nov), unless it is switched off:
-    // a getter, so the switch is looked at each time a chat starts.
-    get settings() { return o.memory?.start ? hooksFile : promptHookSettings() },
+    // asked each time a chat starts, so the switch is looked at then. F-221 (T4): the Orchestrator's chat gets its own file, with the voice lock.
+    settings: chatSettings,
     onChange: () => {
       noteOpen()
-      // A chat that ended lets its session go (after its last write is sent on).
+      sawChats(chats.states())
+      // A chat that ended lets its session go (after its last write is sent on). F-221 (fix round 3): one that left with a lost chat host link
+      // does not yet: the host may still run it; it is let go when the host is back and the reopen loop is over, if it is not running again.
       const now = new Set(Object.keys(chats.states()))
-      for (const sid of lastLive) if (!now.has(sid)) void ended(sid)
+      for (const sid of lastLive) if (!now.has(sid) && !(hostSettling && leftWithHost.has(sid))) void ended(sid)
       lastLive = now
       // States flip several times a second while a chat paints; the page needs the settled one.
       if (liveTimer) return
@@ -1363,7 +1461,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         liveTimer = null
         emit({ t: 'live', live: chats.states() })
         emitWhere()
-        if (mode() === 'member' && sub) writeLine(sub.stream, { t: 'live', live: chats.states() })
+        if (mode() === 'member' && sub) writeLine(sub.stream, { t: 'live', ...liveReport() })
         pushState()
       }, 150)
       liveTimer.unref()
@@ -1574,6 +1672,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
         })
         .catch(e => void log?.warn(`chat host: could not take over its chats: ${message(e)}`))
     : Promise.resolve()
+  /**
+   * F-221 (T4 phase 2): the start-up take-over has settled (done or failed): until then a member PC's reports say `adopting` (liveReport), so the hub
+   * lets none of its leases go for a chat its pool does not have yet. Once settled, the next report says what runs.
+   */
+  let adoptionSettled = !o.chatHost
+  void adopted.then(() => {
+    adoptionSettled = true
+    poolOptions.onChange?.()
+  })
   // F-134, once the chats the host kept are known: profiles of chats that are gone are swept, and a Codex login file left by a crash is settled (put back to the CRM
   // first if Codex had refreshed it) and taken out when no Codex chat runs.
   void adopted.then(async () => {
@@ -1596,25 +1703,81 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
   }).catch(e => log?.warn(`Codex start-up discovery blocked: ${message(e)}`))
   // The host is lost (it died): the chats that ran in it end. Noted first; reopened (resumed) when a host is back.
-  let lostWithHost: Array<{ sid: string; state: ChatState }> = []
+  // F-221 (T4 review): one list for every loss (by session: what each chat was doing), worked through by one reopen loop at a time. A loss while the
+  // loop runs adds to the list (a chat the loop is reopening stays on it) and stops the loop at its next step (no host: nothing could be opened);
+  // the next back goes on with what is left. So no lost chat is dropped, and the host is settled (hostSettled) only once every one was looked at
+  // with a host there: an older loop never settles a newer loss, and a newer loop never settles while an older one still has chats to reopen.
+  const toReopen = new Map<string, ChatState>()
+  let reopening = false
+  const working = (st: ChatState | undefined) => st === 'running' || st === 'question'
   o.chatHost?.onLost(why => {
     hostAdopted = false
-    lostWithHost = Object.entries(chats.states()).map(([sid, state]) => ({ sid, state }))
-    log?.error(`the chat host is gone (${why}): ${lostWithHost.length} chat(s) ended with it; they are reopened when a host is back`)
+    hostSettling = true
+    hostLosses++
+    const now = Object.entries(chats.states())
+    for (const [sid, state] of now) {
+      // T4 review: a chat the loop reopened and told to carry on, whose carry-on has not been typed yet, is still working: the next loop tells it again.
+      const owed = (chats.waiting?.(sid, CONTINUE_TEXT) ?? 0) > 0
+      const was = toReopen.get(sid)
+      toReopen.set(sid, was !== undefined && working(was) ? was : owed ? 'running' : state)
+      leftWithHost.add(sid)
+    }
+    log?.error(`the chat host is gone (${why}): ${now.length} chat(s) ended with it; they are reopened when a host is back`)
   })
   o.chatHost?.onBack(() => {
     hostAdopted = true
-    const list = lostWithHost
-    lostWithHost = []
-    void (async () => {
-      for (const r of list) {
-        if (closing || chats.info(r.sid)) continue
-        const ok = await resumeChat(r.sid, r.state === 'running' || r.state === 'question' ? CONTINUE_TEXT : undefined)
-        log?.info(`chat host: chat ${r.sid.slice(0, 8)} ${ok ? 'reopened after the host was lost' : 'could not be reopened'}`)
+    void reopenLost()
+  })
+  /** The reopen loop: the lost chats one at a time, a gap apart, while a host is there; then the host is settled. */
+  async function reopenLost() {
+    // A loop that runs already goes on with what this back added.
+    if (reopening) return
+    reopening = true
+    let drained = false
+    try {
+      for (;;) {
+        if (closing || !hostAdopted) break
+        const next = toReopen.entries().next()
+        if (next.done) {
+          drained = true
+          break
+        }
+        const [sid, state] = next.value
+        if (chats.info(sid)) {
+          toReopen.delete(sid)
+          continue
+        }
+        const loss = hostLosses
+        const ok = await resumeChat(sid, working(state) ? CONTINUE_TEXT : undefined)
+        log?.info(`chat host: chat ${sid.slice(0, 8)} ${ok ? 'reopened after the host was lost' : 'could not be reopened'}`)
+        // Lost again meanwhile: it stays on the list (onLost noted what it was doing) for the loop of the next back.
+        if (loss === hostLosses) toReopen.delete(sid)
         await new Promise(res => setTimeout(res, o.resumeGapMs ?? 2000))
       }
-    })()
-  })
+    } finally {
+      reopening = false
+    }
+    if (drained && !closing && hostAdopted) hostSettled()
+  }
+  /** F-221 (fix round 3): the host is back and its reopen loop is over: a chat that left with the link and is not running again has stopped. */
+  function hostSettled() {
+    hostSettling = false
+    const gone = [...leftWithHost].filter(sid => !chats.info(sid))
+    leftWithHost.clear()
+    for (const sid of gone) void ended(sid)
+    // A member PC's next live report says it (no more `reconnecting`).
+    poolOptions.onChange?.()
+  }
+  /**
+   * F-221 (fix round 3): what this PC tells its hub of its chats: the live ones, and the ones that left with a lost chat host link (they may come
+   * back). T4 phase 2: `adopting` until its start-up take-over has settled (an agent that just started, e.g. after an Update, while its chat host
+   * keeps the chats running): its pool does not have them yet, so the hub must not take a missing chat for a stopped one (it lets no lease go).
+   */
+  function liveReport(): { live: Record<string, ChatState>; reconnecting?: string[]; adopting?: true } {
+    const live = chats.states()
+    const reconnecting = hostSettling ? [...leftWithHost].filter(sid => !live[sid]) : []
+    return { live, ...(reconnecting.length ? { reconnecting } : {}), ...(adoptionSettled ? {} : { adopting: true as const }) }
+  }
 
   const tail = createTail({
     everyMs: o.syncEveryMs,
@@ -1793,6 +1956,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     executionGuard?.()
     requireLegacyExecution(agent, defaultsNow())
     assertPcControlTarget(floor, self().id, size)
+    // F-221 (T4 review): held before it starts, whoever starts it, when a spoken line holds it (heldStart).
+    heldStart(sid)
     if (engineFor(agent) === 'opencode') {
       const dflt = defaultsNow(), cwd = codeDirOf(floor)
       const selection = openCodeSelection(agent, dflt)
@@ -1838,7 +2003,11 @@ export function createAgentic(o: AgenticOptions): Agentic {
     } else {
       mcp = mcpConfigFor(o.dir, sid, appMcpServers, readRegistry(mcpRegistryFile), agent.mcpServers, mcpConfig)
     }
-    chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    voiceLockGiven = null
+    const started = chats.start({ sessionId: sid, floorId: floor.id, agentId: agent.id, cwd, briefPath, mcpConfig: mcp, strictMcp, model: agent.model || dflt.model, effort, resume, cols: size.cols, rows: size.rows })
+    // F-221 (ob98a, T4): this run has the voice lock when its start was given hooks-orchestrator.json (chatSettings); kept by its start time.
+    if (voiceLockGiven === sid) voiceLocks.started(sid, started.startedAt)
+    voiceLockGiven = null
     launched.set(sid, { effort, at: new Date().toISOString(), ultracode })
     heartbeat.opened(sid)
     chatLog.append({ event: 'start', sessionId: sid, agent: agent.name, floor: floor.name, cause: startCause.get(sid) ?? (resume ? 'resumed' : 'new') })
@@ -2060,8 +2229,15 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if ((raw.t === 'hello' || raw.t === 'live') && isObject(raw.live)) {
         const live = Object.fromEntries(Object.entries(raw.live).filter((e): e is [string, ChatState] => typeof e[1] === 'string' && validMirrorSid(e[0]) && (!controlPinnedPc(e[0]) || controlPinnedPc(e[0]) === from.id)))
         remote.set(from.id, { name: from.name, live })
-        // What it held and no longer runs (it stopped, or restarted): let go.
-        for (const [sid, h] of held) if (h.holder === from.id && !live[sid] && Date.now() - h.heldAt > LEASE_GRACE_MS) release(sid, from)
+        // F-221 (fix round 3): the chats that left its pool with its lost chat host link: they may still run there (taken over again when that link
+        // is back), so they are not let go (its spoken order holds while the chat is away: awayChat). That PC lets them go itself once it knows.
+        const reconnecting = new Set(Array.isArray(raw.reconnecting) ? raw.reconnecting.filter((s): s is string => typeof s === 'string' && validMirrorSid(s)) : [])
+        // What it held and no longer runs (it stopped, or restarted): let go. F-221 (T4 phase 2): never from a report made before its start-up take-over
+        // settled (`adopting`: its pool does not have the chats its chat host kept running yet, so a chat missing from it may still run there, and
+        // a spoken order's hold stays while the chat is away); its first report after the take-over decides.
+        if (raw.adopting !== true) for (const [sid, h] of held) if (h.holder === from.id && !live[sid] && !reconnecting.has(sid) && Date.now() - h.heldAt > LEASE_GRACE_MS) release(sid, from)
+        // F-221 (T4 phase 2): what its chats are seen doing, for a residual hold on one of them.
+        sawChats(live)
         emitWhere()
         pushState()
       }
@@ -2142,7 +2318,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         sub = { token: link.token, stream }
         replica.engineSwitchContinuity = undefined
         downSince = null
-        writeLine(stream, { t: 'hello', live: chats.states(), marks: marksHere() })
+        writeLine(stream, { t: 'hello', ...liveReport(), marks: marksHere() })
         readLines(stream, raw => onHubEvent(link, raw))
         const gone = () => {
           if (sub?.stream !== stream) return
@@ -2595,6 +2771,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() === 'hub') {
       const link = team?.member(home) ?? null
       if (!link) throw offline()
+      // F-221 (T4 review): started on its home PC: held first when a spoken line holds it, as for a start here (heldStart).
+      if (sid) heldStart(sid)
       return { ...(await openOnPeer(link, floor, agent, req.say)), on: name }
     }
     // A member reaches every other PC through the hub, which does the same for it (the run-on route).
@@ -2687,6 +2865,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (team?.role() === 'member') return false
     const at = floors.bySession(sid)
     if (!at) return false
+    // F-221 (T4 phase 2; T4 review): a chat a spoken line holds is held again (a residual hold) as it starts, before the carry-on is typed: startHere
+    // does it (heldStart) for every way a chat starts, this one included.
     try {
       // Here: it was open on this PC when the app stopped (or needs its token again), so it comes back on this PC.
       const opened = await openChat(at.floor.id, at.agent.id, isPcControl(at.floor) ? {} : { here: true })
@@ -2712,6 +2892,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
   let resumeTimer: NodeJS.Timeout | null = null
   /** F-083: false from the start until recovery has reopened its list (or when there is none to wait for: true at once). */
   let recoveryDone = !o.resumeChats || team?.role() === 'member'
+  /**
+   * F-221 (ob98a, fix rounds 2 and 3): the hub knows where its chats are: the chat host's chats are taken over, start-up recovery has reopened its
+   * list, and no lost chat host link is still being settled (hostSettling: until the link is back and its reopen loop is over). Before that a chat
+   * that is not seen is not known to have stopped: a spoken order's hold stays, and a direct line starts no Orchestrator of its own.
+   */
+  const chatsKnown = () => hostAdopted && recoveryDone && !hostSettling
   if (o.resumeChats && team?.role() !== 'member') {
     const mine = createRecovery(path.join(o.dir, 'open-chats.json'), { log })
     recovery = mine
@@ -2765,9 +2951,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
       targetHits.set(to, hits)
     }
   }
-  /** typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. */
-  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void, actor?: Caller) =>
-    typeInto(c, body, { confirmed: true, caller: actor }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
+  /**
+   * typeInto for a message that counted against the cooldowns: if the chat refuses it (409, his draft) the count is taken back. F-221 (review of T2):
+   * `unsure` (his tap on a held message) reads a member PC's lost answer as delivery-unconfirmed, so the card is used up and never sent twice.
+   */
+  const typeIntoOrUndo = (undo: () => void, c: { sessionId: string; id: string }, body: string, uncertain?: () => void, actor?: Caller, unsure = false) =>
+    typeInto(c, body, { confirmed: true, caller: actor, ...(unsure ? { unconfirmedThrows: true } : {}) }).then(ok => { if (!ok) undo(); return ok }).catch(e => {
       if (e?.code === 'delivery-unconfirmed' || e?.code === 'delivery-pending') uncertain?.()
       else undo()
       throw e
@@ -2882,14 +3071,28 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /**
+   * F-221 (ob98a, review of T2): a 'type' request to a member PC whose answer was lost after it was sent (502 no answer, 504 no answer in time) may
+   * have typed all the same. Read as "not typed" (false) as before, unless the caller must never take that for sure (a spoken line, his tap on a
+   * held message): then it is delivery-unconfirmed, as callTool already says for a member's own sends. Fix round 2: a stream that never opened
+   * (roam.ts request: `sent: false`) carried nothing to that PC: that is "not typed" for certain, for every caller.
+   */
+  const lostAnswer = (e: unknown, opt: { unconfirmedThrows?: boolean }): false => {
+    if (opt.unconfirmedThrows && isObject(e) && e.sent !== false && (e.status === 502 || e.status === 504)) {
+      throw Object.assign(apiError(409, 'Delivery is not confirmed: the link to that PC failed before it answered, so the message may already be typed. Inspect the destination; do not resend.'), { code: 'delivery-unconfirmed' })
+    }
+    return false
+  }
+
+  /**
    * Types `body` into a chat here or on a member PC.
    * 10 Nov 2026, Shubham's order ("remove the rule"): a CLAUDE chat is no longer refused because its box holds unsent text (an agent's message,
    * a broadcast, a nudge, an order's reply). The confirmed sender never types over text it did not paste, so when it finds a draft it
    * reports 'blocked'; the message then goes in the OLD direct way instead: pasted after the text, one Enter, no receipt. That is what the
    * old app did, and it unblocks a chat whose box holds a stuck paste. Prompts/menus are still never pressed Enter on (atPrompt guards
    * the callers). A restart (/exit) still refuses a draft: that is not a message. A Codex chat keeps the refusal (see joinsDraft).
+   * F-221 (review of T2): `unconfirmedThrows`: a member PC's lost answer is delivery-unconfirmed, never "not typed" (lostAnswer).
    */
-  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller } = {}): Promise<boolean> {
+  async function typeInto(c: { sessionId: string; id: string }, body: string, opt: { human?: boolean; confirmed?: boolean; caller?: Caller; unconfirmedThrows?: boolean } = {}): Promise<boolean> {
     // 10 Nov 2026, Shubham ("before Codex everything worked"): a message from an agent (agent tools, broadcast, order reply) to a NATIVE CLAUDE
     // chat goes the old direct way again: one paste, one Enter, no receipt, no confirmation, no retry. The checked sender stayed for the chats
     // that need it (Codex, OpenCode, Codex in Claude Code). It also ends the stuck "[Pasted text #N]": Claude Code collapses a long paste, the
@@ -2927,7 +3130,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         }
         const peerLink = team?.member(c.id)
         if (!peerLink) return false
-        return (await request<boolean | 'draft'>(peerLink, 'type', { sessionId: c.sessionId, text: body }).catch(() => false)) === true
+        return (await request<boolean | 'draft'>(peerLink, 'type', { sessionId: c.sessionId, text: body }).catch(e => lostAnswer(e, opt))) === true
       }
       const delivery = isObject(result) ? result.delivery : undefined
       if (delivery === 'sent') return true
@@ -2942,7 +3145,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     }
     const link = team?.member(c.id)
     if (!link) return false
-    const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(() => false)
+    const r = await request<boolean | 'draft'>(link, 'type', { sessionId: c.sessionId, text: body, ...(refuseDraft ? { refuseDraft: true } : {}) }).catch(e => lostAnswer(e, opt))
     if (r === 'draft') throw apiError(409, draftWords(c.sessionId))
     return r === true
   }
@@ -3138,6 +3341,36 @@ export function createAgentic(o: AgenticOptions): Agentic {
   // Only the hub keeps them: a member's tool calls are run by the hub (callTool).
   // F-087: where a hand-off's answer and progress go (the fast Assistant's session registers them: handoff.listen below).
   const fastLinks: { onReturn?: (order: Order, text: string) => Promise<boolean>; onProgress?: (p: OrderProgress) => void } = {}
+  // F-221 (ob98a): live talk's safety, in code. Spoken words never approve, pay, delete or publish. The tap-to-send cards (talk-cards.ts): what a
+  // holding connection hands off, and what the Orchestrator wants to send to another chat while a direct line holds it, wait there for his tap.
+  // The spoken latch (talk-latch.ts): which spoken orders hold the Orchestrator's tools now (toolFor decides by it), read from the open orders only
+  // (orders.json keeps `spoken`), so an order still open after a restart of the agent still holds. The cards live in memory only. Fix round 2: the
+  // direct line's spoken lines go one at a time, typed only into an Orchestrator that rests (spokenLines: the ones waiting for that, in order).
+  const talkCards = createTalkCards({ now: Date.now, tell: (conn, frame) => fastSession?.tell(conn, frame) ?? false, ...(log ? { log } : {}) })
+  // F-221 (ob98a, T4 phase 2): the residual holds (talk-residual.ts, kept in talk-residual.json): a chat a spoken line held when that line closed for
+  // any reason but its reply being seen or his Let go, or that was told to carry on while held, stays held until a turn end is seen there.
+  const residual = createResidualHolds({ now: Date.now, file: path.join(o.dir, 'talk-residual.json'), ...(log ? { log } : {}) })
+  /**
+   * T4 review: what a chat here shows a residual hold beyond its state (talk-residual.ts Seen). `live`: its own screen shows it working (its spinner,
+   * or a prompt of its turn): a turn of this very run. `readBack`: the turn its record reads as running (or asking) began before this run started
+   * (a chat started again at once reads the turn the stop cut off back from its record, until the resume writes its end): no turn of this run.
+   */
+  function residualSeen(sid: string): Seen {
+    const run = chats.info(sid)
+    if (!run) return {}
+    const screen = chats.screenState?.(sid)
+    const turn = turns?.turn(sid)
+    return { live: screen === 'running' || screen === 'question', readBack: !!turn && turn.state !== 'idle' && Date.parse(turn.since) < Date.parse(run.startedAt) }
+  }
+  sawChats = states => {
+    for (const sid of residual.held().keys()) if (states[sid] !== undefined) residual.saw(sid, states[sid], residualSeen(sid))
+  }
+  const spokenLatch = createSpokenLatch({ orders: () => orders.list(), residual: () => residual.held() })
+  // F-221 (ob98a, T4): the latch mirrored into talk-latch/<session> for the voice lock below the model (latch-hook.ts reads it): rebuilt from the
+  // saved orders as the agent starts (below the orders), written when a spoken line arms it (before the line is typed), and synced after every
+  // orders tick (its reply, a chat that stopped) and when he lets go.
+  const latchFiles = createLatchFiles({ dir: latchDir, held: () => spokenLatch.held(), ...(log ? { log } : {}) })
+  const spokenLines = createLineQueue({ now: () => Date.now() })
   // Stage 1 (o400b, rule 4): each open order is followed in its target's own Claude transcript, wherever this PC has it (a member's copy on the hub too).
   const orderTurns = createOrderWatch({ find: sid => findClaudeTranscript(sid, projectsDir), target: sid => chats.claudeSession?.(sid) ?? sid })
   const orders = createOrders({
@@ -3160,6 +3393,14 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // entered); Codex, OpenCode and "Old way" keep the rule above.
     turnOf: (sid, id, since) => (syncOld() || isCodexSession(sid) || isOpenCode(sid) ? null : orderTurns.turnOf(sid, id, since)),
     forget: id => orderTurns.forget(id),
+    // F-221 (ob98a, fix round 2): what tells a spoken order's line can no longer run (orders.ts). Before start-up adoption and recovery are over, a
+    // chat not seen is not known to have stopped (fix round 3: nor while a lost chat host link is settled); a chat on another PC that has not
+    // reported it since may still run there; and only a resting chat with an empty box cannot submit a line that never entered.
+    known: () => chatsKnown(),
+    away: sid => awayChat(sid),
+    boxEmpty: sid => boxEmpty(sid),
+    // T4 phase 2: a spoken line closing for any reason but its reply being seen (or his Let go) leaves its chat held (a residual hold).
+    residual: (od, why) => residual.make(od.to.sessionId, [od.id], `order ${od.id}: ${why}`),
     deliver: async (assistantSid, body, order) => {
       // F-087: the fast Assistant is a process, not a chat: its answer goes to the session (nothing is typed anywhere).
       if (order.from === FAST_FROM) return fastLinks.onReturn ? fastLinks.onReturn(order, body).catch(() => false) : false
@@ -3182,8 +3423,78 @@ export function createAgentic(o: AgenticOptions): Agentic {
   function orderReplies(): boolean {
     return o.orderReplies ?? !(process.env.SAD_ORDER_REPLIES === '0' || existsSync(path.join(o.dir, 'order-replies.off')))
   }
-  const ordersTimer = setInterval(() => void orders.tick(), 1000)
+  // F-221 (T4): after each tick the voice lock's files say what the latch holds now (an order answered or closed lets its chat go below the model too).
+  // T4 phase 2: the residual holds are looked at after the orders (one let go when a turn end is seen in its chat), before the files are synced.
+  const ordersTimer = setInterval(
+    () =>
+      void orders
+        .tick()
+        .then(() => residual.tick({ stateOf: sid => whereAll()[sid]?.state, boxEmpty: sid => boxEmpty(sid), seen: residualSeen }))
+        .catch(e => log?.warn(`orders tick: ${message(e)}`))
+        .finally(() => (closing ? undefined : latchFiles.sync())),
+    1000,
+  )
   ordersTimer.unref?.()
+  // F-221 (T4): at start the files are made to match the saved orders: a spoken order still open holds its chat again (the chat host kept it running).
+  latchFiles.sync()
+
+  /**
+   * F-221 (ob98a, fix round 2): a chat that another PC holds (its lease) and that PC has not reported running since: the PC is out of reach, or has
+   * not said hello yet. The chat may still be running there, so a spoken order's hold stays (it is decided when that PC is back, by its transcript).
+   */
+  function awayChat(sid: string): boolean {
+    const holder = held.get(sid)?.holder
+    return !!holder && holder !== self().id && remote.get(holder)?.live[sid] === undefined
+  }
+  /** What counts as an empty box: nothing in it, or only Claude's own grey suggestion or hint (never text that Enter could send). */
+  const EMPTY_BOX: readonly DraftKind[] = ['none', 'suggestion', 'hint']
+  /**
+   * F-221 (ob98a, fix round 2): the chat's input box holds nothing (no line of ours whose Enter was lost, no draft of his) and no paste of ours is on
+   * its way, read where the chat runs (another PC: its draft-read, as "Inspect terminal" reads it). False when it cannot be read.
+   * T4 review: a text of the app's that waits for its prompt (chats.ts typeWhenReady: a carry-on after a reopen, the watchdog's nudge, a hand-off's
+   * line) is a paste on its way too, though nothing is drawn yet: a spoken line never goes in before it, and a residual hold never ends before it.
+   */
+  async function boxEmpty(sid: string): Promise<boolean> {
+    const w = whereAll()[sid]
+    if (!w) return false
+    let v: DraftView | null = null
+    if (w.id === self().id) {
+      if ((chats.waiting?.(sid) ?? 0) > 0) return false
+      v = chats.draftView?.(sid) ?? null
+    } else {
+      const link = team?.member(w.id)
+      if (!link) return false
+      v = readDraftView(await request<unknown>(link, 'draft-read', { sessionId: sid }, 3000).catch(() => null))
+    }
+    return !!v && EMPTY_BOX.includes(v.kind) && !v.busy
+  }
+  /**
+   * F-221 (fix round 2): a chat here ended (chats.ts onEnded): a spoken order it had not answered is closed at the next tick (orders.ts chatEnded).
+   * T4 phase 2: a residual hold on it is held again from now: what was seen working before the end was no turn end (a crash, a restart).
+   */
+  function spokenChatEnded(sid: string) {
+    orders.chatEnded(sid)
+    residual.again(sid, 'its chat ended or is being restarted')
+  }
+  /**
+   * F-221 (T4 phase 2; T4 review): a chat that a spoken line holds (an open spoken order, or a residual hold) is being started, fresh or from its
+   * conversation, by ANY path: the reopen loop and start-up recovery (told to carry on), the F-083 watchdog (its nudge), a hand-off or a phone ask
+   * that starts it, the tools refresh, his own open. What it runs next may be that line's work, and a spoken order still open may close as answered
+   * the moment its record shows the resume's end of its turn. So a residual hold is made (or made again) on it now, BEFORE it starts and before
+   * anything is typed, holding until a turn end is seen there after it (or his Let go). Under the old rule what its orders were seen doing in the
+   * run before counts for nothing in this one (orders.ts reopened). A chat nothing holds starts as it always did.
+   */
+  function heldStart(sid: string) {
+    carryOnHeld(sid, 'started again while a spoken line held it')
+    orders.reopened(sid)
+  }
+  /** The residual hold heldStart makes: on this chat, carrying every spoken order that holds it now (nothing when none does). */
+  function carryOnHeld(sid: string, why: string) {
+    const ids = spokenLatch.open(sid)
+    if (ids.length === 0) return
+    residual.make(sid, ids, why)
+    latchFiles.sync()
+  }
 
   // F-078: the heartbeat (heartbeat.ts): a plain check of every chat every few minutes; it starts a stopped
   // chat that has unfinished work, nudges it once, and wakes the Assistant only when there is news.
@@ -3223,8 +3534,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
     events: since => chatLog.since(since),
     stoppedOnPurpose: sid => heartbeat.isStopped(sid),
     work: workOf,
-    // F-058 recovery reopens the chats after an update first; the watchdog never races it (and does not wait for ever).
-    recoveryBusy: () => closing || (!recoveryDone && Date.now() - startedAtMs < 10 * 60_000),
+    // F-058 recovery reopens the chats after an update first; the watchdog never races it (and does not wait for ever). F-221 (T4 review): nor the
+    // reopen loop after a lost chat host link (hostSettling: until every lost chat was looked at): that loop tells a working chat to carry on.
+    recoveryBusy: () => closing || hostSettling || (!recoveryDone && Date.now() - startedAtMs < 10 * 60_000),
     freeCommitMB: o.freeCommitMB ?? readFreeCommitMB,
     restart: async (floorId, agentId, text) => {
       try {
@@ -3333,7 +3645,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
       .find(x => isOrchestratorAgent(x.f.name, x.a)) ?? null
 
   /** Types `body` into the Assistant's chat, starting it first when it is not running (the heartbeat and the phone's asks). */
-  async function tellAssistant(body: string): Promise<boolean> {
+  async function tellAssistant(text: string): Promise<boolean> {
+    // F-221 (ob98a): the phone's asks and the heartbeat's news carry words from elsewhere: a lookalike of the tapped marker is made harmless.
+    const body = neutralizeMarks(text)
     const at = assistantAt()
     if (!at) return false
     const sid = at.a.sessionId
@@ -3358,28 +3672,170 @@ export function createAgentic(o: AgenticOptions): Agentic {
   const handoffTimes: number[] = []
   const HANDOFFS_PER_MIN = 6
   const HANDOFF_MAX = 4000
+  type HandOffFail = { ok: false; status: number; reason: string }
+  /**
+   * The order a hand-off becomes, ready to type: the rate limit, the Orchestrator, its order id and the line. F-221 (ob98a): the sender label is the
+   * hub's own words (only his tap's has "he tapped Send"); in the request a lookalike is made harmless. ", order <id>]" stays the last thing of the
+   * marker: orders.ts scanMessages and turns.ts find the order by exactly that.
+   */
+  function handOffLine(clean: string, sender: string) {
+    const now = Date.now()
+    while (handoffTimes.length && now - handoffTimes[0] > 60_000) handoffTimes.shift()
+    if (handoffTimes.length >= HANDOFFS_PER_MIN) return { ok: false, status: 429, reason: 'Too many hand-offs this minute. Wait a little.' } satisfies HandOffFail
+    const at = assistantAt()
+    if (!at) return { ok: false, status: 409, reason: 'There is no Orchestrator chat on this PC.' } satisfies HandOffFail
+    const sid = at.a.sessionId
+    const id = orders.plan(FAST_FROM, sid ?? 'orchestrator', clean)
+    if (!id) return { ok: false, status: 400, reason: 'That is not something to hand off.' } satisfies HandOffFail
+    return { ok: true as const, now, at, who: at.a.name, sid, id, line: `[message from ${sender}, ${orders.marker(id)}] ${neutralizeMarks(clean)}` }
+  }
+  /**
+   * Review of T2: typed, not typed, or not known (a member PC's answer was lost after it was sent: the line may be in all the same). Fix round 3:
+   * "not known" only for a caller that must never take a lost answer for "not typed" (`unsure`: the spoken line, his tap on a card); the plain old
+   * way reads it as "not typed" (a 409, "could not take it"), as it did before T2.
+   */
+  const typeLine = (sid: string, pcId: string, line: string, unsure: boolean) =>
+    unsure
+      ? typeInto({ sessionId: sid, id: pcId }, line, { unconfirmedThrows: true }).catch((e: unknown) => (isObject(e) && e.code === 'delivery-unconfirmed' ? ('unknown' as const) : false))
+      : typeInto({ sessionId: sid, id: pcId }, line).catch(() => false)
+
+  /**
+   * F-221 (ob98a, fix round 2: decisions 2 and 3): a spoken line he did not tap (live talk's direct line, the only one that holds). It is typed only
+   * into an Orchestrator that rests (no turn running, no prompt, nothing in its box) and that no other spoken line holds: one at a time, in order.
+   * Till then it waits here (at most 3 wait, each at most 2 minutes, then BUSY_WORDS for that line, nothing typed), so the latch covers that line's
+   * own turn and never his typed work. Its order is opened and saved (queued, spoken) BEFORE the typing: the latch holds from before the line can be
+   * submitted, and a restart between the typing and the save cannot lose it. It goes again only on a definite "not typed"; "unknown" keeps it.
+   * Fix round 3: a save that did not land types nothing (503); the box is read where the chat runs (another PC: a round trip), so the rest is
+   * looked at again right after that read, with nothing in between until the order is opened: a turn that started meanwhile gets no line.
+   * T4 review: and only into a chat the voice lock reaches (voiceLockOn): the hub refuses the rest itself (a 409, nothing typed), whatever the page
+   * read of GET /talk/caps before; a running one without it is refused at once, not waited for.
+   */
+  async function handOffSpoken(clean: string, origin: OrderOrigin, sender: string, opt: HandOffOptions): Promise<HandOffResult> {
+    const ticket = spokenLines.join()
+    if (!ticket) return { ok: false, status: 409, reason: BUSY_WORDS }
+    /** T4 review: the chat would run the line without the voice lock below the model (here, or on another PC: `elsewhere`): nothing is typed. */
+    const noLock = (who: string, elsewhere: boolean): HandOffFail => {
+      log?.warn(`live talk: a spoken line was not typed: ${who} runs ${elsewhere ? 'on another PC' : 'here'} without the voice lock`)
+      return { ok: false, status: 409, reason: noLockWords(who, elsewhere) }
+    }
+    try {
+      let started = false
+      for (;;) {
+        // The app is stopping: a line still waiting goes no further (it would start the Orchestrator again in an agent that is closing).
+        if (closing) return { ok: false, status: 503, reason: 'The app is stopping; say it again in a moment.' }
+        if (ticket.first()) {
+          const at = assistantAt()
+          if (!at) return { ok: false, status: 409, reason: 'There is no Orchestrator chat on this PC.' }
+          const sid = at.a.sessionId
+          const where = sid ? whereAll()[sid] : undefined
+          if (sid && where) {
+            // Here or on another PC, running without the voice lock: no wait would give it one.
+            if (!voiceLockOn(sid)) return noLock(at.a.name, where.id !== self().id)
+            if (restsNow(sid) && (await boxEmpty(sid)) && restsNow(sid)) break
+          } else if (sid && awayChat(sid)) {
+            // Held by another PC that is out of reach: it may still run there, and a chat on another PC never has the voice lock.
+            return noLock(at.a.name, true)
+          } else if (!started && chatsKnown()) {
+            // Not running anywhere (and not on a PC out of reach): started once, as a hand-off does; the line waits for it to rest at its prompt.
+            started = true
+            try {
+              await openChat(at.f.id, at.a.id, {})
+            } catch (e) {
+              return { ok: false, status: 503, reason: `${at.a.name} could not be started: ${message(e)}` }
+            }
+            continue
+          }
+        }
+        if (ticket.late()) {
+          log?.info('live talk: a spoken line waited 2 minutes for the Orchestrator to rest; it was not typed')
+          return { ok: false, status: 409, reason: BUSY_WORDS }
+        }
+        await new Promise(resolve => setTimeout(resolve, LINE_POLL_MS))
+      }
+      const p = handOffLine(clean, sender)
+      if (!p.ok) return p
+      const running = p.sid ? whereAll()[p.sid] : undefined
+      if (!p.sid || !running) return { ok: false, status: 409, reason: `${p.who} could not take it right now.` }
+      // T4 review: looked at again after the wait (it may have been restarted, moved to another PC or switched to Codex meanwhile); from here to the
+      // typing nothing is awaited, so the line goes into the very run that was checked.
+      if (!voiceLockOn(p.sid)) return noLock(p.who, running.id !== self().id)
+      if (!orders.open(p.id, FAST_FROM, { sessionId: p.sid, agent: p.who, floor: p.at.f.name }, clean, { kind: 'handoff', origin, queued: true, spoken: true, ...(opt.direct ? { direct: true } : {}) })) {
+        // Its hold would not outlive a restart of the agent (orders.json is what keeps it): nothing is typed.
+        orders.discard(p.id)
+        log?.warn('live talk: a spoken line was not typed: its order could not be saved')
+        return { ok: false, status: 503, reason: 'The Server could not save this, so nothing was sent. Say it again in a moment.' }
+      }
+      // F-221 (ob98a, T4): the voice lock holds from before the line can be submitted too (its file, which latch-hook.ts reads): written now, or the
+      // line is not typed at all.
+      if (!latchFiles.sync()) {
+        orders.discard(p.id)
+        latchFiles.sync()
+        log?.warn(`hand-off ${p.id}: the voice lock could not be set; the spoken line was not typed`)
+        return { ok: false, status: 503, reason: 'The voice lock could not be set; say it again in a moment.' }
+      }
+      const typed = await typeLine(p.sid, running.id, p.line, true)
+      if (typed === false) {
+        orders.discard(p.id)
+        latchFiles.sync()
+        return { ok: false, status: 409, reason: `${p.who} could not take it right now.` }
+      }
+      handoffTimes.push(p.now)
+      if (typed === 'unknown') {
+        // It may be in: it stays an order waiting to be taken, and holds, until its turn (or its PC, once back) says otherwise. Never typed again.
+        log?.warn(`hand-off ${p.id}: ${p.who}'s PC did not say whether the spoken line was typed; it is kept as an order waiting to be taken, and holds`)
+        return { ok: true, orderId: p.id, phase: 'queued' }
+      }
+      orders.typed(p.id)
+      return { ok: true, orderId: p.id, phase: 'typed' }
+    } finally {
+      ticket.leave()
+    }
+  }
+  /**
+   * F-221 (fix rounds 2 and 3, decision 2): the Orchestrator rests now, as far as can be told at once: it runs (here or on a PC that reports it) and
+   * no turn is running; it is at no prompt (M1's own check: here its open question in its transcript, or a menu on its screen; on another PC the
+   * 'question' it reports); and no spoken line holds it. Its box is the other half (boxEmpty: nothing in it, no paste on its way).
+   */
+  function restsNow(sid: string): boolean {
+    // T4 phase 2: not before the hub knows its chats (start-up adoption and recovery, a lost chat host link until its reopen loop is over): a chat
+    // reopened there rests at its prompt only until it is told to carry on, so a spoken line waits (and starts nothing) until that is over.
+    if (!chatsKnown()) return false
+    const st = whereAll()[sid]?.state
+    if (st === undefined || st === 'running') return false
+    if (atPrompt(sid)) return false
+    // A spoken line, or a residual hold (T4 phase 2: its line's work may still run there), holds it: not at rest for another spoken line.
+    return spokenLatch.open(sid).length === 0
+  }
+
   const handoff: HandoffApi = {
-    async handOff(text, origin, sender = 'the Assistant') {
+    async handOff(text, origin, sender = 'the Assistant', opt = {}) {
       if (mode() === 'member') return { ok: false, status: 409, reason: 'Hand-offs are made on the hub.' }
+      const max = opt.max ?? HANDOFF_MAX
       const clean = text.replace(/\s+/g, ' ').trim()
       if (!clean) return { ok: false, status: 400, reason: 'There is nothing to hand off.' }
-      if (clean.length > HANDOFF_MAX) return { ok: false, status: 413, reason: `That is longer than ${HANDOFF_MAX} characters.` }
-      const now = Date.now()
-      while (handoffTimes.length && now - handoffTimes[0] > 60_000) handoffTimes.shift()
-      if (handoffTimes.length >= HANDOFFS_PER_MIN) return { ok: false, status: 429, reason: 'Too many hand-offs this minute. Wait a little.' }
-      const at = assistantAt()
-      if (!at) return { ok: false, status: 409, reason: 'There is no Orchestrator chat on this PC.' }
-      const who = at.a.name
-      const sid = at.a.sessionId
+      if (clean.length > max) return { ok: false, status: 413, reason: `That is longer than ${max} characters.` }
+      // F-221 (fix round 2): his spoken words, untapped: one at a time, into a resting Orchestrator, its order saved first.
+      if (opt.spoken) return handOffSpoken(clean, origin, sender, opt)
+      const p = handOffLine(clean, sender)
+      if (!p.ok) return p
+      const { now, at, who, sid, id, line } = p
       const running = sid ? whereAll()[sid] : undefined
-      const id = orders.plan(FAST_FROM, sid ?? 'orchestrator', clean)
-      if (!id) return { ok: false, status: 400, reason: 'That is not something to hand off.' }
-      const line = `[message from ${sender}, ${orders.marker(id)}] ${clean}`
+      const extra = { kind: 'handoff' as const, origin, ...(opt.direct ? { direct: true } : {}) }
       if (sid && running) {
         if (atPrompt(sid)) return { ok: false, status: 409, reason: `${who} is waiting for an answer on the PC.` }
         if (hasDraft(sid)) return { ok: false, status: 409, reason: `Shubham has unsent text in ${who}'s box on the PC; try again shortly.` }
-        if (!(await typeInto({ sessionId: sid, id: running.id }, line).catch(() => false))) return { ok: false, status: 409, reason: `${who} could not take it right now.` }
-        orders.open(id, FAST_FROM, { sessionId: sid, agent: who, floor: at.f.name }, clean, { kind: 'handoff', origin })
+        // Fix round 3: "not known" only for his tap on a card (opt.unsure); a plain hand-off whose answer was lost is "could not take it", as before T2.
+        const typed = await typeLine(sid, running.id, line, opt.unsure === true)
+        if (typed === false) return { ok: false, status: 409, reason: `${who} could not take it right now.` }
+        if (typed === 'unknown') {
+          // His tap's line may be in: the order is opened as waiting to be taken, so its turn (or, if it never shows, its not-taken end) closes it.
+          // It is never typed again: that could put it in twice.
+          log?.warn(`hand-off ${id}: ${who}'s PC did not say whether the line was typed; it is kept as an order waiting to be taken`)
+          orders.open(id, FAST_FROM, { sessionId: sid, agent: who, floor: at.f.name }, clean, { ...extra, queued: true })
+          handoffTimes.push(now)
+          return { ok: true, orderId: id, phase: 'queued' }
+        }
+        orders.open(id, FAST_FROM, { sessionId: sid, agent: who, floor: at.f.name }, clean, extra)
         handoffTimes.push(now)
         return { ok: true, orderId: id, phase: 'typed' }
       }
@@ -3391,7 +3847,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         return { ok: false, status: 503, reason: `${who} could not be started: ${message(e)}` }
       }
       chats.typeWhenReady(opened.sessionId, line, { holdForDraft: true })
-      orders.open(id, FAST_FROM, { sessionId: opened.sessionId, agent: who, floor: at.f.name }, clean, { kind: 'handoff', origin, queued: true })
+      orders.open(id, FAST_FROM, { sessionId: opened.sessionId, agent: who, floor: at.f.name }, clean, { ...extra, queued: true })
       handoffTimes.push(now)
       return { ok: true, orderId: id, phase: 'queued' }
     },
@@ -3401,9 +3857,19 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const st = whereAll()[od.to.sessionId]?.state
       const age = Date.now() - od.at
       const phase = od.queued ? 'queued' : st === 'question' ? 'waiting-you' : st === 'running' ? (age > 15 * 60_000 ? 'slow' : 'working') : 'typed'
-      return { orderId, open: true, phase, sec: Math.round(age / 1000), gist: od.gist, ...(st === 'running' ? { words: readStatus(chats.screen(od.to.sessionId) ?? [])?.text } : {}) }
+      return { orderId, open: true, phase, sec: Math.round(age / 1000), gist: od.gist, ...(st === 'running' ? { words: readStatus(chats.screen(od.to.sessionId) ?? [])?.text } : {}), ...(od.late ? { late: od.late } : {}) }
     },
     cancel: id => orders.cancel(id),
+    releaseSpoken(orderId, why) {
+      // F-221 (ob98a, fix round 2): his Let go (T4's route POST /talk/ask/<orderId>/let-go calls this, then stops the order): the hold goes.
+      const ok = orders.letGo(orderId)
+      // T4 phase 2: and a residual hold that carries this order (the line closed abnormally, or its chat was told to carry on while held).
+      const rest = residual.letGo(orderId)
+      // T4: below the model too, at once (its voice lock file goes).
+      latchFiles.sync()
+      log?.info(`spoken latch: order ${orderId} ${ok || rest ? `let go${rest ? ' (its residual hold too)' : ''}` : 'was not holding'} (${why})`)
+      return ok || rest
+    },
     listen(l) {
       fastLinks.onReturn = l.onReturn
       fastLinks.onProgress = l.onProgress
@@ -3443,6 +3909,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
       deviceLog('A pair code for the phone app was made', by)
       return by
     },
+    // Order oae15: phone control's own switch: ON needs a signed-in CRM administrator (never a chat's key, never a page nobody signed in on).
+    controlProof: (_body, r) => describeHuman(requireCrmHuman(o.auth, r, true)),
+    controlSwitched: (on, by) => deviceLog(on ? 'Phone control switched ON (the Assistant and the Mobile chat may use the phone through Chris)' : 'Phone control switched off', by),
+    mode: () => mode(),
     feed: send => {
       const sid = assistantAt()?.a.sessionId
       return sid ? chatFeeds.attach(sid, send) : () => {}
@@ -3480,7 +3950,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
   /** The answers of handed-off orders, kept an hour for GET /voice/ask/<orderId> (the order itself is gone once its reply is delivered). */
   const orderAnswers = new Map<string, { text: string; at: number; cancelled: boolean }>()
   function orderAsk(id: string): AskView | null {
-    for (const [k, v] of orderAnswers) if (Date.now() - v.at > 3_600_000) orderAnswers.delete(k)
+    // F-221 (T4 phase 2): an answer whose chat a residual hold still holds is kept past the hour (its page still shows the voice lock and Let go).
+    for (const [k, v] of orderAnswers) if (Date.now() - v.at > 3_600_000 && !residual.carrying(k)) orderAnswers.delete(k)
     const a = orderAnswers.get(id)
     if (a) return a.cancelled ? { askId: id, state: 'error', error: 'It was stopped.' } : { askId: id, state: 'done', speak: a.text }
     const st = handoff.status(id)
@@ -3488,12 +3959,12 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (st.phase === 'queued') return { askId: id, state: 'queued' }
     return { askId: id, state: 'working', ...(st.words ? { status: { text: st.words, secs: st.sec ?? null, tokens: null } } : {}) }
   }
-  /** The host's context (its last turns as role/text) into the brief's pairs. */
-  function fastBriefContext(ctx: { history: { role: 'user' | 'assistant'; text: string }[]; openOrders: string[] }) {
-    const history: { user: string; assistant: string }[] = []
+  /** The host's context (its last turns as role/text) into the brief's pairs. F-221: an answer he spoke over keeps its mark (what he heard of it). */
+  function fastBriefContext(ctx: { history: { role: 'user' | 'assistant'; text: string; interrupted?: boolean }[]; openOrders: string[] }) {
+    const history: { user: string; assistant: string; interrupted?: boolean }[] = []
     for (const h of ctx.history) {
       if (h.role === 'user') history.push({ user: h.text, assistant: '' })
-      else if (history.length && !history[history.length - 1].assistant) history[history.length - 1].assistant = h.text
+      else if (history.length && !history[history.length - 1].assistant) history[history.length - 1] = { ...history[history.length - 1], assistant: h.text, ...(h.interrupted ? { interrupted: true } : {}) }
     }
     return { history, openOrders: ctx.openOrders }
   }
@@ -3540,13 +4011,16 @@ export function createAgentic(o: AgenticOptions): Agentic {
         })
       : undefined
   // F-086/F-087: the session around the host (owners, the two sockets, hand-off routing); null host = the Assistant is off and its sockets are refused.
-  fastSession = createFastSession({ host: fastHost ?? null, snapshot: fastSnapshot, names: () => namesFor(fastNames), log: o.log?.child?.('fast') ?? o.log })
+  // F-221 (ob98a): with the talk cards, so it can hold hand-offs (a connection's cards go with it).
+  fastSession = createFastSession({ host: fastHost ?? null, snapshot: fastSnapshot, names: () => namesFor(fastNames), log: o.log?.child?.('fast') ?? o.log, cards: talkCards })
   handoff.listen({
     onReturn: async (order, reply) => {
       // The reply arrives as '[reply from <name> on <floor> to order <id>] <answer>': the answer is what is shown and told.
       const text = reply.replace(/^\[reply from [^\]]*\]\s*/, '')
       if (order.cancelled) cancelledOrders.add(order.id)
       orderAnswers.set(order.id, { text, at: Date.now(), cancelled: order.cancelled === true })
+      // F-221 (ob98a): live talk's direct line: the page speaks its answer itself (GET /talk/ask/<orderId>); the fast Assistant is never told it.
+      if (order.direct) return true
       return fastSession!.answered(order.id, order.gist, text, order.cancelled === true) === 'told'
     },
     onProgress: p => fastSession!.progress(p.orderId, p.phase, p.sec, p.words),
@@ -3637,6 +4111,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (mode() !== 'member') voice.tick()
     void fastHost?.tick()
     void oldHost?.tick()
+    // F-221 (ob98a): cards past their 10 minutes go. (The spoken latch has no clock: its orders decide.)
+    talkCards.sweep()
   }, 1000)
   voiceTimer.unref?.()
 
@@ -3689,6 +4165,201 @@ export function createAgentic(o: AgenticOptions): Agentic {
     if (target) orders.open(id, fromSid, { sessionId: toSid, agent: target.agent.name, floor: target.floor.name }, body)
   }
 
+  // ---------------------------------------------------------------------------------------
+  // F-221 (ob98a): live talk. Quick's hand-offs held as cards, his tap that sends a card, the direct line to the Orchestrator, and its spoken latch.
+
+  /** Where an order was asked, as orders.ts keeps it. */
+  const orderOrigin = (o: Origin): OrderOrigin => ({ kind: o.kind, client: o.clientId, askId: o.askId })
+
+  /** A hand-off from a connection that holds: a card on its screen with the cleaned words; nothing is typed until his tap. */
+  function holdHandoff(text: string, origin: Origin, names: ReturnType<typeof namesFor>) {
+    const nothing = 'Nothing was handed over. Tell him why in one sentence; do not try again yourself.'
+    // The same words would be refused when typed: say so now, not after his tap.
+    const plain = text.replace(/\s+/g, ' ').trim()
+    if (!plain) return { ok: false, reason: 'There is nothing to hand off.', note: nothing }
+    if (isReply(plain) || isAcknowledgement(plain)) return { ok: false, reason: 'That is not something to hand off.', note: nothing }
+    const words = cleanCardText(plain)
+    if (!words) return { ok: false, reason: 'There is nothing to hand off.', note: nothing }
+    if (words.length > CARD_TEXT_MAX) return { ok: false, reason: `That is longer than ${CARD_TEXT_MAX} characters.`, note: nothing }
+    const card = talkCards.create({ kind: 'handoff', to: names.big, text: words, via: origin.via, conn: origin.conn, origin })
+    log?.info(`fast Assistant: a hand-off of ${origin.kind}:${origin.clientId} is held as card ${card.id}; his tap sends it`)
+    return { ok: true, held: true, note: `It is on his screen as a card; he taps Send to give it to ${names.big}. Tell him so in one short sentence. Do not say it is done.` }
+  }
+
+  /** Live talk's routes are his page's: a chat's key, or the fast Assistant's (both come as x-sad-chat-key), is refused before anything runs. */
+  function talkPage(r: MountRequest) {
+    if (r.headers['x-sad-chat-key'] !== undefined) throw authError(403, 'Only his own page may do this; not a chat tool.', 'not-yours')
+  }
+
+  /**
+   * POST /talk/cards/<id>/send {version, text?}: his tap. His signed-in CRM session (requireCrmHuman: a chat's key or the fast key is refused, as on
+   * the approvals and send-as-me routes) and the owner of the app; the version he was shown; once. A hand-off card is typed as an order marked "he
+   * tapped Send" (and never arms the spoken latch: he confirmed it); a relay card carries out the held message as the Orchestrator's chat. The
+   * Orchestrator at a prompt or with his unsent text (M1) is a 409 and the card stays, so he can tap again. The log has ids and times, never words.
+   */
+  async function sendTalkCard(id: string, raw: unknown, r: MountRequest) {
+    const caller = requireCrmHuman(o.auth, r, true)
+    r.caller = caller
+    if (mode() === 'member') throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null })
+    if (!isObject(raw) || typeof raw.version !== 'number' || !Number.isInteger(raw.version)) throw apiError(400, 'Expected {version, text?}')
+    if (raw.text !== undefined && typeof raw.text !== 'string') throw apiError(400, 'text is the words to send')
+    const took = talkCards.take(id, raw.version)
+    if (!took.ok) throw apiError(took.status, took.reason)
+    const rec: CardRecord = took.rec
+    const started = Date.now()
+    const by = describeHuman(caller)
+    let sent = false
+    let orderId: string | undefined
+    try {
+      if (rec.card.kind === 'handoff') {
+        const origin = rec.origin
+        if (!origin) throw apiError(409, 'That card has lost where it was asked; ask again.')
+        const words = typeof raw.text === 'string' ? cleanCardText(raw.text) : rec.card.text
+        if (!words) throw apiError(400, 'There is nothing to send.')
+        if (words.length > CARD_TEXT_MAX) throw apiError(413, `That is longer than ${CARD_TEXT_MAX} characters.`)
+        const names = namesFor(fastNames)
+        // The only place "he tapped Send" is written: in the sender label, so the line ends ", order oX]" as every order does.
+        const label = `${names.fast} (${rec.card.via === 'voice' ? 'spoken' : 'typed'}, he tapped Send)`
+        // His tap is never sent twice: a member PC's lost answer is "not known" (the card is used up), not "not typed" (fix round 3: only here
+        // and for the spoken line; the plain old way keeps its 409).
+        const res = await handoff.handOff(words, orderOrigin(origin), label, { unsure: true })
+        if (!res.ok) throw apiError(res.status, res.reason)
+        sent = true
+        orderId = res.orderId
+        talkCards.settle(id, true, res.orderId)
+        // The connection it was asked on: card-gone (sent, above), then the usual hand-off, its progress, the answer and the o: telling.
+        fastSession?.handedOff(res.orderId, origin, `Asked ${names.big}: ${handoff.status(res.orderId).gist ?? words.slice(0, 80)}`)
+        return { ok: true, kind: 'handoff', orderId: res.orderId, phase: res.phase }
+      }
+      const relay = rec.relay
+      if (!relay) throw apiError(409, 'That card has lost what it was holding; ask again.')
+      // A relay goes with its words exactly as they were held (lines and all); his edit is cleaned the same way as a hand-off card's.
+      const words = typeof raw.text === 'string' ? cleanCardText(raw.text) : rec.card.text
+      if (!words) throw apiError(400, 'There is nothing to send.')
+      if (typeof raw.text === 'string' && words.length > CARD_TEXT_MAX) throw apiError(413, `That is longer than ${CARD_TEXT_MAX} characters.`)
+      let said: string
+      try {
+        said = await toolFor(relay.from, relay.tool, { sessionId: relay.sessionId, text: words }, undefined, { tapped: true })
+      } catch (e) {
+        // A delivery that may have gone (its receipt is not final) is never sent twice: the card is used up.
+        const code = isObject(e) ? e.code : undefined
+        if (code === 'delivery-unconfirmed' || code === 'delivery-pending') sent = true
+        throw e
+      }
+      sent = true
+      return { ok: true, kind: 'relay', said }
+    } finally {
+      talkCards.settle(id, sent, orderId)
+      log?.info(`talk card ${id} (${rec.card.kind}): ${sent ? 'sent' : 'not sent'} by ${by}${orderId ? ` as order ${orderId}` : ''} in ${Date.now() - started} ms`)
+    }
+  }
+
+  /**
+   * POST /talk/ask {id, text}: live talk's direct line ("Send straight to the Assistant chat"). His spoken words, cleaned like a card's, typed into
+   * the Orchestrator as "[message from Live voice (spoken, not tapped), order oX]" through the hand-off's own safe typing, with its tools held by the
+   * spoken latch until its line can no longer run. Fix round 2: typed only into a resting Orchestrator, one line at a time; the request waits for
+   * that (up to 2 minutes, then a 409 BUSY_WORDS). Review of T4: and only into one the voice lock reaches (handOffSpoken: a 409 at once otherwise).
+   * The answer is kept for the page (GET /talk/ask/<orderId>), never told by the fast Assistant.
+   */
+  async function talkAsk(raw: unknown, r: MountRequest) {
+    talkPage(r)
+    if (!isObject(raw) || typeof raw.id !== 'string' || !ID_RE.test(raw.id) || raw.id.startsWith('o:') || typeof raw.text !== 'string') throw apiError(400, 'Expected {id, text}')
+    const words = cleanCardText(raw.text)
+    if (!words) return { ok: false, status: 400, reason: 'There is nothing to send.' }
+    if (words.length > MAX_TEXT) return { ok: false, status: 413, reason: `That is longer than ${MAX_TEXT} characters.` }
+    const res = await handoff.handOff(words, { kind: 'web', askId: raw.id }, 'Live voice (spoken, not tapped)', { max: MAX_TEXT, direct: true, spoken: true })
+    if (!res.ok) return { ok: false, status: res.status, reason: res.reason }
+    log?.info(`live talk: a spoken line went to the Orchestrator as order ${res.orderId} (not tapped: its tools are held)`)
+    return { ok: true, orderId: res.orderId, phase: res.phase }
+  }
+
+  /**
+   * GET /talk/ask/<orderId>: where a direct line is (queued, working with the status words, done with the answer to speak, error), and the cards it
+   * holds. Review of T2: while it is open, `phase` too (handoff.status: 'waiting-you' = the Orchestrator waits for HIS answer on the PC), which a
+   * direct line has no other way to learn (it has no socket for handoff-progress).
+   */
+  function talkAskView(orderId: string, r: MountRequest) {
+    talkPage(r)
+    const v = orderAsk(orderId) ?? askLeftHeld(orderId)
+    if (!v) throw apiError(404, 'No such ask')
+    const st = v.state === 'queued' || v.state === 'working' ? handoff.status(orderId) : null
+    // Fix round 3: past 3 hours its turn still runs and it still holds: the words he is told (the page has no socket for the progress line). T4
+    // phase 2: `held`: the Assistant chat is held for this line now (its order, or the residual hold it left), so the page shows the voice lock and
+    // Let go exactly while it is true, also after the answer (a residual hold), and drops them the moment it is false (after his Let go too).
+    return { ...v, ...(st?.phase ? { phase: st.phase } : {}), ...(st?.late ? { late: st.late } : {}), held: spokenHolds(orderId), cards: talkCards.list({ order: orderId }) }
+  }
+  /**
+   * F-221 (T4 review): a line whose order closed before a restart of the agent (its answer was kept in memory only, orderAnswers) while the residual
+   * hold it left is still on (talk-residual.json outlives the restart): it is answered as over, with a short line in place of the answer, so the page
+   * keeps its voice lock and Let go (`held`) instead of dropping them on a 404 while the Assistant chat stays held. Null when nothing carries it.
+   */
+  function askLeftHeld(orderId: string): AskView | null {
+    if (!residual.carrying(orderId)) return null
+    return { askId: orderId, state: 'done', speak: `The app restarted since; its answer is in ${namesFor(fastNames).big} chat.` }
+  }
+  /** F-221 (T4 phase 2): does this spoken line hold the Assistant chat now: its order (open, not let go), or a residual hold that carries it? */
+  function spokenHolds(orderId: string): boolean {
+    const od = orders.get(orderId)
+    return (!!od && holdsChat(od)) || residual.carrying(orderId) !== null
+  }
+
+  /**
+   * F-221 (ob98a, T4): how far a direct line's hold reaches. 'full': the Orchestrator's chat running on this PC now was started with the voice lock
+   * (hooks-orchestrator.json: Claude Code itself refuses its shell, file edits, agents and other MCP servers while a spoken line holds it), so the
+   * page may offer the direct line. 'app-tools': only the app's own tools would be held (it runs elsewhere, as Codex, not at all, or was started
+   * before the lock existed: it needs a restart), so the page keeps to Quick.
+   */
+  function voiceLockNow(): 'full' | 'app-tools' {
+    return mode() !== 'member' && voiceLockOn(assistantAt()?.a.sessionId) ? 'full' : 'app-tools'
+  }
+  /**
+   * F-221 (T4 review): does the voice lock reach this chat now? It runs on THIS PC (a chat on another PC never has it: a member starts its chats
+   * without it, and the lock's files are this PC's), as Claude Code (not Codex, not Codex in Claude Code), and this very run was started with
+   * hooks-orchestrator.json (kept by start time: a run started before the lock existed, or whose file could not be written, was not). The caps
+   * route answers by it, and handOffSpoken types a spoken line only into such a chat.
+   */
+  function voiceLockOn(sid: string | null | undefined): boolean {
+    const run = sid ? chats.info(sid) : null
+    return !!sid && !!run && run.engine === 'claude' && !run.execution && voiceLocks.has(sid, run.startedAt)
+  }
+
+  /**
+   * F-221 (ob98a, T4): POST /talk/ask/<orderId>/let-go: his Let go on a direct line that holds the Orchestrator (the voice lock's strip shows it).
+   * His own tap: his signed-in CRM session (requireCrmHuman, as a card's Send; a chat's key or the fast key is refused). T4 review: the line is
+   * stopped FIRST, while its hold is still on (handoff.cancel: Esc into the Orchestrator's chat, so the Esc lands with the voice lock on; and as for
+   * any spoken order, Esc alone does not close it: it stays open until its turn is really over, and its reply then says "(cancelled: Shubham
+   * stopped it)", which the page reads as the line's answer). Only then does his tap let the hold go (T2's releaseSpoken: the latch and its voice
+   * lock file). An order that holds nothing any more (answered, or let go before) is not stopped again: no Esc goes into the chat for it. 404 for an
+   * order that is not a spoken one. Logged, never with words.
+   */
+  async function talkLetGo(orderId: string, r: MountRequest) {
+    const caller = requireCrmHuman(o.auth, r, true)
+    r.caller = caller
+    if (mode() === 'member') throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null })
+    const od = orders.get(orderId)
+    // T4 phase 2: a line that closed abnormally is gone from the orders, but the residual hold it left (or one made while it held) carries it.
+    const rest = residual.carrying(orderId)
+    if ((!od || od.spoken !== true) && !rest) throw apiError(404, 'No such spoken line')
+    const holding = (!!od && holdsChat(od)) || !!rest
+    let stopped = false
+    if (od && holdsChat(od)) stopped = await handoff.cancel(orderId)
+    else if (rest) stopped = stopHeldTurn(rest.sessionId)
+    const released = holding ? handoff.releaseSpoken(orderId, 'let-go') : false
+    log?.info(`live talk: order ${orderId} let go by ${describeHuman(caller)}: ${released ? `${stopped ? 'it was stopped, then ' : ''}its hold went` : 'it held nothing any more'}`)
+    return { ok: true, released }
+  }
+  /**
+   * F-221 (T4 phase 2): his Let go on a residual hold stops the turn it holds first, as for an order (T4 review: the Esc lands while the voice lock is
+   * still on): Esc into the chat while it works here (a turn running, or a prompt of it open), nothing when it rests. True when Esc was sent.
+   */
+  function stopHeldTurn(sid: string): boolean {
+    const st = chats.info(sid) ? whereAll()[sid]?.state : undefined
+    if (st !== 'running' && st !== 'question') return false
+    chats.input(sid, String.fromCharCode(27))
+    log?.info(`live talk: Esc into chat ${sid.slice(0, 8)} before its residual hold went (his Let go)`)
+    return true
+  }
+
   /** F-086/F-087: a call from the fast Assistant's process. Its list is fast-tools.ts and is checked here, by the key, at every call. */
   async function fastCall(name: string, rawArgs: unknown): Promise<string> {
     const names = namesFor(fastNames)
@@ -3699,9 +4370,18 @@ export function createAgentic(o: AgenticOptions): Agentic {
       case 'hand_off': {
         const text = typeof args.text === 'string' ? args.text : ''
         const origin = fastSession?.currentOrigin() ?? null
-        const r = await handoff.handOff(text, { kind: origin?.kind ?? 'web', ...(origin ? { client: origin.clientId, askId: origin.askId } : {}) }, names.fast)
+        // F-221 (ob98a): fail closed, for every client (the page, the Alt+K bar, Chris). No current ask (a cancelled turn, the o: turn that tells an
+        // answer, a closed socket), or a cut-off turn the process is still stopping (its late call would be credited to the new ask): nothing typed.
+        if (!origin || fastHost?.stopping()) return json({ ok: false, reason: 'There is no current question to hand off from.' })
+        // F-221: the connection HOLDS (live talk, or the bar's "tap to send"): a card on his screen, nothing typed until his tap.
+        if (origin.hold) return json(holdHandoff(text, origin, names))
+        // The old way (hold off: the Alt+K bar or Live talking classic set to "Send at once" (T4), Chris): typed as before, and it holds nothing
+        // (fix round 2, decision 1: the Orchestrator must still be able to message agents for these, and Chris has no card screen). Its label says
+        // where the words came from (decision 5), so the Orchestrator's brief can tell his typed words from his unconfirmed voice; ", order oX]" stays
+        // last.
+        const r = await handoff.handOff(text, orderOrigin(origin), `${names.fast} (${origin.via === 'voice' ? 'spoken, not tapped' : 'typed'})`)
         if (!r.ok) return json({ ok: false, reason: r.reason, note: 'Nothing was handed over. Tell him why in one sentence; do not try again yourself.' })
-        if (origin) fastSession?.handedOff(r.orderId, origin, `Asked ${names.big.replace(/^the /, 'the ')}: ${handoff.status(r.orderId).gist ?? text.slice(0, 80)}`)
+        fastSession?.handedOff(r.orderId, origin, `Asked ${names.big}: ${handoff.status(r.orderId).gist ?? text.slice(0, 80)}`)
         return json({ ok: true, orderId: r.orderId, phase: r.phase, note: `Handed to ${names.big}. Tell him in one short sentence that you have asked and will come back with the answer; do not say it is done.` })
       }
       case 'order_status': {
@@ -3737,8 +4417,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return toolFor(me.sessionId, name, rawArgs)
   }
 
-  /** A tool call from the chat `sid` (running here, or on a member that passed it on). */
-  async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent }): Promise<string> {
+  /** A tool call from the chat `sid` (running here, or on a member that passed it on). F-221: `tapped` = his tap on a relay card carries it out. */
+  async function toolFor(sid: string, name: string, rawArgs: unknown, as?: { floor: Floor; agent: FloorAgent }, opt: { tapped?: boolean } = {}): Promise<string> {
     // F-127: on a member this is a chat of a floor made here: what lives on the Server (the task list, the phone, WhatsApp, the screen, the memory layer) is not here.
     if (mode() === 'member' && NEEDS_SERVER.has(name)) {
       throw Object.assign(apiError(503, `That needs the Server (${team?.hub()?.name ?? 'the hub'}), which this chat's floor is not on yet. It joins the Server's list when the Server is back.`), { code: 'hub-offline' })
@@ -3760,6 +4440,39 @@ export function createAgentic(o: AgenticOptions): Agentic {
       const at = typeof sessionId === 'string' ? bySession(sessionId) : null
       if (at) return access.needChat(me, at.agent, need, toolWhere)
       if (!access.isAdmin(me)) throw authError(403, "That chat isn't yours.", 'not-yours')
+    }
+
+    // F-221 (ob98a): the spoken latch. While a spoken order he did not tap holds THIS chat (live talk's direct line, the only one that holds: fix
+    // round 2), the tool decides, never the words: reads, notes and prepared cards run; a message to another chat waits as a card on his page; anything
+    // else is refused. Another chat is never affected; his tap on a relay card comes back here with `tapped`. (It sees the app's tools only:
+    // talk-latch.ts.)
+    const ids = sid && !opt.tapped ? spokenLatch.open(sid) : []
+    if (ids.length) {
+      const v = latchVerdict(name, args)
+      if (!v.go && !v.hold) {
+        log?.info(`spoken latch: ${name} refused for chat ${sid.slice(0, 8)} (orders ${ids.join(', ')})`)
+        throw apiError(403, REFUSED_WORDS)
+      }
+      if (!v.go) {
+        // The exact words and target, checked as the send would check them; nothing is typed anywhere.
+        const target = name === 'send_to_chat' ? siblingOf(floor, args.sessionId) : anyChat(args.sessionId)
+        if (target.sessionId === sid) throw apiError(400, "That's your own chat")
+        mayOn(target.sessionId, 'type')
+        const body = text(args.text, 'text')
+        const at = bySession(target.sessionId)
+        const card = talkCards.create({
+          kind: 'relay',
+          to: at ? `${at.agent.name} on ${at.floor.name}` : `chat ${target.sessionId.slice(0, 8)}`,
+          text: neutralizeMarks(body),
+          via: 'voice',
+          // Filed with the hub, not with a socket: the page lists it with its order (GET /talk/ask/<orderId>) and with all cards (GET /talk/cards).
+          conn: null,
+          relay: { tool: name === 'send_to_chat' ? 'send_to_chat' : 'app_send_to_chat', from: sid, sessionId: target.sessionId },
+          orders: ids,
+        })
+        log?.info(`spoken latch: a message from chat ${sid.slice(0, 8)} to chat ${target.sessionId.slice(0, 8)} is held as card ${card.id}`)
+        return HELD_WORDS
+      }
     }
 
     switch (name) {
@@ -3811,7 +4524,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const undo = relayAllowed(sid, target.sessionId)
         // F-072: an order from the Assistant is recorded, and its answer comes back by itself.
         const order = orderFrom(floor, agent, sid, target.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, target, `[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, target.sessionId, body) }, me))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
+        // F-221 (ob98a): a relayed message never carries the tapped marker (its words, or a name). His tap on a held one never sends it twice.
+        if (!(await typeIntoOrUndo(undo, target, neutralizeMarks(`[message from ${agent.name} on ${floor.name}, chat ${sid.slice(0, 8)}${order ? `, ${orders.marker(order)}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, target.sessionId, body) }, me, opt.tapped === true))) throw apiError(409, atPrompt(target.sessionId) ? promptWords(target.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, target.sessionId, body)
         log?.info(`${agent.name} → chat ${target.sessionId.slice(0, 8)} (another floor or PC): a message`)
         return order ? `Sent to chat ${target.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${target.sessionId}.`
@@ -3935,7 +4649,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       // Order o5dc4: the Browser (agent/browser/host.ts): open an address and read it, or read what is open. Nothing is clicked or typed by an agent.
       case 'browser_open': {
         const url = typeof args.url === 'string' ? args.url.trim() : ''
-        if (!url) throw apiError(400, 'Say which address: url is an http(s) address, a name like example.com, or words to search for.')
+        if (!url) throw apiError(400, 'Say which address: url is an address on his tailnet, like https://<machine>.<tailnet>.ts.net:<port> or http://100.x.y.z:<port>.')
         const r = await browser.open(url, { max: typeof args.max === 'number' ? args.max : undefined })
         // Order o7e1e: the answer carries the private mark (its transcript rows are blanked in the CRM drive's copy, conversations.ts).
         return json({ ...r, shown: 'It is open in the Browser page (Shubham sees it live there).', privacy: BROWSER_PRIVATE_NOTE })
@@ -3975,7 +4689,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!joinsDraft(c.sessionId) && hasDraft(c.sessionId)) throw apiError(409, draftWords(c.sessionId))
         const undo = relayAllowed(sid, c.sessionId)
         const order = orderFrom(floor, agent, sid, c.sessionId, body)
-        if (!(await typeIntoOrUndo(undo, c, `[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`, () => { if (order) openOrder(order, sid, c.sessionId, body) }, me))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
+        // F-221 (ob98a): a relayed message never carries the tapped marker (its words, or a name). His tap on a held one never sends it twice.
+        if (!(await typeIntoOrUndo(undo, c, neutralizeMarks(`[message from ${tag}${order ? `, ${orders.marker(order)}` : ''}] ${body}`), () => { if (order) openOrder(order, sid, c.sessionId, body) }, me, opt.tapped === true))) throw apiError(409, atPrompt(c.sessionId) ? promptWords(c.sessionId) : 'That chat stopped before the message reached it')
         if (order) openOrder(order, sid, c.sessionId, body)
         log?.info(`${agent.name} → chat ${c.sessionId.slice(0, 8)}: a message`)
         return order ? `Sent to chat ${c.sessionId} as order ${order}. Its answer at the end of its turn comes back to you here by itself ("[reply from ...]"): do not wait for it, and do not ask it to answer.` : `Sent to chat ${c.sessionId}.`
@@ -4001,7 +4716,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
         const drafts = all.filter(c => !c.asking && c.drafting && !joinsDraft(c.sessionId))
         // A chat on a member PC reports a draft back (409): it is counted with the skipped ones.
         const outcomes = await Promise.all(to.map(async c => {
-          try { return { c, sent: await typeInto(c, `[broadcast from ${tag}] ${body}`, { confirmed: true, caller: me }), unknown: false, pending: false, draft: false } }
+          try { return { c, sent: await typeInto(c, neutralizeMarks(`[broadcast from ${tag}] ${body}`), { confirmed: true, caller: me }), unknown: false, pending: false, draft: false } }
           catch (e) { return { c, sent: false, unknown: isObject(e) && e.code === 'delivery-unconfirmed', pending: isObject(e) && e.code === 'delivery-pending', draft: e instanceof Error && /unsent text in its box/.test(e.message) } }
         }))
         const uncertain = outcomes.filter(r => r.unknown).map(r => r.c)
@@ -4112,6 +4827,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (!isOrchestratorAgent(floor.name, agent)) throw apiError(403, "Only the overlay assistant moves Shubham's screen; ask it (it is the sparkle button in the app).")
         // "Goals on mobile: use the API" (Settings › Assistant, on unless turned off): on a phone the CRM Goals page is not driven. What opens
         // it, or its handlers, is refused here; the page refuses a press or typing while it is on the Goals page (told to by goalsApi).
+        if (name === 'ui_invoke') {
+          const climb = pathClimb(args.args)
+          if (climb) throw apiError(400, `ui_invoke: an argument may not climb out of a path ("${climb.slice(0, 60)}"): give plain ids and words.`)
+        }
         const goalsApi = ui.onPhone() === true && assistantSettings.get().goalsOnMobile
         if (goalsApi) {
           const why = goalsPageCall(name, args)
@@ -4133,7 +4852,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
         if (mode() === 'member') throw apiError(409, 'The phone is reached through the hub; ask from the hub.')
         const device = typeof args.device === 'string' ? args.device : undefined
         const op = name === 'phone_screen' ? 'screen' : typeof args.action === 'string' ? args.action : ''
-        return voice.phone.call(device, op, args, by)
+        // Order oae15: an answer with the phone's words in it carries the private mark (first), so the CRM's copy of this chat leaves it out
+        // (F-211, conversations.ts), and it is cut short of what Claude Code would move into a side file; a bare "Done." holds nothing.
+        return phoneAnswer(await voice.phone.call(device, op, args, by))
       }
       case 'agent_hire': {
         if (!agent.isBoss) throw apiError(403, "Only the floor's boss can hire; ask them.")
@@ -5089,29 +5810,76 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   const pageOf = (q: URLSearchParams | Record<string, unknown>) => {
-    const get = (k: string) => (q instanceof URLSearchParams ? q.get(k) : typeof q[k] === 'string' || typeof q[k] === 'number' ? String(q[k]) : null)
-    return { q: get('q') ?? '', limit: Number(get('limit')) || 60, offset: Number(get('offset')) || 0 }
+    const get = (k: string) => (q instanceof URLSearchParams ? q.get(k) : typeof q[k] === 'string' || typeof q[k] === 'number' || typeof q[k] === 'boolean' ? String(q[k]) : null)
+    // F-235: one project folder's (a folder name, never a path), and the folders themselves.
+    const dir = get('dir') ?? ''
+    return {
+      q: get('q') ?? '',
+      limit: Number(get('limit')) || 60,
+      offset: Number(get('offset')) || 0,
+      dir: dir && !/[\\/]/.test(dir) && dir !== '.' && dir !== '..' ? dir : '',
+      folders: get('folders') === '1' || get('folders') === 'true',
+    }
   }
 
   /** This PC's own conversations, each saying which PC it belongs to (its own, or the one it was copied from). */
-  async function ownSessions(page: { q: string; limit: number; offset: number }) {
+  async function ownSessions(page: ReturnType<typeof pageOf>) {
     const found = await listSessions(projectsDir, page)
-    return { sessions: found.sessions.map(x => ({ ...x, pc: origins.get(x.sessionId) ?? self().name })), total: found.total }
+    return { sessions: found.sessions.map(x => ({ ...x, pc: origins.get(x.sessionId) ?? self().name })), total: found.total, ...(found.folders ? { folders: found.folders } : {}) }
   }
 
-  /** This PC's (or, with `pc`, another's) Claude Code conversations, each with the agent here it already is, if any. */
-  async function sessions(query: URLSearchParams) {
+  /** F-235: the hub's PCs that can't be reached now, known by their PC Control workspace (one is made for every PC the hub knows). */
+  function offlinePcs(reachable: { id: string }[]): { id: string; name: string }[] {
+    const out: { id: string; name: string }[] = []
+    for (const f of allFloors())
+      if (isPcControl(f) && f.targetPcId && !reachable.some(p => p.id === f.targetPcId) && !out.some(p => p.id === f.targetPcId)) out.push({ id: f.targetPcId, name: f.name })
+    return out
+  }
+
+  /** This PC's (or, with `pc`, another's) Claude Code conversations, each with the agent it already is on a floor, if any. */
+  async function sessions(r: MountRequest): Promise<SessionsAnswer> {
+    const query = r.query
+    // F-235: a member reaches only its hub; the hub reaches every PC. So a member asks the hub, which asks the PC named (this one too, for
+    // its own list, so every PC the hub can reach is named). Without its hub: this PC's own, as before.
+    if (mode() === 'member' && sub && team?.hub()?.link) {
+      const q = new URLSearchParams(query)
+      if (!q.get('pc')) q.set('pc', self().id)
+      const there = q.get('pc') !== self().id
+      let got: SessionsAnswer | null = null
+      try {
+        got = (await toHub({ ...r, query: q })) as SessionsAnswer
+      } catch (e) {
+        if (there) throw e
+      }
+      if (got) {
+        const me = self()
+        const list = got.pcs.map(p => ({ ...p, here: p.id === me.id }))
+        if (!list.some(p => p.here)) list.unshift({ ...me, here: true })
+        return {
+          ...got,
+          // "Copied here" is this PC's own word: whether it has a copy.
+          sessions: got.sessions.map(x => ({ ...x, here: there ? findTranscript(x.sessionId, projectsDir) !== null : undefined })),
+          pcs: [...list.filter(p => p.here), ...list.filter(p => !p.here)],
+        }
+      }
+    }
     const pc = query.get('pc')
     const page = pageOf(query)
     const there = pc && pc !== self().id
-    const found = there ? await request<{ sessions: Omit<ClaudeSession, 'agent'>[]; total: number }>(peerOf(pc), 'sessions', page, 60_000) : await ownSessions(page)
+    const found = there
+      ? await request<{ sessions: Omit<ClaudeSession, 'agent'>[]; total: number; folders?: ClaudeProjectFolder[] }>(peerOf(pc), 'sessions', page, 60_000)
+      : await ownSessions(page)
+    // F-235: every PC keeps a copy of every floor's chat (F-021), so another PC's list names whose chat it is too.
     const bound = new Map<string, ClaudeSession['agent']>()
-    if (!there) for (const f of allFloors()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
+    for (const f of allFloors()) for (const a of f.agents) if (a.sessionId) bound.set(a.sessionId, { floorId: f.id, floorName: f.name, agentId: a.id, name: a.name })
     const copied = new Set(there ? found.sessions.filter(x => findTranscript(x.sessionId, projectsDir)).map(x => x.sessionId) : [])
+    const reachable = pcs()
     return {
       sessions: found.sessions.map(x => ({ ...x, agent: bound.get(x.sessionId) ?? null, ...(there ? { here: copied.has(x.sessionId) } : {}) })),
       total: found.total,
-      pcs: pcs(),
+      pcs: reachable,
+      ...(Array.isArray(found.folders) ? { folders: found.folders } : {}),
+      ...(mode() === 'hub' ? { offline: offlinePcs(reachable) } : {}),
     }
   }
 
@@ -5166,12 +5934,36 @@ export function createAgentic(o: AgenticOptions): Agentic {
     return job
   }
 
+  /**
+   * A copy of one of this PC's conversations under a new id, for a floor's agent (transcripts.ts says why a copy): beside the original,
+   * so it resumes in the folder it was held in; or, held in a folder this PC hasn't got (one copied from another PC), under the floor's
+   * folder here (`floorFolder`, looked up only then). The original is only read. `brought`: it was just brought over from another PC (F-022).
+   */
+  async function copyForFloor(from: string, sid: string, floorFolder: () => string, brought: boolean): Promise<{ file: string; cwd: string }> {
+    let cwd = findTranscriptCwd(from, projectsDir)
+    let intoDir: string | undefined
+    if (!cwd || !existsSync(cwd)) {
+      // Held in a folder this PC hasn't got (one copied from another PC): its copy goes under the floor's folder here.
+      if (!cwd && !findTranscript(from, projectsDir)) throw apiError(404, `There is no conversation ${from} on this PC`)
+      if (cwd && !origins.has(from) && !brought) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
+      cwd = floorFolder()
+      intoDir = path.join(projectsDir, encodeProjectPath(cwd))
+    }
+    try {
+      return { file: (await copyTranscript(from, sid, projectsDir, intoDir)).file, cwd }
+    } catch (e) {
+      throw apiError(500, `Couldn't copy that conversation: ${message(e)}`)
+    }
+  }
+
   /** A copy of a conversation becomes an agent's chat (transcripts.ts says why a copy): a new agent's, or the one named's. */
-  async function importChat(floorId: string, body: unknown, as?: ChatOwner): Promise<ChatImported> {
+  async function importChat(floorId: string, body: unknown, as?: ChatOwner, r?: MountRequest): Promise<ChatImported> {
     if (!isObject(body) || typeof body.sessionId !== 'string' || !UUID_RE.test(body.sessionId)) throw apiError(400, 'Expected {sessionId, agentId?, name?, role?}')
     if (['executionProfile', 'executionRevision', 'execution', 'provider', 'harness', 'transcript'].some(k => Object.hasOwn(body, k))) throw executionHttpError('execution-capability-required', 'selection')
     const from = body.sessionId
     if (isPcControl(floorOf(floorId)) || controlAlias(from)) throw immutablePcControl()
+    // F-235: Import agent from a conversation, run on the PC chosen.
+    if (body.runOn !== undefined) return importAgent(floorId, body, from, as, r)
     const intoId = typeof body.agentId === 'string' && body.agentId ? body.agentId : null
     const floor = floorOf(floorId)
     if (intoId) requireLegacyExecution(agentOf(floor, intoId), defaultsNow())
@@ -5182,22 +5974,8 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // F-022: from another PC: brought here first.
     const pc = typeof body.pc === 'string' && body.pc && body.pc !== self().id ? body.pc : null
     if (pc) await fetchFrom(pc, from)
-    let cwd = findTranscriptCwd(from, projectsDir)
-    let intoDir: string | undefined
-    if (!cwd || !existsSync(cwd)) {
-      // Held in a folder this PC hasn't got (one copied from another PC): its copy goes under the floor's folder here.
-      if (!cwd && !findTranscript(from, projectsDir)) throw apiError(404, `There is no conversation ${from} on this PC`)
-      if (cwd && !origins.has(from) && !pc) throw apiError(409, `That conversation was held in ${cwd}, which isn't there any more`)
-      cwd = codeDirOf(floor)
-      intoDir = path.join(projectsDir, encodeProjectPath(cwd))
-    }
     const sid = randomUUID()
-    let copy: string
-    try {
-      copy = (await copyTranscript(from, sid, projectsDir, intoDir)).file
-    } catch (e) {
-      throw apiError(500, `Couldn't copy that conversation: ${message(e)}`)
-    }
+    const { file: copy, cwd } = await copyForFloor(from, sid, () => codeDirOf(floor), pc !== null)
     try {
       let agentId = intoId
       let after: Floor
@@ -5225,6 +6003,110 @@ export function createAgentic(o: AgenticOptions): Agentic {
       rmSync(copy, { force: true })
       throw e
     }
+  }
+
+  /**
+   * F-235 (order o7c1c), Import agent from a conversation: a new agent on the floor whose chat resumes a conversation held on any of the
+   * hub's PCs, on the PC chosen (its home from then on, F-064). The original file is only ever read: the agent gets a copy under a new id.
+   * Run on the PC that holds it, that PC makes the copy beside the original (op `session-copy`), so it resumes in the folder it was held
+   * in, and the hub's own copy is brought up at once (F-021). Run on another, the hub brings the conversation over (F-022) and copies it,
+   * and that PC gets the copy through the F-021 sync when it opens it (in its folder for the floor). A member asks the hub, which reaches
+   * every PC and keeps the floors.
+   */
+  async function importAgent(floorId: string, body: Record<string, unknown>, from: string, as: ChatOwner | undefined, r: MountRequest | undefined): Promise<ChatImported> {
+    if (body.agentId !== undefined) throw apiError(400, 'runOn is for a new agent: leave agentId out')
+    if (typeof body.runOn !== 'string' || !body.runOn) throw apiError(400, 'runOn is the id of the PC its chat runs on')
+    const runOn = body.runOn
+    const holder = typeof body.pc === 'string' && body.pc ? body.pc : self().id
+    if (mode() === 'member') {
+      if (!r) throw apiError(503, "Server (the hub) can't be reached")
+      // "This PC" said by its id: the hub asks it for the copy. A long conversation may take a while to bring over or copy.
+      return (await toHub({ ...r, body: { ...body, pc: holder } }, IMPORT_TIMEOUT_MS)) as ChatImported
+    }
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const role = typeof body.role === 'string' ? body.role.trim() : ''
+    const floor = floorOf(floorId)
+    // As before (importChat): a conversation that is an agent's chat under another way of running is not copied from.
+    const previousBinding = bySession(from)
+    if (previousBinding) requireLegacyExecution(previousBinding.agent, defaultsNow())
+    // Before any copy is made: a name already on the floor.
+    if (name && floor.agents.some(a => a.name.trim().toLowerCase() === name.toLowerCase())) throw apiError(409, `There is already an agent called "${name}" on this floor`)
+    const holderLink = holder === self().id ? null : peerOf(holder)
+    const runLink = runOn === self().id ? null : peerOf(runOn)
+    const nameOf = (id: string, link: LinkPeer | null) => (link ? link.name : id === self().id ? self().name : id)
+    const on = { id: runOn, name: nameOf(runOn, runLink) }
+    const sid = randomUUID()
+    let cwd: string
+    let drop: () => Promise<void>
+    if (runOn === holder && holderLink) {
+      // On the PC that holds it: copied there, beside the original.
+      let made: { cwd: string }
+      try {
+        made = await request<{ bytes: number; cwd: string }>(holderLink, 'session-copy', { sessionId: from, newId: sid, floorId }, IMPORT_TIMEOUT_MS)
+      } catch (e) {
+        if (/doesn't do session-copy/.test(message(e))) throw apiError(409, `${holderLink.name} needs the update first: it can't make the copy itself yet. Run it on another PC, or update ${holderLink.name}.`)
+        throw e
+      }
+      cwd = made.cwd
+      drop = () => request(holderLink, 'session-copy', { drop: sid }).then(() => undefined, () => undefined)
+    } else {
+      // Here: brought over first when another PC holds it (F-022), then copied beside it, or under the floor's folder here.
+      if (holderLink) await fetchFrom(holder, from)
+      const made = await copyForFloor(from, sid, () => codeDirOf(floor), holderLink !== null)
+      // Run on another PC: it opens in that PC's folder for the floor, which this one may not know.
+      cwd = runLink ? (floor.folders[runOn] ?? '') : made.cwd
+      drop = async () => rmSync(made.file, { force: true })
+    }
+    try {
+      const agentId = floors.addAgent(floorId, { name, role }, as).agent.id
+      floors.bindSession(floorId, agentId, sid)
+      const after = mode() === 'hub' ? floors.setHome(floorId, agentId, on) : floorOf(floorId)
+      // Copied on the PC that holds it: this PC's own copy, brought up now (F-021 keeps it so after).
+      if (runOn === holder && holderLink) backfill(holderLink, sid)
+      const agent = agentOf(after, agentId)
+      log?.info(`imported conversation ${from.slice(0, 8)} from ${nameOf(holder, holderLink)} onto ${after.name} as ${agent.name} (${sid.slice(0, 8)}), running on ${on.name}`)
+      return { floor: after, agent, sessionId: sid, cwd, on }
+    } catch (e) {
+      await drop()
+      throw e
+    }
+  }
+
+  /** F-235, a member: waits (5 s at most) for a floor and agent the hub has just made to reach this PC's copy of the floors (sent 150 ms after a change). */
+  async function knownSoon(floorId: string, agentId: string, ms = 5000) {
+    const end = Date.now() + ms
+    while (!allFloors().some(f => f.id === floorId && f.agents.some(a => a.id === agentId)) && Date.now() < end) await new Promise(r => setTimeout(r, 50))
+  }
+
+  /** F-235: how long an import may take (a conversation of hundreds of MB brought over, then copied). */
+  const IMPORT_TIMEOUT_MS = 10 * 60_000
+
+  /** F-235: the copies this PC made for the hub's Import agent (op `session-copy`), so only those can be taken back. */
+  const importCopies = new Map<string, string>()
+
+  /**
+   * F-235, op `session-copy`, asked by the hub: a copy of one of this PC's conversations under a new id, for the floor's new agent (beside
+   * the original, which is only read; see copyForFloor). `{drop}` takes back a copy this PC made for an import that failed after.
+   */
+  async function sessionCopy(raw: unknown): Promise<{ bytes: number; cwd: string } | { dropped: boolean }> {
+    if (!isObject(raw)) throw apiError(400, 'Expected {sessionId, newId, floorId} or {drop}')
+    if (typeof raw.drop === 'string') {
+      const file = importCopies.get(raw.drop)
+      importCopies.delete(raw.drop)
+      // Only a copy made here for an import, and only while no floor has it.
+      if (!file || bySession(raw.drop)) return { dropped: false }
+      rmSync(file, { force: true })
+      return { dropped: true }
+    }
+    const { sessionId, newId, floorId } = raw
+    if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId) || typeof newId !== 'string' || !UUID_RE.test(newId) || typeof floorId !== 'string') throw apiError(400, 'Expected {sessionId, newId, floorId}')
+    if (findTranscript(newId, projectsDir)) throw apiError(409, `There is already a conversation ${newId}`)
+    if (!findTranscript(sessionId, projectsDir)) throw apiError(404, `${self().name} has no conversation ${sessionId}`)
+    // The floor's folder here only when its own folder is gone (this PC may not have the newest floors yet).
+    const made = await copyForFloor(sessionId, newId, () => codeDirOf(floorOf(floorId)), false)
+    importCopies.set(newId, made.file)
+    log?.info(`copied conversation ${sessionId.slice(0, 8)} as ${newId.slice(0, 8)} for the hub's Import agent (the original only read)`)
+    return { bytes: statSync(made.file).size, cwd: made.cwd }
   }
 
   const openRequest = (b: unknown): OpenChatRequest => {
@@ -5302,7 +6184,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
     // Stage 1 (o400b): the "Old way" switch of this PC's chat-terminal layer (Web's Settings › Chats).
     ['GET', /^\/sync-mode$/, () => syncModeAnswer(), 'local'],
     ['POST', /^\/sync-mode$/, (_, r) => setSyncMode(r.body, r), 'local'],
-    ['GET', /^\/sessions$/, (_, r) => sessions(r.query), 'local'],
+    ['GET', /^\/sessions$/, (_, r) => sessions(r), 'local'],
     ['GET', /^\/sessions\/copy-all$/, () => ({ job: copyAll }), 'local'],
     [
       'POST',
@@ -5382,6 +6264,17 @@ export function createAgentic(o: AgenticOptions): Agentic {
     ['POST', /^\/approvals\/answer$/, (_, r) => (humanOnly(r), answerApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/approvals\/cancel$/, (_, r) => (humanOnly(r), cancelApproval(r.body, byOf(r), r)), 'local'],
     ['POST', /^\/send-as-me$/, (_, r) => (humanOnly(r), sendAsMe(r.body, byOf(r), r)), 'local'],
+    // F-221 (ob98a): live talk, the owner's page only (POLICY), never a chat's key nor the fast Assistant's. The cards wait for his tap, and Send
+    // takes his signed-in CRM session as the approvals do; the direct line types his spoken words untapped, with the Orchestrator's tools held.
+    // The hub's own: a member answers itself (no cards there; Send says to sign in on the Server's page; the direct line says hub only).
+    ['GET', /^\/talk\/cards$/, (_, r) => (talkPage(r), { cards: talkCards.list() }), 'local'],
+    ['POST', /^\/talk\/cards\/([^/]+)\/send$/, ([id], r) => sendTalkCard(id, r.body, r), 'local'],
+    ['POST', /^\/talk\/cards\/([^/]+)\/drop$/, ([id], r) => (talkPage(r), { ok: true, dropped: talkCards.dropCard(id, 'dropped') }), 'local'],
+    ['POST', /^\/talk\/ask$/, (_, r) => talkAsk(r.body, r), 'local'],
+    ['GET', /^\/talk\/ask\/([^/]+)$/, ([id], r) => talkAskView(id, r), 'local'],
+    // F-221 (T4): his Let go (his CRM session, as Send), and whether the Orchestrator runs with the voice lock (the page offers the direct line only then).
+    ['POST', /^\/talk\/ask\/([^/]+)\/let-go$/, ([id], r) => talkLetGo(id, r), 'local'],
+    ['GET', /^\/talk\/caps$/, (_, r) => (talkPage(r), { holds: true, voiceLock: voiceLockNow() }), 'local'],
     ['GET', /^\/auto-update$/, (_, r) => (humanOnly(r), withRun(autoUpdate.read(), o.updateRun?.() ?? null))],
     ['POST', /^\/auto-update$/, (_, r) => (humanOnly(r), setAutoUpdate(r.body, byOf(r), r))],
     ['GET', /^\/approvals\/devices$/, () => retiredApprovalDevices()],
@@ -5429,7 +6322,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       /^\/floors\/([^/]+)\/agents\/([^/]+)\/share$/,
       ([id, agentId], r) => shareChat(id, agentId, r.body),
     ],
-    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body, access.ownerOf(callerOf(r))), 'local'],
+    ['POST', /^\/floors\/([^/]+)\/import$/, ([id], r) => importChat(id, r.body, access.ownerOf(callerOf(r)), r), 'local'],
     ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, ([id, agentId], r) => {
       const body = r.body
       if (isObject(body) && ['executionVersion', 'openIntentId', 'expectedExecution'].some(k => Object.hasOwn(body, k))) {
@@ -5982,7 +6875,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
   }
 
   /** A member's change, passed to the hub; its own folder for a floor becomes `folderFor` (checked here, where it is). */
-  async function toHub(r: MountRequest): Promise<unknown> {
+  async function toHub(r: MountRequest, timeoutMs?: number): Promise<unknown> {
     if (/^\/(?:approvals|send-as-me|auto-update)(?:\/|$)/.test(r.rest)) { requireCrmHuman(o.auth, r); throw Object.assign(apiError(409, 'Sign in on the Server page for this action.'), { code: 'hub-sign-in-required', hubOrigin: null }) }
     const link = needHub()
     let body = r.body
@@ -5991,7 +6884,7 @@ export function createAgentic(o: AgenticOptions): Agentic {
       if (typeof codeDir === 'string' && codeDir.trim()) checkFolder(codeDir)
       body = { ...rest, folderFor: { id: self().id, dir: typeof codeDir === 'string' && codeDir.trim() ? codeDir.trim() : null } }
     }
-    const value = await request<unknown>(link, 'http', { method: r.method, rest: r.rest, query: r.query.toString(), body, by: callerOf(r).person })
+    const value = await request<unknown>(link, 'http', { method: r.method, rest: r.rest, query: r.query.toString(), body, by: callerOf(r).person }, timeoutMs)
     // What the hub answers about a floor is in the next state push too; it is on screen now.
     const floor = isObject(value) && isObject(value.floor) ? (value.floor as unknown as Floor) : null
     if (!floor) return value
@@ -6268,6 +7161,9 @@ export function createAgentic(o: AgenticOptions): Agentic {
             const files = await sessionFiles(projectsDir)
             return { files: isObject(raw) && typeof raw.sessionId === 'string' ? files.filter(f => f.sessionId === raw.sessionId) : files }
           })
+        // F-235: the hub's Import agent, run on this PC: a copy beside the original (only read), or taken back.
+        case 'session-copy':
+          return answer(raw => sessionCopy(raw))
         case 'terminal':
           return serveTerminal
         case 'attach-put':
@@ -6279,8 +7175,10 @@ export function createAgentic(o: AgenticOptions): Agentic {
           return answer(() => { throw Object.assign(apiError(409, 'Update the Server and target PC for versioned approval commits.'), { code: 'approval-peer-update-required' }) })
         case 'open':
           // F-025: another PC's Run on, for this one: the chat taken over here.
-          return answer(raw => {
+          return answer(async raw => {
             if (!isObject(raw) || typeof raw.floorId !== 'string' || typeof raw.agentId !== 'string') throw apiError(400, 'Expected {floorId, agentId}')
+            // F-235: an agent the hub made a moment ago (Import agent opens its chat at once) may not have reached this PC's floors yet.
+            await knownSoon(raw.floorId, raw.agentId)
             const expected = engineFor(agentOf(floorOf(raw.floorId), raw.agentId))
             if (raw.expectedEngine === undefined && expected !== 'claude') throw engineUpdateRequired(from.name)
             if (raw.expectedEngine !== undefined) requireRunningEngine(expected, raw.expectedEngine as RuntimeEngine)

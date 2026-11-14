@@ -50,6 +50,15 @@ export function toHub(f: Frame): FastClientFrame | null {
   }
 }
 
+/**
+ * F-221 (ob98a, T4): what follows a frame the old client sent, on the hub's side: after its start, the hold latch as Settings › Assistant › Spoken
+ * hand-offs says ("Tap to send": on, the default; "Send at once": off, the old way), after EVERY start (a plain start begins with hold off, a
+ * reconnect only ever raises it). Null after any other frame. The old client itself is not changed (old-voice.generated.js is pinned).
+ */
+export function holdAfter(f: Frame, tapToSend: boolean): FastClientFrame | null {
+  return f.type === 'voice-start' ? { t: 'hold', on: tapToSend } : null
+}
+
 /** The old client's STT address -> this app's speech route (undefined: not an STT address). */
 export function speechUrl(oldUrl: string, speechBase: string): { url: string; kind: 'status' | 'warm' | 'transcribe' } | undefined {
   const STT = '/api/stt/'

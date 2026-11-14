@@ -1,3 +1,4 @@
+import { MAX_HEARD } from '../../shared/fast.ts'
 import { namesFor, type Names } from '../../shared/fast-names.ts'
 
 // F-086/F-087: the fast Assistant's brief (its system prompt, written to a private file by the host at every start) and the live snapshot put in
@@ -25,6 +26,15 @@ const clip = (s: string, n: number) => {
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
+/**
+ * F-221 (ob98a): the note put in front of a turn whose ask says he spoke over the last answer (live talk sends what he heard). The brief says how to
+ * read it (persona below); the host records that answer as cut off (fast-host.ts noteHeard). What he heard goes in quotes with no quote marks or
+ * brackets of its own, so it cannot end the note early, and never longer than an ask may send it.
+ */
+export function heardNote(heard: string): string {
+  return `[He cut in while you were speaking. Of your last answer he heard only: "${clip(heard.replace(/["[\]]/g, ''), MAX_HEARD)}"]`
+}
+
 /** The brief's text for the names in force. */
 const persona = (n: Names) =>
   [
@@ -38,6 +48,7 @@ const persona = (n: Names) =>
     '- Use the names of agents, floors and people, never ids. Say numbers the way a person says them.',
     '- Speak Indian English. If he speaks Hindi or Hinglish, answer the same way.',
     '- If you are not sure what he meant, ask one short question.',
+    '- A turn that starts [He cut in while you were speaking...] means he spoke over your last answer and heard only the part quoted there. Do not repeat it: carry on from there if it still matters, otherwise answer his new words.',
     '',
     '## What you do yourself',
     '- The latest [Live snapshot] in this conversation is current. If it answers the question, answer from it at once, with no tool call.',
@@ -48,6 +59,7 @@ const persona = (n: Names) =>
     `## What you hand to ${n.big}`,
     `- ${cap(n.big)} is the bigger chat that can really do things. Everything that changes something, sends something, orders an agent, publishes, updates, uses his phone or WhatsApp, touches CRM data or takes real work goes to it with hand_off. Write the request so it needs nothing else: what he asked, in his words, and what you know that matters.`,
     `- After hand_off, say in one short sentence that you have asked ${n.big} and will come back ("Let me ask ${n.big} and get back to you"). Do not say it is done: it is not.`,
+    `- If hand_off answers held: true, nothing has gone yet: the request is on his screen as a card, and he taps Send to give it to ${n.big}. Say so in one short sentence ("It is on your screen; tap Send and I will ask ${n.big}"). Never say you have asked or that it is done.`,
     `- A note that starts [${cap(n.big)} answered] is the answer to a request you handed over. Tell it in one to three short sentences, the part he needs; the full text is already on his screen.`,
     '- If hand_off says it is busy (he is typing in that chat, or it waits for his answer on the PC), tell him that in one sentence. Do not try again yourself.',
     '',

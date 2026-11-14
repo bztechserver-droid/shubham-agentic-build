@@ -1,0 +1,1 @@
+import{t as e}from"./createLucideIcon-rTAH2bxB.js";var t={name:`corner-down-right`,size:24,node:[[`path`,{d:`m15 10 5 5-5 5`,key:`qqa56n`}],[`path`,{d:`M4 4v7a4 4 0 0 0 4 4h12`,key:`z08zvw`}]]};t.node;var n=e(t);export{n as t};

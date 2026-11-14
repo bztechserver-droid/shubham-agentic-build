@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmS
 import path from 'node:path'
 import type { CrmNode, CrmUpload, CrmUploadStart } from '../../shared/crm-files.ts'
 import { BROWSER_PRIVATE_MARK } from '../../shared/browser.ts'
+import { PHONE_PRIVATE_MARK, PHONE_SHOTS_DIR } from '../../shared/phone-private.ts'
 import { writeAtomic } from '../config.ts'
 
 // F-211, stage 1 (orders obd04, o63c5 and o7472; Shubham's own answers, 13 Nov 2026): every floor chat's conversation (its Claude Code JSONL) is kept in two places, on the PC
@@ -125,6 +126,8 @@ interface Sess {
   mark?: string
   parts: Part[]
   manifest?: { fileId?: string; uploadId?: string; parts: number; at: number; failed?: string }
+  /** The tool ids of rows that were blanked (the newest HIDDEN_KEEP): a row that answers one is blanked too, also in a later part. */
+  hidden?: string[]
 }
 
 interface State {
@@ -220,12 +223,62 @@ export function partEnd(file: string, from: number, limit: number, size: number)
  * Those are the browser tools' calls (their address) and their answers (marked BROWSER_PRIVATE_MARK, in the user row and its api-request-blob
  * row alike). The row's own bytes are replaced by as many bytes of a stand-in (a small JSON object, then spaces, the line's end kept), so a part
  * is still bytes [from, to) of the file in length: the manifest's ranges and the size check of a part already in the drive still hold.
+ *
+ * Order oae15 (Shubham, 14 Nov 2026, on phone control: "Yes to both, start"): his phone's rows are kept off the CRM the same way. Those are the
+ * calls of phone_screen and phone_control (what is typed), their answers (marked PHONE_PRIVATE_MARK: the screen's words), and a screenshot the
+ * chat opened: a row that names a file in the phone's shots folder, and then the answer to that call, found by its tool id (Claude Code's answer
+ * row holds the picture but not the file's name). Every tool id in a blanked row is remembered (`hidden`), so a later row that answers one of
+ * them is blanked as well, also when it falls into the next part.
  */
-const BROWSER_CALL = /"name"\s*:\s*"mcp__[^"]{1,100}__browser_(?:open|read)"/
-const STAND_IN = Buffer.from('{"type":"private","note":"A row of the Browser (a page\'s address or text): kept on the PC only."}')
-export const privateRow = (row: Buffer): boolean => {
-  const s = row.toString('latin1')
-  return s.includes(BROWSER_PRIVATE_MARK) || BROWSER_CALL.test(s)
+/**
+ * A CALL of one of these tools in a row, never its definition in a tool list (the request's tool schemas, a deferred-tools list): Claude
+ * Code's tool_use block {"type":"tool_use","id":…,"name":"mcp__<server>__<tool>","input":…}, Codex's function_call ("<server>__<tool>"
+ * then "arguments") and Codex's tool events ({"server":…,"tool":"<tool>"}).
+ */
+const callOf = (tools: string) =>
+  new RegExp(
+    `"type"\\s*:\\s*"tool_use"[^{}]{0,300}?"name"\\s*:\\s*"(?:mcp__)?[^"]{1,100}__(?:${tools})"` +
+      `|"name"\\s*:\\s*"(?:mcp__)?[^"]{1,100}__(?:${tools})"\\s*,\\s*"(?:input|arguments)"\\s*:` +
+      `|"tool"\\s*:\\s*"(?:${tools})"`,
+  )
+const BROWSER_CALL = callOf('browser_open|browser_read')
+const PHONE_CALL = callOf('phone_screen|phone_control')
+// The shots folder's name, then a slash or one to four backslashes (a path in a row is escaped once or twice), then the file's name.
+const PHONE_SHOT = new RegExp(`${PHONE_SHOTS_DIR}(?:\\\\{1,4}|/)shot-`)
+/**
+ * A tool call's id (Claude Code: "id":"toolu_…"; Codex: "call_id":"call_…"), and the id a later row about that call names (its answer's
+ * "tool_use_id", a progress row's "toolUseID", or Codex's "call_id").
+ */
+const CALL_ID = /"(?:id|call_id)"\s*:\s*"((?:toolu|call)_[A-Za-z0-9_-]{4,100})"/g
+const ANSWER_ID = /"(?:tool_use_id|toolUseID|call_id)"\s*:\s*"((?:toolu|call)_[A-Za-z0-9_-]{4,100})"/g
+/** The most tool ids a session remembers (the newest). */
+const HIDDEN_KEEP = 200
+/**
+ * Kept with the ids once a session has had a private row: from then on its compaction summaries are blanked too (Claude Code writes them
+ * itself, asked for detail, and they can quote a screen or a page word for word), and so is the request that carries one.
+ */
+const PRIVATE_SEEN = '@private'
+const SUMMARY = /"isCompactSummary"\s*:\s*true|This session is being continued from a previous conversation/
+const STAND_IN = Buffer.from('{"type":"private","note":"A row of the Browser or of the phone (a page, a screen or what was typed): kept on the PC only."}')
+/**
+ * Order o9d97 (the overlay Assistant uses the Browser's tabs with ui_control): its calls that act in a tab (a b-ref, so what it typed there) or open
+ * an address in one (browse) hold the page's address or words too. Its answers carry the mark (the Browser part of the screen).
+ */
+const UI_CALL = callOf('ui_control')
+const UI_IN_BROWSER = /"action"\s*:\s*"browse"|"ref"\s*:\s*"b\d{1,5}"/
+const privateText = (s: string): boolean =>
+  s.includes(BROWSER_PRIVATE_MARK) ||
+  BROWSER_CALL.test(s) ||
+  (UI_CALL.test(s) && UI_IN_BROWSER.test(s)) ||
+  s.includes(PHONE_PRIVATE_MARK) ||
+  PHONE_CALL.test(s) ||
+  PHONE_SHOT.test(s)
+export const privateRow = (row: Buffer): boolean => privateText(row.toString('latin1'))
+/** True when the row answers a tool call whose row was blanked. */
+const answersHidden = (s: string, hidden: ReadonlySet<string>): boolean => {
+  if (!hidden.size) return false
+  for (const m of s.matchAll(ANSWER_ID)) if (hidden.has(m[1])) return true
+  return false
 }
 export function blankRow(row: Buffer): Buffer {
   let end = row.length
@@ -238,8 +291,11 @@ export function blankRow(row: Buffer): Buffer {
   return out
 }
 
-/** Copies bytes [from, to) of `file` into `out` (the Browser's rows blanked, the same length), and gives the sha256 of what it wrote. */
-export function copyRange(file: string, from: number, to: number, out: string): string {
+/**
+ * Copies bytes [from, to) of `file` into `out` (the Browser's and the phone's rows blanked, the same length), and gives the sha256 of what it wrote.
+ * `hidden`: the tool ids of blanked rows so far (the session's); this adds to it.
+ */
+export function copyRange(file: string, from: number, to: number, out: string, hidden: Set<string> = new Set()): string {
   const hash = createHash('sha256')
   mkdirSync(path.dirname(out), { recursive: true })
   writeFileSync(out, '')
@@ -252,7 +308,17 @@ export function copyRange(file: string, from: number, to: number, out: string): 
   }
   const row = (pieces: Buffer[]) => {
     const r = pieces.length === 1 ? pieces[0] : Buffer.concat(pieces)
-    return privateRow(r) ? blankRow(r) : r
+    const s = r.toString('latin1')
+    if (!privateText(s) && !answersHidden(s, hidden) && !(hidden.has(PRIVATE_SEEN) && SUMMARY.test(s))) return r
+    // Newest last (the session keeps the newest HIDDEN_KEEP): an id seen again moves to the end, and so does the session's private flag.
+    const keep = (id: string) => {
+      hidden.delete(id)
+      hidden.add(id)
+    }
+    for (const m of s.matchAll(CALL_ID)) keep(m[1])
+    for (const m of s.matchAll(ANSWER_ID)) if (hidden.has(m[1])) keep(m[1])
+    keep(PRIVATE_SEEN)
+    return blankRow(r)
   }
   try {
     for (let at = from; at < to;) {
@@ -394,7 +460,8 @@ export function createConversations(o: ConversationsOptions): Conversations {
     const folder = await folderOf(sid, st)
     if (!folder) return
     const tmp = path.join(partsDir, `${KEY_SAFE(sid)}-${st.epoch}-${st.next}.jsonl`)
-    const sha256 = copyRange(file, from, to, tmp)
+    const hidden = new Set(st.hidden ?? [])
+    const sha256 = copyRange(file, from, to, tmp, hidden)
     try {
       for (let tries = 0; ; tries++) {
         const n = st.next
@@ -417,6 +484,7 @@ export function createConversations(o: ConversationsOptions): Conversations {
     }
     st.sent = to
     st.mark = markAt(file, to)
+    if (hidden.size) st.hidden = [...hidden].slice(-HIDDEN_KEEP)
     dirty = true
   }
 
@@ -425,7 +493,7 @@ export function createConversations(o: ConversationsOptions): Conversations {
     return `${JSON.stringify(
       {
         v: 1,
-        what: 'A Claude Code conversation (its JSONL). The parts of the last epoch, joined in this order, are the whole file; a new epoch started again from its first byte. Rows of the Browser (the address or text of a page) are blanked: the same number of bytes, a small {"type":"private"} object then spaces; they stay on the PC only.',
+        what: 'A Claude Code conversation (its JSONL). The parts of the last epoch, joined in this order, are the whole file; a new epoch started again from its first byte. Rows of the Browser (the address or text of a page) and of the phone (its screen, a screenshot, what was typed there) are blanked: the same number of bytes, a small {"type":"private"} object then spaces; they stay on the PC only.',
         sessionId: sid,
         owner: st.owner,
         pc: st.pc,
@@ -531,10 +599,13 @@ export function createConversations(o: ConversationsOptions): Conversations {
         p.failed = 'its bytes are no longer in the file on this PC (the copy was replaced)'
       } else {
         const tmp = path.join(partsDir, `${KEY_SAFE(sid)}-${p.epoch}-${p.n}-again.jsonl`)
-        const sha256 = copyRange(file, p.from, p.to, tmp)
+        // With the session's tool ids (order oae15): an answer in this part to a phone call blanked in an earlier part is blanked again, so the
+        // bytes are the same as the first time. (The ids added since belong to later calls, whose answers come later in the file.)
+        const sha256 = copyRange(file, p.from, p.to, tmp, new Set(st.hidden ?? []))
         try {
           if (sha256 !== p.sha256) {
             p.failed = 'its bytes changed in the file on this PC'
+            trouble(sid, `${partName(p.n)} could not go again: ${p.failed}`)
           } else {
             const u = await o.uploads.addFile({ kind: 'new', target: st.folder, name: partName(p.n), type: 'application/x-ndjson', clientKey: `cv-${KEY_SAFE(sid)}-${p.epoch}-${p.n}` }, tmp)
             p.uploadId = u.id
@@ -582,6 +653,8 @@ export function createConversations(o: ConversationsOptions): Conversations {
       st.epoch++
       st.sent = 0
       delete st.mark
+      // Order oae15: the new epoch sees every call again, in order, from its first byte.
+      delete st.hidden
       if (st.manifest) st.manifest.parts = -1
       dirty = true
     }

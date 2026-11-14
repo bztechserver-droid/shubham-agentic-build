@@ -4,13 +4,26 @@ import type { Logger } from '../log.ts'
 import { DICTATION_WINDOW, type Engine, type TranscribeOptions } from './engine.ts'
 import { DictationChunker } from './dictation.ts'
 import { Segmenter } from './segmenter.ts'
+import { marksHeader, type Tts } from './tts.ts'
 import { pcmMs, wavToPcm } from './wav.ts'
 
 // F-080: the hub's speech service, under /agent-api/speech (the app's token, like the rest of the page's API).
-//   GET  /speech/status                   {available, why?, model, loaded, busy}
+//   GET  /speech/status                   {available, why?, model, loaded, busy, voice}   (voice: the PC voice's status, F-221)
 //   POST /speech/warm                     load the model now (the mic was pressed)
-//   POST /speech/transcribe?lang=&before=&words=a,b   one utterance, whole, as a raw body: audio/wav
+//   POST /speech/transcribe?lang=&before=&words=a,b&guess=1   one utterance, whole, as a raw body: audio/wav
 //                                         (16 kHz mono 16-bit) or application/octet-stream (that PCM) -> {text, raw, audioMs, ms}
+//                                         F-221: guess=1 is live talk's guess at his first short pause: when Whisper has anything running
+//                                         or queued, or is loading the model, it is 409 {busy: true} at once, and nothing is queued. A request
+//                                         the page drops (an aborted fetch, a closed tab) before Whisper has started on it (still queued, or
+//                                         waiting for the model to load) is dropped: never run.
+//                                         Every job leaves one log line, numbers only (engine.ts).
+// F-221 (order ob98a): the PC voice (agent/speech/tts.ts: Windows' own voices, rendered on this PC for live talk's page to play):
+//   POST /speech/say                      {text, voice?, lang?, rate?} -> audio/wav (16-bit PCM, silence at the ends trimmed), with
+//                                         X-Speech-Marks (encodeURIComponent of the JSON [{ms, start, end}]: each word's start in the audio, and
+//                                         text.slice(start, end)), X-Speech-Voice (the voice's name), X-Speech-Ms (the render time)
+//   GET  /speech/voices                   {voices: [{id, name, lang, gender}], default}
+//   POST /speech/say/warm                 start the PC voice now (Talk was pressed) -> {ok, state, ms}
+//   Errors are {error} with the status, as the other routes here. Not Windows: 503 "The PC voice needs Windows".
 //   WS   /speech/stream                   one recording, live (the overlay's mic), text frames as JSON:
 //     page -> {t:'start', lang?, words?, partials?}  {t:'audio', b64}  {t:'stop'}  {t:'cancel'}
 //     hub  -> {t:'ready', model}  {t:'partial', i, text}  {t:'final', i, text, audioMs, ms}  {t:'error', message, status}
@@ -69,13 +82,26 @@ function opts(b: Record<string, unknown>): TranscribeOptions {
 const MAX_UTTERANCE_BYTES = (MAX_UTTERANCE_MS / 1000) * 32_000 + 1024
 const AUDIO_TYPE = /^(?:audio\/(?:wav|x-wav|wave)|application\/octet-stream)\b/i
 
+/** A raw route's JSON answer (an error too: {error}, as the API gives it). Nothing when the page has gone. */
+function answerJson(res: ServerResponse, status: number, body: object) {
+  if (res.headersSent || res.destroyed) return
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(JSON.stringify(body))
+}
+
+/** F-221: aborted when the page goes away before its answer was written (a fetch it aborted, a tab it closed). */
+function goneSignal(res: ServerResponse): AbortSignal {
+  const gone = new AbortController()
+  res.once('close', () => {
+    if (!res.writableEnded) gone.abort()
+  })
+  return gone.signal
+}
+
 /** POST /speech/transcribe: one utterance as a raw body (the API has already checked the token and the Origin). */
 export function transcribeRaw(engine: Engine) {
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const answer = (status: number, body: object) => {
-      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-      res.end(JSON.stringify(body))
-    }
+    const gone = goneSignal(res)
     try {
       if (req.method !== 'POST') throw apiError(405, 'POST the audio')
       if (!AUDIO_TYPE.test(String(req.headers['content-type'] ?? ''))) throw apiError(415, 'Send audio/wav or application/octet-stream (16 kHz mono 16-bit PCM)')
@@ -89,10 +115,63 @@ export function transcribeRaw(engine: Engine) {
       const pcm = decodeAudio(Buffer.concat(chunks))
       const q = new URL(req.url ?? '/', 'http://agent').searchParams
       const words = (q.get('words') ?? '').split(',').filter(Boolean)
-      const r = await engine.transcribe(pcm, opts({ lang: q.get('lang') ?? undefined, before: q.get('before') ?? undefined, words }))
-      answer(200, r ?? { text: '', raw: '', audioMs: pcmMs(pcm), ms: 0 })
+      const guess = q.get('guess') === '1'
+      const r = await engine.transcribe(pcm, { ...opts({ lang: q.get('lang') ?? undefined, before: q.get('before') ?? undefined, words }), ...(guess ? { guess: true } : {}) }, { signal: gone })
+      answerJson(res, 200, r ?? { text: '', raw: '', audioMs: pcmMs(pcm), ms: 0 })
     } catch (e) {
-      answer((e as { status?: number }).status ?? 500, { error: e instanceof Error ? e.message : String(e) })
+      answerJson(res, (e as { status?: number }).status ?? 500, { error: e instanceof Error ? e.message : String(e), ...((e as { busy?: unknown }).busy === true ? { busy: true } : {}) })
+    }
+  }
+}
+
+const SAY_BODY_MAX = 16 * 1024
+const NO_VOICE = 'The PC voice is not set up on this hub'
+
+/** A raw route's JSON body (the API reads the JSON routes' bodies itself, by the same rules: JSON only, so another site's form can't post one). */
+async function readJsonBody(req: IncomingMessage, limit: number): Promise<Record<string, unknown>> {
+  if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) throw apiError(415, 'Send the request body as application/json')
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const c of req) {
+    size += (c as Buffer).length
+    if (size > limit) throw apiError(413, 'Request too large')
+    chunks.push(c as Buffer)
+  }
+  let v: unknown
+  try {
+    v = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  } catch {
+    throw apiError(400, 'The body is not valid JSON')
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw apiError(400, 'Send a JSON object')
+  return v as Record<string, unknown>
+}
+
+const optionalString = (v: unknown, max: number) => (typeof v === 'string' && v ? v.slice(0, max) : undefined)
+
+/** POST /speech/say (F-221): one sentence in the PC's own voice, as a WAV; its word timings in a header. A sentence still waiting when the page goes away is not said. */
+export function sayRaw(tts: Tts | undefined) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const gone = goneSignal(res)
+    try {
+      if (req.method !== 'POST') throw apiError(405, 'POST the words')
+      if (!tts) throw apiError(503, NO_VOICE)
+      const b = await readJsonBody(req, SAY_BODY_MAX)
+      if (typeof b.text !== 'string') throw apiError(400, 'Send {text}: the words to say')
+      const said = await tts.say({ text: b.text, voice: optionalString(b.voice, 300), lang: optionalString(b.lang, 20), rate: typeof b.rate === 'number' ? b.rate : undefined }, gone)
+      if (res.destroyed) return
+      res.writeHead(200, {
+        'content-type': 'audio/wav',
+        'content-length': said.wav.length,
+        'cache-control': 'no-store',
+        'x-speech-marks': marksHeader(said.marks),
+        // A header carries printable ASCII only; Windows' voice names are ("Microsoft Heera").
+        'x-speech-voice': said.voice.replace(/[^\x20-\x7e]/g, '').slice(0, 200),
+        'x-speech-ms': String(said.ms),
+      })
+      res.end(said.wav)
+    } catch (e) {
+      answerJson(res, (e as { status?: number }).status ?? 500, { error: e instanceof Error ? e.message : String(e) })
     }
   }
 }
@@ -316,20 +395,29 @@ export function stream(engine: Engine, log?: Logger, limits: StreamLimits = {}) 
   }
 }
 
-export function speechMount(engine: Engine, log?: Logger): ApiMount {
+/** The speech routes (one mount, so the PC voice's are guarded exactly as Whisper's: the app's token, the owner). `tts`: the PC voice (F-221). */
+export function speechMount(engine: Engine, log?: Logger, tts?: Tts): ApiMount {
   const live = stream(engine, log)
   const once = transcribeRaw(engine)
+  const say = sayRaw(tts)
+  const status = () => (tts ? { ...engine.status(), voice: tts.status() } : engine.status())
+  const voice = () => {
+    if (!tts) throw apiError(503, NO_VOICE)
+    return tts
+  }
   return {
     prefix: '/speech',
     ws: rest => (rest === '/stream' ? live : null),
-    raw: rest => (rest === '/transcribe' ? once : null),
+    raw: rest => (rest === '/transcribe' ? once : rest === '/say' ? say : null),
     async http(r) {
       const { method, rest } = r
-      if (method === 'GET' && rest === '/status') return engine.status()
+      if (method === 'GET' && rest === '/status') return status()
       if (method === 'POST' && rest === '/warm') {
         await engine.warm()
-        return engine.status()
+        return status()
       }
+      if (method === 'GET' && rest === '/voices') return voice().voices()
+      if (method === 'POST' && rest === '/say/warm') return voice().warm()
       throw apiError(404, `No such route: ${method} ${rest}`)
     },
   }

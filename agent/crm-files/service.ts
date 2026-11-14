@@ -31,6 +31,7 @@ import type { CrmPinMark } from '../../shared/crm-files.ts'
 // F-126: the CRM's files as a tree, for the page, for the Linux mount (in process) and for the Windows host's bridge. The CRM's own RECORDS decide what is a file and where it is
 // (files, file_groups, file_versions), not the Google Drive folders. The tree is the one the old agentic-claude-manager drive built:
 //   root -> one folder per `folder` tag of the CRM -> under "projects": one folder per project the person may open (and "Uncategorised") -> its file groups, nested -> files.
+//   oe692: and "Marketing Projects" beside them, always: the projects whose CRM type is "marketing" sit there instead of under "projects".
 // Every change goes through the CRM's own routes (new file, new version, rename, move, new folder); the bytes of a new file go to Google Drive the way the CRM's own pages send them
 // (the short-lived token the CRM hands out, then a resumable upload), never with keys of ours. There is NO delete.
 
@@ -104,6 +105,29 @@ export interface CrmFilesOptions {
   downloadVia?: () => 'drive' | 'crm'
   /** ocbbf: "Keep on this PC" (pins-host.ts). A getter: the host is made after the service. Left out: nothing is kept, and no node has a mark. */
   pins?: () => PinsHost | null
+  /**
+   * oe692: whether the drive has its "Marketing Projects" folder (left out = yes). At the top, beside "projects", it holds the CRM projects whose type is "marketing" (the CRM's
+   * own project_type), and those are then not under "projects" as well. False = the way before oe692: every project under "projects" (index.ts: `marketingFolderFile`, the file
+   * MARKETING_FOLDER_OFF_FILE in the agent's state folder).
+   */
+  marketingFolder?: () => boolean
+}
+
+/**
+ * oe692 (Shubham, 14 Nov 2026: "one more folder in the mounted drive called Marketing Projects"): the drive's top folder for the CRM's marketing projects. It is always there
+ * (empty when the CRM has none) and only shows what the CRM has: nothing is made, changed or removed in the CRM for it. New projects are made in the CRM; inside a project,
+ * folders and files work as in any other project.
+ */
+export const MARKETING_FOLDER = 'Marketing Projects'
+export const MARKETING_ID = `cat:${MARKETING_FOLDER}`
+
+/** oe692: this file in the agent's state folder turns the Marketing Projects folder off (every project back under "projects", the way before). */
+export const MARKETING_FOLDER_OFF_FILE = 'crm-marketing-folder.off'
+
+/** oe692: the Marketing Projects setting as the agent reads it: off while MARKETING_FOLDER_OFF_FILE is in `dir` (looked at on every listing, so it takes effect at once). */
+export function marketingFolderFile(dir: string): () => boolean {
+  const file = path.join(dir, MARKETING_FOLDER_OFF_FILE)
+  return () => !existsSync(file)
 }
 
 /** o813f: this file in the agent's state folder sends every download through the CRM's own (the way before o813f; a file over 100 MB fails there). */
@@ -273,6 +297,8 @@ interface RawFile {
 interface RawProject {
   id: string
   name: string
+  /** oe692: the CRM's project_type is "marketing" (its Projects page labels it so). */
+  marketing: boolean
   writable: boolean
   createdAt: string | null
 }
@@ -410,7 +436,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         const name = text(e.name)
         if (!id || !name) continue
         const at = text(e.accessType)
-        projects.set(id, { id, name, writable: writeCapable && (at === 'manager' || at === 'hierarchy'), createdAt: iso(e.createdAt) })
+        const marketing = text(e.projectType ?? e.project_type).trim().toLowerCase() === 'marketing'
+        projects.set(id, { id, name, marketing, writable: writeCapable && (at === 'manager' || at === 'hierarchy'), createdAt: iso(e.createdAt) })
       }
       const fl = await getJson('org/files?all=true', 'the files')
       const list = isObject(fl) && Array.isArray(fl.files) ? fl.files : null
@@ -567,12 +594,21 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     }
   }
 
+  // ---- oe692: the Marketing Projects folder ---------------------------------------------------------------------------------
+  const marketingOn = (): boolean => o.marketingFolder?.() ?? true
+  /** The top folder a project sits in on the drive: "Marketing Projects" for a marketing project (while that folder is on), else "projects". */
+  const homeOf = (p: RawProject): { id: string; name: string } => (p.marketing && marketingOn() ? { id: MARKETING_ID, name: MARKETING_FOLDER } : { id: catId('projects'), name: 'projects' })
+  /** A CRM category (a file's `folder` tag) with the folder's own name, in any case, is shown inside it rather than as a second top folder of the same name. */
+  const isMarketingTag = (tag: string): boolean => marketingOn() && tag.toLowerCase() === MARKETING_FOLDER.toLowerCase()
+  /** The node a category's files sit in. */
+  const catOf = (tag: string): string => (isMarketingTag(tag) ? MARKETING_ID : catId(tag))
+
   function projectNode(p: RawProject, count: number, mayUp: boolean): CrmNode {
     return {
       id: projId(p.id),
       kind: 'project',
       name: p.name,
-      parentId: catId('projects'),
+      parentId: homeOf(p).id,
       isFolder: true,
       ...(p.createdAt ? { createdAt: p.createdAt } : {}),
       childCount: count,
@@ -600,7 +636,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
   /** Where a file sits inside the projects category: its group (when that group is one of the project's), else the project, else Uncategorised. */
   function placeOf(f: RawFile, groups: Map<string, RawGroup[]>): { parent: string; pid: string | null } {
     const pid = pidOf(f)
-    if (f.folder !== 'projects') return { parent: catId(f.folder), pid: null }
+    if (f.folder !== 'projects') return { parent: catOf(f.folder), pid: null }
     if (!pid) return { parent: UNCATEGORISED, pid: null }
     const g = f.groupId ? groups.get(pid)?.find(x => x.id === f.groupId) : undefined
     return { parent: g ? grpId(pid, g.id) : projId(pid), pid }
@@ -714,18 +750,24 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     const mayUp = s.projects.size > 0 && [...s.projects.values()].some(p => p.writable) ? await mayUpload() : false
     const crumbs: { id: string; name: string }[] = [{ id: 'root', name: ROOT.name }]
 
+    // oe692: the projects of each top folder ("projects", "Marketing Projects"), and the files of a category shown inside Marketing Projects.
+    const homed = (home: string) => [...s.projects.values()].filter(p => homeOf(p).id === home)
+    const marketingFiles = () => s.files.filter(f => isMarketingTag(f.folder))
+
     if (id === 'root') {
       const tags = new Set<string>(['projects'])
-      for (const f of s.files) tags.add(f.folder)
+      for (const f of s.files) if (!isMarketingTag(f.folder)) tags.add(f.folder)
       const kids = [...tags].map((t): CrmNode => ({
         id: catId(t),
         kind: 'category',
         name: t,
         parentId: 'root',
         isFolder: true,
-        childCount: t === 'projects' ? s.projects.size + (s.files.some(f => f.folder === 'projects' && !pidOf(f)) ? 1 : 0) : s.files.filter(f => f.folder === t).length,
+        childCount: t === 'projects' ? homed(catId('projects')).length + (s.files.some(f => f.folder === 'projects' && !pidOf(f)) ? 1 : 0) : s.files.filter(f => f.folder === t).length,
         rights: NO,
       }))
+      // oe692: always there while it is on, even with nothing in it yet.
+      if (marketingOn()) kids.push({ id: MARKETING_ID, kind: 'category', name: MARKETING_FOLDER, parentId: 'root', isFolder: true, childCount: homed(MARKETING_ID).length + marketingFiles().length, rights: NO })
       const gone = removedIndex?.list() ?? []
       if (gone.length > 0) kids.push(goneRootNode(gone.length))
       return { node: { ...ROOT, childCount: kids.length }, children: kids.sort(byName), path: crumbs }
@@ -734,19 +776,31 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
     const [kind, ...rest] = id.split(':')
     if (kind === 'cat') {
       const tag = rest.join(':')
-      if (tag === 'projects') {
-        const counts = new Map<string, number>()
-        let loose = 0
+      const counts = () => {
+        const n = new Map<string, number>()
         for (const f of s.files) {
-          if (f.folder !== 'projects') continue
-          const pid = pidOf(f)
-          if (pid) counts.set(pid, (counts.get(pid) ?? 0) + 1)
-          else loose++
+          const pid = f.folder === 'projects' ? pidOf(f) : ''
+          if (pid) n.set(pid, (n.get(pid) ?? 0) + 1)
         }
-        const kids = [...s.projects.values()].map(p => projectNode(p, counts.get(p.id) ?? 0, mayUp))
+        return n
+      }
+      if (tag === 'projects') {
+        const n = counts()
+        const loose = s.files.filter(f => f.folder === 'projects' && !pidOf(f)).length
+        const kids = homed(catId('projects')).map(p => projectNode(p, n.get(p.id) ?? 0, mayUp))
         if (loose > 0) kids.push({ id: UNCATEGORISED, kind: 'project', name: 'Uncategorised', parentId: catId('projects'), isFolder: true, childCount: loose, rights: NO })
         const node: CrmNode = { id, kind: 'category', name: 'projects', parentId: 'root', isFolder: true, childCount: kids.length, rights: NO }
         return { node, children: kids.sort(byName), path: [...crumbs, { id, name: 'projects' }] }
+      }
+      if (isMarketingTag(tag)) {
+        // oe692: the CRM's marketing projects, and the files of a CRM category of the same name. Read only at this level (no upload, no new folder, no rename, no move):
+        // new projects are made in the CRM; inside a project everything works as in any other project.
+        const n = counts()
+        const loose = marketingFiles()
+        await learnSizes(loose)
+        const kids = [...homed(MARKETING_ID).map(p => projectNode(p, n.get(p.id) ?? 0, mayUp)), ...loose.map(f => fileNode(f, MARKETING_ID, false, false))]
+        const node: CrmNode = { id: MARKETING_ID, kind: 'category', name: MARKETING_FOLDER, parentId: 'root', isFolder: true, childCount: kids.length, rights: NO }
+        return { node, children: kids.sort(byName), path: [...crumbs, { id: MARKETING_ID, name: MARKETING_FOLDER }] }
       }
       const mine = s.files.filter(f => f.folder === tag)
       if (mine.length === 0 && !s.files.some(f => f.folder === tag)) throw new CrmFilesError(404, 'notfound', 'There is no such folder.')
@@ -779,7 +833,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         ...kidsGroups.map(g => groupNode(p, g, id, countIn(g), mayUp)),
         ...filesHere.map(f => fileNode(f, id, p.writable, mayUp)),
       ].sort(byName)
-      const path: { id: string; name: string }[] = [...crumbs, { id: catId('projects'), name: 'projects' }, { id: projId(pid), name: p.name }]
+      const path: { id: string; name: string }[] = [...crumbs, homeOf(p), { id: projId(pid), name: p.name }]
       const chain: RawGroup[] = []
       for (let g = here; g; g = g.parentId ? groups.find(x => x.id === g!.parentId) : undefined) chain.unshift(g)
       for (const g of chain) path.push({ id: grpId(pid, g.id), name: g.name })
@@ -1552,14 +1606,14 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       const mayUp = [...s.projects.values()].some(p => p.writable) ? await mayUpload() : false
       const has = (name: string) => name.toLowerCase().includes(needle)
       const results: { node: CrmNode; path: string }[] = []
-      for (const p of s.projects.values()) if (has(p.name)) results.push({ node: projectNode(p, 0, false), path: 'projects' })
+      for (const p of s.projects.values()) if (has(p.name)) results.push({ node: projectNode(p, 0, false), path: homeOf(p).name })
       const groupsSeen = new Map<string, RawGroup[]>()
       for (const f of s.files) {
         if (results.length > cap * 2) break
         if (!has(f.fileName)) continue
         const pid = pidOf(f)
         if (f.folder !== 'projects' || !pid) {
-          results.push({ node: fileNode(f, f.folder === 'projects' ? UNCATEGORISED : catId(f.folder), false, false), path: f.folder === 'projects' ? 'projects / Uncategorised' : f.folder })
+          results.push({ node: fileNode(f, f.folder === 'projects' ? UNCATEGORISED : catOf(f.folder), false, false), path: f.folder === 'projects' ? 'projects / Uncategorised' : isMarketingTag(f.folder) ? MARKETING_FOLDER : f.folder })
           continue
         }
         const p = s.projects.get(pid)
@@ -1572,7 +1626,7 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
         const place = placeOf(f, new Map([[pid, groups]]))
         const chain: string[] = []
         for (let g = place.parent.startsWith('grp:') ? groups.find(x => x.id === place.parent.split(':')[2]) : undefined; g; g = g.parentId ? groups.find(x => x.id === g!.parentId) : undefined) chain.unshift(g.name)
-        results.push({ node: fileNode(f, place.parent, p.writable, mayUp), path: ['projects', p.name, ...chain].join(' / ') })
+        results.push({ node: fileNode(f, place.parent, p.writable, mayUp), path: [homeOf(p).name, p.name, ...chain].join(' / ') })
       }
       results.sort((a, b) => a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base', numeric: true }) || a.node.id.localeCompare(b.node.id))
       return { results: results.slice(0, cap), more: results.length > cap }
@@ -1584,7 +1638,8 @@ export function createCrmFiles(o: CrmFilesOptions): CrmFilesService {
       const r = await findFiles(
         {
           files: s.files.map(f => ({ id: fileId(f.id), name: f.fileName, type: f.fileType, size: sizeOf(f), modifiedAt: f.updatedAt ?? f.createdAt, category: f.folder, projectId: f.folder === 'projects' ? pidOf(f) || null : null, groupId: f.groupId })),
-          projects: s.projects,
+          // oe692: each project with the top folder it sits in ("projects" or "Marketing Projects"), for the answer's "where".
+          projects: new Map([...s.projects].map(([k, p]) => [k, { id: p.id, name: p.name, home: homeOf(p).name }])),
           groupsOf,
         },
         ask,

@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { apiError } from '../api.ts'
+import { writeAtomic } from '../config.ts'
+import { PHONE_SWITCH_OFF_LINE, type PhoneControlStatus, type PhoneSwitch } from '../../shared/phone-control.ts'
 
 // F-082 (hub side): the Assistant's hands on Shubham's phone. The phone app (Chris) holds an accessibility service; this
 // module is the other end of its protocol (mobile/docs/HUB-PROTOCOL.md §11). The Assistant and the Mobile agent's chat (F-084 H2;
@@ -14,8 +16,16 @@ import { apiError } from '../api.ts'
 //     GET  /voice/control/next?wait=25   the long poll that is also the heartbeat -> {cmd:{id, op, args, why, by, deadlineMs}|null, stopped?}
 //     POST /voice/control/result    {id, ok, kind?, error?, data?}   up to 2 MiB (a screen with its nodes, a shot)
 //     POST /voice/control/progress  {id, waiting:'biometric', summary}   a sensitive action needs his fingerprint: wait longer
-//     POST /voice/control/stop      {reason}   his STOP: everything pending ends, control stays off until the phone arms again
+//     POST /voice/control/stop      {reason}   his STOP: everything pending ends, control stays off until the phone resumes (resume:true: his tap in Chris)
 //   page (app token):  GET /voice/control-status    POST /voice/control-stop (a kill switch that needs no signature: it only takes power away)
+//                      POST /voice/control-switch {on}   order oae15: the PC's own switch (voice.ts: ON needs his CRM administrator session)
+//
+// Order oae15 (Shubham, 14 Nov 2026: "Yes to both, start"): phone control is OFF until he switches it on in the app (Settings › Devices ›
+// Phone control); while it is off every phone_screen / phone_control is refused here, and switching it off stops at once whatever the phone is
+// doing (a STOP for every phone: the phone turns its own switch off too, so only he can start it again there). A STOP ends only with the
+// phone's own resume (resume:true, his tap on the phone), never with a plain armed:true the phone may have sent before it heard of the STOP,
+// and it is kept on disk with the switch, so a restart of the hub does not end it either (a phone stopped while it was away hears it when it
+// comes back). Who stopped it (the phone, Stop now in the app, the switch going off) is what the Assistant is told.
 //
 // What the hub guarantees: one command in flight; at most 60 a minute; none unless the phone is armed and was heard from in the last
 // 90 s; every command's op and arguments are written to phone-control.jsonl with the result's ok/kind/error and its node count, but
@@ -29,7 +39,10 @@ export type PhoneCaller = (typeof CALLERS)[number]
 export const ONLINE_MS = 90_000
 export const PICKUP_MS = 10_000
 export const COMMAND_MS = 20_000
-export const BIOMETRIC_MS = 130_000
+// Order oae15: his fingerprint is waited for at most 90 s on the phone (ControlRunner.CONFIRM_MS), 100 s here (+ the grace), and the chat's
+// tool call gives up after 120 s (mcp-shim.ts CALL_TIMEOUT_MS) from before the pickup (up to PICKUP_MS): so a late yes can never act on the phone
+// after the Assistant was told that it failed (phone.test.ts pins the order of the three).
+export const BIOMETRIC_MS = 100_000
 export const GRACE_MS = 3_000
 export const MAX_PER_MIN = 60
 export const MAX_RESULT_BYTES = 2 * 1024 * 1024
@@ -146,6 +159,10 @@ interface Cmd {
   resolve(r: PhoneResult): void
 }
 
+/** Where a STOP came from: his STOP on the phone, Stop now in the app, or the app's switch going off. */
+type StopFrom = 'phone' | 'app' | 'switch'
+const STOP_FROM: readonly StopFrom[] = ['phone', 'app', 'switch']
+
 interface Dev {
   id: string
   name: string
@@ -157,6 +174,7 @@ interface Dev {
   /** A state was posted since this hub started. */
   stated: boolean
   stopped: boolean
+  stopFrom: StopFrom | null
   queue: Cmd[]
   inflight: Cmd | null
   waiter: { give(c: Cmd | null): void; timer: ReturnType<typeof setTimeout> } | null
@@ -167,14 +185,20 @@ const text = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, ma
 const int = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : 0)
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
+export type { PhoneSwitch }
+
 export interface PhoneControl {
   /** The phone's calls under /voice/control/ (`rest` after that, e.g. '/next'); undefined when the path is none of these. */
   http(d: { id: string; name: string }, method: string, rest: string, query: URLSearchParams, body: unknown): Promise<unknown> | undefined
-  /** The page's two: GET control-status, POST control-stop. */
-  page(method: string, rest: string): unknown
+  /** The page's two: GET control-status, POST control-stop (`paired`: every paired phone's id, so one away now is stopped when it is back). */
+  page(method: string, rest: string, paired?: readonly string[]): unknown
   /** One command for the tools of the Assistant or the Mobile chat (`by`, default the Assistant). Throws for what the hub refuses; a phone's refusal is part of the answer. */
   call(device: string | undefined, op: string, args: Record<string, unknown>, by?: PhoneCaller): Promise<string>
-  status(): { devices: PhoneState[]; log: LogRow[] }
+  status(): { devices: PhoneState[]; log: LogRow[]; switch: PhoneSwitch }
+  /** Order oae15: the PC's switch for phone control (off until he turns it on). */
+  switchState(): PhoneSwitch
+  /** Switches it; off stops every phone at once (`paired`: as for control-stop). `by` is who (a person, never a chat). Throws when it cannot be kept on disk (off still holds until a restart). */
+  setSwitch(on: boolean, by: string, paired?: readonly string[]): PhoneSwitch
   /** A device was removed: forget it. */
   forget(id: string): void
   close(): void
@@ -232,6 +256,39 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
   const devs = new Map<string, Dev>()
   const rows: LogRow[] = []
   const file = deps.dir ? path.join(deps.dir, 'phone-control.jsonl') : null
+  const switchFile = deps.dir ? path.join(deps.dir, 'phone-control-switch.json') : null
+  /** The phones under a STOP (by device id), kept with the switch: a hub restart does not end a STOP; only the phone's resume does. */
+  const held = new Map<string, StopFrom>()
+  let sw: PhoneSwitch = loadSwitch()
+  function loadSwitch(): PhoneSwitch {
+    if (switchFile && existsSync(switchFile)) {
+      try {
+        const j = JSON.parse(readFileSync(switchFile, 'utf8')) as Partial<PhoneSwitch> & { stopped?: unknown }
+        if (isObject(j.stopped)) {
+          for (const [id, from] of Object.entries(j.stopped)) if (STOP_FROM.includes(from as StopFrom)) held.set(id, from as StopFrom)
+        }
+        if (j && typeof j.on === 'boolean') return { on: j.on, at: typeof j.at === 'number' ? j.at : null, by: text(j.by, 200) }
+      } catch {
+        deps.log?.warn('phone: the switch file could not be read: phone control stays off')
+      }
+    }
+    // Never switched (or unreadable): off.
+    return { on: false, at: null, by: '' }
+  }
+  /** Writes the switch and the stopped phones (throws when it cannot). */
+  function writeSwitchFile() {
+    if (!switchFile) return
+    mkdirSync(path.dirname(switchFile), { recursive: true })
+    writeAtomic(switchFile, `${JSON.stringify({ ...sw, stopped: Object.fromEntries(held) })}\n`)
+  }
+  /** The same, where a failure must not stop the caller (it is said in the log; the phone stays stopped in memory). */
+  function keepHeld() {
+    try {
+      writeSwitchFile()
+    } catch (e) {
+      deps.log?.warn(`phone: the stopped phones could not be saved (${e instanceof Error ? e.message : String(e)})`)
+    }
+  }
   const shots = deps.dir ? path.join(deps.dir, 'phone-shots') : null
   if (shots) {
     // What an earlier run left is not kept.
@@ -245,7 +302,9 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
   const dev = (d: { id: string; name: string }): Dev => {
     let x = devs.get(d.id)
     if (!x) {
-      x = { id: d.id, name: d.name, armed: false, reason: null, app: null, heard: 0, stated: false, stopped: false, queue: [], inflight: null, waiter: null, sent: [] }
+      // A phone under a STOP from before (this hub's last run, or stopped while it was away) starts stopped.
+      const from = held.get(d.id) ?? null
+      x = { id: d.id, name: d.name, armed: false, reason: from ? 'stopped' : null, app: null, heard: 0, stated: false, stopped: from !== null, stopFrom: from, queue: [], inflight: null, waiter: null, sent: [] }
       devs.set(d.id, x)
     }
     x.name = d.name
@@ -332,10 +391,23 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     const why: Reason = reason ?? 'switch-off'
     x.reason = armed ? null : why
     x.app = armed && typeof b.app === 'string' ? b.app.slice(0, 120) : null
-    // He turned it back on at the phone (it only says armed when he has not pressed STOP): the hub's stop ends.
-    if (armed) x.stopped = false
-    else {
-      if (why === 'stopped') x.stopped = true
+    // He turned it back on at the phone: only the phone's own resume (his tap there) ends a STOP. A plain armed:true may be a state the phone
+    // sent before it heard of the STOP (the PC's kill switch, or the switch here going off), so it never undoes one (order oae15).
+    if (armed) {
+      if (b.resume === true) {
+        x.stopped = false
+        x.stopFrom = null
+        if (held.delete(x.id)) keepHeld()
+      }
+    } else {
+      if (why === 'stopped') {
+        x.stopped = true
+        x.stopFrom ??= 'phone'
+        if (held.get(x.id) !== x.stopFrom) {
+          held.set(x.id, x.stopFrom)
+          keepHeld()
+        }
+      }
       cancelAll(x, 'failed', `Not done: ${WHY[why]}`)
     }
     return { ok: true, stopped: x.stopped }
@@ -426,12 +498,43 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     return { ok: true }
   }
 
-  function stop(x: Dev, why: string) {
+  function stop(x: Dev, why: string, from: StopFrom = 'phone') {
     x.stopped = true
+    x.stopFrom = from
     x.armed = false
     x.reason = 'stopped'
+    held.set(x.id, from)
+    keepHeld()
     cancelAll(x, 'stopped', `Stopped: ${why}`)
+    // Order oae15: the phone hears it now (its waiting poll answers stopped:true at once), not up to 25 s later, so a resume it is still
+    // retrying cannot undo this STOP.
+    if (x.waiter) {
+      clearTimeout(x.waiter.timer)
+      const w = x.waiter
+      x.waiter = null
+      w.give(null)
+    }
     deps.log?.info(`phone: control stopped on ${x.name} (${why})`)
+  }
+
+  /** A STOP from the PC for every phone: the ones in touch at once, and every other paired one (`paired`) when it next is. */
+  function stopAll(why: string, from: StopFrom, paired: readonly string[] = []) {
+    for (const x of devs.values()) stop(x, why, from)
+    let more = false
+    for (const id of paired) {
+      if (devs.has(id) || held.has(id)) continue
+      held.set(id, from)
+      more = true
+    }
+    if (more) keepHeld()
+  }
+
+  /** What the Assistant is told about a stopped phone: who stopped it, and that only Shubham starts it again, in Chris. */
+  function stoppedLine(x: Dev): string {
+    const again = 'it stays off until Shubham turns "Let Chris control my phone" on again in Chris'
+    if (x.stopFrom === 'app') return `Not done: phone control was stopped from the app on the PC (Stop now); ${again}.`
+    if (x.stopFrom === 'switch') return `Not done: phone control was switched off in the app, which stopped the phone; ${again} (and the app's switch is on).`
+    return `Not done: ${WHY.stopped}.`
   }
 
   function http(d: { id: string; name: string }, method: string, rest: string, query: URLSearchParams, body: unknown): Promise<unknown> | undefined {
@@ -447,6 +550,28 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     return undefined
   }
 
+  // --- the PC's switch (order oae15) ---------------------------------------------------------------
+  function setSwitch(on: boolean, by: string, paired: readonly string[] = []): PhoneSwitch {
+    sw = { on, at: deps.now(), by: text(by, 200) || 'the app' }
+    // Off takes power away at once, before anything else can fail: every phone in touch, and every other paired one when it next is.
+    if (!on) stopAll('phone control was switched off in the app', 'switch', paired)
+    deps.log?.info(`phone: control switched ${on ? 'ON' : 'off'} on the PC (${sw.by})`)
+    if (switchFile) {
+      try {
+        writeSwitchFile()
+      } catch (e) {
+        const why = e instanceof Error ? e.message : String(e)
+        deps.log?.warn(`phone: the switch could not be saved (${why})`)
+        if (on) {
+          sw = { on: false, at: deps.now(), by: sw.by }
+          throw apiError(500, `Phone control could not be switched on: the setting could not be saved (${why}).`)
+        }
+        throw apiError(500, `Phone control is off now, but the setting could not be saved (${why}): switch it off again after a restart.`)
+      }
+    }
+    return { ...sw }
+  }
+
   // --- the Assistant's calls ----------------------------------------------------------------------
   function target(sel: string | undefined): Dev {
     const all = [...devs.values()]
@@ -458,7 +583,7 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     if (ready.length === 1) return ready[0]
     if (ready.length > 1) throw apiError(400, `Several phones are ready (${ready.map(x => x.name).join(', ')}): say which one with device`)
     const x = pool[0]
-    if (x.stopped) throw apiError(409, `Not done: ${WHY.stopped}.`)
+    if (x.stopped) throw apiError(409, stoppedLine(x))
     if (!online(x)) throw apiError(409, `Not done: ${x.name} has not been in touch with the hub for a while (it is off, out of range or Chris is not running).`)
     throw apiError(409, `Not done: ${WHY[x.reason ?? 'switch-off']}.`)
   }
@@ -478,6 +603,7 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
   async function call(sel: string | undefined, op: string, rawArgs: Record<string, unknown>, by: PhoneCaller = 'assistant'): Promise<string> {
     if (!(CALLERS as readonly string[]).includes(by)) throw apiError(400, `No such caller: ${String(by)}`)
     if (!(OPS as readonly string[]).includes(op)) throw apiError(400, `No such phone action: ${op}; they are ${OPS.join(', ')}`)
+    if (!sw.on) throw apiError(409, PHONE_SWITCH_OFF_LINE)
     const args = cleanArgs(op, rawArgs)
     const x = target(sel)
     const t = deps.now()
@@ -523,27 +649,32 @@ export function createPhoneControl(deps: PhoneDeps): PhoneControl {
     waiting: x.inflight?.waiting ?? null,
   })
 
-  function status() {
-    return { devices: [...devs.values()].map(view), log: rows.slice(-50).reverse() }
+  // The page reads it as shared/phone-control.ts's PhoneControlStatus: the type says when the two drift apart.
+  function status(): PhoneControlStatus & { devices: PhoneState[]; log: LogRow[] } {
+    return { devices: [...devs.values()].map(view), log: rows.slice(-50).reverse(), switch: { ...sw } }
   }
 
   return {
     http,
     call,
     status,
-    page(method, rest) {
+    switchState: () => ({ ...sw }),
+    setSwitch,
+    page(method, rest, paired = []) {
       if (method === 'GET' && rest === '/control-status') return status()
       if (method === 'POST' && rest === '/control-stop') {
-        for (const x of devs.values()) stop(x, 'stopped from the app on the PC')
+        stopAll('stopped from the app on the PC', 'app', paired)
         return status()
       }
       return undefined
     },
     forget(id) {
       const x = devs.get(id)
-      if (!x) return
-      stop(x, 'the phone was removed')
-      devs.delete(id)
+      if (x) {
+        stop(x, 'the phone was removed')
+        devs.delete(id)
+      }
+      if (held.delete(id)) keepHeld()
     },
     close() {
       for (const x of devs.values()) {

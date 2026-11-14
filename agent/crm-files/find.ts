@@ -40,7 +40,8 @@ export interface FindGroup {
 
 export interface FindSource {
   files: readonly FindFile[]
-  projects: ReadonlyMap<string, { id: string; name: string }>
+  /** oe692: `home` is the drive's top folder the project sits in ("projects", or "Marketing Projects" for a marketing project); left out = "projects". */
+  projects: ReadonlyMap<string, { id: string; name: string; home?: string }>
   /** A project's file groups (the service keeps them for a minute). */
   groupsOf(pid: string): Promise<readonly FindGroup[]>
 }
@@ -52,7 +53,7 @@ export interface FoundFile {
   project: string | null
   /** The folders inside the project, outermost first, joined by " / " ('' when it sits in the project itself); a category's name; "Uncategorised". */
   folder: string
-  /** Where it is on the CRM files page (projects / <project> / <folders>). */
+  /** Where it is on the CRM files page (projects / <project> / <folders>; oe692: Marketing Projects / <project> / <folders> for a marketing project). */
   where: string
   type: string | null
   /** Its file ending, lower case, no dot ('' when it has none). */
@@ -295,7 +296,7 @@ export async function findFiles(src: FindSource, q: FindAsk, o: { budgetMs?: num
     const chain = chainOf(f)
     const project = f.projectId ? (src.projects.get(f.projectId)?.name ?? null) : null
     const folder = chain ? chain.join(' / ') : ''
-    const where = f.projectId ? ['projects', project ?? '?', ...(chain ?? [])].join(' / ') : f.category === 'projects' ? 'projects / Uncategorised' : f.category
+    const where = f.projectId ? [src.projects.get(f.projectId)?.home ?? 'projects', project ?? '?', ...(chain ?? [])].join(' / ') : f.category === 'projects' ? 'projects / Uncategorised' : f.category
     return { id: f.id, name: f.name, project, folder, where, type: f.type, ending: endingOf(f.name, f.type), size: f.size, modifiedAt: f.modifiedAt }
   })
 

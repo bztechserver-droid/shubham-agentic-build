@@ -1,15 +1,24 @@
 // Order o5dc4 (Shubham: "a big feature ... called Browser. So here we can start a specific url and you can see it and use the browser from within
 // the app like you control the ui"): one browser on the Server (the Chrome or Edge already installed, headless), shown live in the app's Browser
 // page and used from there: its picture comes as a screencast, clicks, keys, scrolling and text go back through the Input domain
-// (shared/browser.ts says what each side sends). The agents open an address in it and read its text (browser_open / browser_read), nothing more.
+// (shared/browser.ts says what each side sends). The agents open an address in it and read its text (browser_open / browser_read).
 //
 // It starts only when asked (his tap, or an agent's browser_open), on 127.0.0.1 with a debugging port from 52100 up (above the app's own ports and
 // Tailscale's range), with a profile of its own in the app's state folder (never his own Chrome profile; no password is ever kept: the password
 // manager is off in its preferences, and headless it never offers to save one). Downloads are refused (nothing is installed through it); a page's
 // alert / confirm / prompt is dismissed with Cancel (and the page is told so), so it never pays, sends or deletes behind a dialog; only http(s)
-// pages are ever shown (anything else goes back to a blank page). A popup opens in the one view. It stops when the last viewer has gone for a
-// minute (a reload comes back in time), after ten minutes with nobody using it (a page left open out of sight counts as nobody: an open page in
-// sight says so every minute), when the page says Close, and when the app stops.
+// pages are ever shown (anything else goes back to a blank page). It stops when the last viewer has gone for a minute (a reload comes back in
+// time), after ten minutes with nobody using it (a page left open out of sight counts as nobody: an open page in sight says so every minute), when
+// the page says Close, and when the app stops.
+//
+// Order o02a5 (Shubham: "Give it tabs separate for phone and PC."): it has tabs, all in the one private context (so all wiped together), each
+// with its own history; the view shows the open one. A popup opens as a new tab (at most BROWSER_MAX_TABS). Closing the last tab closes the browser.
+// Order o9d97 ("let the overlay control it like it does app control"): the Browser page asks what is on the open tab's screen (look: the shared
+// LOOK_SCRIPT, b-refs) and presses, types, keys and scrolls there for the Assistant (act), with what is his alone refused here too (approvals,
+// sends, payments, deletes, installs, sign-ups, password fields; links to public sites). Order o34a3: the agents and the Assistant open tailnet
+// addresses only; a public site opens only when he types it himself.
+// Order o15b2 ("slow and the rendering quality is bad"): up to BROWSER_FRAMES_IN_FLIGHT frames on their way at once, and a sharp WebP frame at the
+// screen's own density once the page is still.
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -18,7 +27,22 @@ import { rm } from 'node:fs/promises'
 import net from 'node:net'
 import path from 'node:path'
 import { apiError, type WsSocket } from '../api.ts'
-import { BROWSER_IDLE, browserMayShow, browserUrl, parseBrowserIn, type BrowserIn, type BrowserOut, type BrowserState } from '../../shared/browser.ts'
+import {
+  AGENT_PUBLIC_REFUSED,
+  agentMayOpen,
+  BROWSER_FRAMES_IN_FLIGHT,
+  BROWSER_IDLE,
+  BROWSER_MAX_TABS,
+  BROWSER_SHARP_AFTER_MS,
+  browserMayShow,
+  browserUrl,
+  parseBrowserIn,
+  type BrowserIn,
+  type BrowserOut,
+  type BrowserState,
+  type BrowserTab,
+} from '../../shared/browser.ts'
+import { keyRefusal, lookCall, pointRefusal, refuseWords, typeable, type LookItem, type LookPoint, type LookResult } from '../../shared/browser-look.ts'
 
 export interface BrowserEngine {
   name: string
@@ -38,6 +62,8 @@ export interface BrowserHostOptions {
   ports?: { from: number; to: number }
   log?: (line: string) => void
   now?: () => number
+  /** Order o34a3: which addresses an agent and the Assistant may open (default: tailnet ones only, shared/browser.ts agentMayOpen). Tests widen it. */
+  agentMay?: (url: string) => boolean
 }
 
 export interface BrowserRead {
@@ -48,14 +74,41 @@ export interface BrowserRead {
   cut: boolean
 }
 
+/** Order o9d97: the open tab's screen for the Assistant (which tab, of how many, and what is on it). */
+export interface BrowserLook {
+  tab: string
+  index: number
+  count: number
+  look: LookResult
+}
+
+/** Order o9d97: what the Assistant does in the open tab (the Browser page asks on its behalf). */
+export type BrowserAct =
+  | { do: 'click'; ref: string }
+  | { do: 'type'; ref: string; text: string; clear?: boolean; submit?: boolean }
+  | { do: 'key'; key: string; ref?: string }
+  | { do: 'scroll'; direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; ref?: string }
+  | { do: 'go'; url: string; newTab?: boolean }
+
+export interface BrowserActDone {
+  /** What was done, in words. */
+  said: string
+  /** Where it pressed, in the page's CSS px (the view puts its marker there). */
+  at?: { x: number; y: number; w: number; h: number }
+}
+
 export interface BrowserHost {
   state(): BrowserState
   /** Starts it if it is not running (and opens `url`, when given). */
   start(url?: string): Promise<BrowserState>
-  /** Opens `url` (started first if need be) and waits for it to load (at most `waitMs`), then reads it. */
+  /** An agent opens `url` (tailnet addresses only: order o34a3), started first if need be, waits for it to load (at most `waitMs`), then reads it. */
   open(url: string, o?: { waitMs?: number; max?: number }): Promise<BrowserRead>
   /** The page as it is now: its address, title and visible text (at most `max` characters). Null when no browser runs. */
   read(max?: number): Promise<BrowserRead | null>
+  /** Order o9d97: the open tab's screen for the Assistant (null: no browser runs). */
+  look(o?: { all?: boolean; tab?: string }): Promise<BrowserLook | null>
+  /** Order o9d97: the Assistant's press, typing, key, scroll or address in the open tab (what is his alone is refused, 403). */
+  act(a: BrowserAct, tab?: string): Promise<BrowserActDone>
   stop(): Promise<void>
   /** A viewer's socket (the Browser page). */
   attach(socket: WsSocket): void
@@ -157,12 +210,27 @@ class Cdp {
   }
 }
 
+/** A picture of the page: base64, its size in the page's CSS px, and its kind (order o15b2: quick JPEG frames, a sharp WebP one when still). */
+interface Frame {
+  data: string
+  w: number
+  h: number
+  fmt: 'jpeg' | 'webp'
+}
+
 interface Viewer {
   socket: WsSocket
-  /** It drew the last frame it was sent (the next one may go). */
-  ready: boolean
+  /** Frames sent to it (numbered from 1), and the newest it said it drew: up to BROWSER_FRAMES_IN_FLIGHT may be on their way at once. */
+  sent: number
+  drawn: number
   /** The newest frame it has not been sent yet. */
-  pending: { data: string; w: number; h: number } | null
+  pending: Frame | null
+}
+
+/** Order o02a5: one tab (a page target in the private context, attached by its own session). */
+interface Tab extends BrowserTab {
+  target: string
+  session: string
 }
 
 const PREFERENCES = {
@@ -204,28 +272,72 @@ const PROFILE_PREFIX = 'profile'
 const profileName = () => `${PROFILE_PREFIX}-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
 const isProfile = (name: string) => name === PROFILE_PREFIX || name.startsWith(`${PROFILE_PREFIX}-`)
 
+/** The keys the Assistant may press in a tab, as the Input domain wants them (key, code, Windows key code). */
+const KEYS: Record<string, { code: string; keyCode: number; text?: string }> = {
+  Enter: { code: 'Enter', keyCode: 13, text: '\r' },
+  Tab: { code: 'Tab', keyCode: 9 },
+  Escape: { code: 'Escape', keyCode: 27 },
+  Backspace: { code: 'Backspace', keyCode: 8 },
+  Delete: { code: 'Delete', keyCode: 46 },
+  ArrowUp: { code: 'ArrowUp', keyCode: 38 },
+  ArrowDown: { code: 'ArrowDown', keyCode: 40 },
+  ArrowLeft: { code: 'ArrowLeft', keyCode: 37 },
+  ArrowRight: { code: 'ArrowRight', keyCode: 39 },
+  PageUp: { code: 'PageUp', keyCode: 33 },
+  PageDown: { code: 'PageDown', keyCode: 34 },
+  Home: { code: 'Home', keyCode: 36 },
+  End: { code: 'End', keyCode: 35 },
+  ' ': { code: 'Space', keyCode: 32, text: ' ' },
+}
+
 export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
   const now = o.now ?? Date.now
   const idleMs = o.idleMs ?? 10 * 60_000
   const graceMs = o.graceMs ?? 60_000
   const ports = o.ports ?? { from: 52100, to: 52999 }
   const log = o.log ?? (() => undefined)
+  const agentMay = o.agentMay ?? agentMayOpen
   let state: BrowserState = { ...BROWSER_IDLE }
   let proc: ChildProcess | null = null
   let cdp: Cdp | null = null
+  /** The private context every tab lives in (gone with the connection: disposeOnDetach). */
+  let ctx: string | null = null
+  const tabs: Tab[] = []
+  /** The open tab (the one the view shows), and its session (null: none). */
+  let current: Tab | null = null
   let page: string | null = null
-  let pageTarget: string | null = null
+  /** Targets this host made itself (a new tab): never taken for a popup; and how many it is making now (their ids not known yet). */
+  const ours = new Set<string>()
+  let making = 0
   let starting: Promise<void> | null = null
   let stopping: Promise<void> | null = null
   /** This session's profile folder (wiped when it stops), and the wipe under way. */
   let profile: string | null = null
   let wiping: Promise<void> = Promise.resolve()
-  let lastFrame: { data: string; w: number; h: number } | null = null
+  let lastFrame: Frame | null = null
   let size = { w: 1280, h: 800, dpr: 1, mobile: false }
+  // Order o15b2: the sharp frame once the page is still (a timer re-armed by each quick frame), and what keeps it from chasing itself.
+  let sharpTimer: ReturnType<typeof setTimeout> | null = null
+  let sharpSeq = 0
+  let sharpSentAt = 0
+  let lastQuick = ''
   let lastUse = now()
   let viewerLeft: number | null = null
   const viewers = new Set<Viewer>()
-  const popups = new Set<string>()
+  // Order o7e1e (14 Nov): what an agent has under way (an open with the launch it may need, a read, a look, an act) is never closed by the
+  // idle check. A launch can take longer than the grace time on a busy PC, and the check used to close the new browser under the open
+  // ("The browser went away"): the last viewer long gone and no use since counted, while the open itself had not marked any use yet.
+  let using = 0
+  const underWay = async <T>(f: () => Promise<T>): Promise<T> => {
+    using++
+    lastUse = now()
+    try {
+      return await f()
+    } finally {
+      using--
+      lastUse = now()
+    }
+  }
 
   const send = (v: Viewer, m: BrowserOut) => {
     try {
@@ -241,13 +353,64 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     state = { ...state, ...s }
     broadcast({ t: 'state', state })
   }
+  /** The tabs as the page sees them, and the open one's fields at the top (what an older page reads). */
+  const publish = (extra: Partial<BrowserState> = {}) => {
+    const c = current
+    setState({
+      tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, loading: t.loading, canBack: t.canBack, canForward: t.canForward })),
+      active: c?.id ?? null,
+      url: c?.url ?? '',
+      title: c?.title ?? '',
+      loading: c?.loading ?? false,
+      canBack: c?.canBack ?? false,
+      canForward: c?.canForward ?? false,
+      ...extra,
+    })
+  }
   const notice = (text: string) => broadcast({ t: 'notice', text })
   const sendFrame = (v: Viewer) => {
-    if (!v.ready || !v.pending) return
+    if (!v.pending || v.sent - v.drawn >= BROWSER_FRAMES_IN_FLIGHT) return
     const f = v.pending
     v.pending = null
-    v.ready = false
-    send(v, { t: 'frame', ...f })
+    v.sent += 1
+    send(v, { t: 'frame', ...f, n: v.sent })
+  }
+  /** A new picture for every viewer (each gets the newest one as soon as it has room for it). */
+  const deliver = (f: Frame) => {
+    lastFrame = f
+    for (const v of viewers) {
+      v.pending = f
+      sendFrame(v)
+    }
+  }
+  const stopSharp = () => {
+    if (sharpTimer) clearTimeout(sharpTimer)
+    sharpTimer = null
+    sharpSeq++
+  }
+  /**
+   * Order o15b2: once the page has been still a moment, one sharp picture of it: WebP at the screen's own density (up to 3x), where the quick frames
+   * of a scroll are JPEG at most 2x. Out of date (a newer frame came meanwhile, another tab was opened): dropped.
+   */
+  const armSharp = (afterMs: number) => {
+    stopSharp()
+    const seq = sharpSeq
+    const timer = setTimeout(() => {
+      sharpTimer = null
+      const c = cdp
+      const p = page
+      if (!c || !p || viewers.size === 0 || seq !== sharpSeq) return
+      void c
+        .send<{ data?: string }>('Page.captureScreenshot', { format: 'webp', quality: 82 }, p, 5000)
+        .then(r => {
+          if (seq !== sharpSeq || cdp !== c || page !== p || !r.data) return
+          sharpSentAt = now()
+          deliver({ data: r.data, w: size.w, h: size.h, fmt: 'webp' })
+        })
+        .catch(() => undefined)
+    }, afterMs)
+    timer.unref?.()
+    sharpTimer = timer
   }
 
   function engine(): BrowserEngine | null {
@@ -255,11 +418,19 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     return null
   }
 
-  async function history() {
-    if (!cdp || !page) return
+  const tabOf = (session?: string) => (session ? tabs.find(t => t.session === session) : undefined)
+  const tabId = () => randomBytes(4).toString('hex')
+
+  async function history(t: Tab) {
+    if (!cdp) return
     try {
-      const h = await cdp.send<{ currentIndex: number; entries: { url: string; title: string }[] }>('Page.getNavigationHistory', {}, page)
-      setState({ canBack: h.currentIndex > 0, canForward: h.currentIndex < h.entries.length - 1 })
+      const h = await cdp.send<{ currentIndex: number; entries: { url: string; title: string }[] }>('Page.getNavigationHistory', {}, t.session)
+      t.canBack = h.currentIndex > 0
+      t.canForward = h.currentIndex < h.entries.length - 1
+      // The page's own title (the target's info gives only its address until it changes again).
+      const title = h.entries[h.currentIndex]?.title
+      if (title) t.title = title
+      publish()
     } catch {
       // the page is changing
     }
@@ -267,60 +438,166 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
 
   async function screencast() {
     if (!cdp || !page) return
-    const sf = Math.min(2, Math.max(1, size.dpr))
-    await cdp.send('Emulation.setDeviceMetricsOverride', { width: size.w, height: size.h, deviceScaleFactor: sf, mobile: size.mobile }, page)
+    // Order o15b2: the page is drawn at the screen's own density (up to 3x: a phone's text was blurred 1.5x at the old 2x cap) for the sharp frame;
+    // the quick frames of a scroll stay at most 2x.
+    const dpr = Math.min(3, Math.max(1, size.dpr))
+    const quick = Math.min(2, dpr)
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: size.w, height: size.h, deviceScaleFactor: dpr, mobile: size.mobile }, page)
     await cdp.send('Page.stopScreencast', {}, page).catch(() => undefined)
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 62, maxWidth: Math.round(size.w * sf), maxHeight: Math.round(size.h * sf), everyNthFrame: 1 }, page)
+    lastQuick = ''
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 62, maxWidth: Math.round(size.w * quick), maxHeight: Math.round(size.h * quick), everyNthFrame: 1 }, page)
+  }
+
+  /** Order o02a5: the view shows tab `t` from now on (its picture, his input, the Assistant's look and act). */
+  async function select(t: Tab) {
+    const c = cdp
+    if (!c) return
+    if (current === t && page === t.session) return
+    const old = current
+    current = t
+    page = t.session
+    stopSharp()
+    lastQuick = ''
+    if (old && old !== t) await c.send('Page.stopScreencast', {}, old.session).catch(() => undefined)
+    // In front: a tab behind another is not painted (its picture would stop at its last frame).
+    await c.send('Page.bringToFront', {}, t.session).catch(() => undefined)
+    publish()
+    await screencast().catch(() => undefined)
+    void history(t)
+  }
+
+  /** A page target of the private context, attached and listened to, as a tab at the end (the view moves to it when `show`). */
+  async function adopt(target: string, show: boolean, url = ''): Promise<Tab> {
+    const c = cdp
+    if (!c) throw apiError(409, 'The browser is not running.')
+    const session = (await c.send<{ sessionId: string }>('Target.attachToTarget', { targetId: target, flatten: true })).sessionId
+    const t: Tab = { id: tabId(), target, session, url, title: '', loading: false, canBack: false, canForward: false }
+    tabs.push(t)
+    await c.send('Page.enable', {}, session)
+    if (show || !current) await select(t)
+    else publish()
+    return t
+  }
+
+  /** A new tab (opening `url`), shown. */
+  async function newTab(url?: string): Promise<Tab> {
+    await ensure()
+    const c = cdp
+    if (!c || !ctx) throw apiError(409, 'The browser is not running.')
+    if (tabs.length >= BROWSER_MAX_TABS) throw apiError(409, `At most ${BROWSER_MAX_TABS} tabs: close one first.`)
+    making++
+    let target: string
+    try {
+      // Made at its address (a blank first page would be one more step back in its history).
+      target = (await c.send<{ targetId: string }>('Target.createTarget', { url: url ?? 'about:blank', browserContextId: ctx })).targetId
+    } finally {
+      making--
+    }
+    ours.add(target)
+    const t = await adopt(target, true, url ?? '')
+    if (url) {
+      lastUse = now()
+      t.loading = true
+      publish()
+    }
+    return t
+  }
+
+  /** Tab `t` goes (its page closed); the one beside it is shown; the last one closes the browser (and wipes it). */
+  async function closeTab(t: Tab) {
+    const c = cdp
+    forget(t)
+    if (c) await c.send('Target.closeTarget', { targetId: t.target }).catch(() => undefined)
+  }
+
+  /** A tab that is gone (closed here, or by its own page): out of the list; the view moves on, or the browser stops with the last one. */
+  function forget(t: Tab) {
+    const i = tabs.indexOf(t)
+    if (i < 0) return
+    tabs.splice(i, 1)
+    ours.delete(t.target)
+    if (tabs.length === 0) {
+      current = null
+      page = null
+      void stop()
+      return
+    }
+    if (current === t) {
+      current = null
+      page = null
+      void select(tabs[Math.min(i, tabs.length - 1)])
+    } else publish()
+  }
+
+  async function navigate(t: Tab, url: string) {
+    const c = cdp
+    if (!c) return
+    lastUse = now()
+    t.url = url
+    t.loading = true
+    publish()
+    await c.send('Page.navigate', { url }, t.session)
   }
 
   function onEvent(method: string, params: Record<string, unknown>, sessionId?: string) {
     const c = cdp
     if (!c) return
-    if (method === 'Page.screencastFrame' && sessionId === page) {
-      void c.send('Page.screencastFrameAck', { sessionId: params.sessionId }, page).catch(() => undefined)
+    if (method === 'Page.screencastFrame') {
+      void c.send('Page.screencastFrameAck', { sessionId: params.sessionId }, sessionId).catch(() => undefined)
+      if (sessionId !== page) return
       const meta = (params.metadata ?? {}) as { deviceWidth?: number; deviceHeight?: number }
-      lastFrame = { data: String(params.data ?? ''), w: Math.round(meta.deviceWidth ?? size.w), h: Math.round(meta.deviceHeight ?? size.h) }
-      for (const v of viewers) {
-        v.pending = lastFrame
-        sendFrame(v)
-      }
+      const data = String(params.data ?? '')
+      // The same picture again (nothing changed on the page): the sharp one already showing stays.
+      if (data === lastQuick) return
+      lastQuick = data
+      deliver({ data, w: Math.round(meta.deviceWidth ?? size.w), h: Math.round(meta.deviceHeight ?? size.h), fmt: 'jpeg' })
+      // A sharp picture once it is still; a frame right behind a sharp one waits longer (so pictures can never chase each other).
+      armSharp(now() - sharpSentAt > 250 ? BROWSER_SHARP_AFTER_MS : 4 * BROWSER_SHARP_AFTER_MS)
       return
     }
-    if (method === 'Page.frameNavigated' && sessionId === page) {
+    const t = tabOf(sessionId)
+    if (method === 'Page.frameNavigated' && t) {
       const frame = (params.frame ?? {}) as { parentId?: string; url?: string; urlFragment?: string }
       if (frame.parentId) return
       const url = `${frame.url ?? ''}${frame.urlFragment ?? ''}`
       // The browser's own "can't reach this page" (its address stays the one he asked for).
       if (url.startsWith('chrome-error://')) {
-        setState({ loading: false })
-        notice(`${state.url || 'That address'} could not be reached from the Server.`)
+        t.loading = false
+        publish()
+        notice(`${t.url || 'That address'} could not be reached from the Server.`)
         return
       }
       if (!browserMayShow(url)) {
         // Never another kind of page (file:, chrome:, a data: page): back to a blank one.
-        void c.send('Page.navigate', { url: 'about:blank' }, page).catch(() => undefined)
+        void c.send('Page.navigate', { url: 'about:blank' }, t.session).catch(() => undefined)
         notice('That kind of page is not opened here: only http and https addresses.')
         return
       }
-      setState({ url: url === 'about:blank' ? '' : url })
-      void history()
+      t.url = url === 'about:blank' ? '' : url
+      publish()
+      void history(t)
       return
     }
-    if (method === 'Page.navigatedWithinDocument' && sessionId === page) {
-      setState({ url: String(params.url ?? state.url) })
-      void history()
+    if (method === 'Page.navigatedWithinDocument' && t) {
+      t.url = String(params.url ?? t.url)
+      publish()
+      void history(t)
       return
     }
-    if (method === 'Page.frameStartedLoading' && sessionId === page) return setState({ loading: true })
-    if ((method === 'Page.frameStoppedLoading' || method === 'Page.loadEventFired') && sessionId === page) {
-      setState({ loading: false })
-      void history()
+    if (method === 'Page.frameStartedLoading' && t) {
+      t.loading = true
+      return publish()
+    }
+    if ((method === 'Page.frameStoppedLoading' || method === 'Page.loadEventFired') && t) {
+      t.loading = false
+      publish()
+      void history(t)
       return
     }
-    if (method === 'Page.javascriptDialogOpening' && sessionId === page) {
+    if (method === 'Page.javascriptDialogOpening' && t) {
       // Cancel, always (Leave, for a "leave this page?"): a dialog never confirms anything here. The viewer is told what it said.
       const type = String(params.type ?? '')
-      void c.send('Page.handleJavaScriptDialog', { accept: type === 'beforeunload' }, page).catch(() => undefined)
+      void c.send('Page.handleJavaScriptDialog', { accept: type === 'beforeunload' }, t.session).catch(() => undefined)
       if (type !== 'beforeunload') notice(`The page asked: "${String(params.message ?? '').slice(0, 200)}". Answered Cancel (nothing was confirmed).`)
       return
     }
@@ -329,29 +606,37 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
       return
     }
     if (method === 'Target.targetInfoChanged') {
-      const info = (params.targetInfo ?? {}) as { targetId?: string; type?: string; title?: string; url?: string }
-      if (info.targetId === pageTarget) {
-        if (typeof info.title === 'string') setState({ title: info.title })
-        return
-      }
-      // A popup: its address opens in the one view, and the popup goes.
-      if (info.targetId && popups.has(info.targetId) && info.url && info.url !== 'about:blank') {
-        popups.delete(info.targetId)
-        void c.send('Target.closeTarget', { targetId: info.targetId }).catch(() => undefined)
-        if (browserMayShow(info.url) && page) void c.send('Page.navigate', { url: info.url }, page).catch(() => undefined)
+      const info = (params.targetInfo ?? {}) as { targetId?: string; title?: string }
+      const tab = tabs.find(x => x.target === info.targetId)
+      if (tab && typeof info.title === 'string' && info.title !== tab.title) {
+        tab.title = info.title
+        publish()
       }
       return
     }
     if (method === 'Target.targetCreated') {
-      const info = (params.targetInfo ?? {}) as { targetId?: string; type?: string }
-      if (info.type === 'page' && info.targetId && pageTarget && info.targetId !== pageTarget) {
-        popups.add(info.targetId)
-        const id = info.targetId
-        // One that stays blank (a page writing into it) goes after a moment.
-        setTimeout(() => {
-          if (popups.delete(id)) void c.send('Target.closeTarget', { targetId: id }).catch(() => undefined)
-        }, 3000)
-      }
+      // Order o02a5: a page of the private context that this host did not make is a popup (a link to a new window): a tab of its own, shown.
+      // A popup names the tab that opened it; one with no opener while this host is making a tab is that tab (its answer comes after this event).
+      const info = (params.targetInfo ?? {}) as { targetId?: string; type?: string; browserContextId?: string; url?: string; openerId?: string }
+      const id = info.targetId
+      if (info.type !== 'page' || !id || info.browserContextId !== ctx || ours.has(id) || tabs.some(x => x.target === id)) return
+      if (!info.openerId && making > 0) return
+      // A moment later: a tab this host is making itself is known by then (its answer comes after this event).
+      setTimeout(() => {
+        if (ours.has(id) || tabs.some(x => x.target === id) || cdp !== c) return
+        if (tabs.length >= BROWSER_MAX_TABS) {
+          void c.send('Target.closeTarget', { targetId: id }).catch(() => undefined)
+          notice(`A page tried to open a new tab, but there are ${BROWSER_MAX_TABS} already: close one first.`)
+          return
+        }
+        ours.add(id)
+        void adopt(id, true, info.url && info.url !== 'about:blank' ? info.url : '').catch(() => undefined)
+      }, 50)
+      return
+    }
+    if (method === 'Target.targetDestroyed' || method === 'Target.detachedFromTarget') {
+      const gone = method === 'Target.targetDestroyed' ? tabs.find(x => x.target === params.targetId) : tabOf(String(params.sessionId ?? ''))
+      if (gone) forget(gone)
     }
   }
 
@@ -369,7 +654,7 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     profile = dir
     const port = await freePort(ports.from, ports.to)
     if (!port) throw apiError(503, 'No free port for the browser on the Server.')
-    setState({ ...BROWSER_IDLE, starting: true, engine: e.name })
+    setState({ ...BROWSER_IDLE, starting: true, engine: e.name, tabs: [], active: null })
     const args = [
       '--headless=new',
       `--remote-debugging-port=${port}`,
@@ -392,10 +677,8 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
       proc = null
       cdp?.close()
       cdp = null
-      page = null
-      pageTarget = null
-      lastFrame = null
-      setState({ ...BROWSER_IDLE, engine: e.name })
+      dropTabs()
+      setState({ ...BROWSER_IDLE, engine: e.name, tabs: [], active: null })
       void wipe()
     })
     log(`browser: ${e.name} started (pid ${child.pid}) on 127.0.0.1:${port}`)
@@ -421,26 +704,24 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
       const c = new Cdp(ws)
       cdp = c
       c.on(onEvent)
-      // Order o7e1e: the view's tab lives in a private context of its own: its cookies, storage and cache are in memory only, and gone when it
-      // closes (or the moment this connection drops, the app stopping without a word). The tab the browser started with is closed.
+      // Order o7e1e: the tabs live in a private context of their own: their cookies, storage and cache are in memory only, and gone when it closes
+      // (or the moment this connection drops, the app stopping without a word). The tab the browser started with is closed.
       const first = (await c.send<{ targetInfos: { targetId: string; type: string }[] }>('Target.getTargets')).targetInfos.filter(t => t.type === 'page')
-      const ctx = (await c.send<{ browserContextId: string }>('Target.createBrowserContext', { disposeOnDetach: true })).browserContextId
+      ctx = (await c.send<{ browserContextId: string }>('Target.createBrowserContext', { disposeOnDetach: true })).browserContextId
       const target = (await c.send<{ targetId: string }>('Target.createTarget', { url: 'about:blank', browserContextId: ctx })).targetId
-      pageTarget = target
-      page = (await c.send<{ sessionId: string }>('Target.attachToTarget', { targetId: target, flatten: true })).sessionId
+      ours.add(target)
       for (const t of first) await c.send('Target.closeTarget', { targetId: t.targetId }).catch(() => undefined)
-      // Only now: a tab that shows up from here on is a popup (the view's own tab, known already, is never one).
+      // Only now: a page of the private context that shows up from here on, not made here, is a popup (order o02a5: a new tab).
       await c.send('Target.setDiscoverTargets', { discover: true })
-      await c.send('Page.enable', {}, page)
       // Downloads refused in both contexts (each has its own setting); not running at all rather than running with them allowed.
       await c.send('Browser.setDownloadBehavior', { behavior: 'deny', browserContextId: ctx, eventsEnabled: true })
       await c.send('Browser.setDownloadBehavior', { behavior: 'deny', eventsEnabled: true }).catch(() => undefined)
-      await screencast()
+      await adopt(target, true)
       setState({ running: true, starting: false, error: null })
     } catch (err) {
       await stopProcess()
       await wipe()
-      setState({ ...BROWSER_IDLE, engine: e.name })
+      setState({ ...BROWSER_IDLE, engine: e.name, tabs: [], active: null })
       throw err
     }
   }
@@ -448,20 +729,20 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
   async function ensure(): Promise<void> {
     // Opened while it was being closed: a new one, after.
     if (stopping) await stopping
-    if (cdp && page && proc) return
+    if (cdp && proc && tabs.length > 0) return
     starting ??= launch().finally(() => {
       starting = null
     })
     await starting
   }
 
+  /** Opens what he typed (any http(s) address, or words to search for) in the open tab (a new one if none). */
   async function go(input: string): Promise<void> {
     const url = browserUrl(input)
     if (!url) throw apiError(400, 'Only http and https addresses are opened here (or words to search for).')
     await ensure()
-    lastUse = now()
-    setState({ url, loading: true })
-    await cdp!.send('Page.navigate', { url }, page!)
+    const t = current ?? (await newTab())
+    await navigate(t, url)
   }
 
   async function stopProcess(): Promise<void> {
@@ -482,9 +763,19 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     }
     proc = null
     cdp = null
+    dropTabs()
+  }
+
+  /** Every tab forgotten (the browser is gone). */
+  function dropTabs() {
+    tabs.length = 0
+    ours.clear()
+    current = null
     page = null
-    pageTarget = null
+    ctx = null
     lastFrame = null
+    lastQuick = ''
+    stopSharp()
   }
 
   /**
@@ -534,7 +825,7 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
       await stopProcess()
       await wipe()
       log('browser: stopped')
-      setState({ ...BROWSER_IDLE, engine: state.engine })
+      setState({ ...BROWSER_IDLE, engine: state.engine, tabs: [], active: null })
     })().finally(() => {
       stopping = null
     })
@@ -556,12 +847,106 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     return { url: String(v.url ?? state.url), title: String(v.title ?? state.title), text: text.slice(0, cap), cut: text.length > cap }
   }
 
+  /** The tab the Assistant acts on: the one asked for (it must be the open one), or the open one. */
+  function actTab(id?: string): Tab {
+    if (!cdp || !current) throw apiError(409, 'No browser runs on the Server: open an address on the Browser page first.')
+    if (id && id !== current.id) throw apiError(409, 'That tab is not the open one any more: read the screen again (ui_screen).')
+    return current
+  }
+
+  /** LOOK_SCRIPT in tab `t`, with its answer. */
+  async function inTab<T>(t: Tab, args: Record<string, unknown>): Promise<T> {
+    const r = await cdp!.send<{ result?: { value?: unknown }; exceptionDetails?: { text?: string } }>('Runtime.evaluate', { expression: lookCall(args), returnByValue: true }, t.session, 10_000)
+    if (r.exceptionDetails) throw apiError(502, `The page did not answer (${String(r.exceptionDetails.text ?? 'an error').slice(0, 120)}).`)
+    return r.result?.value as T
+  }
+
+  async function look(lo: { all?: boolean; tab?: string } = {}): Promise<BrowserLook | null> {
+    if (!cdp || !current) return null
+    const t = actTab(lo.tab)
+    lastUse = now()
+    const result = await inTab<LookResult>(t, { op: 'look', all: lo.all === true, cap: lo.all ? 250 : 70, textCap: 1400 })
+    return { tab: t.id, index: tabs.indexOf(t), count: tabs.length, look: result }
+  }
+
+  /** Where `ref` is now (scrolled into view), refused when it is gone, covered, or his alone. */
+  async function aim(t: Tab, ref: string, what: 'press' | 'type'): Promise<LookPoint & { item: LookItem }> {
+    const p = await inTab<LookPoint>(t, { op: 'point', ref })
+    const no = pointRefusal(p, ref, what)
+    if (no) throw apiError(no.status, no.message)
+    return { ...p, item: p.item! }
+  }
+
+  async function key(t: Tab, k: string) {
+    const spec = KEYS[k]
+    if (!spec) throw apiError(400, `The ${k} key is not one the Assistant presses in the Browser.`)
+    const c = cdp!
+    await c.send('Input.dispatchKeyEvent', { type: spec.text ? 'keyDown' : 'rawKeyDown', key: k, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode, ...(spec.text ? { text: spec.text, unmodifiedText: spec.text } : {}) }, t.session)
+    await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode }, t.session)
+  }
+
+  async function act(a: BrowserAct, id?: string): Promise<BrowserActDone> {
+    if (a.do === 'go') {
+      // Order o34a3: the Assistant opens tailnet addresses only.
+      const url = browserUrl(a.url)
+      if (!url || !agentMay(url)) throw apiError(403, AGENT_PUBLIC_REFUSED)
+      await ensure()
+      if (a.newTab) {
+        await newTab(url)
+        return { said: `Opening ${url} in a new tab (PC tab ${tabs.length}).` }
+      }
+      const t = id ? actTab(id) : (current ?? (await newTab()))
+      await navigate(t, url)
+      return { said: `Opening ${url} in the tab.` }
+    }
+    const t = actTab(id)
+    lastUse = now()
+    const c = cdp!
+    if (a.do === 'click') {
+      const p = await aim(t, a.ref, 'press')
+      await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'none', buttons: 0 }, t.session)
+      await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: 1 }, t.session)
+      await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: 0, clickCount: 1 }, t.session)
+      return { said: `Pressed ${a.ref}.`, at: { x: p.x, y: p.y, w: size.w, h: size.h } }
+    }
+    if (a.do === 'type') {
+      const p = await aim(t, a.ref, 'type')
+      if (a.submit && !p.item.search) throw apiError(403, refuseWords(a.ref, 'Enter there would send its form (only a search field takes Enter from you); type without submit and tell him to send it'))
+      if (p.item.role === 'select') {
+        const r = await inTab<{ ok: boolean; options?: string[] }>(t, { op: 'choose', ref: a.ref, text: a.text })
+        if (!r?.ok) throw apiError(409, `${a.ref} has no option "${a.text}"${r?.options ? `: it has ${r.options.join(', ')}` : ''}.`)
+        return { said: `Chose "${a.text}" in ${a.ref}.`, at: { x: p.x, y: p.y, w: size.w, h: size.h } }
+      }
+      if (!typeable(p.item)) throw apiError(409, `${a.ref} is not a place to type: it is a ${p.item.role}.`)
+      await inTab(t, { op: 'focus', ref: a.ref, clear: a.clear !== false })
+      if (a.text) await c.send('Input.insertText', { text: a.text.slice(0, 4000) }, t.session)
+      if (a.submit) await key(t, 'Enter')
+      return { said: `Typed into ${a.ref}${a.submit ? ' and pressed Enter' : ''}.`, at: { x: p.x, y: p.y, w: size.w, h: size.h } }
+    }
+    if (a.do === 'key') {
+      // With a ref: that element first (focused, never a password or code field).
+      if (a.ref) {
+        await aim(t, a.ref, 'type')
+        await inTab(t, { op: 'focus', ref: a.ref, clear: false })
+      }
+      const focused = await inTab<LookItem | null>(t, { op: 'focused' })
+      const no = keyRefusal(a.key, focused)
+      if (no) throw apiError(403, refuseWords('That key', no))
+      await key(t, a.key === 'Space' ? ' ' : a.key)
+      return { said: `Pressed the ${a.key} key in the tab.` }
+    }
+    const r = await inTab<{ top?: number; max?: number; gone?: boolean }>(t, { op: 'scroll', direction: a.direction, amount: a.amount, ref: a.ref })
+    if (r?.gone) throw apiError(409, `${a.ref} is not on the page any more: read the screen again (ui_screen).`)
+    return { said: `Scrolled ${a.direction}: now at ${r?.top ?? 0} of ${r?.max ?? 0}px.` }
+  }
+
   async function handle(m: BrowserIn, v: Viewer) {
     // Anything a page says means it is open and in sight (a hidden page sends nothing, not even 'drawn').
     lastUse = now()
     if (m.t === 'here') return
     if (m.t === 'drawn') {
-      v.ready = true
+      // Order o15b2: it drew frame n and those before it (an older page says no n: everything sent so far).
+      v.drawn = m.n === undefined ? v.sent : Math.max(v.drawn, Math.min(v.sent, m.n))
       sendFrame(v)
       return
     }
@@ -571,6 +956,21 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
     if (m.t === 'size') {
       size = { w: m.w, h: m.h, dpr: m.dpr, mobile: m.mobile }
       return screencast()
+    }
+    if (m.t === 'tab') {
+      // Order o02a5: his tabs (a new one may start the browser; the others need it running).
+      if (m.do === 'new') {
+        // Not running yet: starting it makes its first tab.
+        if (!cdp) return m.url ? go(m.url) : ensure()
+        const url = m.url ? browserUrl(m.url) : null
+        if (m.url && !url) throw apiError(400, 'Only http and https addresses are opened here (or words to search for).')
+        await newTab(url ?? undefined)
+        return
+      }
+      const t = tabs.find(x => x.id === m.id)
+      if (!t) return
+      if (m.do === 'select') return select(t)
+      return closeTab(t)
     }
     const c = cdp
     const p = page
@@ -600,7 +1000,8 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
   // Stops it when nobody uses it: the last viewer gone a minute (and no agent since), or ten minutes with no one at all. A page still connected
   // but out of sight that long counts as no one (hidden, a phone locked, a tab frozen or kept in the back/forward cache with its socket open).
   const idle = setInterval(() => {
-    if (!proc || stopping) return
+    // Not while it is still starting, or while an agent's call is under way (order o7e1e, 14 Nov).
+    if (!proc || stopping || starting || using > 0) return
     const t = now()
     if (viewers.size > 0) {
       if (t - lastUse > idleMs) {
@@ -624,16 +1025,24 @@ export function createBrowserHost(o: BrowserHostOptions): BrowserHost {
       return state
     },
     async open(url, opt = {}) {
-      await go(url)
-      const until = now() + (opt.waitMs ?? 15_000)
-      await sleep(300)
-      while (now() < until && state.loading) await sleep(200)
-      return (await read(opt.max)) ?? { url: state.url, title: state.title, text: '', cut: false }
+      // Order o34a3: an agent opens tailnet addresses only (a public site opens only when he types it himself).
+      const target = browserUrl(url)
+      if (!target) throw apiError(400, 'Only http and https addresses are opened here (an address on his tailnet).')
+      if (!agentMay(target)) throw apiError(403, AGENT_PUBLIC_REFUSED)
+      return underWay(async () => {
+        await go(target)
+        const until = now() + (opt.waitMs ?? 15_000)
+        await sleep(300)
+        while (now() < until && state.loading) await sleep(200)
+        return (await read(opt.max)) ?? { url: state.url, title: state.title, text: '', cut: false }
+      })
     },
-    read,
+    read: max => underWay(() => read(max)),
+    look: lo => underWay(() => look(lo)),
+    act: (a, tab) => underWay(() => act(a, tab)),
     stop,
     attach(socket) {
-      const v: Viewer = { socket, ready: true, pending: lastFrame }
+      const v: Viewer = { socket, sent: 0, drawn: 0, pending: lastFrame }
       viewers.add(v)
       viewerLeft = null
       lastUse = now()

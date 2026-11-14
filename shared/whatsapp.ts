@@ -5,6 +5,14 @@
 /** The WhatsApp part of the agent's API, under AGENT_API_PREFIX. */
 export const WA_PREFIX = '/whatsapp'
 
+/**
+ * Order o8416 (F-223): the WhatsApp page's own part of the agent's API, under AGENT_API_PREFIX. It proxies to the
+ * WhatsApp backend on this Server (agent/whatsapp-backend/), adding the backend's token on the server side: the page never sees it.
+ */
+export const WA_BACKEND_PREFIX = '/whatsapp-backend'
+/** The WhatsApp backend's port on 127.0.0.1: 50000 or higher, never the agent's own 21221. */
+export const WA_BACKEND_PORT = 50070
+
 /** How long WhatsApp stays open after its last use, unless it is set to stay on. */
 export const WA_IDLE_MS = 10 * 60_000
 

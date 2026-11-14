@@ -139,6 +139,15 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['POST', /^\/approvals\/answer$/, SIGNED],
   ['POST', /^\/approvals\/cancel$/, SIGNED],
   ['POST', /^\/send-as-me$/, SIGNED],
+  // F-221 (ob98a): live talk's cards and direct line: the owner's page (and Send also takes his signed-in CRM session, in the route itself).
+  ['GET', /^\/talk\/cards$/, OWNER],
+  ['POST', /^\/talk\/cards\/([^/]+)\/send$/, OWNER],
+  ['POST', /^\/talk\/cards\/([^/]+)\/drop$/, OWNER],
+  ['POST', /^\/talk\/ask$/, OWNER],
+  ['GET', /^\/talk\/ask\/([^/]+)$/, OWNER],
+  // F-221 (T4): his Let go on a direct line (the route also takes his signed-in CRM session), and the voice lock's reach.
+  ['POST', /^\/talk\/ask\/([^/]+)\/let-go$/, OWNER],
+  ['GET', /^\/talk\/caps$/, OWNER],
   ['GET', /^\/auto-update$/, OWNER],
   ['POST', /^\/auto-update$/, OWNER],
   ['GET', /^\/approvals\/devices$/, OWNER],
@@ -152,7 +161,8 @@ export const POLICY: readonly [string, RegExp, Rule][] = [
   ['GET', /^\/approvals\/log$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents$/, floor('manage')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/move$/, { kind: 'move', floor: 0, agent: 1 }],
-  ['POST', /^\/floors\/([^/]+)\/import$/, floor('manage')],
+  // F-235 (order o7c1c): a conversation from any of the PCs onto a floor: the owner of the app only (as listing them is).
+  ['POST', /^\/floors\/([^/]+)\/import$/, OWNER],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/chat$/, chat('owner')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/run-on$/, chat('owner')],
   ['POST', /^\/floors\/([^/]+)\/agents\/([^/]+)\/terminate$/, chat('owner')],

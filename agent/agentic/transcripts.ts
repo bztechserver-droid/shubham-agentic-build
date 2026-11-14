@@ -4,7 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import type { ChatMessage, ClaudeSession } from '../../shared/agentic.ts'
+import type { ChatMessage, ClaudeProjectFolder, ClaudeSession } from '../../shared/agentic.ts'
+import { hideSecrets } from '../../shared/secret-text.ts'
 
 // F-018: a chat's conversation as claude itself writes it: <config>/projects/<cwd, every
 // character but letters, digits and - made a ->/<sessionId>.jsonl. The agent's chats run on
@@ -185,19 +186,51 @@ function rows(text: string): Record<string, unknown>[] {
   return out
 }
 
-const oneLine = (s: string) => {
-  const t = s.replace(/\s+/g, ' ').trim()
-  return t.length > TITLE_MAX ? `${t.slice(0, TITLE_MAX - 1)}…` : t
+// F-235 (order o7c1c): every text shown about a conversation (its title, first and last messages) has what looks like a secret
+// hidden (shared/secret-text.ts), on the PC that holds it, before it is cut: a key is never sent half-shown.
+const PREVIEW_MAX = 300
+const HIDE_WITHIN = 4000
+
+/** One line, secrets hidden, at most `max` characters. */
+const oneLine = (s: string, max = TITLE_MAX) => {
+  const t = hideSecrets(s.replace(/\s+/g, ' ').trim().slice(0, HIDE_WITHIN))
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t
 }
 
-/** What the person typed first: the conversation's name when claude never titled it. */
-function firstPrompt(head: Record<string, unknown>[]): string | null {
-  for (const row of head) {
-    if (row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true || row.isVisibleInTranscriptOnly === true || !isObject(row.message)) continue
-    const c = row.message.content
-    const t = typeof c === 'string' ? c : Array.isArray(c) ? c.map(p => (isObject(p) && p.type === 'text' && typeof p.text === 'string' ? p.text : '')).join(' ') : ''
+const textParts = (c: unknown[]) => c.map(p => (isObject(p) && p.type === 'text' && typeof p.text === 'string' ? p.text : '')).join(' ')
+
+/**
+ * The words of a message, the person's or claude's: a typed prompt (not claude's own wrapping, a slash command, a reminder or a
+ * cut-in notice) or claude's text. Never a tool's output (a user row of tool_result parts), a tool's input or claude's thinking.
+ */
+function wordsOf(row: Record<string, unknown>): string | null {
+  if (row.isMeta === true || row.isCompactSummary === true || row.isVisibleInTranscriptOnly === true || row.isSidechain === true || !isObject(row.message)) return null
+  const c = row.message.content
+  if (row.type === 'user') {
+    if (Array.isArray(c) && c.some(p => isObject(p) && p.type === 'tool_result')) return null
+    const t = typeof c === 'string' ? c : Array.isArray(c) ? textParts(c) : ''
     // Slash commands and reminders are claude's own wrapping, not the person's words.
-    if (t.trim() && !t.trimStart().startsWith('<')) return oneLine(t)
+    if (!t.trim() || t.trimStart().startsWith('<') || t.trimStart().startsWith('[Request interrupted')) return null
+    return t
+  }
+  if (row.type === 'assistant') {
+    const t = typeof c === 'string' ? c : Array.isArray(c) ? textParts(c) : ''
+    return t.trim() ? t : null
+  }
+  return null
+}
+
+/** What the person typed first (the raw words): the conversation's name when claude never titled it, and its first message. */
+function firstPrompt(head: Record<string, unknown>[]): string | null {
+  for (const row of head) if (row.type === 'user' && wordsOf(row)) return wordsOf(row)
+  return null
+}
+
+/** Its last message (the raw words): the newest the person typed or claude wrote. */
+function lastWords(rows: Record<string, unknown>[]): string | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const t = wordsOf(rows[i])
+    if (t) return t
   }
   return null
 }
@@ -256,8 +289,16 @@ export async function sessionFiles(projectsDir = claudeProjectsDir()): Promise<S
 }
 
 // F-022: a PC may have thousands of conversations; each is read (its first 128 KB and last
-// 256 KB) once for its folder and title, and kept until it is written to again.
-const described = new Map<string, { key: string; cwd: string | null; title: string | null }>()
+// 256 KB) once for its folder and title, and kept until it is written to again. F-235 keeps its
+// first and last messages and when it started from the same read.
+type Described = { key: string; cwd: string | null; title: string | null; first: string | null; last: string | null; startedAt: string | null }
+const described = new Map<string, Described>()
+
+/** The time of its first line that has one (claude writes an ISO time on its rows). */
+function startOf(head: Record<string, unknown>[]): string | null {
+  for (const row of head) if (typeof row.timestamp === 'string' && !Number.isNaN(Date.parse(row.timestamp))) return new Date(row.timestamp).toISOString()
+  return null
+}
 
 async function describe(projectsDir: string, f: SessionFile): Promise<Omit<ClaudeSession, 'agent'>> {
   const file = path.join(projectsDir, f.dir, `${f.sessionId}.jsonl`)
@@ -273,32 +314,78 @@ async function describe(projectsDir: string, f: SessionFile): Promise<Omit<Claud
       // Unreadable now: listed by its id alone.
     }
     const cwd = head.find(r => typeof r.cwd === 'string' && r.cwd)?.cwd as string | undefined
-    d = { key, cwd: cwd ?? null, title: titleOf([...head, ...tail]) ?? firstPrompt(head) }
+    const first = firstPrompt(head)
+    // The newest words, from its end (none when its last 256 KB are all tools' output: an older message is not its last).
+    const last = f.bytes > HEAD_BYTES ? lastWords(tail) : lastWords(head)
+    d = {
+      key,
+      cwd: cwd ?? null,
+      title: titleOf([...head, ...tail]) ?? (first ? oneLine(first) : null),
+      first: first ? oneLine(first, PREVIEW_MAX) : null,
+      last: last ? oneLine(last, PREVIEW_MAX) : null,
+      startedAt: startOf(head),
+    }
     described.set(file, d)
   }
-  return { sessionId: f.sessionId, cwd: d.cwd, title: d.title, bytes: f.bytes, updatedAt: new Date(f.mtime).toISOString() }
+  return {
+    sessionId: f.sessionId,
+    cwd: d.cwd,
+    title: d.title,
+    bytes: f.bytes,
+    updatedAt: new Date(f.mtime).toISOString(),
+    dir: f.dir,
+    first: d.first,
+    last: d.last,
+    startedAt: d.startedAt,
+  }
 }
+
+/** F-235: the project folders that hold conversations (each one's newest first), with the folder they were held in when one says. */
+async function foldersOf(projectsDir: string, files: SessionFile[]): Promise<ClaudeProjectFolder[]> {
+  const by = new Map<string, { newest: SessionFile; sessions: number; bytes: number }>()
+  // `files` are the newest first, so the first of a folder is its newest.
+  for (const f of files) {
+    const had = by.get(f.dir)
+    if (had) {
+      had.sessions++
+      had.bytes += f.bytes
+    } else by.set(f.dir, { newest: f, sessions: 1, bytes: f.bytes })
+  }
+  const out: ClaudeProjectFolder[] = []
+  for (const [dir, x] of by) {
+    out.push({ dir, cwd: (await describe(projectsDir, x.newest)).cwd, sessions: x.sessions, bytes: x.bytes, updatedAt: new Date(x.newest.mtime).toISOString() })
+  }
+  return out
+}
+
+/** What a search looks in: the title, first and last messages (secrets hidden already), the folder and the id. */
+const searchText = (s: Omit<ClaudeSession, 'agent'>, dir: string) => `${s.title ?? ''} ${s.first ?? ''} ${s.last ?? ''} ${s.cwd ?? ''} ${dir} ${s.sessionId}`.toLowerCase()
 
 /**
  * This account's Claude Code conversations, the most recently written first: a page of them
- * (`limit` from `offset`), and how many there are. `q` keeps those whose title, folder or id has
- * it (every one is read for that, once). The agent field is the caller's to fill.
+ * (`limit` from `offset`), and how many there are. `q` keeps those that have every word of it in
+ * their title, first or last message, folder or id (every one is read for that, once). F-235: `dir`
+ * keeps one project folder's; `folders` also lists the project folders (all of them, whatever `dir`
+ * and `q` are). The agent field is the caller's to fill.
  */
 export async function listSessions(
   projectsDir = claudeProjectsDir(),
-  o: { limit?: number; offset?: number; q?: string } = {},
-): Promise<{ sessions: Omit<ClaudeSession, 'agent'>[]; total: number }> {
+  o: { limit?: number; offset?: number; q?: string; dir?: string; folders?: boolean } = {},
+): Promise<{ sessions: Omit<ClaudeSession, 'agent'>[]; total: number; folders?: ClaudeProjectFolder[] }> {
   const limit = Math.max(1, Math.min(o.limit ?? 60, 500))
   const offset = Math.max(0, o.offset ?? 0)
-  const files = await sessionFiles(projectsDir)
-  const q = o.q?.trim().toLowerCase()
-  if (!q) return { sessions: await Promise.all(files.slice(offset, offset + limit).map(f => describe(projectsDir, f))), total: files.length }
+  const all = await sessionFiles(projectsDir)
+  const folders = o.folders ? { folders: await foldersOf(projectsDir, all) } : {}
+  const files = o.dir ? all.filter(f => f.dir === o.dir) : all
+  const words = (o.q ?? '').toLowerCase().split(/\s+/).filter(Boolean)
+  if (!words.length) return { sessions: await Promise.all(files.slice(offset, offset + limit).map(f => describe(projectsDir, f))), total: files.length, ...folders }
   const matching: Omit<ClaudeSession, 'agent'>[] = []
   for (const f of files) {
     const s = await describe(projectsDir, f)
-    if (`${s.title ?? ''} ${s.cwd ?? ''} ${f.dir} ${s.sessionId}`.toLowerCase().includes(q)) matching.push(s)
+    const text = searchText(s, f.dir)
+    if (words.every(w => text.includes(w))) matching.push(s)
   }
-  return { sessions: matching.slice(offset, offset + limit), total: matching.length }
+  return { sessions: matching.slice(offset, offset + limit), total: matching.length, ...folders }
 }
 
 /**

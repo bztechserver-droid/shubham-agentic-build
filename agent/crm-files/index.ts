@@ -5,7 +5,7 @@ import type { ApiMount } from '../api.ts'
 import type { CrmProxy } from '../agentic/crmproxy.ts'
 import { createWinMount } from './mount-win.ts'
 import { crmFilesMount } from './routes.ts'
-import { createCrmFiles, downloadViaFile, type CrmFilesService, type MountDriver } from './service.ts'
+import { createCrmFiles, downloadViaFile, marketingFolderFile, type CrmFilesService, type MountDriver } from './service.ts'
 import { CRM_FILES_MAX_UPLOAD } from '../../shared/crm-files.ts'
 import { UPLOAD_SETTINGS_FILE } from './upload-settings.ts'
 import { createCrmUploads, type CrmUploads } from './uploads.ts'
@@ -94,7 +94,7 @@ export function createCrmFilesModule(o: CrmFilesModuleOptions): CrmFilesModule {
   // o813f: a file in Google Drive is downloaded through Google's Drive API; the file crm-download-via-crm.on in this folder sends every download through the CRM's own (the old way).
   // ocbbf: "Keep on this PC" (pins-host.ts): its copies live in <state>/crm-pins; it is made after the service, which reaches it through this getter.
   let pinsRef: PinsHost | null = null
-  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD, downloadVia: downloadViaFile(o.dir), pins: () => pinsRef })
+  const service = createCrmFiles({ client, mountDriver: driver, spoolDir: path.join(o.dir, 'crm-spool'), openFolder: openFolderHere, log: o.log, maxUpload: () => uploadsRef?.maxSize() ?? CRM_FILES_MAX_UPLOAD, downloadVia: downloadViaFile(o.dir), pins: () => pinsRef, marketingFolder: marketingFolderFile(o.dir) })
   serviceRef = service
   const pins = createPinsHost({ dir: path.join(o.dir, 'crm-pins'), tree: () => service.pinTree(), fetchBytes: (id, start, length) => service.fileBytes(id, start, length), log: o.log })
   pinsRef = pins

@@ -141,9 +141,14 @@ export async function startUiServer(o: UiServerOptions): Promise<UiServer> {
     )
     // The agent's API not answering: the API's own error shape, as Vite's proxy gives it.
     upstream.on('error', () => {
-      if (res.headersSent) return void res.destroy()
+      if (res.headersSent || res.destroyed) return void res.destroy()
       res.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
       res.end(JSON.stringify({ error: `Nothing answers on 127.0.0.1:${port}` }))
+    })
+    // F-221: the page went away before its answer (a fetch it aborted, a tab it closed): the agent's request goes too, as Vite's proxy does
+    // in Dev, so the agent can drop work still queued for it (Whisper's queue: agent/speech/routes.ts).
+    res.on('close', () => {
+      if (!res.writableFinished) upstream.destroy()
     })
     req.pipe(upstream)
   }

@@ -5,6 +5,7 @@ import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { supervise, type Running, type Supervisor } from '../guard/supervisor.ts'
 import type { AnswerSource } from '../../shared/fast.ts'
+import { heardNote } from './fast-brief.ts'
 import { createMemoryGate, type GateView, type MemSample, type MemoryGate } from './fast-gate.ts'
 
 // F-087: the fast Assistant's process. It is NOT a chat: no terminal, no floor, no transcript file. One hidden
@@ -59,11 +60,16 @@ export interface FastAsk {
   source?: AnswerSource
   /** The live page snapshot: put in front of the turn only when it differs from the last one this process was given. */
   snapshot?: string
+  /**
+   * F-221 (ob98a): he cut the last answer off by speaking, and this is the part he heard. The turn carries a note of it (fast-brief.ts heardNote),
+   * and the history records that answer as cut off, with only these words.
+   */
+  heard?: string
 }
 
 export interface BriefContext {
-  /** The last turns, oldest first: what Shubham said and what the Assistant answered. */
-  history: { role: 'user' | 'assistant'; text: string }[]
+  /** The last turns, oldest first: what Shubham said and what the Assistant answered (`interrupted`: he spoke over it and heard only this text). */
+  history: { role: 'user' | 'assistant'; text: string; interrupted?: boolean }[]
   /** Orders handed to the Orchestrator and not answered yet, one line each. */
   openOrders: string[]
 }
@@ -159,6 +165,12 @@ export interface FastHost {
   deliver(note: string, turnId: string, emit: (f: FastFrame) => void): { ok: true } | { ok: false; reason: string }
   /** Stops turn `id` (every turn when left out): its `done` says cancelled, and the process is told to stop (restarted if it does not in 2 s). */
   interrupt(id?: string): void
+  /**
+   * F-221 (ob98a): true from the moment the process is told to stop a cut-off turn until it says it has (or it is restarted). A tool call made now
+   * may be the cut turn's late one, so the hub never credits it to the new ask (index.ts refuses a hand-off then). Fix round 2: also over the moment
+   * the process speaks of a turn written after the cut (that turn's own tool calls come after its first word, and are its own).
+   */
+  stopping(): boolean
   /** Is this tool key the running process's? (The hub gates its calls by it.) */
   keyOwns(key: string): boolean
   /** Once a second: idle end, memory, the supervisor. */
@@ -177,6 +189,10 @@ interface Rec {
   model: FastModel
   emit: (f: FastFrame) => void
   snapshot: string | undefined
+  /** F-221: what he heard of the answer before this one (a note goes in front of the turn). */
+  heard: string | undefined
+  /** F-221 (fix round 2): its place among the turns written to the process it was last written to (Proc.writes): after a cut or before it. */
+  seq?: number
   attempts: number
   said: string
   startedAt: number
@@ -211,6 +227,9 @@ interface Proc {
   holdTimer: ReturnType<typeof setTimeout> | null
   /** Turns waiting for the process to say it has stopped what it was doing. */
   held: Rec[]
+  /** F-221 (fix round 2): how many turns were written to it, and how many of them before the last cut (sendInterrupt). */
+  writes: number
+  cutAt: number
 }
 
 const STDERR_KEEP = 2000
@@ -267,6 +286,8 @@ export function createFastHost(deps: FastDeps): FastHost {
   let costUsd = 0
   const exits: number[] = []
   const timings: TurnTiming[] = []
+  /** F-221 (ob98a): the last turn that ended and whether it was cut off, for the next ask that says what he heard of it (noteHeard). */
+  let lastEnded: { kind: 'user' | 'note'; text: string; cut: boolean } | null = null
 
   const shown = (): FastHostState => (state === 'failed' ? 'unavailable' : state)
   const snapshot = (): FastStatus => ({
@@ -308,10 +329,27 @@ export function createFastHost(deps: FastDeps): FastHost {
   }
 
   const clip = (s: string) => (s.length > HISTORY_CHARS ? `${s.slice(0, HISTORY_CHARS)}…` : s)
-  const remember = (role: 'user' | 'assistant', text: string) => {
+  const remember = (role: 'user' | 'assistant', text: string, interrupted = false) => {
     if (!text.trim()) return
-    history.push({ role, text: clip(text.trim()) })
+    history.push({ role, text: clip(text.trim()), ...(interrupted ? { interrupted: true } : {}) })
     while (history.length > HISTORY_TURNS * 2) history.shift()
+  }
+
+  /**
+   * F-221 (ob98a): his new ask says he spoke over the last answer and heard only `heard`. A turn cut off here was never kept, so it is kept now
+   * with what he heard, marked interrupted; one that had ended here (he cut the voice reading it) has its answer replaced by what he heard.
+   */
+  function noteHeard(heard: string) {
+    const last = lastEnded
+    lastEnded = null
+    if (!last) return
+    if (last.cut) {
+      if (last.kind === 'user') remember('user', last.text)
+      remember('assistant', heard, true)
+      return
+    }
+    const end = history.length - 1
+    if (end >= 0 && history[end].role === 'assistant') history[end] = { role: 'assistant', text: clip(heard.trim()), interrupted: true }
   }
 
   function finish(r: Rec, f: FastFrame) {
@@ -326,16 +364,32 @@ export function createFastHost(deps: FastDeps): FastHost {
 
   function writeTurn(p: Proc, r: Rec): boolean {
     r.attempts++
-    // The snapshot goes in front only when this process has not been given this one.
+    // The snapshot goes in front only when this process has not been given this one. F-221: so does the note of what he heard of the last answer.
     const withSnap = r.snapshot !== undefined && r.snapshot !== p.snapshot
-    const content = withSnap ? [{ type: 'text', text: r.snapshot }, { type: 'text', text: r.text }] : r.text
+    const front = [...(withSnap ? [{ type: 'text', text: r.snapshot }] : []), ...(r.heard ? [{ type: 'text', text: heardNote(r.heard) }] : [])]
+    const content = front.length ? [...front, { type: 'text', text: r.text }] : r.text
     const ok = send(p, { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, uuid: r.uuid })
     if (ok) {
       if (withSnap) p.snapshot = r.snapshot ?? null
       r.startedAt = deps.now()
+      r.seq = ++p.writes
       sentTo.set(r.id, [...(sentTo.get(r.id) ?? []), p.sid])
     }
     return ok
+  }
+
+  /**
+   * F-221 (ob98a, fix round 2: decision 6): the process speaks of a turn written after the cut (by its user_message_uuid): it has stopped the cut
+   * turn, whether or not its answer to the interrupt has come, so the interrupt is settled now. Then the new ask's own hand-off is not refused as
+   * if it were the cut turn's late call (stopping()); a tool call that comes before this first word of the new turn still is.
+   */
+  function movedOn(p: Proc, ev: { user_message_uuid?: unknown }) {
+    if (!p.interruptId || typeof ev.user_message_uuid !== 'string' || p.cancelled.has(ev.user_message_uuid)) return
+    for (const r of turns.values()) {
+      if (r.uuid !== ev.user_message_uuid) continue
+      if (r.seq !== undefined && r.seq > p.cutAt && sentTo.get(r.id)?.includes(p.sid)) settled(p)
+      return
+    }
   }
 
   /** The turn an event belongs to: the one it names; one that names a turn cut off, or is unknown, belongs to nobody. */
@@ -439,6 +493,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     if (m.parent_tool_use_id != null) return
     const ev = m.event as { type?: unknown; index?: number; content_block?: { type?: unknown; name?: unknown }; delta?: { type?: unknown; text?: unknown } } | undefined
     if (!ev || ev.type === 'ping') return
+    movedOn(p, m as { user_message_uuid?: unknown })
     if (ev.type === 'message_start') {
       p.blocks = new Map()
       p.msgStreamed = false
@@ -467,7 +522,9 @@ export function createFastHost(deps: FastDeps): FastHost {
 
   // A whole message with no stream before it (the process did not stream this one).
   function onAssistant(p: Proc, m: Record<string, unknown>) {
-    if (m.parent_tool_use_id != null || p.msgStreamed || m.error) return
+    if (m.parent_tool_use_id != null) return
+    movedOn(p, m as { user_message_uuid?: unknown })
+    if (p.msgStreamed || m.error) return
     const msg = m.message as { content?: unknown } | undefined
     if (!msg || !Array.isArray(msg.content)) return
     const r = recFor(p, m as { user_message_uuid?: unknown })
@@ -498,6 +555,8 @@ export function createFastHost(deps: FastDeps): FastHost {
       settled(p)
       return
     }
+    // F-221 (fix round 2): the end of a turn written after the cut: the cut one is over too.
+    for (const u of uuids) movedOn(p, { user_message_uuid: u })
     let done = [...turns.values()].filter(r => uuids.includes(r.uuid))
     if (!done.length && !uuids.length) {
       const first = turns.values().next().value
@@ -516,6 +575,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     for (const r of done) {
       if (m.is_error === true) {
         errors++
+        lastEnded = null
         const w = errorWords(m)
         finish(r, { t: 'error', id: r.id, status: w.status, message: w.message })
         continue
@@ -524,6 +584,7 @@ export function createFastHost(deps: FastDeps): FastHost {
       const said = (r.said || (typeof m.result === 'string' ? m.result : '')).trim()
       if (r.kind === 'user') remember('user', r.text)
       remember('assistant', said)
+      lastEnded = { kind: r.kind, text: r.text, cut: false }
       const wallMs = deps.now() - r.startedAt
       const ttftMs = r.firstAt === null ? null : r.firstAt - r.startedAt
       timings.push({ id: r.id, model: p.model, ttftMs, wallMs, ms: ms ?? null, costUsd: cost > 0 ? cost : null, at: deps.now() })
@@ -592,6 +653,7 @@ export function createFastHost(deps: FastDeps): FastHost {
     const p: Proc = {
       child, pid: child.pid ?? 0, sid, key, startedAt, initId: randomUUID(), ready: false, readyMs: null, dead: false, files, model, lastCost: 0, stderr: '',
       blocks: new Map(), msgStreamed: false, names, snapshot: null, cancelled: new Set(), interruptId: null, interruptTimer: null, holdTimer: null, held: [],
+      writes: 0, cutAt: 0,
     }
     proc = p
     child.stdin?.on?.('error', () => {})
@@ -690,6 +752,8 @@ export function createFastHost(deps: FastDeps): FastHost {
     if (p.interruptId) return
     const id = randomUUID()
     p.interruptId = id
+    // F-221 (fix round 2): a turn written from now on is after the cut (movedOn).
+    p.cutAt = p.writes
     send(p, { type: 'control_request', request_id: id, request: { subtype: 'interrupt', cancel_queued: true } })
     // A turn waiting for it is written after this long even if it has not answered yet.
     p.holdTimer = setTimeout(() => {
@@ -707,22 +771,33 @@ export function createFastHost(deps: FastDeps): FastHost {
     p.interruptTimer.unref?.()
   }
 
-  /** Cuts a turn off: its `done` says cancelled and what it had said so far. True when the process had been given it. */
-  function cancelRec(r: Rec): boolean {
-    const wasWritten = !!proc && !!sentTo.get(r.id)?.includes(proc.sid)
-    if (wasWritten && proc) proc.cancelled.add(r.uuid)
-    finish(r, { t: 'done', id: r.id, text: r.said.trim(), cancelled: true })
-    return wasWritten
+  /**
+   * Cuts turns off: each `done` says cancelled and what it had said so far. True when the process had been given any of them. F-221 (ob98a, review
+   * of T2): what he heard belongs to the first of them, the one the process was answering; the others waited behind it (a hand-off's answer queued
+   * behind his ask among them), so the first is kept as the last turn that ended (noteHeard).
+   */
+  function cutOff(list: Rec[]): boolean {
+    let written = false
+    for (const r of list) {
+      const was = !!proc && !!sentTo.get(r.id)?.includes(proc.sid)
+      if (was && proc) proc.cancelled.add(r.uuid)
+      finish(r, { t: 'done', id: r.id, text: r.said.trim(), cancelled: true })
+      if (was) written = true
+    }
+    if (list.length) lastEnded = { kind: list[0].kind, text: list[0].text, cut: true }
+    return written
   }
 
   function add(turn: FastAsk, kind: 'user' | 'note', emit: (f: FastFrame) => void): { ok: true } | { ok: false; reason: string } {
     if (stopped) return { ok: false, reason: 'The Assistant is off.' }
     if (state === 'paused' || state === 'failed' || state === 'off' || !sup) return { ok: false, reason: reason ?? 'The Assistant is not running.' }
     const model = turn.model ?? modelPin
-    const r: Rec = { id: turn.id, uuid: randomUUID(), text: turn.text, kind, model, emit, snapshot: turn.snapshot, attempts: 0, said: '', startedAt: deps.now(), firstAt: null }
+    const heard = kind === 'user' && turn.heard?.trim() ? turn.heard.trim() : undefined
+    const r: Rec = { id: turn.id, uuid: randomUUID(), text: turn.text, kind, model, emit, snapshot: turn.snapshot, heard, attempts: 0, said: '', startedAt: deps.now(), firstAt: null }
     // A turn still running is cut off by this one (a note never cuts anything off: it waits its turn).
-    let interrupted = false
-    if (kind === 'user') for (const old of [...turns.values()]) if (cancelRec(old)) interrupted = true
+    const interrupted = kind === 'user' ? cutOff([...turns.values()]) : false
+    // F-221 (ob98a): the answer he spoke over is kept as he heard it (after the cut above, so a turn cut by this very ask counts).
+    if (heard) noteHeard(heard)
     turns.set(r.id, r)
     // A different model is used from the next process on: now if nothing else is in flight, else when the turn is done.
     if (model !== modelPin) {
@@ -777,11 +852,13 @@ export function createFastHost(deps: FastDeps): FastHost {
     interrupt(id) {
       const p = proc
       const list = id === undefined ? [...turns.values()] : turns.has(id) ? [turns.get(id)!] : []
-      let any = false
-      for (const r of list) if (cancelRec(r)) any = true
+      const any = cutOff(list)
       if (any && p && !p.dead) sendInterrupt(p)
       changed()
     },
+    // F-221 (ob98a): from sendInterrupt until settled() (its answer, the result of the cut turn, or (fix round 2) the first word of a turn written
+    // after the cut) or the process ending (a restart).
+    stopping: () => !!proc && !proc.dead && proc.interruptId !== null,
     keyOwns: key => !!proc && !proc.dead && proc.key === key,
     async tick() {
       if (stopped) return

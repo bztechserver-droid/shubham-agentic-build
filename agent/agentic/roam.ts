@@ -88,7 +88,9 @@ export async function request<T>(peer: LinkPeer, op: string, body: unknown = {},
   try {
     stream = await peer.open({ op })
   } catch (e) {
-    throw apiError(502, `${peer.name} turned it down: ${message(e)}`)
+    // F-221 (ob98a, fix round 2): the stream never opened, so nothing of this request reached that PC (`sent: false`); a caller that must tell "not
+    // done" from "not known" (a spoken line, his tap on a held message) reads it. Every failure after this point may have been carried out there.
+    throw Object.assign(apiError(502, `${peer.name} turned it down: ${message(e)}`), { sent: false })
   }
   stream.end(`${JSON.stringify(body)}\n`)
   let lines: unknown[]

@@ -152,6 +152,10 @@ export function createApiFastHost(deps: ApiHostDeps): FastHost {
     keyOwns() {
       return false
     },
+    // F-221 (ob98a): no process and no tool key of its own (keyOwns above): nothing of a cut turn can call the hub.
+    stopping() {
+      return false
+    },
     async tick() {
       // Nothing to watch: no process, no memory.
     },

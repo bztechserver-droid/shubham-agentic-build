@@ -288,6 +288,6 @@ export function combinePools(base: ChatPool, extra: ChatPool): ChatPool {
     promptTaken: (sid, t, since) => owner(sid).promptTaken?.(sid, t, since) ?? null,
     draftMirror: (sid, client) => owner(sid).draftMirror?.(sid, client) ?? null, mirrorTakeOut: sid => owner(sid).mirrorTakeOut?.(sid) ?? Promise.resolve('none' as const),
     generation: sid => owner(sid).generation?.(sid) ?? null,
-    type: (sid, t, opt) => owner(sid).type(sid, t, opt), typeWhenReady: (sid, t, opt) => owner(sid).typeWhenReady(sid, t, opt), kill: (sid, why) => owner(sid).kill(sid, why), waitStopped: sid => base.waitStopped?.(sid) ?? Promise.resolve(), adopt: (a, p, r) => base.adopt(a, p, r), activity: sid => owner(sid).activity(sid), press: (sid, d) => owner(sid).press(sid, d), closeAll() { extra.closeAll(); base.closeAll() },
+    type: (sid, t, opt) => owner(sid).type(sid, t, opt), typeWhenReady: (sid, t, opt) => owner(sid).typeWhenReady(sid, t, opt), waiting: (sid, t) => owner(sid).waiting?.(sid, t) ?? 0, screenState: sid => owner(sid).screenState?.(sid) ?? null, kill: (sid, why) => owner(sid).kill(sid, why), waitStopped: sid => base.waitStopped?.(sid) ?? Promise.resolve(), adopt: (a, p, r) => base.adopt(a, p, r), activity: sid => owner(sid).activity(sid), press: (sid, d) => owner(sid).press(sid, d), closeAll() { extra.closeAll(); base.closeAll() },
   }
 }
